@@ -6,7 +6,7 @@
 # ──────────────────────────────────────────────────────────────────────────────
 
 APP_NAME    = "Pulse"
-APP_VERSION = "1.0.0"           # SemVer: MAJOR.MINOR.PATCH
+APP_VERSION = "1.0.3"           # SemVer: MAJOR.MINOR.PATCH
 APP_AUTHOR  = "skanike"     # ← замените на своё имя/псевдоним
 APP_YEAR    = "2026"
 
@@ -24,10 +24,10 @@ ABOUT_TEXT = f"""\
 {APP_NAME}  v{APP_VERSION}
 
 Приложение для голосового общения с поддержкой
-видео-трансляций, soundboard и шумоподавления.
+видео-трансляций, soundboard и шумоподавлением ыыы.
 
 Автор: {APP_AUTHOR}
 Год:   {APP_YEAR}
 
-Стек: Python · PyQt6 · Opus · OpenGL · WASAPI · RRnoise
+Стек: Python · PyQt6 · Opus · OpenGL · WASAPI · RRnoise · QQ
 """
