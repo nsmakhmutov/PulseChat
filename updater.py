@@ -15,8 +15,8 @@
 #   - Тег релиза должен быть в формате "v1.2.3" или "1.2.3"
 #
 # Зависимости:
-#   - py7zr     (для .7z архивов)  pip install py7zr
-#   - packaging (для SemVer)       pip install packaging
+#   - py7zr      (для .7z архивов)  pip install py7zr
+#   - packaging  (для SemVer)       pip install packaging
 # ──────────────────────────────────────────────────────────────────────────────
 
 import threading
@@ -346,12 +346,39 @@ def download_and_install(download_url: str, on_progress=None, on_done=None, on_e
                 subprocess.Popen(["explorer", extract_dir])
                 return
 
-            # 5. Запускаем новую версию и закрываем текущую
-            print(f"[Updater] Запускаю: {exe_to_run}")
+            # 5. Сообщаем UI что сейчас закроемся
             if on_done:
                 on_done()
 
-            subprocess.Popen([exe_to_run], shell=True)
+            # 6. Запускаем через bat-лончер: он дожидается смерти
+            #    текущего процесса (по PID) и только потом открывает
+            #    новый exe. Без этого оба окна живут одновременно,
+            #    потому что Qt-cleanup занимает время после sys.exit(0).
+            current_pid = os.getpid()
+            bat_path = os.path.join(tempfile.gettempdir(), "pulse_update_launcher.bat")
+            # taskkill /PID — убивает старый процесс принудительно,
+            # ping -n 3 — пауза ~2 сек (стандартный трюк вместо sleep в cmd),
+            # start "" — открывает новый exe в отдельном процессе,
+            # del — самоудаляется после запуска.
+            bat_lines = [
+                "@echo off",
+                f"taskkill /PID {current_pid} /F >nul 2>&1",
+                "ping -n 3 127.0.0.1 >nul",
+                f'start "" "{exe_to_run}"',
+                'del "%~f0"',
+            ]
+            bat_content = "\n".join(bat_lines) + "\n"
+            with open(bat_path, "w", encoding="ascii") as bat_f:
+                bat_f.write(bat_content)
+
+            print(f"[Updater] Лончер: {bat_path}")
+            subprocess.Popen(
+                ["cmd", "/c", bat_path],
+                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+                close_fds=True,
+            )
+            # sys.exit вызывает Qt-cleanup и закрывает окно.
+            # Батник убьёт нас через taskkill если Qt завис.
             sys.exit(0)
 
         except Exception as e:
