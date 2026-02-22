@@ -6,7 +6,7 @@
 # ──────────────────────────────────────────────────────────────────────────────
 
 APP_NAME    = "Pulse"
-APP_VERSION = "1.0.9"           # SemVer: MAJOR.MINOR.PATCH
+APP_VERSION = "1.0.10"           # SemVer: MAJOR.MINOR.PATCH
 APP_AUTHOR  = "skanike"     # ← замените на своё имя/псевдоним
 APP_YEAR    = "2026"
 
@@ -24,7 +24,7 @@ ABOUT_TEXT = f"""\
 {APP_NAME}  v{APP_VERSION}
 
 Приложение для голосового общения с поддержкой
-видео-трансляций, soundboard и шумоподавлением ыыы.
+видео-трансляций, soundboard и шумоподавлением.
 
 Автор: {APP_AUTHOR}
 Год:   {APP_YEAR}
