@@ -7,12 +7,16 @@
 #   2. Делает GET https://api.github.com/repos/{owner}/{repo}/releases/latest
 #   3. Сравнивает tag_name с APP_VERSION.
 #   4. Если новее — вызывает callback(new_version: str, download_url: str).
-#   5. download_and_install(url) — скачивает .zip в %TEMP%,
+#   5. download_and_install(url) — скачивает .zip/.7z в %TEMP%,
 #      распаковывает, находит .exe внутри и запускает его.
 #
 # Требования к GitHub релизу:
-#   - Прикрепи файл VoiceChat.zip (содержащий VoiceChat.exe)
+#   - Прикрепи файл VoiceChat.zip или VoiceChat.7z (содержащий VoiceChat.exe)
 #   - Тег релиза должен быть в формате "v1.2.3" или "1.2.3"
+#
+# Зависимости:
+#   - py7zr     (для .7z архивов)  pip install py7zr
+#   - packaging (для SemVer)       pip install packaging
 # ──────────────────────────────────────────────────────────────────────────────
 
 import threading
@@ -29,17 +33,21 @@ from packaging.version import Version
 
 from version import APP_VERSION, GITHUB_REPO
 
-# Таймаут HTTP-запроса (секунды)
+# Таймаут HTTP-запроса к API (секунды)
 _HTTP_TIMEOUT = 8
 
-# Таймаут скачивания (секунды). Файл может весить десятки МБ.
-_DOWNLOAD_TIMEOUT = 120
+# Таймаут скачивания (секунды). Файл 116 МБ на плохом канале может идти долго.
+_DOWNLOAD_TIMEOUT = 300
 
 # User-Agent для всех запросов — GitHub CDN блокирует запросы без него.
 _USER_AGENT = "VoiceChat-Updater/1.0"
 
-# ZIP magic bytes: первые 4 байта любого валидного .zip файла
+# Поддерживаемые расширения архивов (в порядке приоритета)
+_SUPPORTED_EXTENSIONS = (".zip", ".7z")
+
+# Magic bytes для определения типа архива по содержимому (не по расширению)
 _ZIP_MAGIC = b"PK\x03\x04"
+_7Z_MAGIC  = b"7z\xbc\xaf\x27\x1c"
 
 
 def _parse_version(tag: str) -> str:
@@ -55,16 +63,21 @@ def _is_newer(remote: str, current: str) -> bool:
         return False
 
 
-def _find_zip_asset(assets: list):
+def _find_archive_asset(assets: list):
     """
-    Ищет первый .zip ассет в списке релизных активов.
-    Возвращает (name, browser_download_url) или None.
-    GitHub не принимает .exe — поэтому всегда упаковываем в .zip.
+    Ищет первый поддерживаемый архив (.zip или .7z) в списке релизных активов.
+    Возвращает (name, browser_download_url, ext) или None.
+
+    Приоритет: сначала .zip (встроенная библиотека), потом .7z (py7zr).
+    Раньше функция называлась _find_zip_asset и искала только .zip —
+    это и была причина бага: файл VoiceChatClient.7z не находился,
+    код падал в fallback на html_url (HTML-страница GitHub) → не архив → ошибка.
     """
-    for asset in assets:
-        name = asset.get("name", "").lower()
-        if name.endswith(".zip"):
-            return asset["name"], asset["browser_download_url"]
+    for ext in _SUPPORTED_EXTENSIONS:
+        for asset in assets:
+            name = asset.get("name", "").lower()
+            if name.endswith(ext):
+                return asset["name"], asset["browser_download_url"], ext
     return None
 
 
@@ -73,9 +86,8 @@ def _download_file_with_progress(url: str, dest_path: str, on_progress=None):
     Скачивает файл по URL с поддержкой прогресса.
 
     ВАЖНО: использует urllib.request.Request с User-Agent.
-    urlretrieve() не позволяет передать заголовки — из-за этого
-    GitHub CDN (objects.githubusercontent.com) возвращает HTML-ошибку
-    вместо бинарного файла, что приводит к BadZipFile.
+    urlretrieve() не позволяет передать заголовки — без User-Agent
+    GitHub CDN возвращает HTML вместо бинарного файла.
 
     Raises:
         urllib.error.HTTPError  — сервер вернул HTTP-ошибку (4xx/5xx)
@@ -103,24 +115,56 @@ def _download_file_with_progress(url: str, dest_path: str, on_progress=None):
                 f.write(chunk)
                 downloaded += len(chunk)
                 if on_progress and total_size > 0:
-                    pct = min(100, int(downloaded * 100 / total_size))
+                    pct = min(99, int(downloaded * 100 / total_size))
                     on_progress(pct)
 
-    # Если Content-Length не было — вручную ставим 100%
     if on_progress:
         on_progress(100)
 
 
-def _validate_zip(path: str) -> bool:
+def _detect_archive_type(path: str):
     """
-    Быстрая проверка magic bytes — убеждаемся, что скачали ZIP, а не HTML.
-    Вызывается ДО zipfile.ZipFile(), чтобы дать внятное сообщение об ошибке.
+    Определяет тип архива по magic bytes (не по расширению файла).
+    Возвращает 'zip', '7z' или None если файл не является поддерживаемым архивом.
     """
     try:
         with open(path, "rb") as f:
-            return f.read(4) == _ZIP_MAGIC
+            header = f.read(6)
+        if header[:4] == _ZIP_MAGIC:
+            return "zip"
+        if header[:6] == _7Z_MAGIC:
+            return "7z"
+        return None
     except OSError:
-        return False
+        return None
+
+
+def _extract_archive(archive_path: str, extract_dir: str, archive_type: str):
+    """
+    Распаковывает архив в указанную директорию.
+
+    Raises:
+        zipfile.BadZipFile  — повреждённый ZIP
+        RuntimeError        — py7zr не установлен или неизвестный формат
+        Exception           — прочие ошибки py7zr
+    """
+    if archive_type == "zip":
+        with zipfile.ZipFile(archive_path, "r") as z:
+            z.extractall(extract_dir)
+
+    elif archive_type == "7z":
+        try:
+            import py7zr
+        except ImportError:
+            raise RuntimeError(
+                "Для распаковки .7z необходима библиотека py7zr.\n"
+                "Установите её командой:  pip install py7zr"
+            )
+        with py7zr.SevenZipFile(archive_path, mode="r") as z:
+            z.extractall(path=extract_dir)
+
+    else:
+        raise RuntimeError(f"Неизвестный тип архива: {archive_type!r}")
 
 
 def check_for_updates(on_update_found=None, on_no_update=None, on_error=None):
@@ -170,8 +214,19 @@ def check_for_updates(on_update_found=None, on_no_update=None, on_error=None):
 
     if _is_newer(remote_version, APP_VERSION):
         assets = data.get("assets", [])
-        asset = _find_zip_asset(assets)
-        download_url = asset[1] if asset else data.get("html_url", "")
+        asset = _find_archive_asset(assets)
+
+        if asset is None:
+            # Нет ни .zip ни .7z — сообщаем внятно вместо тихого падения в html_url
+            if on_error:
+                on_error(
+                    f"Найдена новая версия {remote_version}, но к релизу\n"
+                    "не прикреплён архив (.zip или .7z).\n"
+                    "Скачайте вручную с GitHub."
+                )
+            return
+
+        _name, download_url, _ext = asset
         if on_update_found:
             on_update_found(remote_version, download_url)
     else:
@@ -199,8 +254,8 @@ def check_for_updates_async(on_update_found=None, on_no_update=None, on_error=No
 
 def download_and_install(download_url: str, on_progress=None, on_done=None, on_error=None):
     """
-    Скачивает .zip по URL в %TEMP%, распаковывает, ищет .exe внутри и запускает.
-    После запуска установщика - закрывает текущее приложение через sys.exit(0).
+    Скачивает .zip/.7z по URL в %TEMP%, распаковывает, ищет .exe и запускает.
+    После запуска установщика закрывает текущее приложение через sys.exit(0).
 
     Параметры:
         on_progress(percent: int)   - прогресс загрузки 0..100
@@ -208,21 +263,16 @@ def download_and_install(download_url: str, on_progress=None, on_done=None, on_e
         on_error(message: str)      - ошибка
     """
     def _download():
-        dest_zip = None
         try:
-            # 1. Скачиваем ZIP с правильными заголовками.
-            #    urlretrieve() не поддерживает кастомные заголовки — GitHub CDN
-            #    без User-Agent отдаёт HTML вместо бинарного файла → BadZipFile.
-            filename = download_url.split("/")[-1] or "update.zip"
-            if not filename.lower().endswith(".zip"):
-                filename = "update.zip"
-            dest_zip = os.path.join(tempfile.gettempdir(), filename)
+            # 1. Сохраняем с оригинальным именем из URL (включая расширение .7z/.zip)
+            filename = download_url.split("/")[-1].split("?")[0] or "update.bin"
+            dest_path = os.path.join(tempfile.gettempdir(), filename)
 
             print(f"[Updater] Скачиваю: {download_url}")
-            print(f"[Updater] Сохраняю в: {dest_zip}")
+            print(f"[Updater] Сохраняю в: {dest_path}")
 
             try:
-                _download_file_with_progress(download_url, dest_zip, on_progress)
+                _download_file_with_progress(download_url, dest_path, on_progress)
             except urllib.error.HTTPError as e:
                 if on_error:
                     on_error(f"Ошибка сервера при скачивании: HTTP {e.code} {e.reason}")
@@ -232,37 +282,49 @@ def download_and_install(download_url: str, on_progress=None, on_done=None, on_e
                     on_error(f"Нет соединения при скачивании: {e.reason}")
                 return
 
-            # 2. Проверяем magic bytes ДО открытия как ZipFile.
-            #    Если GitHub вернул HTML (например, страницу ошибки) — даём
-            #    внятное сообщение, а не «файл повреждён».
-            file_size = os.path.getsize(dest_zip)
+            file_size = os.path.getsize(dest_path)
             print(f"[Updater] Скачано байт: {file_size}")
 
-            if not _validate_zip(dest_zip):
-                # Читаем начало файла для диагностики
+            # 2. Определяем тип архива по magic bytes (не доверяем расширению)
+            archive_type = _detect_archive_type(dest_path)
+            print(f"[Updater] Тип архива по magic bytes: {archive_type}")
+
+            if archive_type is None:
                 try:
-                    with open(dest_zip, "rb") as f:
+                    with open(dest_path, "rb") as f:
                         preview = f.read(256).decode("utf-8", errors="replace")
                 except Exception:
                     preview = "<не читается>"
-                print(f"[Updater] Скачанный файл — не ZIP. Начало: {preview[:120]!r}")
+                print(f"[Updater] Не архив. Начало файла: {preview[:120]!r}")
                 if on_error:
                     on_error(
-                        "Скачанный файл не является ZIP-архивом.\n"
+                        "Скачанный файл не является архивом (.zip или .7z).\n"
                         "Возможно, GitHub вернул страницу ошибки.\n"
                         "Попробуйте ещё раз или скачайте вручную."
                     )
                 return
 
-            # 3. Распаковываем в temp-папку
+            # 3. Распаковываем
             extract_dir = os.path.join(tempfile.gettempdir(), "voicechat_update")
             if os.path.exists(extract_dir):
                 shutil.rmtree(extract_dir, ignore_errors=True)
             os.makedirs(extract_dir, exist_ok=True)
 
-            print(f"[Updater] Распаковываю в: {extract_dir}")
-            with zipfile.ZipFile(dest_zip, "r") as z:
-                z.extractall(extract_dir)
+            print(f"[Updater] Распаковываю ({archive_type}) в: {extract_dir}")
+            try:
+                _extract_archive(dest_path, extract_dir, archive_type)
+            except RuntimeError as e:
+                if on_error:
+                    on_error(str(e))
+                return
+            except zipfile.BadZipFile:
+                if on_error:
+                    on_error("ZIP-архив повреждён. Попробуйте скачать ещё раз.")
+                return
+            except Exception as e:
+                if on_error:
+                    on_error(f"Ошибка распаковки: {e}")
+                return
 
             # 4. Ищем .exe внутри
             exe_to_run = None
@@ -292,13 +354,6 @@ def download_and_install(download_url: str, on_progress=None, on_done=None, on_e
             subprocess.Popen([exe_to_run], shell=True)
             sys.exit(0)
 
-        except zipfile.BadZipFile:
-            # Сюда попадаем если magic bytes прошли, но архив всё равно битый
-            if on_error:
-                on_error(
-                    "ZIP-архив повреждён (ошибка при распаковке).\n"
-                    "Попробуйте скачать ещё раз."
-                )
         except Exception as e:
             print(f"[Updater] Неожиданная ошибка: {e}")
             if on_error:

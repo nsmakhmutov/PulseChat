@@ -109,6 +109,10 @@ a = Analysis(
         'jinja2',
         'ctypes',
         'fractions',
+        # updater.py импортирует py7zr внутри try/except — PyInstaller не видит статически
+        'py7zr',
+        'py7zr.helpers',
+        'py7zr.compressor',
     ] + collect_submodules('pyrnnoise'),
     hookspath=[],
     hooksconfig={},

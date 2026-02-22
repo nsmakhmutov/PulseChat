@@ -11,3 +11,4 @@ PyQt6==6.10.2
 pyqt6_sip==13.11.0
 pyrnnoise==0.4.3
 sounddevice==0.5.5
+py7zr>=0.20

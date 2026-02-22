@@ -97,6 +97,8 @@ def main():
         "sounddevice": "sounddevice",
         "numpy":       "numpy",
         "pygame":      "pygame",
+        "py7zr":       "py7zr>=0.20",       # нужен updater.py (распаковка .7z)
+        # pipreqs не видит "import py7zr" внутри try/except — добавляем вручную
     }
 
     with open(output_file, "r", encoding="utf-8") as f:
