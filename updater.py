@@ -24,12 +24,22 @@ import sys
 import tempfile
 import zipfile
 import subprocess
+import shutil
 from packaging.version import Version
 
 from version import APP_VERSION, GITHUB_REPO
 
 # Таймаут HTTP-запроса (секунды)
 _HTTP_TIMEOUT = 8
+
+# Таймаут скачивания (секунды). Файл может весить десятки МБ.
+_DOWNLOAD_TIMEOUT = 120
+
+# User-Agent для всех запросов — GitHub CDN блокирует запросы без него.
+_USER_AGENT = "VoiceChat-Updater/1.0"
+
+# ZIP magic bytes: первые 4 байта любого валидного .zip файла
+_ZIP_MAGIC = b"PK\x03\x04"
 
 
 def _parse_version(tag: str) -> str:
@@ -58,6 +68,61 @@ def _find_zip_asset(assets: list):
     return None
 
 
+def _download_file_with_progress(url: str, dest_path: str, on_progress=None):
+    """
+    Скачивает файл по URL с поддержкой прогресса.
+
+    ВАЖНО: использует urllib.request.Request с User-Agent.
+    urlretrieve() не позволяет передать заголовки — из-за этого
+    GitHub CDN (objects.githubusercontent.com) возвращает HTML-ошибку
+    вместо бинарного файла, что приводит к BadZipFile.
+
+    Raises:
+        urllib.error.HTTPError  — сервер вернул HTTP-ошибку (4xx/5xx)
+        urllib.error.URLError   — сетевая ошибка
+        OSError                 — ошибка записи на диск
+    """
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": _USER_AGENT,
+            "Accept": "application/octet-stream",
+        }
+    )
+
+    with urllib.request.urlopen(req, timeout=_DOWNLOAD_TIMEOUT) as response:
+        total_size = int(response.headers.get("Content-Length", 0))
+        downloaded = 0
+        chunk_size = 65536  # 64 KB
+
+        with open(dest_path, "wb") as f:
+            while True:
+                chunk = response.read(chunk_size)
+                if not chunk:
+                    break
+                f.write(chunk)
+                downloaded += len(chunk)
+                if on_progress and total_size > 0:
+                    pct = min(100, int(downloaded * 100 / total_size))
+                    on_progress(pct)
+
+    # Если Content-Length не было — вручную ставим 100%
+    if on_progress:
+        on_progress(100)
+
+
+def _validate_zip(path: str) -> bool:
+    """
+    Быстрая проверка magic bytes — убеждаемся, что скачали ZIP, а не HTML.
+    Вызывается ДО zipfile.ZipFile(), чтобы дать внятное сообщение об ошибке.
+    """
+    try:
+        with open(path, "rb") as f:
+            return f.read(4) == _ZIP_MAGIC
+    except OSError:
+        return False
+
+
 def check_for_updates(on_update_found=None, on_no_update=None, on_error=None):
     """
     Синхронная проверка обновлений. Вызывается из фонового потока.
@@ -75,7 +140,7 @@ def check_for_updates(on_update_found=None, on_no_update=None, on_error=None):
     url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
     headers = {
         "Accept": "application/vnd.github+json",
-        "User-Agent": "VoiceChat-Updater/1.0",
+        "User-Agent": _USER_AGENT,
     }
 
     try:
@@ -143,29 +208,63 @@ def download_and_install(download_url: str, on_progress=None, on_done=None, on_e
         on_error(message: str)      - ошибка
     """
     def _download():
+        dest_zip = None
         try:
-            # 1. Скачиваем zip
+            # 1. Скачиваем ZIP с правильными заголовками.
+            #    urlretrieve() не поддерживает кастомные заголовки — GitHub CDN
+            #    без User-Agent отдаёт HTML вместо бинарного файла → BadZipFile.
             filename = download_url.split("/")[-1] or "update.zip"
+            if not filename.lower().endswith(".zip"):
+                filename = "update.zip"
             dest_zip = os.path.join(tempfile.gettempdir(), filename)
 
-            def _reporthook(block_num, block_size, total_size):
-                if total_size > 0 and on_progress:
-                    pct = min(100, int(block_num * block_size * 100 / total_size))
-                    on_progress(pct)
+            print(f"[Updater] Скачиваю: {download_url}")
+            print(f"[Updater] Сохраняю в: {dest_zip}")
 
-            urllib.request.urlretrieve(download_url, dest_zip, reporthook=_reporthook)
+            try:
+                _download_file_with_progress(download_url, dest_zip, on_progress)
+            except urllib.error.HTTPError as e:
+                if on_error:
+                    on_error(f"Ошибка сервера при скачивании: HTTP {e.code} {e.reason}")
+                return
+            except urllib.error.URLError as e:
+                if on_error:
+                    on_error(f"Нет соединения при скачивании: {e.reason}")
+                return
 
-            # 2. Распаковываем в temp-папку
+            # 2. Проверяем magic bytes ДО открытия как ZipFile.
+            #    Если GitHub вернул HTML (например, страницу ошибки) — даём
+            #    внятное сообщение, а не «файл повреждён».
+            file_size = os.path.getsize(dest_zip)
+            print(f"[Updater] Скачано байт: {file_size}")
+
+            if not _validate_zip(dest_zip):
+                # Читаем начало файла для диагностики
+                try:
+                    with open(dest_zip, "rb") as f:
+                        preview = f.read(256).decode("utf-8", errors="replace")
+                except Exception:
+                    preview = "<не читается>"
+                print(f"[Updater] Скачанный файл — не ZIP. Начало: {preview[:120]!r}")
+                if on_error:
+                    on_error(
+                        "Скачанный файл не является ZIP-архивом.\n"
+                        "Возможно, GitHub вернул страницу ошибки.\n"
+                        "Попробуйте ещё раз или скачайте вручную."
+                    )
+                return
+
+            # 3. Распаковываем в temp-папку
             extract_dir = os.path.join(tempfile.gettempdir(), "voicechat_update")
             if os.path.exists(extract_dir):
-                import shutil
                 shutil.rmtree(extract_dir, ignore_errors=True)
             os.makedirs(extract_dir, exist_ok=True)
 
+            print(f"[Updater] Распаковываю в: {extract_dir}")
             with zipfile.ZipFile(dest_zip, "r") as z:
                 z.extractall(extract_dir)
 
-            # 3. Ищем .exe внутри
+            # 4. Ищем .exe внутри
             exe_to_run = None
             for root, _dirs, files in os.walk(extract_dir):
                 for f in files:
@@ -185,7 +284,8 @@ def download_and_install(download_url: str, on_progress=None, on_done=None, on_e
                 subprocess.Popen(["explorer", extract_dir])
                 return
 
-            # 4. Запускаем и закрываем приложение
+            # 5. Запускаем новую версию и закрываем текущую
+            print(f"[Updater] Запускаю: {exe_to_run}")
             if on_done:
                 on_done()
 
@@ -193,9 +293,14 @@ def download_and_install(download_url: str, on_progress=None, on_done=None, on_e
             sys.exit(0)
 
         except zipfile.BadZipFile:
+            # Сюда попадаем если magic bytes прошли, но архив всё равно битый
             if on_error:
-                on_error("Скачанный файл повреждён. Попробуйте ещё раз.")
+                on_error(
+                    "ZIP-архив повреждён (ошибка при распаковке).\n"
+                    "Попробуйте скачать ещё раз."
+                )
         except Exception as e:
+            print(f"[Updater] Неожиданная ошибка: {e}")
             if on_error:
                 on_error(f"Ошибка загрузки: {e}")
 
