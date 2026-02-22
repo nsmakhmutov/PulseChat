@@ -14,7 +14,7 @@ APP_YEAR    = "2026"
 # Формат: "владелец/репозиторий"  (без https://github.com/)
 # Пример: "john/voicechat-app"
 # Оставьте пустым "" чтобы отключить проверку обновлений.
-GITHUB_REPO = ""                # ← заполните после создания репо на GitHub
+GITHUB_REPO = "nsmakhmutov/PulseChat"
 
 # Полная строка для отображения в интерфейсе
 VERSION_STRING = f"{APP_NAME} v{APP_VERSION}"
