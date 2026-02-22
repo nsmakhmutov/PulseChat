@@ -91,13 +91,14 @@ def main():
     # pipreqs не умеет определять некоторые пакеты по имени модуля.
     # Добавляем их вручную если они не попали в вывод.
     MANUAL_ADDITIONS = {
-        "PyQt6":       "PyQt6>=6.4",
-        "packaging":   "packaging>=23.0",   # нужен updater.py
-        "opuslib":     "opuslib",
-        "sounddevice": "sounddevice",
-        "numpy":       "numpy",
-        "pygame":      "pygame",
-        "py7zr":       "py7zr>=0.20",       # нужен updater.py (распаковка .7z)
+        "PyQt6":                    "PyQt6>=6.4",
+        "packaging":                "packaging>=23.0",   # нужен updater.py
+        "opuslib":                  "opuslib",
+        "sounddevice":              "sounddevice",
+        "numpy":                    "numpy",
+        "pygame":                   "pygame",
+        "py7zr":                    "py7zr>=0.20",       # нужен updater.py (распаковка .7z)
+        "opencv-python-headless":   "opencv-python-headless",  # нужен dxcam внутри себя
         # pipreqs не видит "import py7zr" внутри try/except — добавляем вручную
     }
 

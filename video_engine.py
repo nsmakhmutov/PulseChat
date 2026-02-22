@@ -21,8 +21,17 @@ except ImportError:
     print("[Video] ОШИБКА: PyAV не установлен!")
 
 try:
+    import cv2  # dxcam требует opencv внутри себя
+    CV2_AVAILABLE = True
+except ImportError:
+    CV2_AVAILABLE = False
+    print("[Video] ОШИБКА: opencv-python-headless не установлен (нужен dxcam).")
+
+try:
     import dxcam
-    DXCAM_AVAILABLE = True
+    DXCAM_AVAILABLE = True and CV2_AVAILABLE
+    if not CV2_AVAILABLE:
+        print("[Video] dxcam найден, но отключён — нет cv2.")
 except ImportError:
     DXCAM_AVAILABLE = False
     print("[Video] ОШИБКА: dxcam не найден.")
@@ -199,6 +208,16 @@ class VideoEngine(QObject):
         except Exception as e:
             print(f"[Video] DXcam Init Error: {e}")
             self.running = False
+            # Безопасно избавляемся от частично инициализированного объекта.
+            # DXCamera.__del__ → stop() → self.is_capturing упадёт если __init__
+            # не завершился. Патчим атрибут напрямую чтобы подавить AttributeError.
+            if camera is not None:
+                try:
+                    if not hasattr(camera, 'is_capturing'):
+                        camera.is_capturing = False
+                    camera.release()
+                except Exception:
+                    pass
             return
 
         try:
@@ -223,8 +242,14 @@ class VideoEngine(QObject):
                 print(f"[Capture] Error: {e}")
                 time.sleep(0.1)
 
-        camera.stop()
-        del camera
+        try:
+            camera.stop()
+        except Exception:
+            pass
+        try:
+            del camera
+        except Exception:
+            pass
 
     def _capture_loop_fallback(self, camera):
         """Fallback polling-режим через grab() если dxcam.start() недоступен."""
