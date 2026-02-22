@@ -6,7 +6,7 @@
 # ──────────────────────────────────────────────────────────────────────────────
 
 APP_NAME    = "Pulse"
-APP_VERSION = "1.0.4"           # SemVer: MAJOR.MINOR.PATCH
+APP_VERSION = "1.0.5"           # SemVer: MAJOR.MINOR.PATCH
 APP_AUTHOR  = "skanike"     # ← замените на своё имя/псевдоним
 APP_YEAR    = "2026"
 
@@ -29,5 +29,5 @@ ABOUT_TEXT = f"""\
 Автор: {APP_AUTHOR}
 Год:   {APP_YEAR}
 
-Стек: Python · PyQt6 · Opus · OpenGL · WASAPI · RRnoise · QQ
+Стек: Python · PyQt6 · Opus · OpenGL · WASAPI · RRnoise 
 """
