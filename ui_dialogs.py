@@ -216,13 +216,33 @@ class SettingsDialog(QDialog):
 
     def setup_version_tab(self):
         """Вкладка с информацией о версии и кнопкой проверки обновлений."""
+        from PyQt6.QtCore import QObject, pyqtSignal
+        from PyQt6.QtWidgets import QFrame
+
+        # ── Сигнальный мост фоновый-поток → UI-поток ─────────────────────────
+        # QTimer.singleShot из не-Qt потока ненадёжен в PyQt6.
+        # Единственный корректный способ: emit signal — Qt сам доставит его
+        # в главный поток через очередь событий.
+        class _Bridge(QObject):
+            sig_found   = pyqtSignal(str, str)   # (version, url)
+            sig_no_upd  = pyqtSignal()
+            sig_error   = pyqtSignal(str)         # (message,)
+            sig_progress = pyqtSignal(int)        # (percent,)
+            sig_done    = pyqtSignal()
+
+        self._upd_bridge = _Bridge()
+        self._upd_bridge.sig_found.connect(self._slot_update_found)
+        self._upd_bridge.sig_no_upd.connect(self._slot_no_update)
+        self._upd_bridge.sig_error.connect(self._slot_update_error)
+        self._upd_bridge.sig_progress.connect(self._slot_progress)
+        self._upd_bridge.sig_done.connect(self._slot_download_done)
+
+        # ── UI ────────────────────────────────────────────────────────────────
         tab = QWidget()
         lay = QVBoxLayout(tab)
         lay.setSpacing(12)
         lay.setContentsMargins(20, 20, 20, 20)
 
-        # Логотип-заглушка (иконка приложения)
-        from PyQt6.QtWidgets import QSizePolicy
         icon_lbl = QLabel()
         icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         icon_path = resource_path("assets/icon/app_icon.ico")
@@ -230,33 +250,27 @@ class SettingsDialog(QDialog):
             icon_lbl.setPixmap(QIcon(icon_path).pixmap(64, 64))
         lay.addWidget(icon_lbl)
 
-        # Блок «О программе»
         about_lbl = QLabel(ABOUT_TEXT)
         about_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         about_lbl.setWordWrap(True)
         about_lbl.setStyleSheet("font-size: 13px; line-height: 1.6;")
         lay.addWidget(about_lbl)
 
-        # Разделитель
-        from PyQt6.QtWidgets import QFrame
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
         sep.setFrameShadow(QFrame.Shadow.Sunken)
         lay.addWidget(sep)
 
-        # Статус-строка обновления
         self._ver_status_lbl = QLabel("Обновления не проверялись")
         self._ver_status_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._ver_status_lbl.setWordWrap(True)
         lay.addWidget(self._ver_status_lbl)
 
-        # Кнопки
         self._btn_check_update = QPushButton("🔍  Проверить обновления")
         self._btn_check_update.setFixedHeight(36)
         self._btn_check_update.clicked.connect(self._on_check_update_clicked)
         lay.addWidget(self._btn_check_update)
 
-        # Кнопка «Скачать и установить» — скрыта до обнаружения обновления
         self._btn_install_update = QPushButton("⬇  Скачать и установить")
         self._btn_install_update.setFixedHeight(36)
         self._btn_install_update.setVisible(False)
@@ -267,7 +281,6 @@ class SettingsDialog(QDialog):
         lay.addWidget(self._btn_install_update)
         self._pending_download_url = None
 
-        # Прогресс-бар загрузки — скрыт по умолчанию
         self._ver_progress = QProgressBar()
         self._ver_progress.setVisible(False)
         self._ver_progress.setTextVisible(True)
@@ -280,6 +293,34 @@ class SettingsDialog(QDialog):
         lay.addStretch()
         self.tabs.addTab(tab, "Версия")
 
+    # ── Слоты (вызываются ТОЛЬКО в UI-потоке через сигналы) ──────────────────
+
+    def _slot_update_found(self, version: str, url: str):
+        self._pending_download_url = url
+        self._ver_status_lbl.setTextFormat(Qt.TextFormat.RichText)
+        self._ver_status_lbl.setText(
+            f"🎉 Доступна новая версия: <b>v{version}</b>"
+            f"<br><small>Текущая: v{APP_VERSION}</small>"
+        )
+        self._btn_install_update.setVisible(True)
+        self._btn_check_update.setEnabled(True)
+
+    def _slot_no_update(self):
+        self._ver_status_lbl.setText(f"✅ Версия актуальна  (v{APP_VERSION})")
+        self._btn_check_update.setEnabled(True)
+
+    def _slot_update_error(self, message: str):
+        self._ver_status_lbl.setText(f"❌ {message}")
+        self._btn_check_update.setEnabled(True)
+
+    def _slot_progress(self, pct: int):
+        self._ver_progress.setValue(pct)
+
+    def _slot_download_done(self):
+        self._ver_status_lbl.setText(
+            "✅ Загрузка завершена. Приложение сейчас перезапустится..."
+        )
+
     # ── Проверка обновлений ───────────────────────────────────────────────────
 
     def _on_check_update_clicked(self):
@@ -289,73 +330,32 @@ class SettingsDialog(QDialog):
         self._ver_progress.setVisible(False)
         self._ver_status_lbl.setText("⏳ Проверяю...")
 
+        bridge = self._upd_bridge   # локальная ссылка для захвата в лямбдах
+
         check_for_updates_async(
-            on_update_found=self._on_update_found,
-            on_no_update=self._on_no_update,
-            on_error=self._on_update_error,
+            on_update_found = lambda v, u: bridge.sig_found.emit(v, u),
+            on_no_update    = lambda:       bridge.sig_no_upd.emit(),
+            on_error        = lambda msg:   bridge.sig_error.emit(msg),
         )
-
-    def _on_update_found(self, version: str, url: str):
-        """Вызывается из фонового потока → безопасно обновляем UI через QTimer."""
-        from PyQt6.QtCore import QTimer
-        self._pending_download_url = url
-        QTimer.singleShot(0, lambda: self._show_update_available(version))
-
-    def _show_update_available(self, version: str):
-        self._ver_status_lbl.setText(
-            f"🎉 Доступна новая версия: <b>v{version}</b>"
-            f"<br><small>Текущая: v{APP_VERSION}</small>"
-        )
-        self._ver_status_lbl.setTextFormat(Qt.TextFormat.RichText)
-        self._btn_install_update.setVisible(True)
-        self._btn_check_update.setEnabled(True)
-
-    def _on_no_update(self):
-        from PyQt6.QtCore import QTimer
-        QTimer.singleShot(0, lambda: (
-            self._ver_status_lbl.setText(f"✅ Версия актуальна (v{APP_VERSION})"),
-            self._btn_check_update.setEnabled(True),
-        ))
-
-    def _on_update_error(self, message: str):
-        from PyQt6.QtCore import QTimer
-        QTimer.singleShot(0, lambda: (
-            self._ver_status_lbl.setText(f"❌ {message}"),
-            self._btn_check_update.setEnabled(True),
-        ))
 
     def _on_install_update_clicked(self):
         if not self._pending_download_url:
             return
         from updater import download_and_install
+
         self._btn_install_update.setEnabled(False)
         self._btn_check_update.setEnabled(False)
         self._ver_progress.setVisible(True)
         self._ver_progress.setValue(0)
         self._ver_status_lbl.setText("⬇ Загружаю обновление...")
 
-        from PyQt6.QtCore import QTimer
-
-        def _progress(pct):
-            QTimer.singleShot(0, lambda p=pct: self._ver_progress.setValue(p))
-
-        def _done():
-            QTimer.singleShot(0, lambda: self._ver_status_lbl.setText(
-                "✅ Загрузка завершена. Приложение сейчас перезапустится..."
-            ))
-
-        def _err(msg):
-            QTimer.singleShot(0, lambda m=msg: (
-                self._ver_status_lbl.setText(f"❌ {m}"),
-                self._btn_install_update.setEnabled(True),
-                self._btn_check_update.setEnabled(True),
-            ))
+        bridge = self._upd_bridge
 
         download_and_install(
             self._pending_download_url,
-            on_progress=_progress,
-            on_done=_done,
-            on_error=_err,
+            on_progress = lambda pct: bridge.sig_progress.emit(pct),
+            on_done     = lambda:     bridge.sig_done.emit(),
+            on_error    = lambda msg: bridge.sig_error.emit(msg),
         )
 
     # ── Профиль (без изменений) ───────────────────────────────────────────────

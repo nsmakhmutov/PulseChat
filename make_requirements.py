@@ -20,16 +20,49 @@ import sys
 import os
 
 
+def _get_pipreqs_exe() -> str:
+    """
+    Возвращает путь к исполняемому файлу pipreqs.
+    Ищет в папке Scripts/bin рядом с текущим python.exe —
+    это надёжно работает и с venv, и с глобальным окружением.
+
+    pipreqs 0.5.x не имеет __main__.py, поэтому 'python -m pipreqs'
+    не работает — нужно запускать exe напрямую.
+    """
+    scripts_dir = os.path.dirname(sys.executable)   # .venv/Scripts  (Windows)
+                                                     # .venv/bin      (Linux/Mac)
+    # Windows
+    candidate_win = os.path.join(scripts_dir, "pipreqs.exe")
+    if os.path.exists(candidate_win):
+        return candidate_win
+
+    # Linux / Mac
+    candidate_unix = os.path.join(scripts_dir, "pipreqs")
+    if os.path.exists(candidate_unix):
+        return candidate_unix
+
+    return ""   # не найден — установим ниже
+
+
 def main():
-    # Проверяем наличие pipreqs
-    try:
-        subprocess.run(
-            [sys.executable, "-m", "pipreqs", "--version"],
-            check=True, capture_output=True
-        )
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    pipreqs_exe = _get_pipreqs_exe()
+
+    # Если pipreqs не установлен — ставим и ищем ещё раз
+    if not pipreqs_exe:
         print("pipreqs не найден. Установка...")
-        subprocess.run([sys.executable, "-m", "pip", "install", "pipreqs"], check=True)
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "pipreqs"],
+            check=True
+        )
+        pipreqs_exe = _get_pipreqs_exe()
+
+    if not pipreqs_exe:
+        print("ОШИБКА: pipreqs.exe не найден даже после установки.")
+        print(f"Папка Scripts: {os.path.dirname(sys.executable)}")
+        print("Попробуйте вручную: pip install pipreqs")
+        sys.exit(1)
+
+    print(f"[make_requirements] Используется: {pipreqs_exe}")
 
     project_root = os.path.dirname(os.path.abspath(__file__))
     output_file  = os.path.join(project_root, "requirements.txt")
@@ -39,9 +72,9 @@ def main():
 
     result = subprocess.run(
         [
-            "pipreqs",
+            pipreqs_exe,            # E:\.venv\Scripts\pipreqs.exe
             project_root,
-            "--force",
+            "--force",              # перезаписать если файл уже есть
             "--encoding", "utf-8",
             "--savepath", output_file,
             "--ignore", "dist,build,__pycache__,.git,venv,.venv,env",
@@ -52,11 +85,11 @@ def main():
 
     if result.returncode != 0:
         print("ОШИБКА pipreqs:")
-        print(result.stderr)
+        print(result.stderr or result.stdout)
         sys.exit(1)
 
-    # pipreqs не знает о некоторых пакетах по имени модуля (напр. PyQt6 → PyQt6).
-    # Добавляем известные исключения вручную если они есть в коде но не попали.
+    # pipreqs не умеет определять некоторые пакеты по имени модуля.
+    # Добавляем их вручную если они не попали в вывод.
     MANUAL_ADDITIONS = {
         "PyQt6":       "PyQt6>=6.4",
         "packaging":   "packaging>=23.0",   # нужен updater.py
