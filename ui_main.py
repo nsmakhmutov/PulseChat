@@ -8,15 +8,15 @@ from video_engine import VideoEngine
 from ui_video import VideoWindow
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QPushButton, QTreeWidget, QTreeWidgetItem,
-                             QHeaderView, QMenu, QMessageBox, QStackedWidget,
+                             QHeaderView, QMessageBox, QStackedWidget,
                              QFrame)
 from PyQt6.QtCore import Qt, QTimer, QSize, QSettings
-from PyQt6.QtGui import QIcon, QAction, QFont, QFontDatabase, QBrush, QColor
+from PyQt6.QtGui import QIcon, QFont, QFontDatabase, QBrush, QColor
 
 from config import *
 from audio_engine import AudioHandler
 from network_engine import NetworkClient
-from ui_dialogs import VolumePanel, SettingsDialog, SoundboardDialog
+from ui_dialogs import UserOverlayPanel, SettingsDialog, SoundboardDialog
 from version import APP_VERSION, APP_NAME, GITHUB_REPO
 
 
@@ -54,7 +54,6 @@ class MainWindow(QMainWindow):
 
         self.setup_ui()
         self.apply_theme(self.app_settings.value("theme", "Светлая"))
-
         self.net.connected.connect(self.on_connected)
         self.net.global_state_update.connect(self.update_user_tree)
         self.net.error_occurred.connect(self.on_connection_error)
@@ -64,6 +63,7 @@ class MainWindow(QMainWindow):
 
         self.audio.status_changed.connect(self.on_audio_status_changed)
         self.audio.status_changed.connect(self.net.send_status_update)
+        self.audio.whisper_received.connect(self._on_whisper_received)
         self.video.frame_received.connect(self.on_video_frame)
 
         self.ui_timer = QTimer()
@@ -73,6 +73,13 @@ class MainWindow(QMainWindow):
         self.setup_hotkeys()
         self.net.connect_to_server(self.ip, self.nick, self.avatar)
         self.is_streaming = False
+        self._sb_panel = None   # ссылка на SoundboardPanel (для toggle и lifecycle)
+
+        # Таймер завершения шёпота: если >1.5 с не было пакетов — скрываем оверлей
+        self._whisper_end_timer = QTimer()
+        self._whisper_end_timer.setSingleShot(True)
+        self._whisper_end_timer.setInterval(1500)
+        self._whisper_end_timer.timeout.connect(self._on_whisper_ended)
 
         # Тихая проверка обновлений в фоне (без всплывающих окон)
         self._start_silent_update_check()
@@ -124,6 +131,18 @@ class MainWindow(QMainWindow):
         )
         self._update_banner.clicked.connect(self.open_settings)  # откроет вкладку Версия
         layout.addWidget(self._update_banner)
+
+        # ── Баннер входящего шёпота (скрыт, показывается при получении шёпота) ─
+        self._whisper_banner = QLabel()
+        self._whisper_banner.setVisible(False)
+        self._whisper_banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._whisper_banner.setStyleSheet(
+            "background-color: rgba(52, 73, 94, 220); color: #ecf0f1; "
+            "border: 1px solid #5dade2; border-radius: 8px; "
+            "padding: 8px 12px; font-weight: bold; font-size: 15px;"
+        )
+        self._whisper_banner.setFixedHeight(40)
+        layout.addWidget(self._whisper_banner)
 
         btns = QHBoxLayout()
         btns.setSpacing(15)
@@ -394,6 +413,48 @@ class MainWindow(QMainWindow):
             if vol > 0:
                 winsound.Beep(600 if stype == "self_move" else 400, 150)
 
+    def _on_whisper_received(self, sender_uid: int):
+        """
+        Вызывается при получении первого пакета шёпота от sender_uid.
+        1. Перезапускает таймер тайм-аута — если пакеты идут непрерывно,
+           баннер остаётся, таймер сбрасывается с каждым вызовом.
+        2. Проигрывает тихий тон пониженного тона (370 Гц, 80 мс)
+           чтобы аудиально отметить начало шёпота.
+        3. Показывает баннер в нижней части главного окна с ником шептуна.
+           Дополнительно: голос шептуна в audio_callback проходит через
+           питч-даун фильтр — звучит заметно глубже/темнее обычного голоса.
+        """
+        self._whisper_end_timer.stop()
+        self._whisper_end_timer.start()
+
+        # Звуковой маркер шёпота — один короткий низкий тон при начале
+        if not getattr(self, '_whisper_beep_active', False):
+            self._whisper_beep_active = True
+            vol = int(self.app_settings.value("system_sound_volume", 70)) / 100.0
+            if vol > 0:
+                try:
+                    winsound.Beep(370, 80)   # ~F#4 — заметно ниже обычных 600 Гц
+                except Exception:
+                    pass
+
+        # Ищем ник шептуна
+        nick = "Кто-то"
+        for uid, data in self.known_uids.items():
+            if uid == sender_uid:
+                raw = data['item'].text(0).strip()
+                if raw:
+                    nick = raw
+                break
+
+        # Показываем баннер внутри окна приложения
+        self._whisper_banner.setText(f"🤫  {nick} шепчет вам...")
+        self._whisper_banner.setVisible(True)
+
+    def _on_whisper_ended(self):
+        """Шёпот завершился (тайм-аут 1.5 с без пакетов)."""
+        self._whisper_beep_active = False
+        self._whisper_banner.setVisible(False)
+
     def toggle_mute(self):
         self.audio.is_muted = self.btn_mute.isChecked()
         ico = "assets/icon/mic_off.svg" if self.audio.is_muted else "assets/icon/mic_on.svg"
@@ -445,8 +506,7 @@ class MainWindow(QMainWindow):
         }
         current_streaming_uids = {
             u['uid']
-            for room_list in users_map.values()
-            for u in room_list
+            for u in users_map.get(self.current_room, [])  # ИСПРАВЛЕНИЕ: только текущий канал
             if u.get('is_streaming', False)
         }
 
@@ -609,32 +669,41 @@ class MainWindow(QMainWindow):
         if not uid or uid == "ROOM_HEADER" or uid == self.audio.my_uid:
             return
 
-        menu = QMenu()
+        nick = item.text(0).strip()
 
-        def open_volume_panel(checked=False, _uid=uid, _nick=item.text(0).strip()):
-            current_vol = 1.0
-            with self.audio.users_lock:
-                u = self.audio.remote_users.get(_uid)
-                if u is not None:
-                    current_vol = u.volume
-                else:
-                    ip = self.audio.uid_to_ip.get(_uid, '')
-                    if ip:
-                        current_vol = float(self.audio.settings.value(f"vol_ip_{ip}", 1.0))
-            VolumePanel(_nick, current_vol, _uid, self.audio, self).exec()
+        # Получаем текущую громкость пользователя
+        current_vol = 1.0
+        with self.audio.users_lock:
+            u = self.audio.remote_users.get(uid)
+            if u is not None:
+                current_vol = u.volume
+            else:
+                ip = self.audio.uid_to_ip.get(uid, '')
+                if ip:
+                    current_vol = float(self.audio.settings.value(f"vol_ip_{ip}", 1.0))
 
-        menu.addAction("Управление звуком").triggered.connect(open_volume_panel)
+        # Позиция оверлея: прямо под ником в дереве
+        item_rect = self.tree.visualItemRect(item)
+        global_pos = self.tree.viewport().mapToGlobal(item_rect.bottomLeft())
 
+        # Флаг стрима + колбэк «смотреть» — передаём в панель
         user_data = self.known_uids.get(uid)
         is_streaming = user_data.get('is_s', False) if user_data else False
 
+        watch_cb = None
         if is_streaming:
-            menu.addSeparator()
-            action_watch = QAction(QIcon(resource_path("assets/icon/stream_on.svg")), "Смотреть стрим", self)
-            action_watch.triggered.connect(lambda: self.open_video_window(uid, item.text(0)))
-            menu.addAction(action_watch)
+            # Захватываем uid/item в замыкание без ref на loop-переменные
+            _uid = uid
+            _nick_txt = item.text(0)
+            watch_cb = lambda: self.open_video_window(_uid, _nick_txt)
 
-        menu.exec(self.tree.viewport().mapToGlobal(pos))
+        from ui_dialogs import UserOverlayPanel
+        UserOverlayPanel(
+            nick, current_vol, uid, self.audio, global_pos,
+            parent=self,
+            is_streaming=is_streaming,
+            on_watch_stream=watch_cb,
+        ).show()
 
     def open_video_window(self, uid, nick):
         if uid not in self.stream_windows or not self.stream_windows[uid].isVisible():
@@ -679,7 +748,28 @@ class MainWindow(QMainWindow):
             self.audio.start(self.app_settings.value("device_in_name"), self.app_settings.value("device_out_name"))
 
     def open_soundboard(self):
-        SoundboardDialog(self.net, self).exec()
+        from ui_dialogs import SoundboardPanel
+
+        # Проверяем состояние существующей панели с защитой от RuntimeError
+        # (возникает если C++ объект уже уничтожен Qt — крайний случай)
+        try:
+            if self._sb_panel is not None:
+                if self._sb_panel.isVisible():
+                    # Панель открыта → toggle: закрываем и выходим
+                    self._sb_panel.close()
+                    self._sb_panel = None
+                    return
+                else:
+                    # Панель существует но скрыта → удаляем старый объект
+                    self._sb_panel.deleteLater()
+                    self._sb_panel = None
+        except RuntimeError:
+            # C++ объект уже мёртв — просто сбрасываем ссылку
+            self._sb_panel = None
+
+        panel = SoundboardPanel(self.net, self)
+        self._sb_panel = panel
+        panel.show_above(self.btn_sb)
 
     def _update_known_users_registry(self, users_map):
         REGISTRY_FILE = "known_users.json"
@@ -742,12 +832,13 @@ class MainWindow(QMainWindow):
         )
         self._update_banner.setVisible(True)
 
-    # ── Закрытие ───────────────────────────────────────────────────────────────
-
     def closeEvent(self, e):
+        """При нажатии ✕ — корректно завершаем приложение."""
         self.audio.stop()
         self.net.running = False
-        super().closeEvent(e)
+        from PyQt6.QtWidgets import QApplication
+        QApplication.quit()
+        e.accept()
 
     def on_audio_status_changed(self, mute, deaf):
         self.net.send_status_update(mute, deaf)

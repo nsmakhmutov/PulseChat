@@ -55,6 +55,17 @@ FLAG_LOOPBACK_AUDIO = 16  # Подтип: системный звук (WASAPI Lo
 # тем самым не слыша собственного голоса в стриме (Mix Minus без DSP).
 FLAG_STREAM_VOICES  = 32  # Подтип: голоса чата из стрима, бит поверх FLAG_STREAM_AUDIO
 
+# FLAG_WHISPER: приватный шёпот от одного пользователя к конкретному получателю.
+# Payload: [target_uid: 4 байта big-endian unsigned int] + [opus данные].
+# Сервер читает target_uid и доставляет пакет ТОЛЬКО этому пользователю.
+# Отправитель в этот момент НЕ слышен остальным участникам комнаты —
+# нормальный аудио-пакет не отправляется, пока активен шёпот.
+FLAG_WHISPER = 64
+
+# Struct для извлечения target_uid из whisper-пакета (первые 4 байта payload после UDP-заголовка)
+WHISPER_HEADER_STRUCT = struct.Struct("!I")   # 4 байта: target_uid
+WHISPER_HEADER_SIZE   = WHISPER_HEADER_STRUCT.size
+
 # Struct для извлечения speaker_uid из voice-stream пакета
 import struct as _struct
 STREAM_VOICE_HEADER_STRUCT = _struct.Struct("!I")   # 4 байта: speaker_uid

@@ -11,7 +11,8 @@ from config import (
     resource_path, DEFAULT_PORT_TCP, DEFAULT_PORT_UDP, BUFFER_SIZE,
     UDP_HEADER_STRUCT, UDP_HEADER_SIZE, FLAG_VIDEO, FLAG_STREAM_AUDIO, MAX_VIDEO_PAYLOAD,
     CMD_SOUNDBOARD, FLAG_LOOPBACK_AUDIO, FLAG_STREAM_VOICES,
-    STREAM_VOICE_HEADER_STRUCT, STREAM_VOICE_HEADER_SIZE
+    STREAM_VOICE_HEADER_STRUCT, STREAM_VOICE_HEADER_SIZE,
+    FLAG_WHISPER, WHISPER_HEADER_STRUCT, WHISPER_HEADER_SIZE
 )
 
 MAX_SILENT_RECONNECT_ATTEMPTS = 4
@@ -236,6 +237,19 @@ class NetworkClient(QObject):
                     if seq % 50 == 0:
                         print(f"[Net-Recv] Получен пакет FLAG_STREAM_AUDIO (loopback={is_loopback}) от uid={uid}")
                     self.audio.add_incoming_stream_packet(uid, seq, data[UDP_HEADER_SIZE:], flags)
+                elif flags & FLAG_WHISPER:
+                    # ШЁПОТ: приватный голос от конкретного пользователя.
+                    # Payload: [target_uid: 4 байта] + [opus].
+                    # target_uid уже был проверен сервером — пакет дошёл нам,
+                    # значит мы и есть target. Извлекаем opus и воспроизводим.
+                    if len(data) < UDP_HEADER_SIZE + WHISPER_HEADER_SIZE:
+                        continue
+                    # opus начинается после WHISPER_HEADER (4 байта target_uid)
+                    opus_payload = data[UDP_HEADER_SIZE + WHISPER_HEADER_SIZE:]
+                    # uid отправителя уже есть в заголовке пакета.
+                    # Используем отдельный метод — он испускает whisper_received
+                    # чтобы UI мог уведомить получателя о шёпоте.
+                    self.audio.add_incoming_whisper_packet(uid, seq, opus_payload)
                 else:
                     self.audio.add_incoming_packet(uid, seq, data[UDP_HEADER_SIZE:], flags)
             except Exception as e:

@@ -1,5 +1,3 @@
-
-
 import os
 import json
 import ctypes
@@ -42,6 +40,7 @@ class LoginWindow(QWidget):
     def setup_ui(self):
         self.setWindowTitle("Вход")
         self.setFixedSize(350, 480)
+        self.setWindowIcon(QIcon(resource_path("assets/icon/app_icon.ico")))
         layout = QVBoxLayout(self)
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 

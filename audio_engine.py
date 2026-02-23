@@ -683,6 +683,56 @@ class RemoteUser:
 class AudioHandler(QObject):
     volume_level_signal = pyqtSignal(int)
     status_changed = pyqtSignal(bool, bool)
+    # Испускается при получении первого пакета шёпота от нового отправителя.
+    # Аргумент — uid отправителя. MainWindow использует для уведомления получателя.
+    whisper_received = pyqtSignal(int)
+    # Испускается когда пакеты шёпота перестали приходить (тайм-аут).
+    whisper_ended = pyqtSignal()
+
+    def _apply_whisper_bass_effect(self, s: np.ndarray) -> np.ndarray:
+        """
+        Эффект «тёмный бас» для входящего шёпота — двухкаскадный IIR biquad lowpass.
+
+        ПОЧЕМУ НЕТ АРТЕФАКТОВ:
+        FIR/convolve и pitch-shift через np.interp обрабатывают каждый 20ms фрейм
+        независимо → на стыке соседних фреймов возникает разрыв, слышимый как
+        шипение/треск (характерная «щётка» 50 раз в секунду).
+
+        IIR-фильтр в Direct Form II Transposed хранит состояние (z[0], z[1]) между
+        вызовами. Выход фрейма N плавно перетекает во фрейм N+1 — разрывов нет.
+
+        Параметры фильтра:
+        • 2-й порядок Butterworth LP, fc=1 200 Гц, fs=48 000 Гц (каскад 1)
+        • Тот же фильтр применяется второй раз (каскад 2) → 4-й порядок итого.
+        • Крутизна: −80 dB/дек — эффективно «срезает» всё выше 2 кГц.
+        • Голос становится тёмным, «нутряным», явно отличается от обычной речи.
+        • Коэффициенты вычислены через билинейное z-преобразование аналогового прототипа.
+
+        Singletons b/a/z хранятся в self._wlp_* и инициализируются в __init__.
+        Состояния z сбрасываются в start_whisper().
+        """
+        b = self._wlp_b
+        a1, a2 = self._wlp_a1, self._wlp_a2
+
+        # ── Каскад 1 ──────────────────────────────────────────────────────────
+        z0, z1 = self._wlp_z1[0], self._wlp_z1[1]
+        out = np.empty(len(s), dtype=np.float64)
+        x = s.astype(np.float64)
+        for i in range(len(x)):
+            w   = x[i] - a1 * z0 - a2 * z1
+            out[i] = b[0] * w + b[1] * z0 + b[2] * z1
+            z1, z0 = z0, w
+        self._wlp_z1[0], self._wlp_z1[1] = z0, z1
+
+        # ── Каскад 2 (тот же фильтр, независимое состояние) ──────────────────
+        z0, z1 = self._wlp_z2[0], self._wlp_z2[1]
+        for i in range(len(out)):
+            w      = out[i] - a1 * z0 - a2 * z1
+            out[i] = b[0] * w + b[1] * z0 + b[2] * z1
+            z1, z0 = z0, w
+        self._wlp_z2[0], self._wlp_z2[1] = z0, z1
+
+        return out.astype(np.float32)
 
     def __init__(self):
         super().__init__()
@@ -741,6 +791,23 @@ class AudioHandler(QObject):
         self.last_voice_time = 0
         self.my_uid = 0
         self.my_sequence = 0
+
+        # ── Шёпот (приватная передача одному пользователю) ─────────────────
+        # Пока whisper_target_uid != 0 — голос идёт только этому uid,
+        # остальные участники комнаты отправителя не слышат.
+        self.whisper_target_uid: int = 0
+        self._whisper_sequence: int = 0
+
+        # ── IIR-фильтр для whisper-эффекта (4-й порядок Butterworth LP, fc=1200 Гц) ──
+        # Коэффициенты вычислены через билинейное z-преобразование для fs=48 000 Гц.
+        # Два независимых каскада (z1, z2) — состояние сохраняется МЕЖДУ фреймами,
+        # что полностью исключает межфреймовые артефакты.
+        # Сброс состояний производится в start_whisper().
+        self._wlp_b  = np.array([0.005543, 0.011086, 0.005543], dtype=np.float64)
+        self._wlp_a1 = -1.77868
+        self._wlp_a2 =  0.80018
+        self._wlp_z1 = np.zeros(2, dtype=np.float64)   # состояние каскада 1
+        self._wlp_z2 = np.zeros(2, dtype=np.float64)   # состояние каскада 2
         # Отдельный счётчик для FLAG_STREAM_VOICES пакетов.
         # Нельзя использовать my_sequence: несколько спикеров в одном audio_callback
         # получали бы одинаковый seq → JitterBuffer на стороне зрителя отбрасывал
@@ -996,27 +1063,47 @@ class AudioHandler(QObject):
                     pcm_to_encode = (denoised_float * 32767).astype(np.int16).tobytes()
                     encoded = self.encoder.encode(pcm_to_encode, CHUNK_SIZE)
                     self.my_sequence += 1
-                    packet = struct.pack('!IdIB', self.my_uid, curr_time, self.my_sequence, flags) + encoded
 
-                    if not self.was_talking:
-                        while self.vad_pre_buffer:
+                    whisper_uid = self.whisper_target_uid   # атомарное чтение int
+
+                    if whisper_uid != 0:
+                        # ── РЕЖИМ ШЁПОТА ──────────────────────────────────────
+                        # Отправляем ТОЛЬКО целевому пользователю.
+                        # Нормальный аудио-пакет в комнату НЕ кладём в очередь →
+                        # остальные участники не слышат отправителя в этот момент.
+                        self._whisper_sequence += 1
+                        w_flags = FLAG_WHISPER
+                        w_header = struct.pack('!IdIB', self.my_uid, curr_time,
+                                               self._whisper_sequence, w_flags)
+                        # Payload: [target_uid: 4 байта] + [opus]
+                        w_payload = struct.pack('!I', whisper_uid) + encoded
+                        try:
+                            self.send_queue.put_nowait(w_header + w_payload)
+                        except Exception:
+                            pass
+                    else:
+                        # ── ОБЫЧНЫЙ РЕЖИМ: пакет в комнату ───────────────────
+                        packet = struct.pack('!IdIB', self.my_uid, curr_time, self.my_sequence, flags) + encoded
+
+                        if not self.was_talking:
+                            while self.vad_pre_buffer:
+                                try:
+                                    self.send_queue.put_nowait(self.vad_pre_buffer.pop(0))
+                                except:
+                                    pass
+                            self.was_talking = True
+                        self.send_queue.put_nowait(packet)
+
+                        # Стрим-аудио: дополнительно посылаем тот же encoded с FLAG_STREAM_AUDIO
+                        # Сервер направит его только зрителям, а не в комнату (нет дублирования)
+                        if self.stream_audio_sending_enabled:
+                            stream_flags = flags | FLAG_STREAM_AUDIO
+                            stream_packet = struct.pack('!IdIB', self.my_uid, curr_time,
+                                                        self.my_sequence, stream_flags) + encoded
                             try:
-                                self.send_queue.put_nowait(self.vad_pre_buffer.pop(0))
+                                self.send_queue.put_nowait(stream_packet)
                             except:
                                 pass
-                        self.was_talking = True
-                    self.send_queue.put_nowait(packet)
-
-                    # Стрим-аудио: дополнительно посылаем тот же encoded с FLAG_STREAM_AUDIO
-                    # Сервер направит его только зрителям, а не в комнату (нет дублирования)
-                    if self.stream_audio_sending_enabled:
-                        stream_flags = flags | FLAG_STREAM_AUDIO
-                        stream_packet = struct.pack('!IdIB', self.my_uid, curr_time,
-                                                    self.my_sequence, stream_flags) + encoded
-                        try:
-                            self.send_queue.put_nowait(stream_packet)
-                        except:
-                            pass
                 else:
                     self.was_talking = False
                     if not is_talking:
@@ -1036,6 +1123,17 @@ class AudioHandler(QObject):
                             try:
                                 decoded = user.decoder.decode(data, CHUNK_SIZE)
                                 s = np.frombuffer(decoded, dtype=np.int16).astype(np.float32) / 32767.0
+
+                                # ── Whisper bass effect ───────────────────────────────────────
+                                # Если этот пользователь сейчас шепчет нам (whisper пакеты
+                                # приходили < 2 с назад) — применяем питч-даун эффект.
+                                # Голос становится заметно глубже/темнее → получатель
+                                # слышит «другой тип разговора» без каких-либо UI подсказок.
+                                w_uid = getattr(self, '_whisper_in_uid', 0)
+                                w_ts  = getattr(self, '_whisper_in_ts',  0.0)
+                                if uid == w_uid and (curr_time - w_ts) < 2.0:
+                                    s = self._apply_whisper_bass_effect(s)
+
                                 self.mix_buffer += s * user.volume
 
                                 # ── Mix Minus для зрителей (FLAG_STREAM_VOICES) ───────────────
@@ -1131,11 +1229,61 @@ class AudioHandler(QObject):
                 return self.remote_users[uid].is_locally_muted
         return False
 
+    # ── Шёпот ────────────────────────────────────────────────────────────────
+
+    def start_whisper(self, target_uid: int):
+        """
+        Начинает шёпот к конкретному пользователю.
+        Пока активно — голос кодируется и отправляется только ему (FLAG_WHISPER).
+        Нормальные аудио-пакеты в комнату НЕ отправляются, остальные не слышат.
+
+        ВАЖНО: _whisper_sequence инициализируется от my_sequence, а НЕ от 0.
+        JitterBuffer получателя уже видел seq из нормального потока (my_sequence).
+        Сброс в 0 → все шёпот-пакеты отбрасывались бы как seq <= last_seq.
+        """
+        self.whisper_target_uid = target_uid
+        self._whisper_sequence = self.my_sequence  # продолжаем seq без разрыва
+        # Сбрасываем состояние IIR-фильтра чтобы шёпот каждого нового собеседника
+        # начинался с чистого состояния (без «хвоста» от предыдущего шёпота).
+        self._wlp_z1[:] = 0.0
+        self._wlp_z2[:] = 0.0
+        print(f"[Audio] Whisper START → uid={target_uid}, seq_from={self._whisper_sequence}")
+
+    def stop_whisper(self):
+        """Останавливает шёпот, возвращает нормальную передачу в комнату.
+        Синхронизируем my_sequence чтобы не было обратного прыжка seq."""
+        # Переносим счётчик чтобы нормальные пакеты продолжили нумерацию
+        # с того места, где остановился шёпот. Иначе получатели в комнате
+        # увидят резкий откат seq и часть пакетов будет отброшена JitterBuffer.
+        if self._whisper_sequence > self.my_sequence:
+            self.my_sequence = self._whisper_sequence
+        print(f"[Audio] Whisper STOP  (was → uid={self.whisper_target_uid}), seq_sync={self.my_sequence}")
+        self.whisper_target_uid = 0
+
     def add_incoming_packet(self, uid, seq, data, flags=0):
         try:
             self.incoming_packets.put_nowait((uid, seq, data, flags))
         except:
             pass
+
+    def add_incoming_whisper_packet(self, uid, seq, data):
+        """
+        Входящий шёпот (FLAG_WHISPER) от uid.
+        Отличие от add_incoming_packet: при первом пакете от нового шептуна
+        испускает сигнал whisper_received(uid) — UI показывает уведомление.
+        При тайм-ауте (>1.5 с без пакетов) испускает whisper_ended().
+        """
+        now = time.time()
+        prev_uid = getattr(self, '_whisper_in_uid', 0)
+        prev_ts  = getattr(self, '_whisper_in_ts',  0.0)
+
+        # Новый шептун или шёпот возобновился после тайм-аута
+        if uid != prev_uid or (now - prev_ts) > 1.5:
+            self._whisper_in_uid = uid
+            self.whisper_received.emit(uid)
+
+        self._whisper_in_ts = now
+        self.add_incoming_packet(uid, seq, data, 0)
 
     def add_incoming_stream_packet(self, uid, seq, data, flags=0):
         """Входящий пакет стрим-аудио (FLAG_STREAM_AUDIO) от сервера."""
