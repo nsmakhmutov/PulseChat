@@ -10,7 +10,7 @@ from PyQt6.QtCore import Qt, QSize, QSettings, QEvent, QPropertyAnimation, QEasi
 from PyQt6.QtGui import QIcon, QGuiApplication, QPainter, QColor, QPen, QFont, QPainterPath, QBrush
 from config import resource_path, CMD_SOUNDBOARD
 from audio_engine import PYRNNOISE_AVAILABLE
-from version import APP_VERSION, APP_NAME, APP_AUTHOR, APP_YEAR, ABOUT_TEXT, GITHUB_REPO
+from version import APP_VERSION, APP_NAME, APP_AUTHOR,QA_TESTERS, APP_YEAR, ABOUT_TEXT, GITHUB_REPO
 
 
 # ──────────────────────────────────────────────────────────────────────────────
