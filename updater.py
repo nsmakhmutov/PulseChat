@@ -351,25 +351,56 @@ def download_and_install(download_url: str, on_progress=None, on_done=None, on_e
                 on_done()
 
             # 6. Запускаем через bat-лончер: он дожидается смерти
-            #    текущего процесса (по PID) и только потом открывает
-            #    новый exe. Без этого оба окна живут одновременно,
-            #    потому что Qt-cleanup занимает время после sys.exit(0).
+            #    текущего процесса (по PID), копирует новые файлы поверх
+            #    папки установки (xcopy), затем запускает exe из оригинального
+            #    расположения.
+            #
+            #    ВАЖНО: запускать exe нужно именно из install_dir, а не из TEMP.
+            #    Иначе первый запуск после обновления работает из %TEMP%,
+            #    а повторный — снова из старой папки → версия откатывается.
             current_pid = os.getpid()
+
+            # Папка установки текущего (старого) приложения
+            if getattr(sys, 'frozen', False):
+                # PyInstaller: sys.executable = .../VoiceChatClient/VoiceChatClient.exe
+                install_dir = os.path.dirname(sys.executable)
+                exe_name    = os.path.basename(sys.executable)
+            else:
+                # Dev-режим (python client_main.py)
+                install_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
+                exe_name    = os.path.basename(exe_to_run)
+
+            # Папка с новыми файлами внутри TEMP (рядом с найденным exe)
+            new_files_dir = os.path.dirname(exe_to_run)
+
+            # Итоговый exe который запустим из оригинального места
+            target_exe = os.path.join(install_dir, exe_name)
+
             bat_path = os.path.join(tempfile.gettempdir(), "pulse_update_launcher.bat")
-            # taskkill /PID — убивает старый процесс принудительно,
-            # ping -n 3 — пауза ~2 сек (стандартный трюк вместо sleep в cmd),
-            # start "" — открывает новый exe в отдельном процессе,
-            # del — самоудаляется после запуска.
+            # taskkill /PID — убивает старый процесс принудительно
+            # ping -n 3   — пауза ~2 сек пока процесс гарантированно умрёт
+            # xcopy       — копирует ВСЕ новые файлы поверх папки установки
+            #               /E = включая подпапки, /Y = перезаписывать без вопросов
+            #               /I = цель — папка, /Q = без вывода имён файлов
+            # start ""    — запускает обновлённый exe из оригинального места
+            # ping -n 2   — минимальная пауза перед самоудалением
+            # del         — батник удаляет сам себя
             bat_lines = [
                 "@echo off",
                 f"taskkill /PID {current_pid} /F >nul 2>&1",
                 "ping -n 3 127.0.0.1 >nul",
-                f'start "" "{exe_to_run}"',
+                f'xcopy /E /Y /I /Q "{new_files_dir}\\*" "{install_dir}\\" >nul 2>&1',
+                f'start "" "{target_exe}"',
+                "ping -n 2 127.0.0.1 >nul",
                 'del "%~f0"',
             ]
-            bat_content = "\n".join(bat_lines) + "\n"
+            bat_content = "\r\n".join(bat_lines) + "\r\n"
             with open(bat_path, "w", encoding="ascii") as bat_f:
                 bat_f.write(bat_content)
+
+            print(f"[Updater] install_dir  : {install_dir}")
+            print(f"[Updater] new_files_dir: {new_files_dir}")
+            print(f"[Updater] target_exe   : {target_exe}")
 
             print(f"[Updater] Лончер: {bat_path}")
             subprocess.Popen(
