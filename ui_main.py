@@ -427,16 +427,6 @@ class MainWindow(QMainWindow):
         self._whisper_end_timer.stop()
         self._whisper_end_timer.start()
 
-        # Звуковой маркер шёпота — один короткий низкий тон при начале
-        if not getattr(self, '_whisper_beep_active', False):
-            self._whisper_beep_active = True
-            vol = int(self.app_settings.value("system_sound_volume", 70)) / 100.0
-            if vol > 0:
-                try:
-                    winsound.Beep(370, 80)   # ~F#4 — заметно ниже обычных 600 Гц
-                except Exception:
-                    pass
-
         # Ищем ник шептуна
         nick = "Кто-то"
         for uid, data in self.known_uids.items():

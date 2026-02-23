@@ -6,7 +6,7 @@
 # ──────────────────────────────────────────────────────────────────────────────
 
 APP_NAME    = "Pulse"
-APP_VERSION = "1.0.12"           # SemVer: MAJOR.MINOR.PATCH
+APP_VERSION = "1.0.13"           # SemVer: MAJOR.MINOR.PATCH
 APP_AUTHOR  = "skanike"     # ← замените на своё имя/псевдоним
 APP_YEAR    = "2026"
 
