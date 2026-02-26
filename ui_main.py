@@ -84,6 +84,26 @@ class MainWindow(QMainWindow):
         # Тихая проверка обновлений в фоне (без всплывающих окон)
         self._start_silent_update_check()
 
+        # ── Кэш объектов для refresh_ui() ──────────────────────────────────────
+        # refresh_ui() вызывается каждые 100 мс. Создание QColor/QSize/QSettings
+        # внутри метода = 10 аллокаций/сек × N_users без необходимости.
+        # Кэшируем один раз здесь, обновляем только при смене темы.
+        self._cache_theme = self.app_settings.value("theme", "Светлая")
+        self._c_talk   = QColor("#2ecc71")
+        self._c_mute   = QColor("#e74c3c")
+        self._c_stream = QColor("#3498db")
+        self._c_def    = QColor("#ecf0f1") if self._cache_theme == "Темная" else QColor("#444444")
+        self._icon_size = QSize(20, 20)
+
+        # ── Кэш шрифтов для update_user_tree() ─────────────────────────────────
+        # update_user_tree() вызывается при каждом sync_users от сервера.
+        # Создание QFont внутри метода = лишние аллокации при каждом обновлении.
+        # Шрифты зависят от custom_font_family, который не меняется в runtime.
+        self._font_room    = QFont(self.custom_font_family, 12)
+        self._font_room.setBold(True)
+        self._font_user    = QFont(self.custom_font_family, 14)
+        self._font_watcher = QFont(self.custom_font_family, 11)
+
     def setup_ui(self):
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — {self.nick}")
         self.setMinimumSize(450, 600)
@@ -526,9 +546,8 @@ class MainWindow(QMainWindow):
         self.tree.clear()
         self.known_uids.clear()
 
-        font_r = QFont(self.custom_font_family, 12)
-        font_r.setBold(True)
-        font_u = QFont(self.custom_font_family, 14)
+        font_r = self._font_room
+        font_u = self._font_user
 
         all_rooms = sorted(list(set(users_map.keys()).union(set(self.default_rooms))),
                            key=lambda x: (x not in self.default_rooms, x))
@@ -567,11 +586,10 @@ class MainWindow(QMainWindow):
 
                 watchers = u.get('watchers', [])
                 if u.get('is_streaming', False) and watchers:
-                    font_w = QFont(self.custom_font_family, 11)
                     for watcher in watchers:
                         w_nick = watcher.get('nick', '?')
                         watcher_item = QTreeWidgetItem(item_u, [f"    {w_nick}", "", "", ""])
-                        watcher_item.setFont(0, font_w)
+                        watcher_item.setFont(0, self._font_watcher)
                         watcher_item.setForeground(0, QBrush(QColor("#888888")))
                         watcher_item.setFlags(watcher_item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
                         watcher_item.setData(0, Qt.ItemDataRole.UserRole, None)
@@ -586,11 +604,18 @@ class MainWindow(QMainWindow):
         self.ping_lbl.setStyleSheet(f"color: {col}; font-weight: bold; font-size: 13px; margin-right: 10px;")
 
         now = time.time()
-        c_talk = QColor("#2ecc71")
-        c_mute = QColor("#e74c3c")
-        c_stream = QColor("#3498db")
-        c_def = QColor("#ecf0f1") if self.app_settings.value("theme") == "Темная" else QColor("#444444")
-        icon_size = QSize(20, 20)
+
+        # Обновляем кэш цветов при смене темы (меняется редко)
+        theme_now = self.app_settings.value("theme", "Светлая")
+        if theme_now != self._cache_theme:
+            self._cache_theme = theme_now
+            self._c_def = QColor("#ecf0f1") if theme_now == "Темная" else QColor("#444444")
+
+        c_talk   = self._c_talk
+        c_mute   = self._c_mute
+        c_stream = self._c_stream
+        c_def    = self._c_def
+        icon_size = self._icon_size
 
         with self.audio.users_lock:
             me_talk = (now - self.audio.last_voice_time < 0.3) and not self.audio.is_muted
@@ -719,6 +744,19 @@ class MainWindow(QMainWindow):
             w.overlay_stream_volume_changed.connect(self.audio.set_stream_volume)
             # Синхронизировать попап с текущим значением громкости стрима
             w.overlay._vol_popup.set_value(self.audio.stream_volume)
+
+            # --- Качество видео (per-viewer server-side throttling) ---
+            # Когда зритель нажимает кнопку качества → сообщаем серверу skip_factor.
+            # Сервер начнёт пропускать N-1 из N кадров для этого зрителя.
+            w.quality_changed.connect(
+                lambda sf, _uid=uid: self.net.send_quality_request(sf)
+            )
+            # Периодический IDR-запрос в режиме MEDIUM/LOW качества:
+            # каждые 2 с зритель просит I-frame, чтобы P-frame артефакты
+            # от пропущенных кадров очищались быстро.
+            w.viewer_keyframe_needed.connect(
+                lambda _uid=uid: self.net.request_viewer_keyframe(_uid)
+            )
 
             w.show()
             self.stream_windows[uid] = w

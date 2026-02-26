@@ -44,27 +44,21 @@ VIDEO_FPS = 60
 VIDEO_BITRATE = 6000000  # 6 Mbps
 
 # Флаг для UDP заголовка (битмаска):
-# 1=Mute, 2=Deaf, 4=Video, 8=StreamAudio, 16=LoopbackAudio, 32=StreamVoices, 254=Ping
+# 1=Mute, 2=Deaf, 4=Video, 8=StreamAudio, 16=LoopbackAudio, 32=StreamVoices, 64=Whisper, 254=Ping
 FLAG_VIDEO          = 4
 FLAG_STREAM_AUDIO   = 8   # Аудио стрима — маршрутизируется только зрителям
 FLAG_LOOPBACK_AUDIO = 16  # Подтип: системный звук (WASAPI Loopback), бит поверх FLAG_STREAM_AUDIO
+# FLAG_WHISPER: приватная передача голоса одному пользователю.
+# Payload: [target_uid: 4 байта big-endian unsigned int] + [opus данные].
+# Сервер смотрит target_uid и доставляет пакет только ему.
+# Остальные участники комнаты пакет не получают.
+FLAG_WHISPER        = 64
 
 # FLAG_STREAM_VOICES: голосовой микс стримера — отдельный поток для зрителей.
 # Payload: [speaker_uid: 4 байта big-endian unsigned int] + [opus данные]
 # Зритель проверяет speaker_uid и ОТБРАСЫВАЕТ пакет если speaker_uid == my_uid,
 # тем самым не слыша собственного голоса в стриме (Mix Minus без DSP).
 FLAG_STREAM_VOICES  = 32  # Подтип: голоса чата из стрима, бит поверх FLAG_STREAM_AUDIO
-
-# FLAG_WHISPER: приватный шёпот от одного пользователя к конкретному получателю.
-# Payload: [target_uid: 4 байта big-endian unsigned int] + [opus данные].
-# Сервер читает target_uid и доставляет пакет ТОЛЬКО этому пользователю.
-# Отправитель в этот момент НЕ слышен остальным участникам комнаты —
-# нормальный аудио-пакет не отправляется, пока активен шёпот.
-FLAG_WHISPER = 64
-
-# Struct для извлечения target_uid из whisper-пакета (первые 4 байта payload после UDP-заголовка)
-WHISPER_HEADER_STRUCT = struct.Struct("!I")   # 4 байта: target_uid
-WHISPER_HEADER_SIZE   = WHISPER_HEADER_STRUCT.size
 
 # Struct для извлечения speaker_uid из voice-stream пакета
 import struct as _struct
@@ -76,7 +70,7 @@ STREAM_VOICE_HEADER_SIZE   = STREAM_VOICE_HEADER_STRUCT.size
 # чтобы не смешиваться с его же микрофонным потоком (ключ X).
 LOOPBACK_UID_OFFSET = 1_000_000
 
-MAX_VIDEO_PAYLOAD = 1400
+MAX_VIDEO_PAYLOAD = 1300
 VIDEO_CHUNK_HEADER = struct.Struct("!IHH")
 VIDEO_HEADER_SIZE = VIDEO_CHUNK_HEADER.size
 
@@ -93,6 +87,12 @@ VIDEO_CHUNK_STRUCT = struct.Struct("!IHH")
 # UID (I) + Timestamp (d) + Sequence (I) + Flags (B)
 UDP_HEADER_STRUCT = struct.Struct("!IdIB")
 UDP_HEADER_SIZE = UDP_HEADER_STRUCT.size
+
+# VIDEO_LOW_QUALITY_IDR_INTERVAL_MS: константа нужна ui_video.py для IDR-таймера.
+# В текущей архитектуре (без quality routing) таймер запускается, но отправляет
+# запрос в stub-метод net.request_viewer_keyframe() → ничего не происходит.
+# Значение 2000мс оставлено для совместимости с ui_video.py.
+VIDEO_LOW_QUALITY_IDR_INTERVAL_MS = 2000
 
 # --- Команды ---
 CMD_LOGIN         = 'login'

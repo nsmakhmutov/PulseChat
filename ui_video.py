@@ -273,11 +273,20 @@ class VideoOverlay(QFrame):
     stop_watch_clicked = pyqtSignal()
     fullscreen_clicked = pyqtSignal()
     stream_volume_changed = pyqtSignal(float)   # 0.0–2.0
+    quality_changed    = pyqtSignal(int)         # skip_factor: 1, 2, 4
+
+    # Циклические уровни качества: (skip_factor, emoji-метка, tooltip)
+    _QUALITY_LEVELS = [
+        (1, "🎯", "Высокое HD (1280×720, ~30fps)"),
+        (2, "⚡", "Среднее SD (640×360, ~15fps, меньше трафика)"),
+        (4, "📉", "Низкое SD (640×360, ~15fps, минимум трафика)"),
+    ]
 
     def __init__(self, parent: QWidget):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         self.setMouseTracking(True)
+        self._quality_idx = 0   # текущий индекс в _QUALITY_LEVELS (по умолчанию HIGH)
 
         self.setStyleSheet("""
             VideoOverlay {
@@ -328,6 +337,12 @@ class VideoOverlay(QFrame):
         sep.setFixedWidth(2)
         sep.setFixedHeight(32)
 
+        # --- Качество видео (цикличная кнопка: HIGH → MEDIUM → LOW → HIGH) ---
+        self.btn_quality = self._make_btn(None, self._QUALITY_LEVELS[0][2])
+        self.btn_quality.setText(self._QUALITY_LEVELS[0][1])
+        self.btn_quality.setFont(QFont("Segoe UI", 14))
+        self.btn_quality.clicked.connect(self._cycle_quality)
+
         # --- Fullscreen ---
         self.btn_fs = self._make_btn(None, "Полный экран / Оконный режим")
         self.btn_fs.setText("⛶")
@@ -338,6 +353,7 @@ class VideoOverlay(QFrame):
         layout.addWidget(self.btn_deafen)
         layout.addWidget(self.btn_stop)
         layout.addWidget(self.btn_vol_stream)
+        layout.addWidget(self.btn_quality)
         layout.addWidget(sep, alignment=Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(self.btn_fs)
 
@@ -443,6 +459,23 @@ class VideoOverlay(QFrame):
         """Переключить иконку кнопки fullscreen."""
         self.btn_fs.setText("❐" if is_fullscreen else "⛶")
 
+    def _cycle_quality(self):
+        """Циклически переключает качество HIGH → MEDIUM → LOW → HIGH и эмитит сигнал."""
+        self._quality_idx = (self._quality_idx + 1) % len(self._QUALITY_LEVELS)
+        skip, emoji, tip = self._QUALITY_LEVELS[self._quality_idx]
+        self.btn_quality.setText(emoji)
+        self.btn_quality.setToolTip(tip)
+        self.quality_changed.emit(skip)
+
+    def set_quality_by_skip(self, skip_factor: int):
+        """Синхронизировать иконку кнопки с внешне заданным skip_factor."""
+        for idx, (sf, emoji, tip) in enumerate(self._QUALITY_LEVELS):
+            if sf == skip_factor:
+                self._quality_idx = idx
+                self.btn_quality.setText(emoji)
+                self.btn_quality.setToolTip(tip)
+                break
+
 
 # ---------------------------------------------------------------------------
 # VideoWindow — окно-контейнер: поверхность + оверлей + тулбар статистики
@@ -474,6 +507,15 @@ class VideoWindow(QWidget):
     overlay_stop_watch     = pyqtSignal()
     overlay_stream_volume_changed = pyqtSignal(float)   # 0.0–2.0
 
+    # --- Качество видео ---
+    # Эмитит skip_factor при смене пользователем качества (1/2/4).
+    # MainWindow подключает к net.send_quality_request().
+    quality_changed        = pyqtSignal(int)
+
+    # Эмитит при необходимости получить свежий IDR-кадр (в low-quality режиме).
+    # MainWindow подключает к net.request_viewer_keyframe(streamer_uid).
+    viewer_keyframe_needed = pyqtSignal()
+
     def __init__(self, nick: str):
         super().__init__()
         self.uid: int | None = None
@@ -484,9 +526,19 @@ class VideoWindow(QWidget):
         self._current_fps = 0.0
         self._is_fullscreen = False
         self._closing = False        # флаг: окно в процессе закрытия
+        self._quality_skip = 1       # текущий skip_factor (1=HIGH, 2=MED, 4=LOW)
 
         self._setup_ui(nick)
         self._setup_hide_timer()
+
+        # IDR-таймер: в режимах MEDIUM/LOW периодически запрашиваем I-frame,
+        # чтобы P-frame артефакты от пропущенных кадров очищались регулярно.
+        # При HIGH (skip=1) таймер не запущен — пакеты не пропускаются.
+        from config import VIDEO_LOW_QUALITY_IDR_INTERVAL_MS
+        self._idr_timer = QTimer(self)
+        self._idr_timer.setSingleShot(False)
+        self._idr_timer.setInterval(VIDEO_LOW_QUALITY_IDR_INTERVAL_MS)
+        self._idr_timer.timeout.connect(self.viewer_keyframe_needed)
 
     # ------------------------------------------------------------------
     # Построение UI
@@ -519,6 +571,7 @@ class VideoWindow(QWidget):
         self.overlay.stop_watch_clicked.connect(self._on_overlay_stop)
         self.overlay.fullscreen_clicked.connect(self.toggle_fullscreen)
         self.overlay.stream_volume_changed.connect(self.overlay_stream_volume_changed)
+        self.overlay.quality_changed.connect(self._on_quality_changed)
         self.overlay.hide()  # скрыт по умолчанию
 
         # --- Тулбар статистики (снизу) ---
@@ -535,8 +588,10 @@ class VideoWindow(QWidget):
         self._lbl_res      = QLabel("Res: —")
         self._lbl_frames   = QLabel("Frames: 0")
         self._lbl_renderer = QLabel("🟢 OpenGL GPU")
+        self._lbl_quality  = QLabel("Качество: 🎯 HD")
 
-        for lbl in (self._lbl_fps, self._lbl_res, self._lbl_frames, self._lbl_renderer):
+        for lbl in (self._lbl_fps, self._lbl_res, self._lbl_frames,
+                    self._lbl_renderer, self._lbl_quality):
             lbl.setStyleSheet(lbl_style)
             bar_layout.addWidget(lbl)
 
@@ -655,6 +710,30 @@ class VideoWindow(QWidget):
         self.close()
 
     # ------------------------------------------------------------------
+    # Управление качеством видео
+    # ------------------------------------------------------------------
+    def _on_quality_changed(self, skip_factor: int):
+        """
+        Вызывается при нажатии кнопки качества в оверлее.
+        Обновляет внутреннее состояние, метку тулбара, IDR-таймер,
+        затем пробрасывает skip_factor наружу через quality_changed.
+        """
+        self._quality_skip = skip_factor
+        labels = {1: "🎯 HD", 2: "⚡ SD", 4: "📉 LQ"}
+        self._lbl_quality.setText(f"Качество: {labels.get(skip_factor, str(skip_factor))}")
+
+        # IDR-таймер: включаем при любом снижении качества
+        if skip_factor > 1:
+            self._idr_timer.start()
+        else:
+            self._idr_timer.stop()
+
+        # Немедленный IDR-запрос: зритель сразу получит чистый I-frame
+        self.viewer_keyframe_needed.emit()
+        # Уведомляем MainWindow → net.send_quality_request()
+        self.quality_changed.emit(skip_factor)
+
+    # ------------------------------------------------------------------
     # Публичный метод синхронизации состояния аудио с иконками оверлея
     # ------------------------------------------------------------------
     def sync_audio_state(self, is_muted: bool, is_deafened: bool):
@@ -712,6 +791,7 @@ class VideoWindow(QWidget):
     def closeEvent(self, event):
         """Перехватываем закрытие окна, испускаем сигнал до уничтожения объекта."""
         self._closing = True         # блокируем sync_audio_state от внешних сигналов
+        self._idr_timer.stop()       # останавливаем IDR-таймер
         if self._is_fullscreen:
             self._exit_fullscreen()
         self._hide_timer.stop()

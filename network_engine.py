@@ -2,52 +2,67 @@ import socket
 import threading
 import json
 import time
+import queue
 import pygame
 import struct
 import os
+import platform
+import ctypes
+
 from PyQt6.QtCore import QObject, pyqtSignal, QSettings
 
 from config import (
     resource_path, DEFAULT_PORT_TCP, DEFAULT_PORT_UDP, BUFFER_SIZE,
     UDP_HEADER_STRUCT, UDP_HEADER_SIZE, FLAG_VIDEO, FLAG_STREAM_AUDIO, MAX_VIDEO_PAYLOAD,
     CMD_SOUNDBOARD, FLAG_LOOPBACK_AUDIO, FLAG_STREAM_VOICES,
-    STREAM_VOICE_HEADER_STRUCT, STREAM_VOICE_HEADER_SIZE,
-    FLAG_WHISPER, WHISPER_HEADER_STRUCT, WHISPER_HEADER_SIZE
+    STREAM_VOICE_HEADER_STRUCT, STREAM_VOICE_HEADER_SIZE
 )
 
 MAX_SILENT_RECONNECT_ATTEMPTS = 4
 RECONNECT_DELAY = 3.0
 
+# Устанавливаем точность системного таймера в 1 мс на Windows.
+# Без этого time.sleep(0.001) может спать 10-15мс — аудио глитчи.
+if platform.system() == "Windows":
+    try:
+        winmm = ctypes.WinDLL('winmm')
+        winmm.timeBeginPeriod(1)
+    except Exception:
+        pass
+
 
 class NetworkClient(QObject):
-    connected = pyqtSignal(dict)
+    connected           = pyqtSignal(dict)
     global_state_update = pyqtSignal(dict)
-    error_occurred = pyqtSignal(str)
+    error_occurred      = pyqtSignal(str)
 
-    connection_lost = pyqtSignal()
+    connection_lost     = pyqtSignal()
     connection_restored = pyqtSignal()
-    reconnect_failed = pyqtSignal()
+    reconnect_failed    = pyqtSignal()
 
     def __init__(self, audio):
         super().__init__()
-        self.audio = audio
-        self.video = None
-        self.server_addr = None
-        self.running = False
+        self.audio  = audio
+        self.video  = None
+        self.server_addr  = None
+        self.running      = False
         self.current_ping = 0
         self.packets_sent = 0
         self.packets_received = 0
 
-        self._ip = None
-        self._nick = None
+        self._ip     = None
+        self._nick   = None
         self._avatar = None
 
-        self._is_connected = False
-        self._reconnecting = False
+        self._is_connected       = False
+        self._reconnecting       = False
         self._reconnect_attempts = 0
 
         self._init_sockets()
 
+    # ------------------------------------------------------------------
+    # Сокеты
+    # ------------------------------------------------------------------
     def _init_sockets(self):
         try:
             self.tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -57,6 +72,9 @@ class NetworkClient(QObject):
         except Exception as e:
             print(f"[Net] Socket init error: {e}")
 
+    # ------------------------------------------------------------------
+    # Soundboard
+    # ------------------------------------------------------------------
     def play_soundboard_file(self, filename):
         try:
             path = resource_path(os.path.join("assets/panel", filename))
@@ -71,9 +89,12 @@ class NetworkClient(QObject):
         except Exception as e:
             print(f"[Net] Soundboard error: {e}")
 
+    # ------------------------------------------------------------------
+    # Подключение к серверу
+    # ------------------------------------------------------------------
     def connect_to_server(self, ip, nick, avatar):
-        self._ip = ip
-        self._nick = nick
+        self._ip     = ip
+        self._nick   = nick
         self._avatar = avatar
         self._reconnect_attempts = 0
         self._reconnecting = False
@@ -106,35 +127,38 @@ class NetworkClient(QObject):
                 print(f"[Net] CRITICAL: UDP bind failed: {e}")
                 raise
 
+        # 8 MB буфер приёма: при 6Mbps видео ≈ 750KB/s → запас ~10 сек.
         try:
-            self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
-            print("[Net] UDP receive buffer set to 1MB")
+            self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
+            print("[Net] UDP receive buffer set to 8MB")
         except Exception:
             pass
 
         self.send_json({"action": "login", "nick": self._nick, "avatar": self._avatar})
-        self.running = True
+        self.running       = True
         self._is_connected = True
 
-        threading.Thread(target=self.tcp_listen, daemon=True).start()
-        threading.Thread(target=self.udp_sender_loop, daemon=True).start()
+        threading.Thread(target=self.tcp_listen,         daemon=True).start()
+        threading.Thread(target=self.udp_sender_loop,    daemon=True).start()
         threading.Thread(target=self.udp_keepalive_loop, daemon=True).start()
-        threading.Thread(target=self.udp_receive_loop, daemon=True).start()
-        threading.Thread(target=self.ping_loop, daemon=True).start()
+        threading.Thread(target=self.udp_receive_loop,   daemon=True).start()
+        threading.Thread(target=self.ping_loop,          daemon=True).start()
 
         print("[Net] Connected to server")
 
+    # ------------------------------------------------------------------
+    # Переподключение
+    # ------------------------------------------------------------------
     def _on_connection_lost(self):
         if self._reconnecting:
             return
-        self._reconnecting = True
-        self._is_connected = False
-        self.running = False
+        self._reconnecting       = True
+        self._is_connected       = False
+        self.running             = False
         self._reconnect_attempts = 0
 
         print("[Net] Connection lost. Starting reconnect loop...")
         self.connection_lost.emit()
-
         threading.Thread(target=self._reconnect_loop, daemon=True).start()
 
     def _reconnect_loop(self):
@@ -142,12 +166,10 @@ class NetworkClient(QObject):
             self._reconnect_attempts += 1
             print(f"[Net] Reconnect attempt {self._reconnect_attempts}/{MAX_SILENT_RECONNECT_ATTEMPTS}...")
             time.sleep(RECONNECT_DELAY)
-
             try:
                 self._init_sockets()
                 self._do_connect()
-
-                self._reconnecting = False
+                self._reconnecting       = False
                 self._reconnect_attempts = 0
                 print("[Net] Reconnected successfully!")
                 self.connection_restored.emit()
@@ -166,14 +188,18 @@ class NetworkClient(QObject):
         if not self._ip:
             print("[Net] No server address saved, cannot reconnect.")
             return
-
         print("[Net] Manual reconnect requested.")
-        self._reconnecting = True
+        self._reconnecting       = True
         self._reconnect_attempts = 0
         self.running = False
-
         threading.Thread(target=self._reconnect_loop, daemon=True).start()
 
+    # ------------------------------------------------------------------
+    # Видео — прямой sendto() из потока энкодера.
+    # Конкуренции потоков нет: ping раз в 7 сек, keepalive раз в 1 сек,
+    # аудио идёт через udp_sender_loop. Burst из ~10 видео-чанков
+    # на Winsock занимает <1 мс — пинг это не замечает.
+    # ------------------------------------------------------------------
     def send_video_packet(self, payload):
         if not self.server_addr or self.audio.my_uid == 0:
             return
@@ -185,6 +211,9 @@ class NetworkClient(QObject):
         except Exception as e:
             print(f"[Net] Error sending video packet: {e}")
 
+    # ------------------------------------------------------------------
+    # Приём UDP-пакетов
+    # ------------------------------------------------------------------
     def udp_receive_loop(self):
         while self.running:
             try:
@@ -195,6 +224,7 @@ class NetworkClient(QObject):
                 uid, ts, seq, flags = UDP_HEADER_STRUCT.unpack(data[:UDP_HEADER_SIZE])
 
                 if flags == 254:
+                    # Pong — измеряем RTT
                     self.packets_received += 1
                     delay = (time.time() - ts) * 1000
                     if self.current_ping == 0:
@@ -207,56 +237,40 @@ class NetworkClient(QObject):
                         self.video.process_incoming_packet(uid, data[UDP_HEADER_SIZE:])
                     else:
                         print(f"[Net] Video packet from {uid}, but VideoEngine not initialized")
+
                 elif flags & FLAG_STREAM_AUDIO and flags & FLAG_STREAM_VOICES:
-                    # Голосовой поток стрима (Mix Minus).
-                    # Payload: [speaker_uid: 4 байта] + [opus данные].
-                    # Отбрасываем пакет если speaker_uid == наш собственный uid —
-                    # так зритель не слышит своего голоса в стриме без DSP.
+                    # Голосовой поток стрима — Mix Minus без DSP.
+                    # Payload: [speaker_uid: 4 байта] + [opus].
+                    # Свой голос отбрасываем — не слышим себя в стриме.
                     if len(data) < UDP_HEADER_SIZE + STREAM_VOICE_HEADER_SIZE:
                         continue
                     speaker_uid, = STREAM_VOICE_HEADER_STRUCT.unpack(
                         data[UDP_HEADER_SIZE: UDP_HEADER_SIZE + STREAM_VOICE_HEADER_SIZE]
                     )
                     if speaker_uid == self.audio.my_uid:
-                        # Свой голос — тихо отбрасываем (Mix Minus без DSP)
                         continue
-                    # Чужой голос — передаём с speaker_uid (не uid стримера!).
-                    # Это критично: если передавать uid стримера, все голоса разных
-                    # спикеров попадают в один jitter buffer stream_remote_users[streamer]
-                    # и вытесняют друг друга по seq. С speaker_uid каждый спикер
-                    # получает отдельный слот → нет конфликтов seq.
-                    # Фильтр recently_received в _stream_packet_processor_loop работает
-                    # корректно: если viewer в той же комнате — speaker есть в remote_users
-                    # → пакет отброшен (уже слышим напрямую). Если в другой — играет.
                     opus_payload = data[UDP_HEADER_SIZE + STREAM_VOICE_HEADER_SIZE:]
                     self.audio.add_incoming_stream_packet(speaker_uid, seq, opus_payload, flags)
 
                 elif flags & FLAG_STREAM_AUDIO:
-                    # Стрим-аудио: отфильтровка и воспроизведение — в AudioHandler
+                    # Стрим-аудио (системный звук / виртуальный кабель)
                     is_loopback = bool(flags & FLAG_LOOPBACK_AUDIO)
                     if seq % 50 == 0:
-                        print(f"[Net-Recv] Получен пакет FLAG_STREAM_AUDIO (loopback={is_loopback}) от uid={uid}")
+                        print(f"[Net-Recv] FLAG_STREAM_AUDIO (loopback={is_loopback}) от uid={uid}")
                     self.audio.add_incoming_stream_packet(uid, seq, data[UDP_HEADER_SIZE:], flags)
-                elif flags & FLAG_WHISPER:
-                    # ШЁПОТ: приватный голос от конкретного пользователя.
-                    # Payload: [target_uid: 4 байта] + [opus].
-                    # target_uid уже был проверен сервером — пакет дошёл нам,
-                    # значит мы и есть target. Извлекаем opus и воспроизводим.
-                    if len(data) < UDP_HEADER_SIZE + WHISPER_HEADER_SIZE:
-                        continue
-                    # opus начинается после WHISPER_HEADER (4 байта target_uid)
-                    opus_payload = data[UDP_HEADER_SIZE + WHISPER_HEADER_SIZE:]
-                    # uid отправителя уже есть в заголовке пакета.
-                    # Используем отдельный метод — он испускает whisper_received
-                    # чтобы UI мог уведомить получателя о шёпоте.
-                    self.audio.add_incoming_whisper_packet(uid, seq, opus_payload)
+
                 else:
+                    # Обычный голос чата
                     self.audio.add_incoming_packet(uid, seq, data[UDP_HEADER_SIZE:], flags)
+
             except Exception as e:
                 if self.running:
                     print(f"[Net] UDP receive error: {e}")
                 continue
 
+    # ------------------------------------------------------------------
+    # Отправка аудио-пакетов из очереди AudioHandler
+    # ------------------------------------------------------------------
     def udp_sender_loop(self):
         while self.running:
             try:
@@ -266,6 +280,9 @@ class NetworkClient(QObject):
             except Exception:
                 continue
 
+    # ------------------------------------------------------------------
+    # Keepalive (статус mute/deaf) и Ping
+    # ------------------------------------------------------------------
     def udp_keepalive_loop(self):
         while self.running:
             if self.audio.my_uid != 0:
@@ -288,20 +305,25 @@ class NetworkClient(QObject):
                     print(f"[Net] Ping error: {e}")
             time.sleep(7)
 
+    # ------------------------------------------------------------------
+    # TCP — команды сервера
+    # ------------------------------------------------------------------
     def tcp_listen(self):
         raw_data = ""
+        # JSONDecoder создаём ОДИН РАЗ — он stateless и thread-safe.
+        # Создание внутри цикла (старый код) аллоцировало новый объект на КАЖДОЕ
+        # входящее сообщение: при 10 sync/сек это +10 аллокаций/сек без причины.
+        _decoder = json.JSONDecoder()
         while self.running:
             try:
-                # Исправление 1.1: Читаем сырые байты, игнорируем разорванные UTF-8 символы
                 chunk_bytes = self.tcp_sock.recv(4096)
                 if not chunk_bytes:
                     print("[Net] Server closed connection (empty recv).")
                     break
                 raw_data += chunk_bytes.decode('utf-8', errors='ignore')
-
                 while True:
                     try:
-                        msg, idx = json.JSONDecoder().raw_decode(raw_data)
+                        msg, idx = _decoder.raw_decode(raw_data)
                         raw_data = raw_data[idx:].lstrip()
                         self.process_message(msg)
                     except json.JSONDecodeError:
@@ -343,12 +365,21 @@ class NetworkClient(QObject):
         self.send_json({"action": "update_user", "nick": nick, "avatar": avatar})
 
     def send_status_update(self, mute, deaf):
-        self.send_json({
-            "action": "update_status",
-            "mute": mute,
-            "deaf": deaf
-        })
+        self.send_json({"action": "update_status", "mute": mute, "deaf": deaf})
 
     def set_video_engine(self, video):
         self.video = video
         print("[Net] VideoEngine registered")
+
+    # ------------------------------------------------------------------
+    # Заглушки для совместимости с ui_main.py (качество не реализовано).
+    # Кнопка качества в оверлее работает визуально, но на маршрутизацию
+    # сервера не влияет — все зрители получают полный поток.
+    # ------------------------------------------------------------------
+    def send_quality_request(self, skip_factor: int):
+        """Stub: в текущей архитектуре качество не маршрутизируется."""
+        pass
+
+    def request_viewer_keyframe(self, streamer_uid: int):
+        """Stub: IDR-таймер из ui_video.py вызывает этот метод периодически."""
+        pass

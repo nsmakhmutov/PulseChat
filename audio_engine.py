@@ -60,8 +60,12 @@ class StreamAudioCapture:
         self._sequence = 0
         self._native_sr: int = SAMPLE_RATE
 
-        # Промежуточный буфер для сборки точных 20ms фреймов (CHUNK_SIZE)
-        self._pcm_buffer = np.array([], dtype=np.float32)
+        # Промежуточный буфер для сборки точных 20ms фреймов (CHUNK_SIZE).
+        # Предаллоцируем с запасом 8× CHUNK_SIZE — ни разу не растём при обычной работе.
+        # self._pcm_len — логическая длина данных в буфере (не size буфера).
+        # Это устраняет np.concatenate (50x/сек) → 0 аллокаций в hot path.
+        self._pcm_buf = np.empty(CHUNK_SIZE * 8, dtype=np.float32)
+        self._pcm_len = 0
         self._buffer_lock = threading.Lock()
         # True когда захват идёт из CABLE Output (VB-CABLE).
         # В этом режиме AEC полностью отключён — голосов в CABLE Output нет физически.
@@ -93,7 +97,9 @@ class StreamAudioCapture:
 
     def start(self, device_idx=None):
         self.stop()
-        self._pcm_buffer = np.array([], dtype=np.float32)  # Очищаем буфер при старте
+        # Сброс буфера при старте — данные от прошлого сеанса не нужны
+        with self._buffer_lock:
+            self._pcm_len = 0
         self._running.set()
         self._thread = threading.Thread(
             target=self._capture_loop,
@@ -501,13 +507,25 @@ class StreamAudioCapture:
                     mono = np.interp(x_new, x_old, mono).astype(np.float32)
 
             with self._buffer_lock:
-                # Добавляем полученные семплы в общий буфер
-                self._pcm_buffer = np.concatenate((self._pcm_buffer, mono))
+                # ── Записываем семплы в предаллоцированный буфер ────────────────
+                # Аллокации нет — просто копируем в уже существующий массив.
+                incoming = len(mono)
+                needed = self._pcm_len + incoming
+                if needed > len(self._pcm_buf):
+                    # Буфер переполнен (редко): увеличиваем вдвое
+                    new_size = max(needed, len(self._pcm_buf) * 2)
+                    new_buf = np.empty(new_size, dtype=np.float32)
+                    new_buf[:self._pcm_len] = self._pcm_buf[:self._pcm_len]
+                    self._pcm_buf = new_buf
+                self._pcm_buf[self._pcm_len:self._pcm_len + incoming] = mono
+                self._pcm_len += incoming
 
                 # Откусываем строго по CHUNK_SIZE (960 семплов = 20мс) и отправляем
-                while len(self._pcm_buffer) >= CHUNK_SIZE:
-                    chunk = self._pcm_buffer[:CHUNK_SIZE]
-                    self._pcm_buffer = self._pcm_buffer[CHUNK_SIZE:]
+                while self._pcm_len >= CHUNK_SIZE:
+                    chunk = self._pcm_buf[:CHUNK_SIZE].copy()
+                    # Сдвигаем остаток влево (numpy делает это на C-уровне)
+                    self._pcm_len -= CHUNK_SIZE
+                    self._pcm_buf[:self._pcm_len] = self._pcm_buf[CHUNK_SIZE:CHUNK_SIZE + self._pcm_len]
 
                     # ── AEC: вычитаем голоса собеседников ──────────────────────
                     # При VB-CABLE (_using_vbcable=True) пропускаем полностью:
@@ -523,7 +541,8 @@ class StreamAudioCapture:
 
                     self._sequence += 1
                     flags = FLAG_STREAM_AUDIO | FLAG_LOOPBACK_AUDIO
-                    packet = struct.pack('!IdIB', uid, time.time(), self._sequence, flags) + encoded
+                    # Используем прекомпилированный struct вместо struct.pack('!IdIB', ...)
+                    packet = UDP_HEADER_STRUCT.pack(uid, time.time(), self._sequence, flags) + encoded
                     self.send_queue.put_nowait(packet)
 
                     if self._sequence % 50 == 0:
@@ -817,6 +836,16 @@ class AudioHandler(QObject):
         self.vad_pre_buffer = []
         self.was_talking = False
         self.stream = None
+        # Счётчик воспроизведённых loopback-кадров (для периодического лога).
+        # Инициализируем здесь чтобы убрать hasattr() из audio_callback hot path.
+        self._lb_play_counter = 0
+        # Ссылки на рабочие потоки — нужны для корректного join() в stop().
+        # Без явного join() повторные вызовы start() (переподключение, смена
+        # устройства) накапливают «зомби»-потоки: каждый поток висит в памяти
+        # пока не завершится _is_running.wait(), что может занять до 0.1 сек
+        # после clear(). За 10 переподключений = 20 лишних потоков.
+        self._pkt_thread: threading.Thread | None = None
+        self._stream_pkt_thread: threading.Thread | None = None
 
     def set_bitrate(self, bitrate_kbps):
         bitrate_bps = int(bitrate_kbps) * 1000
@@ -866,14 +895,23 @@ class AudioHandler(QObject):
                 callback=self.audio_callback
             )
             self.stream.start()
-            threading.Thread(target=self._packet_processor_loop, daemon=True).start()
-            threading.Thread(target=self._stream_packet_processor_loop, daemon=True).start()
+            self._pkt_thread = threading.Thread(target=self._packet_processor_loop, daemon=True)
+            self._stream_pkt_thread = threading.Thread(target=self._stream_packet_processor_loop, daemon=True)
+            self._pkt_thread.start()
+            self._stream_pkt_thread.start()
         except Exception as e:
             print(f"[Audio] Ошибка старта: {e}")
             self._is_running.clear()
 
     def stop(self):
         self._is_running.clear()
+        # Дожидаемся завершения рабочих потоков — иначе повторный start()
+        # создаст дублирующие потоки (утечка памяти и CPU)
+        for attr in ('_pkt_thread', '_stream_pkt_thread'):
+            t = getattr(self, attr, None)
+            if t is not None and t.is_alive():
+                t.join(timeout=0.5)
+            setattr(self, attr, None)
         if hasattr(self, 'stream') and self.stream:
             try:
                 self.stream.stop()
@@ -1073,7 +1111,7 @@ class AudioHandler(QObject):
                         # остальные участники не слышат отправителя в этот момент.
                         self._whisper_sequence += 1
                         w_flags = FLAG_WHISPER
-                        w_header = struct.pack('!IdIB', self.my_uid, curr_time,
+                        w_header = UDP_HEADER_STRUCT.pack(self.my_uid, curr_time,
                                                self._whisper_sequence, w_flags)
                         # Payload: [target_uid: 4 байта] + [opus]
                         w_payload = struct.pack('!I', whisper_uid) + encoded
@@ -1083,7 +1121,7 @@ class AudioHandler(QObject):
                             pass
                     else:
                         # ── ОБЫЧНЫЙ РЕЖИМ: пакет в комнату ───────────────────
-                        packet = struct.pack('!IdIB', self.my_uid, curr_time, self.my_sequence, flags) + encoded
+                        packet = UDP_HEADER_STRUCT.pack(self.my_uid, curr_time, self.my_sequence, flags) + encoded
 
                         if not self.was_talking:
                             while self.vad_pre_buffer:
@@ -1098,7 +1136,7 @@ class AudioHandler(QObject):
                         # Сервер направит его только зрителям, а не в комнату (нет дублирования)
                         if self.stream_audio_sending_enabled:
                             stream_flags = flags | FLAG_STREAM_AUDIO
-                            stream_packet = struct.pack('!IdIB', self.my_uid, curr_time,
+                            stream_packet = UDP_HEADER_STRUCT.pack(self.my_uid, curr_time,
                                                         self.my_sequence, stream_flags) + encoded
                             try:
                                 self.send_queue.put_nowait(stream_packet)
@@ -1107,7 +1145,7 @@ class AudioHandler(QObject):
                 else:
                     self.was_talking = False
                     if not is_talking:
-                        empty_packet = struct.pack('!IdIB', self.my_uid, curr_time, 0, flags)
+                        empty_packet = UDP_HEADER_STRUCT.pack(self.my_uid, curr_time, 0, flags)
                         self.vad_pre_buffer.append(empty_packet)
                         if len(self.vad_pre_buffer) > 5: self.vad_pre_buffer.pop(0)
             except:
@@ -1155,7 +1193,7 @@ class AudioHandler(QObject):
                                         self._sv_sequence += 1
                                         sv_flags = (FLAG_STREAM_AUDIO | FLAG_STREAM_VOICES)
                                         # header: uid стримера (отправитель), ts, seq, flags
-                                        sv_header = struct.pack('!IdIB', self.my_uid, curr_time,
+                                        sv_header = UDP_HEADER_STRUCT.pack(self.my_uid, curr_time,
                                                                 self._sv_sequence, sv_flags)
                                         # payload: speaker_uid (чей голос) + opus
                                         sv_payload = struct.pack('!I', uid) + data
@@ -1183,8 +1221,6 @@ class AudioHandler(QObject):
                                 s = np.frombuffer(decoded, dtype=np.int16).astype(np.float32) / 32767.0
                                 self.mix_buffer += s * sv
                                 if s_uid >= LOOPBACK_UID_OFFSET:
-                                    if not hasattr(self, '_lb_play_counter'):
-                                        self._lb_play_counter = 0
                                     self._lb_play_counter += 1
                                     if self._lb_play_counter % 100 == 0:
                                         print(f"[Audio-Output] Стрим-звук воспроизводится "

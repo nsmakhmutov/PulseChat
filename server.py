@@ -7,8 +7,7 @@ from config import (
     UDP_RECV_BUFFER_SIZE, UDP_SEND_BUFFER_SIZE,
     UDP_HEADER_STRUCT, UDP_HEADER_SIZE, FLAG_VIDEO, FLAG_STREAM_AUDIO,
     CMD_LOGIN, CMD_JOIN_ROOM, CMD_STREAM_START, CMD_STREAM_STOP,
-    CMD_SYNC_USERS, CMD_SOUNDBOARD, FLAG_LOOPBACK_AUDIO, FLAG_STREAM_VOICES,
-    FLAG_WHISPER, WHISPER_HEADER_STRUCT, WHISPER_HEADER_SIZE
+    CMD_SYNC_USERS, CMD_SOUNDBOARD, FLAG_LOOPBACK_AUDIO, FLAG_STREAM_VOICES
 )
 
 
@@ -123,25 +122,8 @@ class SFUServer:
                 is_video = bool(flags & FLAG_VIDEO)
                 is_stream_audio = bool(flags & FLAG_STREAM_AUDIO)
                 is_stream_voices = bool(flags & FLAG_STREAM_VOICES)
-                is_whisper = bool(flags & FLAG_WHISPER)
 
-                if is_whisper:
-                    # ШЁПОТ → доставляем только конкретному target_uid
-                    # Payload: [target_uid: 4 байта big-endian] + [opus данные]
-                    if len(data) < UDP_HEADER_SIZE + WHISPER_HEADER_SIZE:
-                        continue
-                    target_uid, = WHISPER_HEADER_STRUCT.unpack(
-                        data[UDP_HEADER_SIZE: UDP_HEADER_SIZE + WHISPER_HEADER_SIZE]
-                    )
-                    with self.udp_lock:
-                        target_addr = self.udp_map.get(target_uid)
-                    if target_addr:
-                        try:
-                            self.udp_sock.sendto(data, target_addr)
-                        except Exception:
-                            pass
-
-                elif is_video:
+                if is_video:
                     # ВИДЕО → только зрители стримера
                     # Копируем список адресов под коротким локом
                     with self.watchers_lock:
@@ -213,17 +195,29 @@ class SFUServer:
                             pass
 
                 else:
-                    # АУДИО → все в той же комнате, кроме отправителя
-                    # Снимаем снимок нужных данных под коротким локом
+                    # АУДИО → все в той же комнате, кроме отправителя.
+                    # FIX: Убираем вложенный лок (clients_lock → udp_lock).
+                    # Старый код захватывал udp_lock ВНУТРИ clients_lock →
+                    # риск дедлока если другой поток держит udp_lock и ждёт clients_lock.
+                    # Новый код:
+                    #   1. Под clients_lock собираем список uid получателей (int-ы, не адреса).
+                    #   2. Отпускаем clients_lock.
+                    #   3. Под udp_lock однократно разрешаем uid → addr.
+                    #   4. sendto() — вообще без локов.
                     with self.clients_lock:
-                        target_addrs = []
-                        for c_data in self.clients.values():
-                            if (c_data['uid'] != sender_uid
-                                    and c_data['room'] == sender_room):
-                                with self.udp_lock:
-                                    t_addr = self.udp_map.get(c_data['uid'])
-                                if t_addr:
-                                    target_addrs.append(t_addr)
+                        target_uids = [
+                            c_data['uid']
+                            for c_data in self.clients.values()
+                            if c_data['uid'] != sender_uid
+                               and c_data['room'] == sender_room
+                        ]
+
+                    with self.udp_lock:
+                        target_addrs = [
+                            self.udp_map[uid]
+                            for uid in target_uids
+                            if uid in self.udp_map
+                        ]
 
                     # sendto — вне любых локов
                     for target_addr in target_addrs:
@@ -242,6 +236,9 @@ class SFUServer:
         uid = int(time.time() * 1000) % 1000000
         client_ip = addr[0]
         buffer = ""
+        # JSONDecoder создаём ОДИН РАЗ на соединение — он stateless.
+        # Каждое сообщение json.JSONDecoder() в старом коде = лишняя аллокация.
+        _decoder = json.JSONDecoder()
         try:
             while True:
                 chunk_bytes = conn.recv(BUFFER_SIZE)
@@ -251,7 +248,7 @@ class SFUServer:
 
                 while True:
                     try:
-                        msg, idx = json.JSONDecoder().raw_decode(buffer)
+                        msg, idx = _decoder.raw_decode(buffer)
                         buffer = buffer[idx:].lstrip()
                         action = msg.get('action')
 
