@@ -17,7 +17,7 @@ from PyQt6.QtGui import QIcon, QFont, QFontDatabase, QBrush, QColor
 from config import *
 from audio_engine import AudioHandler
 from network_engine import NetworkClient
-from ui_dialogs import UserOverlayPanel, SettingsDialog, SoundboardDialog
+from ui_dialogs import UserOverlayPanel, SettingsDialog, SoundboardDialog, WhisperSystemOverlay
 from version import APP_VERSION, APP_NAME, GITHUB_REPO
 
 
@@ -88,11 +88,15 @@ class MainWindow(QMainWindow):
         self.is_streaming = False
         self._sb_panel = None   # ссылка на SoundboardPanel (для toggle и lifecycle)
 
-        # Таймер завершения шёпота: если >1.5 с не было пакетов — скрываем оверлей
+        # Таймер завершения шёпота: если >1.5 с не было пакетов — скрываем баннер/оверлей
         self._whisper_end_timer = QTimer()
         self._whisper_end_timer.setSingleShot(True)
         self._whisper_end_timer.setInterval(1500)
         self._whisper_end_timer.timeout.connect(self._on_whisper_ended)
+
+        # Системный оверлей шёпота — поверх всех окон Windows
+        # Создаём один раз, показываем/скрываем при событиях шёпота.
+        self._whisper_overlay = WhisperSystemOverlay()
 
         # Тихая проверка обновлений в фоне (без всплывающих окон)
         self._start_silent_update_check()
@@ -439,17 +443,114 @@ class MainWindow(QMainWindow):
         """)
 
     def setup_hotkeys(self):
+        """
+        Регистрирует все глобальные горячие клавиши:
+          — mute/deafen (toggle)
+          — PTT-шёпот для каждого из 5 слотов (press → start, release → stop)
+
+        Почему НЕ используем trigger_on_release=True:
+          keyboard.add_hotkey(hk, cb, trigger_on_release=True) — это НЕ "при отпускании клавиши".
+          Это "повторить срабатывание хоткея когда комбо отпущено как единица".
+          На практике: либо не срабатывает вовсе, либо срабатывает непредсказуемо.
+          В итоге whisper_target_uid остаётся != 0 → голос навсегда застрял в шёпоте.
+
+        Правильный PTT:
+          1. keyboard.add_hotkey(hk, _press) — срабатывает при физическом нажатии комбо.
+          2. keyboard.hook(_raw_key_up)      — глобальный перехват всех key-up событий.
+             Как только физически отпущена триггер-клавиша (последняя в комбо) —
+             сразу вызываем stop_whisper(). Это работает мгновенно и надёжно.
+
+        keyboard.unhook_all() в начале снимает оба типа хуков (add_hotkey + hook).
+        suppress=False — клавиши проходят в игру/браузер без блокировки.
+        """
         try:
             keyboard.unhook_all()
-            m = self.app_settings.value("hk_mute", "Tab+m")
-            d = self.app_settings.value("hk_deafen", "Tab+d")
-            keyboard.add_hotkey(m, lambda: self.btn_mute.click())
-            keyboard.add_hotkey(d, lambda: self.btn_deafen.click())
-        except Exception:
-            pass
+
+            # ── Базовые хоткеи ────────────────────────────────────────────────
+            m = self.app_settings.value("hk_mute",   "alt+[")
+            d = self.app_settings.value("hk_deafen", "alt+]")
+            if m:
+                try:
+                    keyboard.add_hotkey(m, lambda: self.btn_mute.click())
+                except Exception as e:
+                    print(f"[HK] mute hotkey error: {e}")
+            if d:
+                try:
+                    keyboard.add_hotkey(d, lambda: self.btn_deafen.click())
+                except Exception as e:
+                    print(f"[HK] deafen hotkey error: {e}")
+
+            # ── PTT-хоткеи шёпота (слоты 0–4) ────────────────────────────────
+            for i in range(5):
+                nick = self.app_settings.value(f"whisper_slot_{i}_nick", "")
+                hk   = self.app_settings.value(f"whisper_slot_{i}_hk",   "")
+                if not nick or not hk:
+                    continue
+
+                def _make_ptt(target_nick: str, hotkey_str: str):
+                    active = [False]
+
+                    # Триггер-клавиша = последняя в комбо: "alt+1" → "1", "f8" → "f8"
+                    # Именно её key-up означает "пользователь отпустил PTT".
+                    trigger_key = hotkey_str.replace(" ", "").split("+")[-1].lower()
+
+                    def _press():
+                        if active[0]:
+                            return  # автоповтор ОС — игнорируем
+                        uid = None
+                        for u_uid, data in self.known_uids.items():
+                            try:
+                                if data['item'].text(0).strip() == target_nick:
+                                    uid = u_uid
+                                    break
+                            except Exception:
+                                pass
+                        if uid is not None:
+                            active[0] = True
+                            self.audio.start_whisper(uid)
+                            print(f"[HK] Whisper PTT START → {target_nick} (uid={uid})")
+                        else:
+                            print(f"[HK] Whisper PTT: '{target_nick}' не найден онлайн")
+
+                    def _raw_key_up(e):
+                        """
+                        Глобальный перехват key-up.
+                        Срабатывает при отпускании ЛЮБОЙ клавиши — но мы проверяем
+                        только нашу триггер-клавишу и только если PTT активен.
+                        Это гарантирует что stop_whisper() всегда вызовется,
+                        даже если система не доставила "hotkey release" событие.
+                        """
+                        if (active[0]
+                                and e.event_type == 'up'
+                                and e.name
+                                and e.name.lower() == trigger_key):
+                            active[0] = False
+                            self.audio.stop_whisper()
+                            print(f"[HK] Whisper PTT STOP  ← {target_nick}")
+
+                    return _press, _raw_key_up
+
+                _press, _raw_key_up = _make_ptt(nick, hk)
+                try:
+                    # Только press через add_hotkey (обрабатывает модификаторы корректно)
+                    keyboard.add_hotkey(hk, _press, trigger_on_release=False, suppress=False)
+                    # Release через raw hook — надёжный физический key-up
+                    keyboard.hook(_raw_key_up, suppress=False)
+                    print(f"[HK] Whisper slot {i}: '{nick}' → '{hk}' (trigger_key='{hk.replace(' ','').split('+')[-1].lower()}')")
+                except Exception as e:
+                    print(f"[HK] Whisper slot {i} error ({hk!r}): {e}")
+
+        except Exception as e:
+            print(f"[HK] setup_hotkeys error: {e}")
 
     def play_notification(self, stype="self_move"):
-        vol = int(self.app_settings.value("system_sound_volume", 70)) / 100.0
+        # Квадратичная кривая: vol_linear = (slider/100)^2
+        # При slider=30 (новый default) → pygame vol 0.09  (≈ −21 dB, ненавязчиво)
+        # При slider=70 (старый default) → pygame vol 0.49  (всё ещё громко,
+        #   но вдвое тише прежних 0.70 — для пользователей со старыми настройками)
+        # При slider=100 → pygame vol 1.00  (максимум без обрезки)
+        raw = int(self.app_settings.value("system_sound_volume", 30)) / 100.0
+        vol = raw ** 2  # перцептивно равномерная шкала вместо линейной
         sound = self._loaded_sounds.get(stype)
         if sound is not None:
             try:
@@ -463,35 +564,37 @@ class MainWindow(QMainWindow):
 
     def _on_whisper_received(self, sender_uid: int):
         """
-        Вызывается при получении первого пакета шёпота от sender_uid.
-        1. Перезапускает таймер тайм-аута — если пакеты идут непрерывно,
-           баннер остаётся, таймер сбрасывается с каждым вызовом.
-        2. Проигрывает тихий тон пониженного тона (370 Гц, 80 мс)
-           чтобы аудиально отметить начало шёпота.
-        3. Показывает баннер в нижней части главного окна с ником шептуна.
-           Дополнительно: голос шептуна в audio_callback проходит через
-           питч-даун фильтр — звучит заметно глубже/темнее обычного голоса.
+        Вызывается при КАЖДОМ первом пакете шёпота (или после 1.5 с паузы).
+        • Перезапускает таймер тайм-аута → баннер и оверлей живут пока идут пакеты.
+        • Показывает баннер в главном окне и системный оверлей поверх всех окон.
         """
+        # Останавливаем предыдущий таймер → перезапускаем 1.5 сек отсчёт
         self._whisper_end_timer.stop()
         self._whisper_end_timer.start()
 
-        # Ищем ник шептуна
+        # Ищем ник шептуна среди активных пользователей
         nick = "Кто-то"
         for uid, data in self.known_uids.items():
             if uid == sender_uid:
-                raw = data['item'].text(0).strip()
-                if raw:
-                    nick = raw
+                try:
+                    raw = data['item'].text(0).strip()
+                    if raw:
+                        nick = raw
+                except Exception:
+                    pass
                 break
 
-        # Показываем баннер внутри окна приложения
+        # ── Баннер в главном окне ─────────────────────────────────────────────
         self._whisper_banner.setText(f"🤫  {nick} шепчет вам...")
         self._whisper_banner.setVisible(True)
 
+        # ── Системный оверлей поверх всех окон ───────────────────────────────
+        self._whisper_overlay.show_for(nick)
+
     def _on_whisper_ended(self):
-        """Шёпот завершился (тайм-аут 1.5 с без пакетов)."""
-        self._whisper_beep_active = False
+        """Шёпот завершился (1.5 с без пакетов) — скрываем баннер и системный оверлей."""
         self._whisper_banner.setVisible(False)
+        self._whisper_overlay.hide_overlay()
 
     def toggle_mute(self):
         self.audio.is_muted = self.btn_mute.isChecked()
@@ -956,6 +1059,12 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, e):
         """При нажатии ✕ — корректно завершаем приложение."""
+        # Скрываем системный оверлей (поверх всех окон — должен исчезнуть первым)
+        try:
+            self._whisper_overlay.hide_overlay()
+            self._whisper_overlay.deleteLater()
+        except Exception:
+            pass
         self.audio.stop()
         self.net.running = False
         from PyQt6.QtWidgets import QApplication

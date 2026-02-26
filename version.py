@@ -6,7 +6,7 @@
 # ──────────────────────────────────────────────────────────────────────────────
 
 APP_NAME    = "InPulse"
-APP_VERSION = "1.0.20"           # SemVer: MAJOR.MINOR.PATCH
+APP_VERSION = "1.0.21"           # SemVer: MAJOR.MINOR.PATCH
 APP_AUTHOR  = "skanike"     # ← замените на своё имя/псевдоним
 APP_YEAR    = "2026"
 QA_TESTERS = "skarex · Rapoch · Arex · Zolotoy · Kronos"

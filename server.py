@@ -7,7 +7,8 @@ from config import (
     UDP_RECV_BUFFER_SIZE, UDP_SEND_BUFFER_SIZE,
     UDP_HEADER_STRUCT, UDP_HEADER_SIZE, FLAG_VIDEO, FLAG_STREAM_AUDIO,
     CMD_LOGIN, CMD_JOIN_ROOM, CMD_STREAM_START, CMD_STREAM_STOP,
-    CMD_SYNC_USERS, CMD_SOUNDBOARD, FLAG_LOOPBACK_AUDIO, FLAG_STREAM_VOICES
+    CMD_SYNC_USERS, CMD_SOUNDBOARD, FLAG_LOOPBACK_AUDIO, FLAG_STREAM_VOICES,
+    FLAG_WHISPER, STREAM_VOICE_HEADER_STRUCT, STREAM_VOICE_HEADER_SIZE
 )
 
 
@@ -122,8 +123,27 @@ class SFUServer:
                 is_video = bool(flags & FLAG_VIDEO)
                 is_stream_audio = bool(flags & FLAG_STREAM_AUDIO)
                 is_stream_voices = bool(flags & FLAG_STREAM_VOICES)
+                is_whisper = bool(flags & FLAG_WHISPER)
 
-                if is_video:
+                if is_whisper:
+                    # ШЁПОТ → только target_uid.
+                    # Payload: [target_uid: 4 байта big-endian unsigned int] + [opus].
+                    # Сервер извлекает target_uid и доставляет пакет только ему.
+                    # Остальные участники комнаты пакет не получают.
+                    if len(data) < UDP_HEADER_SIZE + STREAM_VOICE_HEADER_SIZE:
+                        continue
+                    (target_uid,) = STREAM_VOICE_HEADER_STRUCT.unpack(
+                        data[UDP_HEADER_SIZE: UDP_HEADER_SIZE + STREAM_VOICE_HEADER_SIZE]
+                    )
+                    with self.udp_lock:
+                        target_addr = self.udp_map.get(target_uid)
+                    if target_addr:
+                        try:
+                            self.udp_sock.sendto(data, target_addr)
+                        except Exception:
+                            pass
+
+                elif is_video:
                     # ВИДЕО → только зрители стримера
                     # Копируем список адресов под коротким локом
                     with self.watchers_lock:

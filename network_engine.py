@@ -15,7 +15,8 @@ from config import (
     resource_path, DEFAULT_PORT_TCP, DEFAULT_PORT_UDP, BUFFER_SIZE,
     UDP_HEADER_STRUCT, UDP_HEADER_SIZE, FLAG_VIDEO, FLAG_STREAM_AUDIO, MAX_VIDEO_PAYLOAD,
     CMD_SOUNDBOARD, FLAG_LOOPBACK_AUDIO, FLAG_STREAM_VOICES,
-    STREAM_VOICE_HEADER_STRUCT, STREAM_VOICE_HEADER_SIZE
+    STREAM_VOICE_HEADER_STRUCT, STREAM_VOICE_HEADER_SIZE,
+    VIDEO_PACING_RATE_BYTES_SEC, FLAG_WHISPER,
 )
 
 MAX_SILENT_RECONNECT_ATTEMPTS = 4
@@ -58,6 +59,19 @@ class NetworkClient(QObject):
         self._reconnecting       = False
         self._reconnect_attempts = 0
 
+        # Последний проигранный звук soundboard.
+        # Используется для блокировки спама: новый звук не запустится,
+        # пока текущий ещё играет.
+        self._sb_sound: "pygame.mixer.Sound | None" = None
+
+        # -------------------------------------------------------------------
+        # Pacing-очередь для видео-пакетов (leaky bucket).
+        # Пакеты кладёт send_video_packet(), дренирует video_pacing_loop().
+        # maxsize=2000: ~2.7 сек буфера при 720p60 6Mbps (737 пакетов/сек).
+        # Если очередь заполнена — старые пакеты дропаются (актуальность важнее).
+        # -------------------------------------------------------------------
+        self.video_pacing_queue = queue.Queue(maxsize=2000)
+
         self._init_sockets()
 
     # ------------------------------------------------------------------
@@ -76,14 +90,34 @@ class NetworkClient(QObject):
     # Soundboard
     # ------------------------------------------------------------------
     def play_soundboard_file(self, filename):
+        """
+        Воспроизвести soundboard-файл.
+
+        Защита от спама: новый звук НЕ запускается, пока предыдущий ещё играет.
+        Это предотвращает накопление звуков при частых кликах.
+
+        Громкость: квадратичная кривая (slider/100)^2.
+        Соответствует той же перцептивной шкале, что и системные уведомления:
+          slider 40 (default) -> 0.16x (~-16 dB)
+          slider 70           -> 0.49x (~-6 dB)
+          slider 100          -> 1.00x (0 dB, максимум pygame)
+        """
         try:
+            # Anti-spam: блокируем, пока текущий звук ещё играет
+            if self._sb_sound is not None and self._sb_sound.get_num_channels() > 0:
+                print(f"[Net] Soundboard: пропущен {filename!r} — звук ещё играет")
+                return
+
             path = resource_path(os.path.join("assets/panel", filename))
             if os.path.exists(path):
                 sound = pygame.mixer.Sound(path)
-                vol = int(QSettings("MyVoiceChat", "GlobalSettings").value("soundboard_volume", 50)) / 100.0
+                # Квадратичная кривая: (raw/100)^2 — совпадает с системными звуками
+                raw = int(QSettings("MyVoiceChat", "GlobalSettings").value("soundboard_volume", 40)) / 100.0
+                vol = raw ** 2
                 sound.set_volume(vol)
                 sound.play()
-                print(f"[Net] Playing soundboard: {filename}")
+                self._sb_sound = sound  # сохраняем для проверки get_num_channels()
+                print(f"[Net] Playing soundboard: {filename} (vol={vol:.3f})")
             else:
                 print(f"[Net] Soundboard file not found: {path}")
         except Exception as e:
@@ -138,11 +172,12 @@ class NetworkClient(QObject):
         self.running       = True
         self._is_connected = True
 
-        threading.Thread(target=self.tcp_listen,         daemon=True).start()
-        threading.Thread(target=self.udp_sender_loop,    daemon=True).start()
-        threading.Thread(target=self.udp_keepalive_loop, daemon=True).start()
-        threading.Thread(target=self.udp_receive_loop,   daemon=True).start()
-        threading.Thread(target=self.ping_loop,          daemon=True).start()
+        threading.Thread(target=self.tcp_listen,          daemon=True).start()
+        threading.Thread(target=self.udp_sender_loop,     daemon=True).start()
+        threading.Thread(target=self.udp_keepalive_loop,  daemon=True).start()
+        threading.Thread(target=self.udp_receive_loop,    daemon=True).start()
+        threading.Thread(target=self.ping_loop,           daemon=True).start()
+        threading.Thread(target=self.video_pacing_loop,   daemon=True).start()
 
         print("[Net] Connected to server")
 
@@ -195,21 +230,87 @@ class NetworkClient(QObject):
         threading.Thread(target=self._reconnect_loop, daemon=True).start()
 
     # ------------------------------------------------------------------
-    # Видео — прямой sendto() из потока энкодера.
-    # Конкуренции потоков нет: ping раз в 7 сек, keepalive раз в 1 сек,
-    # аудио идёт через udp_sender_loop. Burst из ~10 видео-чанков
-    # на Winsock занимает <1 мс — пинг это не замечает.
+    # Видео — пакеты кладём в pacing-очередь.
+    # Реальная отправка происходит в video_pacing_loop() с ограничением
+    # скорости, чтобы избежать burst'ов, которые перегружают Radmin VPN
+    # и роняют пинг на каналах с RTT 40-50 мс.
     # ------------------------------------------------------------------
     def send_video_packet(self, payload):
         if not self.server_addr or self.audio.my_uid == 0:
             return
         header = UDP_HEADER_STRUCT.pack(self.audio.my_uid, time.time(), 0, FLAG_VIDEO)
         packet = header + payload
+        # Если очередь переполнена — дропаем самый старый пакет, берём новый.
+        # Актуальный кадр важнее давно стоящего в очереди.
+        if self.video_pacing_queue.full():
+            try:
+                self.video_pacing_queue.get_nowait()
+            except queue.Empty:
+                pass
         try:
-            self.udp_sock.sendto(packet, self.server_addr)
-            self.packets_sent += 1
-        except Exception as e:
-            print(f"[Net] Error sending video packet: {e}")
+            self.video_pacing_queue.put_nowait(packet)
+        except queue.Full:
+            pass
+
+    # ------------------------------------------------------------------
+    # Leaky bucket pacing для видео-пакетов.
+    #
+    # Проблема (до pacing):
+    #   _fragment_and_send() отправлял 100-300 UDP-пакетов за <1 мс в одном
+    #   burst'е (особенно IDR-кадры). На 10ms-канале (RadminVPN) это проходит,
+    #   на 40-50ms-канале очередь отправки ядра переполняется → ВСЕ UDP пакеты
+    #   (включая ping) встают в очередь → ping улетает до 5000 мс.
+    #
+    # Решение (leaky bucket):
+    #   Пакеты отправляются с постоянным интервалом ~1.4 мс, не превышая
+    #   VIDEO_PACING_RATE_BYTES_SEC. Burst'ы невозможны.
+    #
+    # Точность на Windows:
+    #   timeBeginPeriod(1) уже вызван в этом файле → time.sleep() имеет
+    #   разрешение ~1 мс. Для sub-millisecond интервалов используем
+    #   perf_counter busy-wait с порогом 0.5 мс.
+    # ------------------------------------------------------------------
+    def video_pacing_loop(self):
+        # Средний размер видео-пакета: MAX_VIDEO_PAYLOAD + UDP_HEADER(13) + VIDEO_HEADER(8)
+        avg_packet_bytes = MAX_VIDEO_PAYLOAD + 21
+        # Интервал между пакетами в секундах
+        pacing_interval  = avg_packet_bytes / VIDEO_PACING_RATE_BYTES_SEC  # ~1.39 мс
+
+        SLEEP_THRESHOLD = 0.0005  # 0.5 мс — ниже этого busy-wait точнее sleep()
+
+        last_send_t = time.perf_counter()
+
+        while self.running:
+            try:
+                packet = self.video_pacing_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+
+            if not self.server_addr:
+                continue
+
+            # Ждём нужный момент отправки
+            target_t = last_send_t + pacing_interval
+            now      = time.perf_counter()
+            delta    = target_t - now
+
+            if delta > SLEEP_THRESHOLD:
+                time.sleep(delta - SLEEP_THRESHOLD)
+                # Busy-wait оставшиеся <0.5 мс для точности
+                while time.perf_counter() < target_t:
+                    pass
+            elif delta > 0:
+                # Короткий busy-wait (< 0.5 мс)
+                while time.perf_counter() < target_t:
+                    pass
+
+            try:
+                self.udp_sock.sendto(packet, self.server_addr)
+                self.packets_sent += 1
+            except Exception as e:
+                print(f"[Net] Pacing send error: {e}")
+
+            last_send_t = time.perf_counter()
 
     # ------------------------------------------------------------------
     # Приём UDP-пакетов
@@ -258,6 +359,18 @@ class NetworkClient(QObject):
                     if seq % 50 == 0:
                         print(f"[Net-Recv] FLAG_STREAM_AUDIO (loopback={is_loopback}) от uid={uid}")
                     self.audio.add_incoming_stream_packet(uid, seq, data[UDP_HEADER_SIZE:], flags)
+
+                elif flags & FLAG_WHISPER:
+                    # Шёпот — приватный голос от sender к нам.
+                    # Payload: [target_uid: 4 байта] + [opus].
+                    # Отбрасываем 4-байтовый заголовок target_uid перед декодированием,
+                    # иначе opuslib получит мусор в начале и вернёт ошибку.
+                    if len(data) < UDP_HEADER_SIZE + STREAM_VOICE_HEADER_SIZE:
+                        continue
+                    opus_payload = data[UDP_HEADER_SIZE + STREAM_VOICE_HEADER_SIZE:]
+                    # add_incoming_whisper_packet: испускает сигнал whisper_received(uid)
+                    # при первом пакете от нового шептуна → UI показывает баннер.
+                    self.audio.add_incoming_whisper_packet(uid, seq, opus_payload)
 
                 else:
                     # Обычный голос чата

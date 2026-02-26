@@ -1,5 +1,6 @@
 import os
 import json
+import math
 import sounddevice as sd
 import dxcam
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QScrollArea,
@@ -10,6 +11,30 @@ from PyQt6.QtCore import Qt, QSize, QSettings, QEvent, QPropertyAnimation, QEasi
 from PyQt6.QtGui import QIcon, QGuiApplication, QPainter, QColor, QPen, QFont, QPainterPath, QBrush
 from config import resource_path, CMD_SOUNDBOARD
 from audio_engine import PYRNNOISE_AVAILABLE
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Вспомогательные функции для нелинейной кривой громкости пользователя
+# ──────────────────────────────────────────────────────────────────────────────
+# Почему экспонента, а не линейный множитель:
+#   Речь через Opus кодируется при очень низком уровне (~-20 дБ относительно FS).
+#   Линейный диапазон 0–2.0x (слайдер 0–200) даёт буст максимум +6 дБ — почти
+#   не слышно. Экспоненциальная кривая 10^((slider-100)/100):
+#     slider 0   →  0.01x  (-40 дБ)   — тихо
+#     slider 100 →  1.00x  (  0 дБ)   — нейтрально (дефолт, поведение НЕ меняется)
+#     slider 150 →  3.16x  (+10 дБ)   — заметный буст
+#     slider 200 → 10.00x  (+20 дБ)   — максимальный буст для тихих микрофонов
+# При слайдере 100 пользователь слышит ровно то же что раньше — совместимость.
+def _slider_to_vol(slider_int: int) -> float:
+    """Слайдер 0-200 → коэффициент громкости по экспоненциальной кривой."""
+    return 10.0 ** ((slider_int - 100) / 100.0)
+
+
+def _vol_to_slider(vol: float) -> int:
+    """Коэффициент громкости → позиция слайдера (обратная функция)."""
+    if vol <= 0.0:
+        return 0
+    return max(0, min(200, int(math.log10(vol) * 100 + 100)))
 from version import APP_VERSION, APP_NAME, APP_AUTHOR,QA_TESTERS, APP_YEAR, ABOUT_TEXT, GITHUB_REPO
 
 
@@ -159,7 +184,7 @@ class UserOverlayPanel(QFrame):
         vol_row.setSpacing(8)
         self.sl_vol = QSlider(Qt.Orientation.Horizontal)
         self.sl_vol.setRange(0, 200)
-        self.sl_vol.setValue(int(current_vol * 100))
+        self.sl_vol.setValue(_vol_to_slider(current_vol))
         self.lbl_vol = QLabel(f"{self.sl_vol.value()}%")
         self.lbl_vol.setFixedWidth(38)
         self.lbl_vol.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -298,7 +323,9 @@ class UserOverlayPanel(QFrame):
 
     def _on_vol_changed(self, v: int):
         self.lbl_vol.setText(f"{v}%")
-        self.audio.set_user_volume(self.uid, v / 100.0)
+        # Экспоненциальная кривая: slider 100 = 1.0x (нейтрально),
+        # slider 200 = 10.0x (+20 дБ) — позволяет поднять тихие микрофоны.
+        self.audio.set_user_volume(self.uid, _slider_to_vol(v))
 
     def _on_toggle_mute(self):
         state = self.audio.toggle_user_mute(self.uid)
@@ -383,10 +410,10 @@ class VolumePanel(QDialog):
         layout = QVBoxLayout(self)
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(0, 200)
-        self.slider.setValue(int(current_vol * 100))
+        self.slider.setValue(_vol_to_slider(current_vol))
         self.label = QLabel(f"{self.slider.value()}%")
         self.slider.valueChanged.connect(
-            lambda v: (self.label.setText(f"{v}%"), self.audio.set_user_volume(self.uid, v / 100.0)))
+            lambda v: (self.label.setText(f"{v}%"), self.audio.set_user_volume(self.uid, _slider_to_vol(v))))
 
         layout.addWidget(QLabel("Уровень громкости:"))
         layout.addWidget(self.slider)
@@ -403,6 +430,105 @@ class VolumePanel(QDialog):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Системный оверлей шёпота — поверх всех окон Windows
+# ──────────────────────────────────────────────────────────────────────────────
+class WhisperSystemOverlay(QWidget):
+    """
+    Полупрозрачный оверлей в правом верхнем углу экрана.
+    Появляется поверх любых окон (игры, браузер, IDE) когда тебе шепчут.
+
+    Флаги окна:
+      WindowStaysOnTopHint  — поверх всего
+      FramelessWindowHint   — без заголовка/рамки
+      Tool                  — не мигает в панели задач, не крадёт Alt+Tab
+    WA_ShowWithoutActivating — не уводит фокус из игры при появлении.
+    """
+
+    def __init__(self):
+        super().__init__(
+            None,
+            Qt.WindowType.WindowStaysOnTopHint |
+            Qt.WindowType.FramelessWindowHint  |
+            Qt.WindowType.Tool,
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setFixedSize(290, 60)
+
+        # ── Содержимое ────────────────────────────────────────────────────────
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(14, 0, 14, 0)
+        layout.setSpacing(10)
+
+        self._icon_lbl = QLabel("🤫")
+        self._icon_lbl.setStyleSheet(
+            "font-size: 22px; background: transparent; border: none;"
+        )
+        layout.addWidget(self._icon_lbl)
+
+        text_col = QVBoxLayout()
+        text_col.setSpacing(0)
+
+        self._top_lbl = QLabel("Тебе шепчет")
+        self._top_lbl.setStyleSheet(
+            "color: rgba(180,190,220,0.85); font-size: 10px; "
+            "font-weight: normal; background: transparent; border: none;"
+        )
+
+        self._nick_lbl = QLabel("...")
+        self._nick_lbl.setStyleSheet(
+            "color: #ecf0f1; font-size: 13px; font-weight: bold; "
+            "background: transparent; border: none;"
+        )
+
+        text_col.addWidget(self._top_lbl)
+        text_col.addWidget(self._nick_lbl)
+        layout.addLayout(text_col, stretch=1)
+
+        # ── Пульсирующая анимация ─────────────────────────────────────────────
+        self._effect = QGraphicsOpacityEffect(self)
+        self.setGraphicsEffect(self._effect)
+        self._anim = QPropertyAnimation(self._effect, b"opacity")
+        self._anim.setDuration(1100)
+        self._anim.setStartValue(1.0)
+        self._anim.setEndValue(0.5)
+        self._anim.setEasingCurve(QEasingCurve.Type.SineCurve)
+        self._anim.setLoopCount(-1)  # бесконечно
+
+    def _reposition(self):
+        """Правый верхний угол основного экрана."""
+        try:
+            from PyQt6.QtWidgets import QApplication
+            screen = QApplication.primaryScreen()
+            if screen:
+                g = screen.availableGeometry()
+                self.move(g.right() - self.width() - 18, g.top() + 18)
+        except Exception:
+            pass
+
+    def show_for(self, nick: str):
+        """Показать оверлей с именем шептуна."""
+        self._nick_lbl.setText(nick)
+        self._reposition()
+        self.show()
+        self._anim.start()
+
+    def hide_overlay(self):
+        """Скрыть оверлей и остановить анимацию."""
+        self._anim.stop()
+        self.hide()
+
+    def paintEvent(self, event):
+        """Скруглённый фон — рисуем сами т.к. WA_TranslucentBackground."""
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setBrush(QBrush(QColor(18, 20, 38, 215)))
+        p.setPen(QPen(QColor(93, 173, 226, 140), 1.5))
+        p.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 12, 12)
+        p.end()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Диалог настроек
 # ──────────────────────────────────────────────────────────────────────────────
 class SettingsDialog(QDialog):
@@ -412,7 +538,7 @@ class SettingsDialog(QDialog):
         self.mw = parent  # MainWindow
         self.app_settings = QSettings("MyVoiceChat", "GlobalSettings")
         self.setWindowTitle("Настройки")
-        self.resize(620, 580)
+        self.resize(680, 600)
 
         main_layout = QVBoxLayout(self)
         self.tabs = QTabWidget()
@@ -426,7 +552,10 @@ class SettingsDialog(QDialog):
         # 3. Персонализация (Тема + Хоткеи в одной вкладке)
         self.setup_personalization_tab()
 
-        # 4. Версия
+        # 4. Шёпот — PTT горячие клавиши
+        self.setup_whisper_tab()
+
+        # 5. Версия
         self.setup_version_tab()
 
         main_layout.addWidget(self.tabs)
@@ -540,7 +669,16 @@ class SettingsDialog(QDialog):
 
         # ── Прочие ползунки ───────────────────────────────────────────────────
         aud_lay.addSpacing(8)
-        sys_vol = int(self.app_settings.value("system_sound_volume", 70))
+
+        # Системные звуки (уведомления):  слайдер 0-100, но применяется КВАДРАТ
+        # (slider/100)^2.  Это выравнивает перцептивную громкость:
+        #   0% →  0.00x  (тихо)
+        #  20% →  0.04x  (‑28 dB, комфортно для фоновых уведомлений)
+        #  50% →  0.25x  (‑12 dB, средне)
+        # 100% →  1.00x  (0 dB, максимум pygame)
+        # При линейной шкале default 70 → pygame vol 0.70 — слишком громко.
+        # При квадратичной default 30 → 0.09x (≈ −21 dB) — ненавязчиво.
+        sys_vol = int(self.app_settings.value("system_sound_volume", 30))
         self.lbl_sys = QLabel(f"Системные звуки: {sys_vol}%")
         self.sl_sys = QSlider(Qt.Orientation.Horizontal)
         self.sl_sys.setRange(0, 100)
@@ -549,7 +687,8 @@ class SettingsDialog(QDialog):
         aud_lay.addWidget(self.lbl_sys)
         aud_lay.addWidget(self.sl_sys)
 
-        sb_vol = int(self.app_settings.value("soundboard_volume", 50))
+        # Soundboard: та же квадратичная кривая. Default 40 → 0.16x (‑16 dB).
+        sb_vol = int(self.app_settings.value("soundboard_volume", 40))
         self.lbl_sb = QLabel(f"Soundboard: {sb_vol}%")
         self.sl_sb = QSlider(Qt.Orientation.Horizontal)
         self.sl_sb.setRange(0, 100)
@@ -605,6 +744,139 @@ class SettingsDialog(QDialog):
 
         lay.addStretch()
         self.tabs.addTab(tab, "Персонализация")
+
+    # ── Вкладка «Шёпот» ──────────────────────────────────────────────────────
+    def setup_whisper_tab(self):
+        """
+        5 PTT-слотов: каждый — выбор собеседника (из known_users.json) +
+        сочетание клавиш. Тема применяется автоматически через QDialog stylesheet
+        родителя (MainWindow.apply_theme): QComboBox, QLineEdit, QPushButton,
+        QLabel, QGroupBox наследуют bg/text/border от него.
+        """
+        tab = QWidget()
+        lay = QVBoxLayout(tab)
+        lay.setSpacing(10)
+        lay.setContentsMargins(16, 16, 16, 16)
+
+        # ── Описание ──────────────────────────────────────────────────────────
+        desc = QLabel(
+            "Удерживай клавишу → голос идёт только этому собеседнику (PTT-шёпот).\n"
+            "Работает поверх любых окон (игр, браузера и т.д.).\n"
+            "Формат клавиш: <b>alt+1</b>, <b>ctrl+shift+w</b>, <b>f8</b> и т.д."
+        )
+        desc.setTextFormat(Qt.TextFormat.RichText)
+        desc.setWordWrap(True)
+        desc.setStyleSheet("font-size: 12px; line-height: 1.5;")
+        lay.addWidget(desc)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setFrameShadow(QFrame.Shadow.Sunken)
+        lay.addWidget(sep)
+
+        # ── Читаем известных пользователей ────────────────────────────────────
+        # known_users.json: {ip: {nick, first_seen, last_seen}}
+        # Показываем только ники (без IP) — сортировка по алфавиту.
+        known_nicks: list[str] = []
+        try:
+            if os.path.exists("known_users.json"):
+                with open("known_users.json", "r", encoding="utf-8") as f:
+                    registry: dict = json.load(f)
+                known_nicks = sorted(
+                    {v.get("nick", "") for v in registry.values() if v.get("nick", "")},
+                    key=str.lower,
+                )
+        except Exception:
+            pass
+
+        EMPTY = "— не выбрано —"
+        combo_items = [EMPTY] + known_nicks
+
+        # ── Заголовки колонок ─────────────────────────────────────────────────
+        hdr = QHBoxLayout()
+        hdr.setContentsMargins(4, 0, 4, 0)
+        n_lbl = QLabel("#")
+        n_lbl.setFixedWidth(20)
+        n_lbl.setStyleSheet("font-weight: bold; font-size: 12px;")
+        p_lbl = QLabel("Собеседник")
+        p_lbl.setStyleSheet("font-weight: bold; font-size: 12px;")
+        k_lbl = QLabel("Горячая клавиша (удерживать)")
+        k_lbl.setStyleSheet("font-weight: bold; font-size: 12px;")
+        hdr.addWidget(n_lbl)
+        hdr.addWidget(p_lbl, stretch=3)
+        hdr.addSpacing(8)
+        hdr.addWidget(k_lbl, stretch=4)
+        lay.addLayout(hdr)
+
+        # ── 5 слотов ──────────────────────────────────────────────────────────
+        self._w_slots: list[tuple[QComboBox, QLineEdit]] = []
+
+        for i in range(5):
+            row = QHBoxLayout()
+            row.setSpacing(8)
+            row.setContentsMargins(0, 0, 0, 0)
+
+            num = QLabel(str(i + 1))
+            num.setFixedWidth(20)
+            num.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            num.setStyleSheet("color: #888; font-size: 12px;")
+
+            # Комбобокс — собеседник
+            cb = QComboBox()
+            cb.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            cb.setMinimumWidth(150)
+            for item in combo_items:
+                cb.addItem(item)
+
+            saved_nick = self.app_settings.value(f"whisper_slot_{i}_nick", "")
+            if saved_nick and saved_nick in known_nicks:
+                cb.setCurrentText(saved_nick)
+            else:
+                cb.setCurrentIndex(0)  # «— не выбрано —»
+
+            # Поле горячей клавиши
+            le = QLineEdit()
+            le.setPlaceholderText("напр. alt+1, ctrl+shift+w, f8")
+            le.setMinimumWidth(180)
+            saved_hk = self.app_settings.value(f"whisper_slot_{i}_hk", "")
+            le.setText(saved_hk)
+
+            row.addWidget(num)
+            row.addWidget(cb, stretch=3)
+            row.addWidget(le, stretch=4)
+            lay.addLayout(row)
+
+            self._w_slots.append((cb, le))
+
+        # ── Кнопка очистки ────────────────────────────────────────────────────
+        lay.addSpacing(4)
+        btn_clear = QPushButton("Очистить все слоты")
+        btn_clear.setStyleSheet(
+            "QPushButton { color: #e74c3c; border: 1px solid #e74c3c; "
+            "border-radius: 6px; padding: 4px 14px; }"
+            "QPushButton:hover { background-color: rgba(231,76,60,0.12); }"
+        )
+        btn_clear.setFixedWidth(200)
+        btn_clear.clicked.connect(self._clear_whisper_slots)
+        lay.addWidget(btn_clear, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        # ── Примечание о формате ──────────────────────────────────────────────
+        note = QLabel(
+            "ℹ  Если нужный собеседник не появляется — он ещё не был в сессии.\n"
+            "    Зайди в канал вместе с ним, список обновится автоматически."
+        )
+        note.setStyleSheet("font-size: 11px; color: #888;")
+        note.setWordWrap(True)
+        lay.addSpacing(6)
+        lay.addWidget(note)
+
+        lay.addStretch()
+        self.tabs.addTab(tab, "Шёпот")
+
+    def _clear_whisper_slots(self):
+        for cb, le in self._w_slots:
+            cb.setCurrentIndex(0)
+            le.clear()
 
     # ── Вкладка «Версия» ──────────────────────────────────────────────────────
     def setup_version_tab(self):
@@ -815,6 +1087,14 @@ class SettingsDialog(QDialog):
         s.setValue("soundboard_volume", self.sl_sb.value())
         s.setValue("vad_threshold_slider", self.sl_vad.value())
         s.setValue("theme", self.theme_combo.currentText())
+
+        # Сохраняем слоты PTT-шёпота (до 5)
+        for i, (cb, le) in enumerate(self._w_slots):
+            # Если выбрано «не выбрано» (index 0) — сохраняем пустую строку
+            nick = "" if cb.currentIndex() == 0 else cb.currentText()
+            hk   = le.text().strip()
+            s.setValue(f"whisper_slot_{i}_nick", nick)
+            s.setValue(f"whisper_slot_{i}_hk",   hk)
 
         self.mw.nick = self.ed_nick.text()
         self.mw.avatar = self.cur_av

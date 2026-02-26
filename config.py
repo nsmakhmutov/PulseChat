@@ -43,6 +43,12 @@ VIDEO_HEIGHT = 720
 VIDEO_FPS = 60
 VIDEO_BITRATE = 6000000  # 6 Mbps
 
+# VIDEO_PACING_RATE: скорость отправки видео-пакетов в pacing-потоке (байт/сек).
+# = VIDEO_BITRATE * 1.25 / 8, чтобы покрыть UDP+IP overhead и не создавать бёрсты.
+# При VIDEO_BITRATE=6Mbps → 937 500 байт/сек → ~720 пакетов/сек → ~1.39 мс/пакет.
+# Увеличивать с осторожностью: чем выше — тем меньше эффект pacing.
+VIDEO_PACING_RATE_BYTES_SEC = int(VIDEO_BITRATE * 1.25 / 8)  # ~937 500 байт/сек
+
 # Флаг для UDP заголовка (битмаска):
 # 1=Mute, 2=Deaf, 4=Video, 8=StreamAudio, 16=LoopbackAudio, 32=StreamVoices, 64=Whisper, 254=Ping
 FLAG_VIDEO          = 4
