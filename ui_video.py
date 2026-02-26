@@ -792,9 +792,27 @@ class VideoWindow(QWidget):
         """Перехватываем закрытие окна, испускаем сигнал до уничтожения объекта."""
         self._closing = True         # блокируем sync_audio_state от внешних сигналов
         self._idr_timer.stop()       # останавливаем IDR-таймер
+        self._hide_timer.stop()      # останавливаем таймер авто-скрытия
+
+        # FIX MEM: явно очищаем последний кадр (QImage = ~3.7 МБ для 1280×720 RGB).
+        # Без этого _current_image держался до уничтожения VideoSurface объекта,
+        # что при deleteLater() может произойти не сразу.
+        # После очистки OpenGL текстура тоже освобождается при следующем paintGL().
+        if hasattr(self, 'surface') and self.surface is not None:
+            try:
+                self.surface._current_image = None
+            except RuntimeError:
+                pass
+
+        # Останавливаем таймер попапа громкости
+        if hasattr(self, 'overlay') and self.overlay is not None:
+            try:
+                self.overlay._vol_hide_timer.stop()
+            except (RuntimeError, AttributeError):
+                pass
+
         if self._is_fullscreen:
             self._exit_fullscreen()
-        self._hide_timer.stop()
         if self.uid is not None:
             self.window_closed.emit(self.uid)
         super().closeEvent(event)

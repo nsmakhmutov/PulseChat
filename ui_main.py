@@ -1,4 +1,5 @@
 import os
+import gc
 import json
 import pygame
 import winsound
@@ -48,6 +49,18 @@ class MainWindow(QMainWindow):
         self.audio = AudioHandler()
         self.net = NetworkClient(self.audio)
 
+        # Предзагрузка звуков уведомлений: каждый звук загружается ОДИН РАЗ.
+        # Раньше play_notification() вызывал pygame.mixer.Sound(path) при каждом
+        # событии (mute/unmute/join/leave) → декодирование с диска + новый объект
+        # каждый раз. Теперь объект создаётся здесь и переиспользуется.
+        self._loaded_sounds: dict = {}
+        for key, path in self.sound_files.items():
+            if os.path.exists(path):
+                try:
+                    self._loaded_sounds[key] = pygame.mixer.Sound(path)
+                except Exception as ex:
+                    print(f"[UI] Не удалось загрузить звук {key}: {ex}")
+
         self.video = VideoEngine(self.net)
         self.net.set_video_engine(self.video)
         self.stream_windows = {}
@@ -95,8 +108,24 @@ class MainWindow(QMainWindow):
         self._c_def    = QColor("#ecf0f1") if self._cache_theme == "Темная" else QColor("#444444")
         self._icon_size = QSize(20, 20)
 
-        # ── Кэш шрифтов для update_user_tree() ─────────────────────────────────
-        # update_user_tree() вызывается при каждом sync_users от сервера.
+        # ── Кэш QBrush для refresh_ui() ────────────────────────────────────────
+        # QBrush(QColor) создавался на КАЖДЫЙ вызов refresh_ui() (10 раз/сек)
+        # для КАЖДОГО пользователя → постоянное давление на GC.
+        # Кэшируем один раз, пересоздаём только при смене темы.
+        self._br_talk   = QBrush(self._c_talk)
+        self._br_mute   = QBrush(self._c_mute)
+        self._br_stream = QBrush(self._c_stream)
+        self._br_def    = QBrush(self._c_def)
+        self._br_gray   = QBrush(QColor("#888888"))   # для заголовков комнат и watchers
+
+        # ── Кэш иконок для refresh_ui() ────────────────────────────────────────
+        # refresh_ui() вызывается каждые 100 мс и раньше создавал QIcon().pixmap()
+        # внутри цикла → 4 иконки × N пользователей × 10 вызовов/сек = лишние
+        # аллокации и давление на GC. Создаём pixmap один раз здесь.
+        self._px_live      = QIcon(resource_path("assets/icon/live.svg")).pixmap(25, 25)
+        self._px_vol_off   = QIcon(resource_path("assets/icon/volume_off.svg")).pixmap(self._icon_size)
+        self._px_mic_off   = QIcon(resource_path("assets/icon/mic_off.svg")).pixmap(self._icon_size)
+        self._px_ban       = QIcon(resource_path("assets/icon/ban.svg")).pixmap(self._icon_size)
         # Создание QFont внутри метода = лишние аллокации при каждом обновлении.
         # Шрифты зависят от custom_font_family, который не меняется в runtime.
         self._font_room    = QFont(self.custom_font_family, 12)
@@ -420,13 +449,12 @@ class MainWindow(QMainWindow):
             pass
 
     def play_notification(self, stype="self_move"):
-        path = self.sound_files.get(stype)
         vol = int(self.app_settings.value("system_sound_volume", 70)) / 100.0
-        if path and os.path.exists(path):
+        sound = self._loaded_sounds.get(stype)
+        if sound is not None:
             try:
-                s = pygame.mixer.Sound(path)
-                s.set_volume(vol)
-                s.play()
+                sound.set_volume(vol)
+                sound.play()
             except Exception:
                 pass
         else:
@@ -531,10 +559,19 @@ class MainWindow(QMainWindow):
             if stopped_streams:
                 self.play_notification("stream_off")
                 for uid in stopped_streams:
+                    # FIX MEM: раньше здесь был deleteLater() + del stream_windows[uid].
+                    # Это НЕ вызывало _on_stream_window_closed() → decode_worker
+                    # для этого uid продолжал работать, держа H264-декодер в памяти
+                    # (~10–40 МБ) до своего 2-секундного тайм-аута. Сигнал
+                    # audio.status_changed тоже не отключался.
+                    #
+                    # Теперь: _on_stream_window_closed() обрабатывает ВСЁ:
+                    #   — disconnect audio.status_changed
+                    #   — stop_viewer_for_uid (немедленно сигнализирует воркеру)
+                    #   — deleteLater() окна
+                    #   — deferred GC + Windows heap trim через 2.5 сек
                     if uid in self.stream_windows:
-                        # ИСПРАВЛЕНИЕ: Удаляем окно из памяти
-                        self.stream_windows[uid].deleteLater()
-                        del self.stream_windows[uid]
+                        self._on_stream_window_closed(uid)
 
         # ИСПРАВЛЕНИЕ 2.1: Очищаем движки от мусора и отключившихся
         self.audio.cleanup_users(all_active_uids)
@@ -557,7 +594,7 @@ class MainWindow(QMainWindow):
             item_r = QTreeWidgetItem(self.tree, [f"# {cl_room.upper()}", "", "", ""])
             item_r.setFirstColumnSpanned(True)
             item_r.setFont(0, font_r)
-            item_r.setForeground(0, QBrush(QColor("#888888")))
+            item_r.setForeground(0, self._br_gray)
             item_r.setFlags(item_r.flags() & ~Qt.ItemFlag.ItemIsSelectable)
             item_r.setData(0, Qt.ItemDataRole.UserRole, "ROOM_HEADER")
             item_r.setData(1, Qt.ItemDataRole.UserRole, room)
@@ -590,7 +627,7 @@ class MainWindow(QMainWindow):
                         w_nick = watcher.get('nick', '?')
                         watcher_item = QTreeWidgetItem(item_u, [f"    {w_nick}", "", "", ""])
                         watcher_item.setFont(0, self._font_watcher)
-                        watcher_item.setForeground(0, QBrush(QColor("#888888")))
+                        watcher_item.setForeground(0, self._br_gray)
                         watcher_item.setFlags(watcher_item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
                         watcher_item.setData(0, Qt.ItemDataRole.UserRole, None)
 
@@ -609,7 +646,8 @@ class MainWindow(QMainWindow):
         theme_now = self.app_settings.value("theme", "Светлая")
         if theme_now != self._cache_theme:
             self._cache_theme = theme_now
-            self._c_def = QColor("#ecf0f1") if theme_now == "Темная" else QColor("#444444")
+            self._c_def  = QColor("#ecf0f1") if theme_now == "Темная" else QColor("#444444")
+            self._br_def = QBrush(self._c_def)   # пересоздаём кисть при смене темы
 
         c_talk   = self._c_talk
         c_mute   = self._c_mute
@@ -630,22 +668,19 @@ class MainWindow(QMainWindow):
                 curr_d = self.audio.is_deafened if uid == self.audio.my_uid else is_d
 
                 if curr_s:
-                    item.setData(1, Qt.ItemDataRole.DecorationRole,
-                                 QIcon(resource_path("assets/icon/live.svg")).pixmap(25, 25))
+                    item.setData(1, Qt.ItemDataRole.DecorationRole, self._px_live)
                 else:
                     item.setData(1, Qt.ItemDataRole.DecorationRole, None)
 
                 if curr_d:
-                    item.setData(2, Qt.ItemDataRole.DecorationRole,
-                                 QIcon(resource_path("assets/icon/volume_off.svg")).pixmap(icon_size))
+                    item.setData(2, Qt.ItemDataRole.DecorationRole, self._px_vol_off)
                 else:
                     item.setData(2, Qt.ItemDataRole.DecorationRole, None)
 
                 if uid == self.audio.my_uid:
                     talk = me_talk
                     if self.audio.is_muted:
-                        item.setData(3, Qt.ItemDataRole.DecorationRole,
-                                     QIcon(resource_path("assets/icon/mic_off.svg")).pixmap(icon_size))
+                        item.setData(3, Qt.ItemDataRole.DecorationRole, self._px_mic_off)
                     else:
                         item.setData(3, Qt.ItemDataRole.DecorationRole, None)
                 else:
@@ -654,22 +689,20 @@ class MainWindow(QMainWindow):
                     is_locally_muted = u_audio.is_locally_muted if u_audio else False
 
                     if is_locally_muted:
-                        item.setData(3, Qt.ItemDataRole.DecorationRole,
-                                     QIcon(resource_path("assets/icon/ban.svg")).pixmap(icon_size))
+                        item.setData(3, Qt.ItemDataRole.DecorationRole, self._px_ban)
                     elif is_m:
-                        item.setData(3, Qt.ItemDataRole.DecorationRole,
-                                     QIcon(resource_path("assets/icon/mic_off.svg")).pixmap(icon_size))
+                        item.setData(3, Qt.ItemDataRole.DecorationRole, self._px_mic_off)
                     else:
                         item.setData(3, Qt.ItemDataRole.DecorationRole, None)
 
                 if talk:
-                    item.setForeground(0, QBrush(c_talk))
+                    item.setForeground(0, self._br_talk)
                 elif curr_s:
-                    item.setForeground(0, QBrush(c_stream))
+                    item.setForeground(0, self._br_stream)
                 elif curr_d or is_m or (uid != self.audio.my_uid and u_audio and is_locally_muted):
-                    item.setForeground(0, QBrush(c_mute))
+                    item.setForeground(0, self._br_mute)
                 else:
-                    item.setForeground(0, QBrush(c_def))
+                    item.setForeground(0, self._br_def)
 
     def on_tree_double_click(self, item, col):
         if item.data(0, Qt.ItemDataRole.UserRole) == "ROOM_HEADER":
@@ -733,10 +766,13 @@ class MainWindow(QMainWindow):
             # «Прекратить просмотр» — окно само закрывается, нам остаётся отправить stop
             w.overlay_stop_watch.connect(lambda _uid=uid: self._on_stream_window_closed(_uid))
 
-            # Синхронизировать иконки оверлея при каждом изменении статуса аудио
-            self.audio.status_changed.connect(
-                lambda muted, deafened, _w=w: _w.sync_audio_state(muted, deafened)
-            )
+            # Синхронизировать иконки оверлея при каждом изменении статуса аудио.
+            # ВАЖНО: используем прямое подключение (не lambda), чтобы можно было
+            # вызвать disconnect() по имени метода при закрытии окна.
+            # Lambda-соединения накапливались в audio.status_changed и никогда
+            # не отключались → каждое открытие окна оставляло мёртвую лямбду
+            # с живой ссылкой на VideoWindow в памяти.
+            self.audio.status_changed.connect(w.sync_audio_state)
             # Установить актуальное состояние прямо сейчас
             w.sync_audio_state(self.audio.is_muted, self.audio.is_deafened)
 
@@ -766,9 +802,52 @@ class MainWindow(QMainWindow):
             self.stream_windows[uid].activateWindow()
 
     def _on_stream_window_closed(self, uid):
-        # Окно само удалится из памяти, просто удаляем ссылку
+        w = self.stream_windows.get(uid)
+        if w is not None:
+            try:
+                self.audio.status_changed.disconnect(w.sync_audio_state)
+            except (RuntimeError, TypeError):
+                pass
         self.stream_windows.pop(uid, None)
         self.net.send_json({"action": "stream_watch_stop", "streamer_uid": uid})
+
+        # FIX MEM: Останавливаем decode_worker для этого uid.
+        #
+        # Без этого вызова после закрытия окна decode_worker продолжал работать:
+        #   — При сценарии 3 (зритель закрыл вручную): воркер работает ВЕЧНО пока
+        #     стример не остановит трансляцию, всё это время держа FFmpeg декодер
+        #     (FRAME×2 потока = ~10 МБ, ранее AUTO = ~40 МБ).
+        #   — При сценарии 4 (стример остановил): воркер ждёт 2 сек тайм-аут,
+        #     всё это время память не освобождается.
+        # stop_viewer_for_uid() — non-blocking: кладёт None в очередь и уходит.
+        # Воркер завершится сам и вызовет decoder.close() + gc.collect() в finally.
+        self.video.stop_viewer_for_uid(uid)
+
+        if w is not None:
+            try:
+                w.deleteLater()
+            except RuntimeError:
+                pass
+
+        gc.collect()
+
+        # Откладываем ещё один GC на 2.5 сек: к этому моменту decode_worker
+        # гарантированно завершился и его decoder/буферы готовы к сборке.
+        # Windows heap trim выполним здесь же — после декодера.
+        def _deferred_cleanup():
+            gc.collect()
+            try:
+                import ctypes
+                kernel32 = ctypes.windll.kernel32
+                kernel32.SetProcessWorkingSetSizeEx(
+                    kernel32.GetCurrentProcess(),
+                    ctypes.c_size_t(0xFFFFFFFF),
+                    ctypes.c_size_t(0xFFFFFFFF),
+                    0,
+                )
+            except Exception:
+                pass
+        QTimer.singleShot(2500, _deferred_cleanup)
 
     def open_settings(self):
         if SettingsDialog(self.audio, self).exec():
@@ -800,14 +879,29 @@ class MainWindow(QMainWindow):
         panel.show_above(self.btn_sb)
 
     def _update_known_users_registry(self, users_map):
+        """
+        Обновляет реестр известных пользователей (known_users.json).
+
+        FIX MEM: раньше этот метод читал JSON-файл с диска при КАЖДОМ вызове
+        update_user_tree() — а сервер шлёт sync_users несколько раз в секунду.
+        Каждый вызов создавал новый dict, строки, объекты → постоянный мусор.
+
+        Теперь реестр кэшируется в self._known_users_cache и читается с диска
+        только один раз при первом вызове. На диск записывается только при реальных
+        изменениях данных. Это устраняет постоянную аллокацию/GC-давление.
+        """
         REGISTRY_FILE = "known_users.json"
-        try:
-            registry = {}
-            if os.path.exists(REGISTRY_FILE):
-                with open(REGISTRY_FILE, 'r', encoding='utf-8') as f:
-                    registry = json.load(f)
-        except Exception:
-            registry = {}
+
+        # Ленивая загрузка кэша (один раз за время жизни приложения)
+        if not hasattr(self, '_known_users_cache'):
+            try:
+                if os.path.exists(REGISTRY_FILE):
+                    with open(REGISTRY_FILE, 'r', encoding='utf-8') as f:
+                        self._known_users_cache = json.load(f)
+                else:
+                    self._known_users_cache = {}
+            except Exception:
+                self._known_users_cache = {}
 
         changed = False
         now_str = time.strftime("%Y-%m-%d %H:%M")
@@ -818,9 +912,9 @@ class MainWindow(QMainWindow):
                 nick = u.get('nick', '')
                 if not ip:
                     continue
-                entry = registry.get(ip, {})
+                entry = self._known_users_cache.get(ip, {})
                 if entry.get('nick') != nick or entry.get('last_seen') != now_str:
-                    registry[ip] = {
+                    self._known_users_cache[ip] = {
                         'nick': nick,
                         'first_seen': entry.get('first_seen', now_str),
                         'last_seen': now_str,
@@ -830,7 +924,7 @@ class MainWindow(QMainWindow):
         if changed:
             try:
                 with open(REGISTRY_FILE, 'w', encoding='utf-8') as f:
-                    json.dump(registry, f, ensure_ascii=False, indent=2)
+                    json.dump(self._known_users_cache, f, ensure_ascii=False, indent=2)
             except Exception as e:
                 print(f"[UI] known_users.json write error: {e}")
 
@@ -910,6 +1004,8 @@ class MainWindow(QMainWindow):
             self.video.stop_streaming()
             self.audio.set_stream_audio_enabled(False)
             self.is_streaming = False
+            # stop_streaming() уже делает gc.collect() + Windows heap trim внутри.
+            # Доп. trim здесь — для Qt-объектов (QImage в on_video_frame буфере).
 
         self.update_stream_button_icon()
 

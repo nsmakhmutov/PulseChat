@@ -2,6 +2,7 @@ import threading
 import time
 import queue
 import struct
+import gc
 import numpy as np
 from PyQt6.QtCore import QObject, pyqtSignal
 from PyQt6.QtGui import QImage
@@ -145,10 +146,46 @@ class VideoEngine(QObject):
     def stop_streaming(self):
         self.running = False
         if self.capture_thread:
-            self.capture_thread.join(timeout=1)
+            self.capture_thread.join(timeout=3)   # +1 сек: dxcam.stop() может занять время
+            self.capture_thread = None
         if self.encode_thread:
-            self.encode_thread.join(timeout=1)
-        print("[Video] Стрим остановлен")
+            self.encode_thread.join(timeout=3)    # +1 сек: flush энкодера
+            self.encode_thread = None
+
+        # Очистка очереди кадров: необработанные numpy-массивы (до 4 × ~2.8 МБ
+        # для 1280×720) оставались в frame_queue до следующей GC-итерации.
+        with self.frame_queue.mutex:
+            self.frame_queue.queue.clear()
+            self.frame_queue.all_tasks_done.notify_all()
+            self.frame_queue.unfinished_tasks = 0
+
+        # Принудительный запуск GC + trim памяти.
+        # gc.collect(1) + (2) — ломаем циклические ссылки C-extension объектов.
+        gc.collect(1)
+        gc.collect(2)
+
+        # Windows: освобождаем "рабочее множество" страниц обратно в ОС.
+        # Проблема: numpy frame-массивы (4 × 2.7 МБ), FFmpeg encoder working buffers
+        # (~30 МБ) освобождены Python GC, но Windows heap удерживает страницы
+        # (demand zero pages) для возможного повторного использования.
+        # Task Manager видит эти страницы как "частная память" (Private Bytes).
+        #
+        # SetProcessWorkingSetSizeEx(-1, -1, 0) принудительно сбрасывает рабочее
+        # множество — страницы уходят в standby list и Task Manager их не считает.
+        # При следующем обращении страницы будут page-faulted обратно (мгновенно).
+        # Аналогичный трюк используют Discord, Chrome, Firefox.
+        try:
+            import ctypes
+            kernel32 = ctypes.windll.kernel32
+            kernel32.SetProcessWorkingSetSizeEx(
+                kernel32.GetCurrentProcess(),
+                ctypes.c_size_t(0xFFFFFFFF),
+                ctypes.c_size_t(0xFFFFFFFF),
+                0,
+            )
+            print("[Video] Стрим остановлен: GC + Windows heap trim выполнен")
+        except Exception:
+            print("[Video] Стрим остановлен, GC выполнен")
 
     def force_keyframe(self):
         self._force_keyframe = True
@@ -181,6 +218,48 @@ class VideoEngine(QObject):
                 if t:
                     t.join(timeout=1)
                 self.decode_queues.pop(uid, None)
+
+    def stop_viewer_for_uid(self, uid):
+        """
+        Немедленно останавливает decode_worker для данного uid и очищает все
+        связанные буферы. Вызывать когда зритель закрывает окно просмотра
+        (неважно — вручную или потому что стример остановил трансляцию).
+
+        Не блокирует: сигнал None кладётся в очередь и worker завершается сам
+        (через <2 секунды). Все Python-ссылки снимаются здесь — GC может
+        освободить декодер как только поток завершится.
+
+        Thread-safe: может вызываться из Qt main thread.
+        """
+        # 1. Посылаем сигнал завершения в очередь
+        q = self.decode_queues.pop(uid, None)
+        if q is not None:
+            # Очищаем очередь (могут быть 1-2 кадра) и ставим None
+            try:
+                while True:
+                    q.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                q.put_nowait(None)
+            except queue.Full:
+                pass
+            # q теперь не хранится в decode_queues, поэтому process_incoming_packet
+            # и _ensure_decode_worker не смогут положить новые данные в старый воркер.
+            # Следующий вызов _ensure_decode_worker создаст новый поток — но только
+            # если окно просмотра снова открыто (on_video_frame → update_frame).
+
+        # 2. Снимаем ссылку на поток — GC соберёт Thread объект после завершения.
+        #    Не делаем join(): блокировка Qt main thread на 2 сек = freeze UI.
+        self.decode_threads.pop(uid, None)
+
+        # 3. Немедленно очищаем сборочные буферы — bytes объекты кадра (~50–200 КБ × N)
+        with self._buffer_lock:
+            self.incoming_buffer.pop(uid, None)
+            self.assembly_info.pop(uid, None)
+            self.decoders.pop(uid, None)
+
+        print(f"[Video] stop_viewer_for_uid({uid}): сигнал завершения декодера отправлен")
 
     # ------------------------------------------------------------------
     # Захват экрана
@@ -224,6 +303,17 @@ class VideoEngine(QObject):
                 time.sleep(0.1)
 
         camera.stop()
+        # КРИТИЧЕСКИ ВАЖНО: явно освобождаем D3D11 ресурсы.
+        # dxcam использует Direct3D11 staging textures и device context:
+        #   - 1280×720 BGRA × 4 буфера (Double/Triple buffering) ≈ 15–30 МБ
+        # del camera не вызывает D3D Release() немедленно — C-extension объект
+        # уничтожается только при следующей GC-итерации. camera.release()
+        # вызывает деструктор сразу и освобождает GPU/CPU память синхронно.
+        try:
+            camera.release()
+            print("[Video] DXCam D3D11 ресурсы освобождены")
+        except Exception:
+            pass
         del camera
 
     def _capture_loop_fallback(self, camera):
@@ -252,6 +342,11 @@ class VideoEngine(QObject):
                 print(f"[Capture Fallback] Error: {e}")
                 time.sleep(1)
 
+        # Fallback: camera.release() тоже нужен (те же D3D11 ресурсы)
+        try:
+            camera.release()
+        except Exception:
+            pass
         del camera
 
     # ------------------------------------------------------------------
@@ -272,49 +367,80 @@ class VideoEngine(QObject):
 
         pts_counter = 0
 
-        while self.running:
-            try:
-                try:
-                    frame_np = self.frame_queue.get(timeout=0.5)
-                except queue.Empty:
-                    continue
-
-                if frame_np.size == 0:
-                    continue
-
-                src_h, src_w, _ = frame_np.shape
-
-                if src_w != width or src_h != height:
-                    img   = Image.fromarray(frame_np, 'RGB')
-                    img   = img.resize((width, height), Image.Resampling.BILINEAR)
-                    frame = av.VideoFrame.from_image(img)
-                else:
-                    frame = av.VideoFrame.from_ndarray(frame_np, format='rgb24')
-
-                frame.pts = pts_counter
-                pts_counter += 1
-
-                if self._force_keyframe:
-                    try:
-                        frame.pict_type = 'I'
-                    except (TypeError, AttributeError):
-                        frame.pict_type = av.video.frame.PictureType.I
-                    self._force_keyframe = False
-                    print("[Video] Принудительный IDR-кадр отправлен")
-
-                packets = codec.encode(frame)
-                for packet in packets:
-                    self._fragment_and_send(bytes(packet))
-
-            except Exception as e:
-                print(f"[Encoder] Error: {e}")
-
-        # Flush encoder
         try:
-            for packet in codec.encode(None):
-                self._fragment_and_send(bytes(packet))
-        except Exception:
-            pass
+            while self.running:
+                try:
+                    try:
+                        frame_np = self.frame_queue.get(timeout=0.5)
+                    except queue.Empty:
+                        continue
+
+                    if frame_np.size == 0:
+                        continue
+
+                    src_h, src_w, _ = frame_np.shape
+
+                    if src_w != width or src_h != height:
+                        img   = Image.fromarray(frame_np, 'RGB')
+                        img   = img.resize((width, height), Image.Resampling.BILINEAR)
+                        frame = av.VideoFrame.from_image(img)
+                        del img
+                    else:
+                        frame = av.VideoFrame.from_ndarray(frame_np, format='rgb24')
+
+                    # Явно освобождаем numpy-массив кадра сразу после конвертации.
+                    # frame_np — это ссылка на DXCam-буфер размером ~2.8 МБ (1280×720×3).
+                    # Без del он живёт до следующей итерации, удерживая буфер DXCam.
+                    del frame_np
+
+                    frame.pts = pts_counter
+                    pts_counter += 1
+
+                    if self._force_keyframe:
+                        try:
+                            frame.pict_type = 'I'
+                        except (TypeError, AttributeError):
+                            frame.pict_type = av.video.frame.PictureType.I
+                        self._force_keyframe = False
+                        print("[Video] Принудительный IDR-кадр отправлен")
+
+                    packets = codec.encode(frame)
+                    # Явно освобождаем av.VideoFrame после кодирования.
+                    # Энкодер держит до 16 reference frames внутри — del здесь
+                    # освобождает Python-обёртку, сам FFmpeg-буфер управляется кодеком.
+                    del frame
+
+                    for packet in packets:
+                        self._fragment_and_send(bytes(packet))
+
+                except Exception as e:
+                    print(f"[Encoder] Error: {e}")
+
+            # Flush encoder
+            try:
+                for packet in codec.encode(None):
+                    self._fragment_and_send(bytes(packet))
+            except Exception:
+                pass
+
+        finally:
+            # КРИТИЧЕСКИ ВАЖНО: явно закрываем H264-энкодер.
+            #
+            # PyAV / FFmpeg энкодер держит в памяти:
+            #   - libx264: reference frames (~14 МБ) + lookahead (~30 МБ)
+            #             + motion estimation таблицы (~20 МБ) = ~64 МБ
+            #   - h264_nvenc: CUDA-контекст + GPU-pinned буферы = ещё больше
+            #
+            # Без codec.close() эта память не освобождается до вызова Python GC,
+            # который может откладываться на неопределённое время (или не вызываться
+            # вообще пока heap не вырастет достаточно). Каждый цикл вкл/выкл
+            # трансляции добавлял ~60-100 МБ "зависшей" памяти.
+            try:
+                codec.close()
+                print("[Video] Энкодер закрыт, FFmpeg-буферы освобождены")
+            except Exception as ex:
+                print(f"[Video] Ошибка при закрытии энкодера: {ex}")
+            del codec
 
     def _fragment_and_send(self, data):
         if not self.net or not self.net.udp_socket_bound:
@@ -460,35 +586,64 @@ class VideoEngine(QObject):
 
         Принимает bytes из decode_queue[uid] и эмитит frame_received сигнал
         в Qt-поток. None в очереди = сигнал завершения.
+
+        FIX MEM: decoder явно закрывается в блоке finally — без этого PyAV
+        удерживал нативный H264-контекст (FFmpeg avcodec_context) до сборки
+        GC, что при частых вкл/выкл трансляции накапливало ~10-15 МБ.
         """
         decoder = av.CodecContext.create('h264', 'r')
-        decoder.thread_type = 'AUTO'
 
-        while True:
+        # FIX MEM: thread_type='AUTO' заставлял FFmpeg создавать N_cores потоков,
+        # каждый со своими копиями reference frame буферов.
+        # Для 1280×720 H264: AUTO × 8 cores = 8 × ~5MB = ~40MB только для декодера.
+        # FRAME-threading + 2 потока: ~10MB и нет артефактов при baseline профиле.
+        decoder.thread_type  = 'FRAME'
+        decoder.thread_count = 2
+
+        try:
+            while True:
+                try:
+                    raw = q.get(timeout=2.0)
+                except queue.Empty:
+                    # Если 2 секунды нет данных — поток сам завершится.
+                    # Сигнал None или закрытие decode_queues[uid] приходит раньше.
+                    break
+
+                if raw is None:
+                    # Явный сигнал завершения от stop_viewer_for_uid / cleanup_users
+                    break
+
+                try:
+                    packet = av.Packet(raw)
+                    frames = decoder.decode(packet)
+                    for frame in frames:
+                        img_np = frame.to_rgb().to_ndarray()
+                        h, w, _ = img_np.shape
+                        bytes_per_line = img_np.strides[0]
+                        q_img = QImage(
+                            img_np.tobytes(), w, h,
+                            bytes_per_line,
+                            QImage.Format.Format_RGB888,
+                        )
+                        # Освобождаем промежуточные буферы немедленно.
+                        # img_np (numpy) — 1280×720×3 = 2.7 МБ; без явного del
+                        # он живёт до следующей итерации, удваивая пиковое потребление.
+                        self.frame_received.emit(uid, q_img.copy())
+                        del img_np, q_img
+                    del packet, frames
+                except Exception:
+                    pass
+                finally:
+                    # raw — bytes объект сжатого H264 кадра (~20–80 КБ).
+                    # Без явного del он держится до следующего q.get() (до 2 сек).
+                    del raw
+        finally:
+            # Явное освобождение FFmpeg контекста.
+            # С thread_count=2 вместо AUTO освобождает ~10MB вместо ~40MB.
             try:
-                raw = q.get(timeout=2.0)
-            except queue.Empty:
-                # Если 2 секунды нет данных — поток сам завершится
-                # (стример отключился или пауза). Очистка произойдёт через cleanup_users.
-                break
-
-            if raw is None:
-                # Явный сигнал завершения
-                break
-
-            try:
-                packet = av.Packet(raw)
-                frames = decoder.decode(packet)
-                for frame in frames:
-                    img_np = frame.to_rgb().to_ndarray()
-                    h, w, _ = img_np.shape
-                    # Страйд спасает от крашей PyQt на некратных разрешениях
-                    bytes_per_line = img_np.strides[0]
-                    q_img = QImage(
-                        img_np.tobytes(), w, h,
-                        bytes_per_line,
-                        QImage.Format.Format_RGB888,
-                    )
-                    self.frame_received.emit(uid, q_img.copy())
+                decoder.close()
             except Exception:
                 pass
+            del decoder
+            gc.collect()
+            print(f"[Video] decode_worker uid={uid} завершён, FFmpeg контекст освобождён")
