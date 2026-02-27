@@ -79,6 +79,24 @@ class VideoEngine(QObject):
         self._dx_factory   = None
         self._force_keyframe = False
 
+        # -------------------------------------------------------------------
+        # FIX #4: Периодическая чистка протухших фреймов вынесена в отдельный поток.
+        #
+        # Было: цикл O(N незаконченных кадров) выполнялся внутри _buffer_lock
+        #       на КАЖДЫЙ входящий UDP-пакет (при 60fps ≈ 300 пакетов/кадр).
+        #       Это добавляло до нескольких µs удержания лока на каждый пакет
+        #       в UDP-потоке.
+        #
+        # Стало: _frame_cleanup_loop просыпается раз в 500 мс и чистит под
+        #        коротким локом только действительно протухшие записи.
+        #        UDP-поток больше не занимается хозяйственными задачами.
+        # -------------------------------------------------------------------
+        threading.Thread(
+            target=self._frame_cleanup_loop,
+            daemon=True,
+            name="video-frame-cleanup",
+        ).start()
+
     # ------------------------------------------------------------------
     # Энкодер
     # ------------------------------------------------------------------
@@ -218,6 +236,30 @@ class VideoEngine(QObject):
                 if t:
                     t.join(timeout=1)
                 self.decode_queues.pop(uid, None)
+
+    def _frame_cleanup_loop(self):
+        """
+        FIX #4: Периодически удаляет незавершённые фрагменты кадров старше 1 сек.
+
+        Раньше эта же логика выполнялась на КАЖДЫЙ входящий UDP-пакет внутри
+        _buffer_lock (в process_incoming_packet). При 60fps и ~300 пакетах на
+        кадр это означало 300 лишних итераций O(N кадров) под локом в секунду.
+
+        Теперь чистка происходит раз в 500 мс — достаточно редко, чтобы не
+        нагружать CPU, и достаточно часто, чтобы буфер не разрастался.
+        """
+        while True:
+            time.sleep(0.5)
+            now = time.time()
+            with self._buffer_lock:
+                for uid in list(self.assembly_info.keys()):
+                    to_del = [
+                        fid for fid, info in self.assembly_info[uid].items()
+                        if now - info['ts'] > 1.0
+                    ]
+                    for fid in to_del:
+                        self.incoming_buffer[uid].pop(fid, None)
+                        self.assembly_info[uid].pop(fid, None)
 
     def stop_viewer_for_uid(self, uid):
         """
@@ -522,15 +564,9 @@ class VideoEngine(QObject):
                     del self.incoming_buffer[uid][frame_id]
                     del self.assembly_info[uid][frame_id]
 
-                # Чистим протухшие незаконченные кадры (старше 1 сек)
-                now    = time.time()
-                to_del = [
-                    fid for fid, info in self.assembly_info[uid].items()
-                    if now - info['ts'] > 1.0
-                ]
-                for fid in to_del:
-                    self.incoming_buffer[uid].pop(fid, None)
-                    self.assembly_info[uid].pop(fid, None)
+                # FIX #4: Чистка протухших незаконченных кадров вынесена в
+                # _frame_cleanup_loop (раз в 500 мс). Раньше этот O(N) цикл
+                # выполнялся на каждый UDP-пакет под _buffer_lock — лишняя нагрузка.
 
             # --- Сборка bytearray ВНЕ лока ---
             # _buffer_lock уже освобождён. UDP-поток может продолжать работу

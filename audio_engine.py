@@ -1,5 +1,6 @@
 import threading
 import queue
+from collections import deque
 import numpy as np
 import sounddevice as sd
 import opuslib
@@ -651,8 +652,10 @@ class AudioHandler(QObject):
         self.stream_users_lock = threading.Lock()
         # Громкость стрима (0.0 - 2.0), регулируется зрителем из оверлея
         self.stream_volume = 1.0
-        # Флаг: стример включил «Транслировать звук»
-        self.stream_audio_sending_enabled = False
+        # FIX #5: threading.Event вместо простого bool.
+        # bool-присваивание GIL-атомарно, но Event явно выражает намерение и
+        # согласуется со стилем _is_muted / _is_deafened в этом же классе.
+        self._stream_audio_sending = threading.Event()
         # AEC удалён: при использовании VB-CABLE (CABLE Output) эхо физически
         # невозможно — голоса зрителей никогда не попадают в CABLE Output.
         # Захват системного аудио
@@ -687,7 +690,11 @@ class AudioHandler(QObject):
         # второй и последующие пакеты (seq <= last_seq → return), зрители слышали
         # только первого спикера. Отдельный монотонный счётчик решает проблему.
         self._sv_sequence = 0
-        self.vad_pre_buffer = []
+        # FIX #3: deque(maxlen=5) вместо list.
+        # vad_pre_buffer.pop(0) на list — O(n): сдвигает все элементы влево.
+        # deque.popleft() — O(1), что важно для audio_callback hot path.
+        # maxlen=5 заменяет ручную проверку `if len > 5: pop(0)`.
+        self.vad_pre_buffer = deque(maxlen=5)
         self.was_talking = False
         self.stream = None
         # Счётчик воспроизведённых loopback-кадров (для периодического лога).
@@ -700,6 +707,25 @@ class AudioHandler(QObject):
         # после clear(). За 10 переподключений = 20 лишних потоков.
         self._pkt_thread: threading.Thread | None = None
         self._stream_pkt_thread: threading.Thread | None = None
+
+        # -------------------------------------------------------------------
+        # FIX #1: Copy-on-Write снимки для audio_callback.
+        #
+        # Проблема: audio_callback — реалтайм-поток с дедлайном 20 мс.
+        # Захват users_lock / stream_users_lock внутри callback'а блокировал
+        # его на время работы _packet_processor_loop (удерживает тот же лок).
+        # Результат: пропуск дедлайна → слышимые щелчки и глитчи в аудио.
+        #
+        # Решение: _packet_processor_loop берёт снимок dict после каждого
+        # изменения remote_users (внутри того же with users_lock).
+        # audio_callback читает _audio_users_snapshot БЕЗ лока:
+        #   - Присваивание ссылки dict GIL-атомарно → нет torn read.
+        #   - Снимок «отстаёт» максимум на 1 пакет (~20 мс) — для аудио незаметно.
+        #   - RemoteUser.jitter_buffer имеет собственный лок → thread-safe.
+        #   - RemoteUser.volume / .is_locally_muted — простые примитивы, GIL-safe.
+        # -------------------------------------------------------------------
+        self._audio_users_snapshot: dict = {}
+        self._audio_stream_users_snapshot: dict = {}
 
     def set_bitrate(self, bitrate_kbps):
         bitrate_bps = int(bitrate_kbps) * 1000
@@ -788,12 +814,17 @@ class AudioHandler(QObject):
                 if uid not in active_uids:
                     del self.pending_volumes[uid]
 
+            # FIX #1: обновляем COW-снимок после удаления пользователей
+            self._audio_users_snapshot = dict(self.remote_users)
+
         # stream_remote_users — под отдельным локом (не блокировать audio_callback)
         with self.stream_users_lock:
             for uid in list(self.stream_remote_users.keys()):
                 real_uid = uid - LOOPBACK_UID_OFFSET if uid >= LOOPBACK_UID_OFFSET else uid
                 if real_uid not in active_uids:
                     del self.stream_remote_users[uid]
+            # FIX #1: обновляем COW-снимок после удаления
+            self._audio_stream_users_snapshot = dict(self.stream_remote_users)
 
     def _packet_processor_loop(self):
         while self._is_running.is_set():
@@ -819,6 +850,13 @@ class AudioHandler(QObject):
                     if data:
                         user.jitter_buffer.add(seq, data)
                         user.last_packet_time = time.time()
+
+                    # FIX #1: обновляем COW-снимок внутри лока — согласованное состояние.
+                    # dict() копирует только ссылки (не RemoteUser объекты) — это быстро.
+                    # audio_callback читает снимок без лока, опираясь на GIL-атомарность
+                    # присваивания ссылки.
+                    self._audio_users_snapshot = dict(self.remote_users)
+
             except queue.Empty:
                 continue
             except Exception:
@@ -871,6 +909,8 @@ class AudioHandler(QObject):
                             user.last_packet_time = time.time()
                             if seq % 50 == 0:
                                 print(f"[AudioHandler] Системный звук от uid={uid} добавлен в джиттер-буфер")
+                        # FIX #1: COW-снимок для audio_callback
+                        self._audio_stream_users_snapshot = dict(self.stream_remote_users)
                 else:
                     # --- Микрофон стримера ---
                     if uid == self.my_uid:
@@ -913,6 +953,8 @@ class AudioHandler(QObject):
                         if data:
                             user.jitter_buffer.add(seq, data)
                             user.last_packet_time = time.time()
+                        # FIX #1: COW-снимок для audio_callback
+                        self._audio_stream_users_snapshot = dict(self.stream_remote_users)
 
             except queue.Empty:
                 continue
@@ -950,112 +992,129 @@ class AudioHandler(QObject):
             deaf_flag = 2 if self._is_deafened.is_set() else 0
             flags = mute_flag | deaf_flag
 
+            # Читаем whisper_target_uid ДО проверки мута — шёпот обходит мут.
+            # Это атомарное чтение int (GIL-safe).
+            whisper_uid = self.whisper_target_uid
+
             try:
-                if is_talking and not self._is_muted.is_set():
+                if is_talking and whisper_uid != 0:
+                    # ── РЕЖИМ ШЁПОТА ─────────────────────────────────────────
+                    # Шёпот отправляется НЕЗАВИСИМО от состояния мута.
+                    # Мут означает «не говорить в комнату» — шёпот приватный
+                    # и не нарушает намерение пользователя заглушить себя от
+                    # остальных. PTT-кнопка шёпота — явное действие отправить.
+                    #
+                    # Нормальный аудио-пакет в комнату НЕ кладём в очередь →
+                    # остальные участники не слышат отправителя в этот момент.
                     pcm_to_encode = (denoised_float * 32767).astype(np.int16).tobytes()
                     encoded = self.encoder.encode(pcm_to_encode, CHUNK_SIZE)
                     self.my_sequence += 1
+                    self._whisper_sequence += 1
+                    w_flags = FLAG_WHISPER
+                    w_header = UDP_HEADER_STRUCT.pack(self.my_uid, curr_time,
+                                           self._whisper_sequence, w_flags)
+                    # Payload: [target_uid: 4 байта] + [opus]
+                    w_payload = struct.pack('!I', whisper_uid) + encoded
+                    try:
+                        self.send_queue.put_nowait(w_header + w_payload)
+                    except Exception:
+                        pass
 
-                    whisper_uid = self.whisper_target_uid   # атомарное чтение int
+                elif is_talking and not self._is_muted.is_set():
+                    # ── ОБЫЧНЫЙ РЕЖИМ: пакет в комнату ───────────────────────
+                    pcm_to_encode = (denoised_float * 32767).astype(np.int16).tobytes()
+                    encoded = self.encoder.encode(pcm_to_encode, CHUNK_SIZE)
+                    self.my_sequence += 1
+                    packet = UDP_HEADER_STRUCT.pack(self.my_uid, curr_time, self.my_sequence, flags) + encoded
 
-                    if whisper_uid != 0:
-                        # ── РЕЖИМ ШЁПОТА ──────────────────────────────────────
-                        # Отправляем ТОЛЬКО целевому пользователю.
-                        # Нормальный аудио-пакет в комнату НЕ кладём в очередь →
-                        # остальные участники не слышат отправителя в этот момент.
-                        self._whisper_sequence += 1
-                        w_flags = FLAG_WHISPER
-                        w_header = UDP_HEADER_STRUCT.pack(self.my_uid, curr_time,
-                                               self._whisper_sequence, w_flags)
-                        # Payload: [target_uid: 4 байта] + [opus]
-                        w_payload = struct.pack('!I', whisper_uid) + encoded
-                        try:
-                            self.send_queue.put_nowait(w_header + w_payload)
-                        except Exception:
-                            pass
-                    else:
-                        # ── ОБЫЧНЫЙ РЕЖИМ: пакет в комнату ───────────────────
-                        packet = UDP_HEADER_STRUCT.pack(self.my_uid, curr_time, self.my_sequence, flags) + encoded
-
-                        if not self.was_talking:
-                            while self.vad_pre_buffer:
-                                try:
-                                    self.send_queue.put_nowait(self.vad_pre_buffer.pop(0))
-                                except:
-                                    pass
-                            self.was_talking = True
-                        self.send_queue.put_nowait(packet)
-
-                        # Стрим-аудио: дополнительно посылаем тот же encoded с FLAG_STREAM_AUDIO
-                        # Сервер направит его только зрителям, а не в комнату (нет дублирования)
-                        if self.stream_audio_sending_enabled:
-                            stream_flags = flags | FLAG_STREAM_AUDIO
-                            stream_packet = UDP_HEADER_STRUCT.pack(self.my_uid, curr_time,
-                                                        self.my_sequence, stream_flags) + encoded
+                    if not self.was_talking:
+                        # FIX #3: deque.popleft() — O(1) вместо list.pop(0) — O(n)
+                        while self.vad_pre_buffer:
                             try:
-                                self.send_queue.put_nowait(stream_packet)
+                                self.send_queue.put_nowait(self.vad_pre_buffer.popleft())
                             except:
                                 pass
+                        self.was_talking = True
+                    self.send_queue.put_nowait(packet)
+
+                    # Стрим-аудио: дополнительно посылаем тот же encoded с FLAG_STREAM_AUDIO
+                    # Сервер направит его только зрителям, а не в комнату (нет дублирования)
+                    if self._stream_audio_sending.is_set():
+                        stream_flags = flags | FLAG_STREAM_AUDIO
+                        stream_packet = UDP_HEADER_STRUCT.pack(self.my_uid, curr_time,
+                                                    self.my_sequence, stream_flags) + encoded
+                        try:
+                            self.send_queue.put_nowait(stream_packet)
+                        except:
+                            pass
+
                 else:
+                    # Не говорим (или мут без шёпота) — сбрасываем was_talking,
+                    # пополняем pre_buffer для следующего старта речи.
                     self.was_talking = False
-                    if not is_talking:
+                    if not is_talking and whisper_uid == 0:
                         empty_packet = UDP_HEADER_STRUCT.pack(self.my_uid, curr_time, 0, flags)
+                        # FIX #3: deque(maxlen=5) — автоматически вытесняет старые
+                        # элементы при переполнении, ручная проверка len > 5 не нужна.
                         self.vad_pre_buffer.append(empty_packet)
-                        if len(self.vad_pre_buffer) > 5: self.vad_pre_buffer.pop(0)
             except:
                 pass
 
         self.mix_buffer.fill(0)
         if not self._is_deafened.is_set():
-            with self.users_lock:
-                for uid, user in self.remote_users.items():
-                    if curr_time - user.last_packet_time < 1.5:
-                        data = user.jitter_buffer.get()
-                        if data and not user.is_locally_muted:
-                            try:
-                                decoded = user.decoder.decode(data, CHUNK_SIZE)
-                                s = np.frombuffer(decoded, dtype=np.int16).astype(np.float32) / 32767.0
+            # FIX #1: читаем COW-снимок БЕЗ лока.
+            # _packet_processor_loop обновляет _audio_users_snapshot внутри
+            # users_lock после каждого изменения. Снимок «отстаёт» максимум
+            # на 1 пакет (~20 мс) — для аудиомикширования незаметно.
+            # JitterBuffer.get() имеет собственный внутренний лок — thread-safe.
+            for uid, user in self._audio_users_snapshot.items():
+                if curr_time - user.last_packet_time < 1.5:
+                    data = user.jitter_buffer.get()
+                    if data and not user.is_locally_muted:
+                        try:
+                            decoded = user.decoder.decode(data, CHUNK_SIZE)
+                            s = np.frombuffer(decoded, dtype=np.int16).astype(np.float32) / 32767.0
 
-                                # ── Whisper bass effect ───────────────────────────────────────
-                                # Если этот пользователь сейчас шепчет нам (whisper пакеты
-                                # приходили < 2 с назад) — применяем питч-даун эффект.
-                                # Голос становится заметно глубже/темнее → получатель
-                                # слышит «другой тип разговора» без каких-либо UI подсказок.
-                                w_uid = getattr(self, '_whisper_in_uid', 0)
-                                w_ts  = getattr(self, '_whisper_in_ts',  0.0)
-                                if uid == w_uid and (curr_time - w_ts) < 2.0:
-                                    s = self._apply_whisper_bass_effect(s)
+                            # ── Whisper bass effect ───────────────────────────────────────
+                            # Если этот пользователь сейчас шепчет нам (whisper пакеты
+                            # приходили < 2 с назад) — применяем питч-даун эффект.
+                            # Голос становится заметно глубже/темнее → получатель
+                            # слышит «другой тип разговора» без каких-либо UI подсказок.
+                            w_uid = getattr(self, '_whisper_in_uid', 0)
+                            w_ts  = getattr(self, '_whisper_in_ts',  0.0)
+                            if uid == w_uid and (curr_time - w_ts) < 2.0:
+                                s = self._apply_whisper_bass_effect(s)
 
-                                self.mix_buffer += s * user.volume
+                            self.mix_buffer += s * user.volume
 
-                                # ── Mix Minus для зрителей (FLAG_STREAM_VOICES) ───────────────
-                                # Стример ретранслирует голос каждого собеседника зрителям
-                                # с пометкой speaker_uid. Зритель на своей стороне отбросит
-                                # пакет, если speaker_uid == его собственный uid (Mix Minus
-                                # без DSP). Это устраняет эхо даже если AEC не справился.
-                                #
-                                # Payload: [speaker_uid: 4 байта big-endian] + [opus-данные].
-                                # Флаги: FLAG_STREAM_AUDIO | FLAG_STREAM_VOICES.
-                                # Сервер маршрутизирует такие пакеты только зрителям стримера.
-                                #
-                                # FIX Bug #2: каждый голос получает свой уникальный seq через
-                                # self._sv_sequence — иначе все спикеры одного кадра имели
-                                # одинаковый seq и JitterBuffer на приёмной стороне отбрасывал
-                                # все пакеты кроме первого (seq <= last_seq → return).
-                                if self.stream_audio_sending_enabled:
-                                    try:
-                                        self._sv_sequence += 1
-                                        sv_flags = (FLAG_STREAM_AUDIO | FLAG_STREAM_VOICES)
-                                        # header: uid стримера (отправитель), ts, seq, flags
-                                        sv_header = UDP_HEADER_STRUCT.pack(self.my_uid, curr_time,
-                                                                self._sv_sequence, sv_flags)
-                                        # payload: speaker_uid (чей голос) + opus
-                                        sv_payload = struct.pack('!I', uid) + data
-                                        self.send_queue.put_nowait(sv_header + sv_payload)
-                                    except Exception:
-                                        pass
-                            except:
-                                pass
+                            # ── Mix Minus для зрителей (FLAG_STREAM_VOICES) ───────────────
+                            # Стример ретранслирует голос каждого собеседника зрителям
+                            # с пометкой speaker_uid. Зритель на своей стороне отбросит
+                            # пакет, если speaker_uid == его собственный uid (Mix Minus
+                            # без DSP). Это устраняет эхо даже если AEC не справился.
+                            #
+                            # Payload: [speaker_uid: 4 байта big-endian] + [opus-данные].
+                            # Флаги: FLAG_STREAM_AUDIO | FLAG_STREAM_VOICES.
+                            # Сервер маршрутизирует такие пакеты только зрителям стримера.
+                            #
+                            # FIX Bug #2: каждый голос получает свой уникальный seq через
+                            # self._sv_sequence — иначе все спикеры одного кадра имели
+                            # одинаковый seq и JitterBuffer на приёмной стороне отбрасывал
+                            # все пакеты кроме первого (seq <= last_seq → return).
+                            if self._stream_audio_sending.is_set():
+                                try:
+                                    self._sv_sequence += 1
+                                    sv_flags = (FLAG_STREAM_AUDIO | FLAG_STREAM_VOICES)
+                                    # header: uid стримера (отправитель), ts, seq, flags
+                                    sv_header = UDP_HEADER_STRUCT.pack(self.my_uid, curr_time,
+                                                            self._sv_sequence, sv_flags)
+                                    # payload: speaker_uid (чей голос) + opus
+                                    sv_payload = struct.pack('!I', uid) + data
+                                    self.send_queue.put_nowait(sv_header + sv_payload)
+                                except Exception:
+                                    pass
+                        except:
+                            pass
 
             # ── Стрим-аудио: игровой звук от стримера (зрительская сторона) ─────────
             # Микшируем ВНУТРИ deafen-проверки: если зритель нажал «заглушить всё»,
@@ -1065,22 +1124,22 @@ class AudioHandler(QObject):
             #   ducking не нужен, AEC не нужен, полная громкость всегда.
             # С WASAPI Loopback (fallback): AEC применён внутри StreamAudioCapture._audio_cb.
             sv = self.stream_volume   # float, чтение атомарно (GIL-safe)
-            with self.stream_users_lock:
-                for s_uid, user in self.stream_remote_users.items():
-                    if curr_time - user.last_packet_time < 1.5:
-                        data = user.jitter_buffer.get()
-                        if data:
-                            try:
-                                decoded = user.decoder.decode(data, CHUNK_SIZE)
-                                s = np.frombuffer(decoded, dtype=np.int16).astype(np.float32) / 32767.0
-                                self.mix_buffer += s * sv
-                                if s_uid >= LOOPBACK_UID_OFFSET:
-                                    self._lb_play_counter += 1
-                                    if self._lb_play_counter % 100 == 0:
-                                        print(f"[Audio-Output] Стрим-звук воспроизводится "
-                                              f"(громкость: {sv:.2f})")
-                            except Exception as e:
-                                print(f"[Audio-Output] Ошибка декодирования стрим-аудио: {e}")
+            # FIX #1: читаем COW-снимок БЕЗ лока — аналогично блоку remote_users выше.
+            for s_uid, user in self._audio_stream_users_snapshot.items():
+                if curr_time - user.last_packet_time < 1.5:
+                    data = user.jitter_buffer.get()
+                    if data:
+                        try:
+                            decoded = user.decoder.decode(data, CHUNK_SIZE)
+                            s = np.frombuffer(decoded, dtype=np.int16).astype(np.float32) / 32767.0
+                            self.mix_buffer += s * sv
+                            if s_uid >= LOOPBACK_UID_OFFSET:
+                                self._lb_play_counter += 1
+                                if self._lb_play_counter % 100 == 0:
+                                    print(f"[Audio-Output] Стрим-звук воспроизводится "
+                                          f"(громкость: {sv:.2f})")
+                        except Exception as e:
+                            print(f"[Audio-Output] Ошибка декодирования стрим-аудио: {e}")
 
         np.clip(self.mix_buffer, -1.0, 1.0, out=self.mix_buffer)
 
@@ -1154,20 +1213,34 @@ class AudioHandler(QObject):
     def add_incoming_whisper_packet(self, uid, seq, data):
         """
         Входящий шёпот (FLAG_WHISPER) от uid.
-        Отличие от add_incoming_packet: при первом пакете от нового шептуна
-        испускает сигнал whisper_received(uid) — UI показывает уведомление.
-        При тайм-ауте (>1.5 с без пакетов) испускает whisper_ended().
+
+        Испускает whisper_received(uid) на КАЖДЫЙ пакет — это необходимо
+        для корректной работы UI-таймера завершения шёпота (_whisper_end_timer).
+
+        Почему раньше было неправильно:
+          Сигнал испускался только при первом пакете или после паузы >1.5с.
+          _whisper_end_timer (1500 мс, single-shot) перезапускался только тогда.
+          Результат: через ~1.5с после начала шёпота таймер срабатывал и скрывал
+          оверлей, хотя шептун всё ещё держал PTT-кнопку.
+
+        Почему теперь правильно:
+          Сигнал испускается на каждый пакет (~50/сек). MainWindow._on_whisper_received
+          перезапускает таймер при каждом сигнале, но обновляет текст/показывает
+          оверлей только при смене отправителя (uid != текущий) — без визуального
+          мерцания. Пока идут пакеты — таймер никогда не истекает.
         """
         now = time.time()
         prev_uid = getattr(self, '_whisper_in_uid', 0)
-        prev_ts  = getattr(self, '_whisper_in_ts',  0.0)
 
-        # Новый шептун или шёпот возобновился после тайм-аута
-        if uid != prev_uid or (now - prev_ts) > 1.5:
-            self._whisper_in_uid = uid
-            self.whisper_received.emit(uid)
+        # Обновляем метаданные шёпота
+        self._whisper_in_uid = uid
+        self._whisper_in_ts  = now
 
-        self._whisper_in_ts = now
+        # Эмитим на каждый пакет: UI-таймер перезапускается, оверлей не гаснет.
+        # MainWindow._on_whisper_received сам решает нужно ли показывать оверлей заново
+        # (только если uid изменился или оверлей ещё не виден).
+        self.whisper_received.emit(uid)
+
         self.add_incoming_packet(uid, seq, data, 0)
 
     def add_incoming_stream_packet(self, uid, seq, data, flags=0):
@@ -1179,13 +1252,11 @@ class AudioHandler(QObject):
 
     def set_stream_audio_enabled(self, enabled: bool):
         """Включить/выключить передачу микрофона и системного звука стримером зрителям."""
-        self.stream_audio_sending_enabled = enabled
-
         if enabled:
-            self.start_stream_audio()
+            self._stream_audio_sending.set()
         else:
-            self.stop_stream_audio()
-
+            self._stream_audio_sending.clear()
+        self.start_stream_audio() if enabled else self.stop_stream_audio()
         print(f"[Audio] Stream mic & loopback sending: {'ON' if enabled else 'OFF'}")
 
     def set_stream_volume(self, volume: float):

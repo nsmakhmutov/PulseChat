@@ -545,6 +545,7 @@ class VideoWindow(QWidget):
     # ------------------------------------------------------------------
     def _setup_ui(self, nick: str):
         self.setWindowTitle(f"Стрим: {nick}")
+        self.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
         self.resize(1280, 720)
         self.setMinimumSize(640, 360)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -715,18 +716,19 @@ class VideoWindow(QWidget):
     def _on_quality_changed(self, skip_factor: int):
         """
         Вызывается при нажатии кнопки качества в оверлее.
-        Обновляет внутреннее состояние, метку тулбара, IDR-таймер,
+        Обновляет внутреннее состояние, метку тулбара,
         затем пробрасывает skip_factor наружу через quality_changed.
+
+        Примечание: периодический IDR-таймер убран (FIX #6).
+        net.request_viewer_keyframe() — stub-метод, качество-маршрутизация
+        не реализована. Таймер каждые 2 сек вызывал no-op, создавая
+        бессмысленный шум в логах. Одиночный IDR-запрос при смене качества
+        (viewer_keyframe_needed.emit ниже) оставлен — он срабатывает через
+        реальный путь: сервер → request_keyframe → VideoEngine.force_keyframe().
         """
         self._quality_skip = skip_factor
         labels = {1: "🎯 HD", 2: "⚡ SD", 4: "📉 LQ"}
         self._lbl_quality.setText(f"Качество: {labels.get(skip_factor, str(skip_factor))}")
-
-        # IDR-таймер: включаем при любом снижении качества
-        if skip_factor > 1:
-            self._idr_timer.start()
-        else:
-            self._idr_timer.stop()
 
         # Немедленный IDR-запрос: зритель сразу получит чистый I-frame
         self.viewer_keyframe_needed.emit()

@@ -6,7 +6,7 @@ import dxcam
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QScrollArea,
                              QWidget, QGridLayout, QLabel, QSlider, QTabWidget,
                              QComboBox, QProgressBar, QLineEdit, QCheckBox, QFrame,
-                             QGroupBox, QSizePolicy, QGraphicsOpacityEffect)
+                             QGroupBox, QSizePolicy)
 from PyQt6.QtCore import Qt, QSize, QSettings, QEvent, QPropertyAnimation, QEasingCurve, QRect, QPoint, QTimer
 from PyQt6.QtGui import QIcon, QGuiApplication, QPainter, QColor, QPen, QFont, QPainterPath, QBrush
 from config import resource_path, CMD_SOUNDBOARD
@@ -453,78 +453,72 @@ class WhisperSystemOverlay(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        self.setFixedSize(290, 60)
+        # Высота фиксирована; ширина выставляется динамически в _reposition()
+        self.setFixedHeight(46)
 
         # ── Содержимое ────────────────────────────────────────────────────────
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(14, 0, 14, 0)
-        layout.setSpacing(10)
+        layout.setContentsMargins(18, 0, 18, 0)
+        layout.setSpacing(12)
 
-        self._icon_lbl = QLabel("🤫")
-        self._icon_lbl.setStyleSheet(
-            "font-size: 22px; background: transparent; border: none;"
-        )
+        # Иконка whispers.ico вместо эмодзи
+        self._icon_lbl = QLabel()
+        self._icon_lbl.setFixedSize(26, 26)
+        icon_path = resource_path("assets/icon/whispers.ico")
+        if os.path.exists(icon_path):
+            self._icon_lbl.setPixmap(QIcon(icon_path).pixmap(26, 26))
+        else:
+            # Резерв: рендерим текстовый символ если .ico не найден
+            self._icon_lbl.setText("🤫")
+            self._icon_lbl.setStyleSheet(
+                "font-size: 20px; background: transparent; border: none;"
+            )
+        self._icon_lbl.setStyleSheet("background: transparent; border: none;")
         layout.addWidget(self._icon_lbl)
 
-        text_col = QVBoxLayout()
-        text_col.setSpacing(0)
-
-        self._top_lbl = QLabel("Тебе шепчет")
-        self._top_lbl.setStyleSheet(
-            "color: rgba(180,190,220,0.85); font-size: 10px; "
-            "font-weight: normal; background: transparent; border: none;"
-        )
-
-        self._nick_lbl = QLabel("...")
-        self._nick_lbl.setStyleSheet(
+        # Одна строка: "Тебе шепчет  NickName"
+        self._text_lbl = QLabel("Тебе шепчет  ...")
+        self._text_lbl.setStyleSheet(
             "color: #ecf0f1; font-size: 13px; font-weight: bold; "
-            "background: transparent; border: none;"
+            "background: transparent; border: none; letter-spacing: 0.3px;"
         )
-
-        text_col.addWidget(self._top_lbl)
-        text_col.addWidget(self._nick_lbl)
-        layout.addLayout(text_col, stretch=1)
-
-        # ── Пульсирующая анимация ─────────────────────────────────────────────
-        self._effect = QGraphicsOpacityEffect(self)
-        self.setGraphicsEffect(self._effect)
-        self._anim = QPropertyAnimation(self._effect, b"opacity")
-        self._anim.setDuration(1100)
-        self._anim.setStartValue(1.0)
-        self._anim.setEndValue(0.5)
-        self._anim.setEasingCurve(QEasingCurve.Type.SineCurve)
-        self._anim.setLoopCount(-1)  # бесконечно
+        layout.addWidget(self._text_lbl, stretch=1)
+        # Анимация намеренно убрана: оверлей горит ровно, без мигания,
+        # пока идут пакеты шёпота, и гасится сразу по их окончании.
 
     def _reposition(self):
-        """Правый верхний угол основного экрана."""
+        """Растягиваем на всю ширину экрана, прибиваем к верхнему краю."""
         try:
             from PyQt6.QtWidgets import QApplication
             screen = QApplication.primaryScreen()
             if screen:
                 g = screen.availableGeometry()
-                self.move(g.right() - self.width() - 18, g.top() + 18)
+                self.setFixedWidth(g.width())
+                self.move(g.left(), g.top())
         except Exception:
             pass
 
     def show_for(self, nick: str):
         """Показать оверлей с именем шептуна."""
-        self._nick_lbl.setText(nick)
+        self._text_lbl.setText(f"Тебе шепчет  {nick}")
         self._reposition()
         self.show()
-        self._anim.start()
 
     def hide_overlay(self):
-        """Скрыть оверлей и остановить анимацию."""
-        self._anim.stop()
+        """Скрыть оверлей."""
         self.hide()
 
     def paintEvent(self, event):
-        """Скруглённый фон — рисуем сами т.к. WA_TranslucentBackground."""
+        """Полноширинная полупрозрачная плашка — рисуем вручную (WA_TranslucentBackground)."""
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setBrush(QBrush(QColor(18, 20, 38, 215)))
-        p.setPen(QPen(QColor(93, 173, 226, 140), 1.5))
-        p.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 12, 12)
+        # Фон — тёмная полоса на всю ширину
+        p.setBrush(QBrush(QColor(15, 17, 32, 220)))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawRect(self.rect())
+        # Тонкая акцентная линия снизу
+        p.setPen(QPen(QColor(93, 173, 226, 180), 2))
+        p.drawLine(0, self.height() - 1, self.width(), self.height() - 1)
         p.end()
 
 
@@ -1098,7 +1092,7 @@ class SettingsDialog(QDialog):
 
         self.mw.nick = self.ed_nick.text()
         self.mw.avatar = self.cur_av
-        self.mw.setWindowTitle(f"VoiceChat - {self.mw.nick}")
+        self.mw.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — {self.mw.nick}")
         if hasattr(self.mw, 'net'):
             self.mw.net.update_user_info(self.mw.nick, self.mw.avatar)
 

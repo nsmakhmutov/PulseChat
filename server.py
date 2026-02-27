@@ -110,13 +110,15 @@ class SFUServer:
                     self.udp_sock.sendto(data, addr)
                     continue
 
-                # Обновляем UDP-адрес отправителя и статистику
+                # Обновляем UDP-адрес отправителя.
+                # stats обновляем ВНЕ лока — простые инты, GIL достаточен.
+                # Раньше они были внутри udp_lock без необходимости: чтение из
+                # stats_monitor() никогда не держало udp_lock, а запись int — атомарна.
                 with self.udp_lock:
                     self.udp_map[sender_uid] = addr
-                    # stats — простые инты, GIL достаточен
-                    self.stats["packets"] += 1
-                    self.stats["bytes"] += len(data)
                     sender_room = self.uid_to_room.get(sender_uid)
+                self.stats["packets"] += 1
+                self.stats["bytes"] += len(data)
 
                 if not sender_room:
                     continue

@@ -80,6 +80,17 @@ class NetworkClient(QObject):
     # Сокеты
     # ------------------------------------------------------------------
     def _init_sockets(self):
+        # FIX #2: явно закрываем старые сокеты перед созданием новых.
+        # Раньше при каждой неудачной попытке переподключения (_reconnect_loop)
+        # создавались новые socket-объекты, а предыдущие оставались открытыми —
+        # утечка файловых дескрипторов (до 4 при MAX_SILENT_RECONNECT_ATTEMPTS=4).
+        for attr in ('tcp_sock', 'udp_sock'):
+            old = getattr(self, attr, None)
+            if old is not None:
+                try:
+                    old.close()
+                except Exception:
+                    pass
         try:
             self.tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)

@@ -11,8 +11,8 @@ from ui_video import VideoWindow
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QPushButton, QTreeWidget, QTreeWidgetItem,
                              QHeaderView, QMessageBox, QStackedWidget,
-                             QFrame)
-from PyQt6.QtCore import Qt, QTimer, QSize, QSettings
+                             QFrame, QSizeGrip)
+from PyQt6.QtCore import Qt, QTimer, QSize, QSettings, QRect, QPoint
 from PyQt6.QtGui import QIcon, QFont, QFontDatabase, QBrush, QColor
 
 from config import *
@@ -20,6 +20,107 @@ from audio_engine import AudioHandler
 from network_engine import NetworkClient
 from ui_dialogs import UserOverlayPanel, SettingsDialog, SoundboardDialog, WhisperSystemOverlay
 from version import APP_VERSION, APP_NAME, GITHUB_REPO
+
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Кастомная строка заголовка окна (вместо системного title bar Windows)
+# ──────────────────────────────────────────────────────────────────────────────
+class CustomTitleBar(QWidget):
+    """
+    Кастомный title bar для безрамочного окна.
+    Поддерживает: перетаскивание окна, сворачивание, разворачивание/восстановление,
+    закрытие, двойной клик для maximize/restore.
+    """
+
+    def __init__(self, parent_window, title=""):
+        super().__init__(parent_window)
+        self._win = parent_window
+        self._drag_pos = None
+        self.setFixedHeight(40)
+        self.setObjectName("customTitleBar")
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 0, 4, 0)
+        layout.setSpacing(6)
+
+        # Иконка приложения (logo.ico — единый источник иконки по всему проекту)
+        self._icon_lbl = QLabel()
+        self._icon_lbl.setFixedSize(22, 22)
+        self._icon_lbl.setPixmap(
+            QIcon(resource_path("assets/icon/logo.ico")).pixmap(22, 22)
+        )
+        # Inline-стиль намеренно НЕ устанавливается: у QLabel без своего
+        # setStyleSheet() родительский stylesheet (#customTitleBar *) применяется
+        # корректно и задаёт прозрачный фон через CSS.
+        layout.addWidget(self._icon_lbl)
+
+        # Текст заголовка
+        # ВАЖНО: не вызываем self._title_lbl.setStyleSheet() здесь.
+        # Если у виджета есть собственный stylesheet (даже без color:), Qt полностью
+        # блокирует наследование цвета из родительского stylesheet — именно поэтому
+        # #titleBarText { color: ... } в apply_theme не работал в светлой теме.
+        # Всё оформление делается через apply_theme CSS-правила.
+        self._title_lbl = QLabel(title)
+        self._title_lbl.setObjectName("titleBarText")
+        layout.addWidget(self._title_lbl, stretch=1)
+
+        # ── Кнопки управления окном ──────────────────────────────────────────
+        # Размеры задаём через setFixedSize, а не через inline stylesheet —
+        # по той же причине: inline stylesheet блокирует цвет из apply_theme.
+        self._btn_min = QPushButton("─")
+        self._btn_min.setObjectName("titleBtnMin")
+        self._btn_min.setFixedSize(34, 30)
+        self._btn_min.clicked.connect(parent_window.showMinimized)
+
+        self._btn_max = QPushButton("□")
+        self._btn_max.setObjectName("titleBtnMax")
+        self._btn_max.setFixedSize(34, 30)
+        self._btn_max.clicked.connect(self._toggle_maximize)
+
+        self._btn_close = QPushButton("✕")
+        self._btn_close.setObjectName("titleBtnClose")
+        self._btn_close.setFixedSize(34, 30)
+        self._btn_close.clicked.connect(parent_window.close)
+
+        layout.addWidget(self._btn_min)
+        layout.addWidget(self._btn_max)
+        layout.addWidget(self._btn_close)
+
+    def set_title(self, title: str):
+        self._title_lbl.setText(title)
+
+    def _toggle_maximize(self):
+        if self._win.isMaximized():
+            self._win.showNormal()
+            self._btn_max.setText("□")
+        else:
+            self._win.showMaximized()
+            self._btn_max.setText("❐")
+
+    # ── Drag to move ─────────────────────────────────────────────────────────
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._drag_pos = e.globalPosition().toPoint() - self._win.frameGeometry().topLeft()
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if e.buttons() == Qt.MouseButton.LeftButton and self._drag_pos is not None:
+            if self._win.isMaximized():
+                self._win.showNormal()
+                self._btn_max.setText("□")
+                # Пересчитываем drag_pos после восстановления нормального размера
+                self._drag_pos = QPoint(self._win.width() // 2, 20)
+            self._win.move(e.globalPosition().toPoint() - self._drag_pos)
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        self._drag_pos = None
+        super().mouseReleaseEvent(e)
+
+    def mouseDoubleClickEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._toggle_maximize()
 
 
 class MainWindow(QMainWindow):
@@ -48,6 +149,13 @@ class MainWindow(QMainWindow):
 
         self.audio = AudioHandler()
         self.net = NetworkClient(self.audio)
+
+        # ── Состояние для ресайза безрамочного окна ──────────────────────────
+        self._resize_margin = 6          # px — зона у края для начала ресайза
+        self._resize_direction: str | None = None
+        self._resize_start_pos: QPoint | None = None
+        self._resize_start_geom: QRect | None = None
+        self.setMouseTracking(True)
 
         # Предзагрузка звуков уведомлений: каждый звук загружается ОДИН РАЗ.
         # Хранится как (data, sr) кортеж — sounddevice воспроизводит напрямую без
@@ -140,10 +248,31 @@ class MainWindow(QMainWindow):
     def setup_ui(self):
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — {self.nick}")
         self.setMinimumSize(450, 600)
-        self.setWindowIcon(QIcon(resource_path("assets/icon/app_icon.ico")))
+        self.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
+
+        # ── Корневой контейнер окна ──────────────────────────────────────────
+        _root = QWidget()
+        _root.setObjectName("windowRoot")
+        _root_layout = QVBoxLayout(_root)
+        _root_layout.setContentsMargins(0, 0, 0, 0)
+        _root_layout.setSpacing(0)
+
+        # Кастомный заголовок
+        self._title_bar = CustomTitleBar(self, f"{APP_NAME} v{APP_VERSION} — {self.nick}")
+        _root_layout.addWidget(self._title_bar)
+
+        # Разделитель под заголовком
+        _sep = QFrame()
+        _sep.setFrameShape(QFrame.Shape.HLine)
+        _sep.setObjectName("titleSeparator")
+        _sep.setFixedHeight(1)
+        _root_layout.addWidget(_sep)
 
         self._stack = QStackedWidget()
-        self.setCentralWidget(self._stack)
+        _root_layout.addWidget(self._stack, stretch=1)
+
+        self.setCentralWidget(_root)
 
         main_page = QWidget()
         main_page.setObjectName("centralWidget")
@@ -315,23 +444,150 @@ class MainWindow(QMainWindow):
         self._btn_reconnect.setEnabled(False)
         self.net.manual_reconnect()
 
+    def setWindowTitle(self, title: str):
+        """Переопределяем — синхронно обновляем кастомный title bar."""
+        super().setWindowTitle(title)
+        if hasattr(self, '_title_bar'):
+            self._title_bar.set_title(title)
+
+    # ── Edge-resize для безрамочного окна ────────────────────────────────────
+    _EDGE_CURSORS = {
+        "top-left":     Qt.CursorShape.SizeFDiagCursor,
+        "top-right":    Qt.CursorShape.SizeBDiagCursor,
+        "bottom-left":  Qt.CursorShape.SizeBDiagCursor,
+        "bottom-right": Qt.CursorShape.SizeFDiagCursor,
+        "left":         Qt.CursorShape.SizeHorCursor,
+        "right":        Qt.CursorShape.SizeHorCursor,
+        "top":          Qt.CursorShape.SizeVerCursor,
+        "bottom":       Qt.CursorShape.SizeVerCursor,
+    }
+
+    def _edge_at(self, pos: QPoint) -> str | None:
+        m = self._resize_margin
+        x, y, w, h = pos.x(), pos.y(), self.width(), self.height()
+        l, r, t, b = x <= m, x >= w - m, y <= m, y >= h - m
+        if t and l:   return "top-left"
+        if t and r:   return "top-right"
+        if b and l:   return "bottom-left"
+        if b and r:   return "bottom-right"
+        if l:         return "left"
+        if r:         return "right"
+        if t:         return "top"
+        if b:         return "bottom"
+        return None
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton and not self.isMaximized():
+            edge = self._edge_at(e.pos())
+            if edge:
+                self._resize_direction = edge
+                self._resize_start_pos = e.globalPosition().toPoint()
+                self._resize_start_geom = QRect(self.geometry())
+                e.accept()
+                return
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if (self._resize_direction
+                and e.buttons() == Qt.MouseButton.LeftButton
+                and self._resize_start_pos is not None
+                and self._resize_start_geom is not None):
+            delta = e.globalPosition().toPoint() - self._resize_start_pos
+            g = QRect(self._resize_start_geom)
+            d = self._resize_direction
+            if "right"  in d: g.setRight(g.right()   + delta.x())
+            if "bottom" in d: g.setBottom(g.bottom() + delta.y())
+            if "left"   in d: g.setLeft(g.left()     + delta.x())
+            if "top"    in d: g.setTop(g.top()       + delta.y())
+            if g.width() >= self.minimumWidth() and g.height() >= self.minimumHeight():
+                self.setGeometry(g)
+            e.accept()
+            return
+        if not self.isMaximized():
+            edge = self._edge_at(e.pos())
+            self.setCursor(self._EDGE_CURSORS[edge]) if edge else self.unsetCursor()
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        self._resize_direction = None
+        self._resize_start_pos = None
+        self._resize_start_geom = None
+        super().mouseReleaseEvent(e)
+
     def apply_theme(self, theme_name):
         font_f = self.custom_font_family
         is_dark = (theme_name == "Темная")
 
-        bg = "#2b2b2b" if is_dark else "#e6e6e6"
-        surface = "#3c3f41" if is_dark else "#f2f2f2"
-        text = "#e0e0e0" if is_dark else "#1a1a1a"
-        header_bg = "#4e5254" if is_dark else "#d1d1d1"
-        border = "#515151" if is_dark else "#b8b8b8"
-        accent_red = "#e74c3c" if is_dark else "#d32f2f"
-        hover = "#505457" if is_dark else "#bcbcbc"
-        tab_inactive = "#323537" if is_dark else "#dcdcdc"
-        grad_s = "#45494a" if is_dark else "#fdfdfd"
-        grad_e = "#323232" if is_dark else "#d8d8d8"
+        # ── Светлая тема чуть темнее — не слепит ──────────────────────────────
+        bg      = "#2b2b2b" if is_dark else "#c8cacc"   # было #e6e6e6
+        surface = "#3c3f41" if is_dark else "#d6d8da"   # было #f2f2f2
+        text        = "#e0e0e0" if is_dark else "#1a1a1a"
+        header_bg   = "#4e5254" if is_dark else "#b8bbbe"
+        border      = "#515151" if is_dark else "#a0a4a8"
+        accent_red  = "#e74c3c" if is_dark else "#d32f2f"
+        hover       = "#505457" if is_dark else "#adb0b3"
+        tab_inactive= "#323537" if is_dark else "#c4c7ca"
+        grad_s      = "#45494a" if is_dark else "#e0e2e4"
+        grad_e      = "#323232" if is_dark else "#c5c8cb"
+
+        # ── Title bar — одинаково тёмный в обеих темах ─────────────────────
+        title_bg   = "#1e1e2e" if is_dark else "#1e2a35"   # тёмно-синий в обоих случаях
+        title_text = "#cdd6f4" if is_dark else "#dce6f0"   # светлый текст всегда
+        title_sep  = "#414559" if is_dark else "#16212b"
+        win_border = "#414559" if is_dark else "#5d6d7e"
 
         self.setStyleSheet(f"""
             * {{ font-family: '{font_f}'; font-size: 18px; color: {text}; }}
+
+            /* Внешняя рамка безрамочного окна */
+            #windowRoot {{
+                background-color: {bg};
+                border: 1px solid {win_border};
+            }}
+
+            /* Кастомный title bar */
+            #customTitleBar {{
+                background-color: {title_bg};
+                border: none;
+            }}
+            /* Иконка и потомки title bar без собственного stylesheet */
+            #customTitleBar QLabel {{
+                background: transparent;
+                border: none;
+            }}
+            #titleBarText {{
+                color: {title_text};
+                font-size: 13px;
+                font-weight: bold;
+                letter-spacing: 0.5px;
+                background: transparent;
+                border: none;
+            }}
+            #titleBtnMin, #titleBtnMax {{
+                background: transparent;
+                border: none;
+                border-radius: 5px;
+                color: {title_text};
+                font-size: 15px;
+            }}
+            #titleBtnMin:hover, #titleBtnMax:hover {{
+                background: rgba(255,255,255,0.12);
+            }}
+            #titleBtnClose {{
+                background: transparent;
+                border: none;
+                border-radius: 5px;
+                color: {title_text};
+                font-size: 15px;
+            }}
+            #titleBtnClose:hover {{
+                background: #e74c3c;
+                color: white;
+            }}
+            #titleSeparator {{
+                background-color: {title_sep};
+                border: none;
+            }}
 
             QMainWindow, QDialog, #centralWidget, QTabWidget, QScrollArea {{ 
                 background-color: {bg}; 
@@ -563,13 +819,27 @@ class MainWindow(QMainWindow):
 
     def _on_whisper_received(self, sender_uid: int):
         """
-        Вызывается при КАЖДОМ первом пакете шёпота (или после 1.5 с паузы).
-        • Перезапускает таймер тайм-аута → баннер и оверлей живут пока идут пакеты.
-        • Показывает баннер в главном окне и системный оверлей поверх всех окон.
+        Вызывается на КАЖДЫЙ входящий пакет шёпота (audio_engine эмитит
+        whisper_received на каждый пакет, ~50/сек).
+
+        Логика разделена на два уровня:
+          1. ВСЕГДА: перезапускаем _whisper_end_timer (1500 мс).
+             Пока идут пакеты — таймер никогда не истечёт → оверлей горит всегда.
+          2. ТОЛЬКО ПРИ СМЕНЕ ОТПРАВИТЕЛЯ или когда оверлей ещё не показан:
+             обновляем ник и вызываем show_for(). Это исключает 50 вызовов
+             show()/setText() в секунду, которые вызывали бы мерцание анимации.
         """
-        # Останавливаем предыдущий таймер → перезапускаем 1.5 сек отсчёт
+        # ── 1. Всегда: сбрасываем таймер завершения ──────────────────────────
         self._whisper_end_timer.stop()
         self._whisper_end_timer.start()
+
+        # ── 2. При смене отправителя или первом появлении: обновляем UI ──────
+        if sender_uid == getattr(self, '_current_whisper_uid', None) \
+                and self._whisper_banner.isVisible():
+            # Тот же шептун, оверлей уже виден — только таймер сброшен, больше ничего.
+            return
+
+        self._current_whisper_uid = sender_uid
 
         # Ищем ник шептуна среди активных пользователей
         nick = "Кто-то"
@@ -591,7 +861,8 @@ class MainWindow(QMainWindow):
         self._whisper_overlay.show_for(nick)
 
     def _on_whisper_ended(self):
-        """Шёпот завершился (1.5 с без пакетов) — скрываем баннер и системный оверлей."""
+        """Шёпот завершился (1500 мс без пакетов) — скрываем баннер и системный оверлей."""
+        self._current_whisper_uid = None
         self._whisper_banner.setVisible(False)
         self._whisper_overlay.hide_overlay()
 
