@@ -617,17 +617,15 @@ class VideoEngine(QObject):
                     packet = av.Packet(raw)
                     frames = decoder.decode(packet)
                     for frame in frames:
-                        img_np = frame.to_rgb().to_ndarray()
+                        img_np = np.ascontiguousarray(frame.to_rgb().to_ndarray())
                         h, w, _ = img_np.shape
-                        bytes_per_line = img_np.strides[0]
                         q_img = QImage(
-                            img_np.tobytes(), w, h,
-                            bytes_per_line,
+                            img_np.data, w, h,
+                            img_np.strides[0],
                             QImage.Format.Format_RGB888,
                         )
-                        # Освобождаем промежуточные буферы немедленно.
-                        # img_np (numpy) — 1280×720×3 = 2.7 МБ; без явного del
-                        # он живёт до следующей итерации, удваивая пиковое потребление.
+                        # q_img.copy() отвязывает QImage от numpy-буфера
+                        # перед del img_np — обязательно.
                         self.frame_received.emit(uid, q_img.copy())
                         del img_np, q_img
                     del packet, frames

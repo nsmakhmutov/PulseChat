@@ -1,12 +1,12 @@
 import threading
 import queue
-from collections import deque
 import numpy as np
 import sounddevice as sd
 import opuslib
 import heapq
 import struct
 import time
+from scipy.signal import butter, sosfilt, sosfilt_zi
 from PyQt6.QtCore import QObject, pyqtSignal, QSettings
 from config import *
 
@@ -48,10 +48,9 @@ class StreamAudioCapture:
         capture.stop()                # после остановки стрима
     """
 
-    def __init__(self, send_queue, uid_getter, aec=None):
+    def __init__(self, send_queue, uid_getter):
         self.send_queue = send_queue
         self.get_uid = uid_getter
-        self.aec = aec  # AECProcessor — подавитель эха (опционально)
         self._running = threading.Event()
         self._thread = None
         self.encoder = opuslib.Encoder(SAMPLE_RATE, CHANNELS, OPUS_APPLICATION)
@@ -527,15 +526,9 @@ class StreamAudioCapture:
                     self._pcm_len -= CHUNK_SIZE
                     self._pcm_buf[:self._pcm_len] = self._pcm_buf[CHUNK_SIZE:CHUNK_SIZE + self._pcm_len]
 
-                    # ── AEC: вычитаем голоса собеседников ──────────────────────
-                    # При VB-CABLE (_using_vbcable=True) пропускаем полностью:
-                    # CABLE Output физически не содержит голосов зрителей,
-                    # AEC здесь только вносил бы артефакты.
-                    # При WASAPI Loopback (_using_vbcable=False) применяем как раньше:
-                    # loopback захватывает пост-микс наушников, там могут быть голоса.
-                    if self.aec is not None and not self._using_vbcable:
-                        chunk = self.aec.process(chunk)
-
+                    # ── Отправляем чанк зрителям ───────────────────────────
+                    # VB-CABLE физически не содержит голосов зрителей →
+                    # AEC не нужен, эхо невозможно как явление.
                     pcm = (chunk * 32767).astype(np.int16).tobytes()
                     encoded = self.encoder.encode(pcm, CHUNK_SIZE)
 
@@ -550,107 +543,6 @@ class StreamAudioCapture:
 
         except Exception as e:
             pass
-
-
-class AECProcessor:
-    """
-    Адаптивный подавитель акустического эха (AEC) с защитой от фазовых артефактов.
-    """
-
-    def __init__(self, max_delay_frames: int = 8, max_frames: int = 16):
-        # Гарантируем, что max_frames больше max_delay_frames для стабильности
-        self.maxlen = max(max_frames, max_delay_frames + 4)
-        self._ref_buffer: deque = deque(maxlen=self.maxlen)
-        self._lock = threading.Lock()
-        self.enabled = True
-
-        # Состояние для сглаживания (Anti-Artifacts)
-        self._last_offset = -1
-        self._last_alpha = 0.0
-
-    def push_reference(self, frame: np.ndarray):
-        with self._lock:
-            self._ref_buffer.append(frame.astype(np.float32).copy())
-
-    def process(self, captured: np.ndarray) -> np.ndarray:
-        if not self.enabled:
-            return captured
-
-        with self._lock:
-            n = len(self._ref_buffer)
-            # ЖДЕМ ПОЛНОГО ЗАПОЛНЕНИЯ БУФЕРА!
-            # Это критично: пока буфер растет, offset смещается на 960 семплов каждый кадр.
-            # Заполненный кольцевой буфер дает железобетонную "точку отсчета".
-            if n < self.maxlen:
-                return captured
-            refs = list(self._ref_buffer)
-
-        cap_rms = float(np.sqrt(np.mean(captured ** 2)))
-        if cap_rms < 1e-6:
-            self._last_alpha = 0.0
-            return captured
-
-        cap_len = len(captured)
-        ref_concat = np.concatenate(refs)
-
-        # 1. Поиск задержки
-        corr = np.correlate(ref_concat, captured, mode='valid')
-        if len(corr) == 0:
-            return captured
-
-        target_offset = int(np.argmax(corr))
-
-        if self._last_offset == -1:
-            self._last_offset = target_offset
-
-        # 2. Формируем опорное окно (Защита от скачков фазы и роботизации)
-        # Если смещение изменилось (дрейф часов), делаем мягкий кроссфейд между окнами,
-        # а не жестко переключаем индекс.
-        if target_offset != self._last_offset:
-            old_end = self._last_offset + cap_len
-            new_end = target_offset + cap_len
-
-            if old_end <= len(ref_concat) and new_end <= len(ref_concat):
-                ref_old = ref_concat[self._last_offset: old_end]
-                ref_new = ref_concat[target_offset: new_end]
-
-                # Кроссфейд (Fade Out старого, Fade In нового)
-                fade_in = np.linspace(0.0, 1.0, cap_len, dtype=np.float32)
-                fade_out = 1.0 - fade_in
-
-                ref_window = (ref_old * fade_out) + (ref_new * fade_in)
-                self._last_offset = target_offset
-            else:
-                ref_window = ref_concat[target_offset: target_offset + cap_len]
-                self._last_offset = target_offset
-        else:
-            ref_window = ref_concat[self._last_offset: self._last_offset + cap_len]
-
-        # 3. Вычисляем целевой коэффициент вычитания (МНК)
-        rr = float(np.dot(ref_window, ref_window))
-        if rr < 1e-10:
-            target_alpha = 0.0
-        else:
-            target_alpha = float(np.dot(captured, ref_window) / rr)
-            # При сжатии Opus альфа редко бывает > 1.2
-            target_alpha = max(0.0, min(1.2, target_alpha))
-
-        # 4. Посемпловое сглаживание альфы (Защита от треска на границах чанков)
-        # Плавно переводим множитель от значения прошлого кадра к новому.
-        alphas = np.linspace(self._last_alpha, target_alpha, cap_len, dtype=np.float32)
-        self._last_alpha = target_alpha
-
-        # 5. Итоговое вычитание
-        candidate = captured - alphas * ref_window
-
-        # Мягкий клиппинг и возврат
-        return np.clip(candidate, -1.0, 1.0)
-
-    def reset(self):
-        with self._lock:
-            self._ref_buffer.clear()
-            self._last_offset = -1
-            self._last_alpha = 0.0
 
 
 class JitterBuffer:
@@ -710,47 +602,16 @@ class AudioHandler(QObject):
 
     def _apply_whisper_bass_effect(self, s: np.ndarray) -> np.ndarray:
         """
-        Эффект «тёмный бас» для входящего шёпота — двухкаскадный IIR biquad lowpass.
+        Эффект «тёмный бас» для входящего шёпота — 4-й порядок Butterworth LP.
 
-        ПОЧЕМУ НЕТ АРТЕФАКТОВ:
-        FIR/convolve и pitch-shift через np.interp обрабатывают каждый 20ms фрейм
-        независимо → на стыке соседних фреймов возникает разрыв, слышимый как
-        шипение/треск (характерная «щётка» 50 раз в секунду).
+        Реализован через scipy.signal.sosfilt (C-уровень) вместо
+        pure-Python цикла — ~100× быстрее, без аудио-глитчей в колбеке.
 
-        IIR-фильтр в Direct Form II Transposed хранит состояние (z[0], z[1]) между
-        вызовами. Выход фрейма N плавно перетекает во фрейм N+1 — разрывов нет.
-
-        Параметры фильтра:
-        • 2-й порядок Butterworth LP, fc=1 200 Гц, fs=48 000 Гц (каскад 1)
-        • Тот же фильтр применяется второй раз (каскад 2) → 4-й порядок итого.
-        • Крутизна: −80 dB/дек — эффективно «срезает» всё выше 2 кГц.
-        • Голос становится тёмным, «нутряным», явно отличается от обычной речи.
-        • Коэффициенты вычислены через билинейное z-преобразование аналогового прототипа.
-
-        Singletons b/a/z хранятся в self._wlp_* и инициализируются в __init__.
-        Состояния z сбрасываются в start_whisper().
+        SOS-матрица и начальные условия zi хранятся в self._wlp_sos / _wlp_zi.
+        Состояние сохраняется МЕЖДУ фреймами → нет межфреймовых артефактов.
+        Сброс zi производится в start_whisper().
         """
-        b = self._wlp_b
-        a1, a2 = self._wlp_a1, self._wlp_a2
-
-        # ── Каскад 1 ──────────────────────────────────────────────────────────
-        z0, z1 = self._wlp_z1[0], self._wlp_z1[1]
-        out = np.empty(len(s), dtype=np.float64)
-        x = s.astype(np.float64)
-        for i in range(len(x)):
-            w   = x[i] - a1 * z0 - a2 * z1
-            out[i] = b[0] * w + b[1] * z0 + b[2] * z1
-            z1, z0 = z0, w
-        self._wlp_z1[0], self._wlp_z1[1] = z0, z1
-
-        # ── Каскад 2 (тот же фильтр, независимое состояние) ──────────────────
-        z0, z1 = self._wlp_z2[0], self._wlp_z2[1]
-        for i in range(len(out)):
-            w      = out[i] - a1 * z0 - a2 * z1
-            out[i] = b[0] * w + b[1] * z0 + b[2] * z1
-            z1, z0 = z0, w
-        self._wlp_z2[0], self._wlp_z2[1] = z0, z1
-
+        out, self._wlp_zi = sosfilt(self._wlp_sos, s.astype(np.float64), zi=self._wlp_zi)
         return out.astype(np.float32)
 
     def __init__(self):
@@ -792,13 +653,10 @@ class AudioHandler(QObject):
         self.stream_volume = 1.0
         # Флаг: стример включил «Транслировать звук»
         self.stream_audio_sending_enabled = False
-        # AEC: адаптивный подавитель эха голосов собеседников в loopback-потоке.
-        # Автоматически определяет задержку (0-4 фрейма) и коэффициент вычитания.
-        # max_delay_frames=8 → поиск до 160 мс (было 4=80 мс).
-        # Типичная задержка WASAPI 10–80 мс; с запасом для систем с большим буфером.
-        self.aec = AECProcessor(max_delay_frames=8)
-        # Захват системного аудио (WASAPI Loopback) для трансляции
-        self.stream_audio_capture = StreamAudioCapture(self.send_queue, lambda: self.my_uid, aec=self.aec)
+        # AEC удалён: при использовании VB-CABLE (CABLE Output) эхо физически
+        # невозможно — голоса зрителей никогда не попадают в CABLE Output.
+        # Захват системного аудио
+        self.stream_audio_capture = StreamAudioCapture(self.send_queue, lambda: self.my_uid)
         self._is_running = threading.Event()
         self._is_muted = threading.Event()
         self._is_deafened = threading.Event()
@@ -818,15 +676,11 @@ class AudioHandler(QObject):
         self._whisper_sequence: int = 0
 
         # ── IIR-фильтр для whisper-эффекта (4-й порядок Butterworth LP, fc=1200 Гц) ──
-        # Коэффициенты вычислены через билинейное z-преобразование для fs=48 000 Гц.
-        # Два независимых каскада (z1, z2) — состояние сохраняется МЕЖДУ фреймами,
-        # что полностью исключает межфреймовые артефакты.
-        # Сброс состояний производится в start_whisper().
-        self._wlp_b  = np.array([0.005543, 0.011086, 0.005543], dtype=np.float64)
-        self._wlp_a1 = -1.77868
-        self._wlp_a2 =  0.80018
-        self._wlp_z1 = np.zeros(2, dtype=np.float64)   # состояние каскада 1
-        self._wlp_z2 = np.zeros(2, dtype=np.float64)   # состояние каскада 2
+        # Реализован через scipy sosfilt (C-уровень) вместо pure-Python цикла.
+        # SOS-матрица постоянна, начальные условия zi хранят состояние между фреймами.
+        # Сброс zi производится в start_whisper().
+        self._wlp_sos = butter(4, 1200, btype='low', fs=48000, output='sos')
+        self._wlp_zi  = sosfilt_zi(self._wlp_sos).astype(np.float64)
         # Отдельный счётчик для FLAG_STREAM_VOICES пакетов.
         # Нельзя использовать my_sequence: несколько спикеров в одном audio_callback
         # получали бы одинаковый seq → JitterBuffer на стороне зрителя отбрасывал
@@ -1230,10 +1084,6 @@ class AudioHandler(QObject):
 
         np.clip(self.mix_buffer, -1.0, 1.0, out=self.mix_buffer)
 
-        # AEC push_reference полностью удалён:
-        #   С VB-CABLE — не нужен (CABLE Output чист по построению).
-        #   С WASAPI Loopback — AEC работает внутри StreamAudioCapture._audio_cb.
-
         outdata[:] = self.mix_buffer.reshape(-1, 1)
 
     def register_ip_mapping(self, uid, ip_addr):
@@ -1279,10 +1129,9 @@ class AudioHandler(QObject):
         """
         self.whisper_target_uid = target_uid
         self._whisper_sequence = self.my_sequence  # продолжаем seq без разрыва
-        # Сбрасываем состояние IIR-фильтра чтобы шёпот каждого нового собеседника
+        # Сбрасываем состояние sosfilt-фильтра чтобы шёпот каждого нового собеседника
         # начинался с чистого состояния (без «хвоста» от предыдущего шёпота).
-        self._wlp_z1[:] = 0.0
-        self._wlp_z2[:] = 0.0
+        self._wlp_zi = sosfilt_zi(self._wlp_sos).astype(np.float64)
         print(f"[Audio] Whisper START → uid={target_uid}, seq_from={self._whisper_sequence}")
 
     def stop_whisper(self):
@@ -1332,13 +1181,10 @@ class AudioHandler(QObject):
         """Включить/выключить передачу микрофона и системного звука стримером зрителям."""
         self.stream_audio_sending_enabled = enabled
 
-        # Start or stop the WASAPI Loopback capture automatically
         if enabled:
-            self.aec.reset()  # Очищаем AEC-буфер перед новым стримом
             self.start_stream_audio()
         else:
             self.stop_stream_audio()
-            self.aec.reset()  # Очищаем после остановки
 
         print(f"[Audio] Stream mic & loopback sending: {'ON' if enabled else 'OFF'}")
 

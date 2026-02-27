@@ -1,7 +1,8 @@
 import os
 import gc
 import json
-import pygame
+import sounddevice as sd
+import soundfile as sf
 import winsound
 import keyboard
 import time
@@ -45,19 +46,18 @@ class MainWindow(QMainWindow):
         self.prev_room_uids: set = set()
         self.prev_streaming_uids: set = set()
 
-        pygame.mixer.init()
         self.audio = AudioHandler()
         self.net = NetworkClient(self.audio)
 
         # Предзагрузка звуков уведомлений: каждый звук загружается ОДИН РАЗ.
-        # Раньше play_notification() вызывал pygame.mixer.Sound(path) при каждом
-        # событии (mute/unmute/join/leave) → декодирование с диска + новый объект
-        # каждый раз. Теперь объект создаётся здесь и переиспользуется.
+        # Хранится как (data, sr) кортеж — sounddevice воспроизводит напрямую без
+        # повторного чтения с диска при каждом событии.
         self._loaded_sounds: dict = {}
         for key, path in self.sound_files.items():
             if os.path.exists(path):
                 try:
-                    self._loaded_sounds[key] = pygame.mixer.Sound(path)
+                    data, sr = sf.read(path, dtype='float32')
+                    self._loaded_sounds[key] = (data, sr)
                 except Exception as ex:
                     print(f"[UI] Не удалось загрузить звук {key}: {ex}")
 
@@ -545,17 +545,16 @@ class MainWindow(QMainWindow):
 
     def play_notification(self, stype="self_move"):
         # Квадратичная кривая: vol_linear = (slider/100)^2
-        # При slider=30 (новый default) → pygame vol 0.09  (≈ −21 dB, ненавязчиво)
-        # При slider=70 (старый default) → pygame vol 0.49  (всё ещё громко,
-        #   но вдвое тише прежних 0.70 — для пользователей со старыми настройками)
-        # При slider=100 → pygame vol 1.00  (максимум без обрезки)
+        # При slider=30 (default) → 0.09x  (≈ −21 dB, ненавязчиво)
+        # При slider=70           → 0.49x  (вдвое тише прежних 0.70)
+        # При slider=100          → 1.00x  (максимум)
         raw = int(self.app_settings.value("system_sound_volume", 30)) / 100.0
         vol = raw ** 2  # перцептивно равномерная шкала вместо линейной
-        sound = self._loaded_sounds.get(stype)
-        if sound is not None:
+        entry = self._loaded_sounds.get(stype)
+        if entry is not None:
             try:
-                sound.set_volume(vol)
-                sound.play()
+                data, sr = entry
+                sd.play(data * vol, sr)
             except Exception:
                 pass
         else:

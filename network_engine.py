@@ -3,7 +3,9 @@ import threading
 import json
 import time
 import queue
-import pygame
+import sounddevice as sd
+import soundfile as sf
+import numpy as np
 import struct
 import os
 import platform
@@ -59,10 +61,10 @@ class NetworkClient(QObject):
         self._reconnecting       = False
         self._reconnect_attempts = 0
 
-        # Последний проигранный звук soundboard.
+        # Флаг воспроизведения soundboard.
         # Используется для блокировки спама: новый звук не запустится,
         # пока текущий ещё играет.
-        self._sb_sound: "pygame.mixer.Sound | None" = None
+        self._sb_playing = threading.Event()
 
         # -------------------------------------------------------------------
         # Pacing-очередь для видео-пакетов (leaky bucket).
@@ -91,35 +93,43 @@ class NetworkClient(QObject):
     # ------------------------------------------------------------------
     def play_soundboard_file(self, filename):
         """
-        Воспроизвести soundboard-файл.
+        Воспроизвести soundboard-файл через sounddevice.
 
         Защита от спама: новый звук НЕ запускается, пока предыдущий ещё играет.
         Это предотвращает накопление звуков при частых кликах.
 
         Громкость: квадратичная кривая (slider/100)^2.
-        Соответствует той же перцептивной шкале, что и системные уведомления:
           slider 40 (default) -> 0.16x (~-16 dB)
           slider 70           -> 0.49x (~-6 dB)
-          slider 100          -> 1.00x (0 dB, максимум pygame)
+          slider 100          -> 1.00x (0 dB)
         """
         try:
             # Anti-spam: блокируем, пока текущий звук ещё играет
-            if self._sb_sound is not None and self._sb_sound.get_num_channels() > 0:
+            if self._sb_playing.is_set():
                 print(f"[Net] Soundboard: пропущен {filename!r} — звук ещё играет")
                 return
 
             path = resource_path(os.path.join("assets/panel", filename))
-            if os.path.exists(path):
-                sound = pygame.mixer.Sound(path)
-                # Квадратичная кривая: (raw/100)^2 — совпадает с системными звуками
-                raw = int(QSettings("MyVoiceChat", "GlobalSettings").value("soundboard_volume", 40)) / 100.0
-                vol = raw ** 2
-                sound.set_volume(vol)
-                sound.play()
-                self._sb_sound = sound  # сохраняем для проверки get_num_channels()
-                print(f"[Net] Playing soundboard: {filename} (vol={vol:.3f})")
-            else:
+            if not os.path.exists(path):
                 print(f"[Net] Soundboard file not found: {path}")
+                return
+
+            raw = int(QSettings("MyVoiceChat", "GlobalSettings").value("soundboard_volume", 40)) / 100.0
+            vol = raw ** 2  # квадратичная кривая: (raw/100)^2
+
+            def _play():
+                try:
+                    self._sb_playing.set()
+                    data, sr = sf.read(path, dtype='float32')
+                    sd.play(data * vol, sr)
+                    sd.wait()
+                except Exception as e:
+                    print(f"[Net] Soundboard playback error: {e}")
+                finally:
+                    self._sb_playing.clear()
+
+            threading.Thread(target=_play, daemon=True, name="soundboard-play").start()
+            print(f"[Net] Playing soundboard: {filename} (vol={vol:.3f})")
         except Exception as e:
             print(f"[Net] Soundboard error: {e}")
 

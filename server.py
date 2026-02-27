@@ -2,6 +2,7 @@ import socket
 import threading
 import json
 import time
+import secrets
 from config import (
     DEFAULT_PORT_TCP, DEFAULT_PORT_UDP, BUFFER_SIZE,
     UDP_RECV_BUFFER_SIZE, UDP_SEND_BUFFER_SIZE,
@@ -253,7 +254,7 @@ class SFUServer:
     # TCP-обработчик одного клиента
     # ------------------------------------------------------------------
     def tcp_handler(self, conn, addr):
-        uid = int(time.time() * 1000) % 1000000
+        uid = secrets.randbelow(10**9) + 1  # криптографически уникальный, без коллизий
         client_ip = addr[0]
         buffer = ""
         # JSONDecoder создаём ОДИН РАЗ на соединение — он stateless.
