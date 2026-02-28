@@ -393,10 +393,13 @@ class SFUServer:
                             self.send_global_state()
 
                         elif action == CMD_SOUNDBOARD:
+                            # Добавляем ник отправителя — клиент покажет «кто включил»
+                            with self.clients_lock:
+                                sender_nick = self.clients[conn]['nick'] if conn in self.clients else '?'
+                                conns = list(self.clients.keys())
+                            msg['from_nick'] = sender_nick
                             payload = json.dumps(msg).encode('utf-8')
                             # FIX #2: sendall вне clients_lock — не блокируем чтение других потоков
-                            with self.clients_lock:
-                                conns = list(self.clients.keys())
                             for c in conns:
                                 try:
                                     c.sendall(payload)

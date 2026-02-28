@@ -43,6 +43,10 @@ class NetworkClient(QObject):
     connection_restored = pyqtSignal()
     reconnect_failed    = pyqtSignal()
 
+    # Эмитит (from_nick) при получении soundboard-пакета от сервера.
+    # MainWindow показывает тост и обновляет желтую метку в открытой панели.
+    soundboard_played   = pyqtSignal(str)
+
     def __init__(self, audio):
         super().__init__()
         self.audio  = audio
@@ -102,23 +106,19 @@ class NetworkClient(QObject):
     # ------------------------------------------------------------------
     # Soundboard
     # ------------------------------------------------------------------
-    def play_soundboard_file(self, filename, data_b64=None):
+    def play_soundboard_file(self, filename, data_b64=None, from_nick=None):
         """
         Воспроизвести soundboard-файл через sounddevice.
 
         Два режима:
         1. Стандартный (data_b64 is None): файл ищется в assets/panel/ по имени.
         2. Кастомный (data_b64 задан): аудио декодируется из base64 и воспроизводится
-           прямо из памяти (BytesIO). Файл на диске не нужен — работает у всех
-           участников без синхронизации файлов.
+           прямо из памяти (BytesIO). Файл на диске не нужен.
+
+        from_nick: ник отправителя (добавляется сервером). Эмитит soundboard_played
+                   сразу, до фонового воспроизведения — MainWindow покажет тост.
 
         Защита от спама: новый звук НЕ запускается, пока предыдущий ещё играет.
-        Это предотвращает накопление звуков при частых кликах.
-
-        Громкость: квадратичная кривая (slider/100)^2.
-          slider 40 (default) -> 0.16x (~-16 dB)
-          slider 70           -> 0.49x (~-6 dB)
-          slider 100          -> 1.00x (0 dB)
         """
         import io
         import base64 as _b64
@@ -152,6 +152,11 @@ class NetworkClient(QObject):
                     return
                 audio_source = path
 
+            # Эмитим сигнал в GUI-потоке ДО запуска фонового воспроизведения.
+            # MainWindow и VideoWindow подпишутся на него для тоста / метки автора.
+            if from_nick:
+                self.soundboard_played.emit(from_nick)
+
             def _play():
                 try:
                     self._sb_playing.set()
@@ -165,7 +170,7 @@ class NetworkClient(QObject):
                     self._sb_playing.clear()
 
             threading.Thread(target=_play, daemon=True, name="soundboard-play").start()
-            print(f"[Net] Playing soundboard: {filename} (vol={vol:.3f}, custom={bool(data_b64)})")
+            print(f"[Net] Playing soundboard: {filename} (vol={vol:.3f}, custom={bool(data_b64)}, by={from_nick!r})")
         except Exception as e:
             print(f"[Net] Soundboard error: {e}")
 
@@ -508,7 +513,7 @@ class NetworkClient(QObject):
         elif act == 'sync_users':
             self.global_state_update.emit(msg.get('all_users', {}))
         elif act == 'play_soundboard':
-            self.play_soundboard_file(msg.get('file'), msg.get('data_b64'))
+            self.play_soundboard_file(msg.get('file'), msg.get('data_b64'), msg.get('from_nick'))
         elif act == 'request_keyframe':
             if self.video:
                 self.video.force_keyframe()

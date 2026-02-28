@@ -1658,20 +1658,35 @@ class SoundboardPanel(QWidget):
 
     def rebuild(self):
         """
-        Пересобирает UI панели при добавлении / удалении кастомных звуков
-        из вкладки настроек. Вызывается через _rebuild_sb_panel_if_open().
+        Пересобирает UI панели при добавлении / удалении кастомных звуков.
+        Вызывается через _rebuild_sb_panel_if_open().
+        Сохраняет состояние жёлтой метки автора между пересборками.
         """
-        # Очищаем старый контент
-        old_layout = self.layout()
-        if old_layout:
-            # Удаляем все виджеты
-            while old_layout.count():
-                item = old_layout.takeAt(0)
-                if item.widget():
-                    item.widget().deleteLater()
-            # Удаляем сам layout через замену
+        # Сохраняем состояние метки автора — _build_ui создаст новые виджеты
+        saved_text    = ""
+        saved_visible = False
+        saved_ms      = 0
+        try:
+            saved_text    = self._from_nick_lbl.text()
+            saved_visible = self._from_nick_lbl.isVisible()
+            if self._from_nick_timer.isActive():
+                saved_ms = self._from_nick_timer.remainingTime()
+            self._from_nick_timer.stop()
+        except (RuntimeError, AttributeError):
+            pass
+
         self._build_ui()
         self.adjustSize()
+
+        # Восстанавливаем метку если была активна
+        if saved_visible and saved_text:
+            try:
+                self._from_nick_lbl.setText(saved_text)
+                self._from_nick_lbl.setVisible(True)
+                if saved_ms > 0:
+                    self._from_nick_timer.start(saved_ms)
+            except (RuntimeError, AttributeError):
+                pass
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
@@ -1711,6 +1726,24 @@ class SoundboardPanel(QWidget):
             border: none;
         """)
 
+        # Жёлтая метка «▶ [ник]» — кто последний включил звук.
+        # Скрыта по умолчанию, показывается 4 с через flash_from_nick().
+        self._from_nick_lbl = QLabel("")
+        self._from_nick_lbl.setStyleSheet("""
+            color: #f5c518;
+            font-size: 12px;
+            font-weight: bold;
+            background: transparent;
+            border: none;
+            padding: 0 6px;
+        """)
+        self._from_nick_lbl.setVisible(False)
+
+        # Таймер скрытия метки (single-shot, 4 с)
+        self._from_nick_timer = QTimer(self)
+        self._from_nick_timer.setSingleShot(True)
+        self._from_nick_timer.timeout.connect(self._hide_from_nick_lbl)
+
         btn_close = QPushButton("✕")
         btn_close.setFixedSize(22, 22)
         btn_close.setStyleSheet(f"""
@@ -1730,6 +1763,7 @@ class SoundboardPanel(QWidget):
 
         hdr.addWidget(lbl_title)
         hdr.addStretch()
+        hdr.addWidget(self._from_nick_lbl)
         hdr.addWidget(btn_close)
         card_lay.addLayout(hdr)
 
@@ -1937,22 +1971,52 @@ class SoundboardPanel(QWidget):
         """Отправляет soundboard-команду серверу. Flash-эффект убран."""
         self.net.send_json({"action": CMD_SOUNDBOARD, "file": fname})
 
+    # ── Публичный API: желтая метка автора ───────────────────────────────────
+
+    def flash_from_nick(self, nick: str):
+        """
+        Показывает «▶ [nick]» жёлтым в заголовке панели на 4 секунды.
+        Вызывается из MainWindow/_on_soundboard_played каждый раз при звуке.
+        Безопасен к вызову даже если панель скрыта (обновит метку к следующему открытию).
+        """
+        try:
+            self._from_nick_lbl.setText(f"▶  {nick}")
+            self._from_nick_lbl.setVisible(True)
+            self._from_nick_timer.start(4000)
+        except (RuntimeError, AttributeError):
+            pass
+
+    def _hide_from_nick_lbl(self):
+        try:
+            self._from_nick_lbl.setVisible(False)
+        except (RuntimeError, AttributeError):
+            pass
+
     # ── Анимация ──────────────────────────────────────────────────────────────
 
     def show_above(self, ref_widget: QWidget):
         """
-        Позиционирует панель над ref_widget (кнопкой soundboard)
-        и запускает анимацию выезда снизу вверх.
+        Центрирует панель горизонтально по родительскому окну.
+        Ширина = ширина окна − 32 px (16 px отступ с каждого края).
+        Панель выезжает снизу вверх над ref_widget с анимацией.
         """
-        self.adjustSize()
+        # Верхнеуровневое окно — по его ширине растягиваем панель
+        top_win = ref_widget.window()
+        target_w = max(self.minimumWidth(), top_win.width() - 32)
+        self.setMinimumWidth(target_w)
+        self.setMaximumWidth(target_w)
 
-        g_pos = ref_widget.mapToGlobal(QPoint(0, 0))
+        self.adjustSize()
         panel_w = self.width()
         panel_h = self.height()
 
-        x = g_pos.x() + ref_widget.width() // 2 - panel_w // 2
-        y_final = g_pos.y() - panel_h - 6
+        # X: центр окна
+        g_win = top_win.mapToGlobal(QPoint(0, 0))
+        x = g_win.x() + (top_win.width() - panel_w) // 2
 
+        # Y: над кнопкой ref_widget
+        g_btn = ref_widget.mapToGlobal(QPoint(0, 0))
+        y_final = g_btn.y() - panel_h - 6
         y_start = y_final + 18
 
         self.setGeometry(x, y_start, panel_w, panel_h)

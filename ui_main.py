@@ -187,6 +187,9 @@ class MainWindow(QMainWindow):
         self.audio.whisper_received.connect(self._on_whisper_received)
         self.video.frame_received.connect(self.on_video_frame)
 
+        # Тост «кто включил soundboard» — желтый лейбл поверх окна
+        self.net.soundboard_played.connect(self._on_soundboard_played)
+
         self.ui_timer = QTimer()
         self.ui_timer.timeout.connect(self.refresh_ui)
         self.ui_timer.start(100)
@@ -195,6 +198,29 @@ class MainWindow(QMainWindow):
         self.net.connect_to_server(self.ip, self.nick, self.avatar)
         self.is_streaming = False
         self._sb_panel = None   # ссылка на SoundboardPanel (для toggle и lifecycle)
+
+        # ── Тост soundboard ─────────────────────────────────────────────────────
+        # QLabel поверх главного окна с абсолютным позиционированием.
+        # Показывается на 3.5 с когда кто-то нажимает кнопку в soundboard-панели.
+        self._sb_toast = QLabel(self)
+        self._sb_toast.setStyleSheet("""
+            QLabel {
+                background-color: rgba(20, 22, 30, 215);
+                color: #f5c518;
+                font-size: 13px;
+                font-weight: bold;
+                border: 1px solid rgba(245,197,24,0.45);
+                border-radius: 8px;
+                padding: 5px 14px;
+            }
+        """)
+        self._sb_toast.setVisible(False)
+        self._sb_toast.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+
+        self._sb_toast_timer = QTimer(self)
+        self._sb_toast_timer.setSingleShot(True)
+        self._sb_toast_timer.setInterval(3500)
+        self._sb_toast_timer.timeout.connect(lambda: self._sb_toast.setVisible(False))
 
         # Таймер завершения шёпота: если >1.5 с не было пакетов — скрываем баннер/оверлей
         self._whisper_end_timer = QTimer()
@@ -1167,6 +1193,8 @@ class MainWindow(QMainWindow):
         if uid not in self.stream_windows or not self.stream_windows[uid].isVisible():
             w = VideoWindow(nick)
             w.uid = uid
+            # Передаём NetworkClient для SoundboardPanel в оверлее стрима
+            w.set_net(self.net)
             w.window_closed.connect(self._on_stream_window_closed)
 
             # --- Оверлей: подключаем кнопки управления ---
@@ -1287,6 +1315,39 @@ class MainWindow(QMainWindow):
         panel = SoundboardPanel(self.net, self)
         self._sb_panel = panel
         panel.show_above(self.btn_sb)
+
+    def _on_soundboard_played(self, from_nick: str):
+        """
+        Показывает жёлтый тост «🎵 [nick] включил звук» над кнопкой soundboard.
+        Также обновляет метку автора в открытой soundboard-панели (главное окно
+        и все открытые окна стримов).
+        """
+        # ── Тост поверх главного окна ─────────────────────────────────────────
+        self._sb_toast.setText(f"🎵  {from_nick}  включил звук")
+        self._sb_toast.adjustSize()
+        # Центрируем по ширине окна, над кнопкой btn_sb
+        tw = self._sb_toast.width()
+        tx = (self.width() - tw) // 2
+        ty = self.btn_sb.y() - self._sb_toast.height() - 8
+        self._sb_toast.move(tx, max(4, ty))
+        self._sb_toast.raise_()
+        self._sb_toast.setVisible(True)
+        self._sb_toast_timer.start()
+
+        # ── Метка автора в открытых soundboard-панелях ────────────────────────
+        # Главное окно
+        try:
+            if self._sb_panel is not None and self._sb_panel.isVisible():
+                self._sb_panel.flash_from_nick(from_nick)
+        except (RuntimeError, AttributeError):
+            pass
+        # Окна стримов
+        for w in list(self.stream_windows.values()):
+            try:
+                if w.isVisible() and w._sb_panel is not None and w._sb_panel.isVisible():
+                    w._sb_panel.flash_from_nick(from_nick)
+            except (RuntimeError, AttributeError):
+                pass
 
     def _update_known_users_registry(self, users_map):
         """

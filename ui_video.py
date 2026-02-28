@@ -274,6 +274,8 @@ class VideoOverlay(QFrame):
     fullscreen_clicked = pyqtSignal()
     stream_volume_changed = pyqtSignal(float)   # 0.0–2.0
     quality_changed    = pyqtSignal(int)         # skip_factor: 1, 2, 4
+    # Клик по кнопке soundboard в оверлее стрима → VideoWindow.open_soundboard()
+    soundboard_clicked = pyqtSignal()
 
     # Циклические уровни качества: (skip_factor, emoji-метка, tooltip)
     _QUALITY_LEVELS = [
@@ -330,18 +332,18 @@ class VideoOverlay(QFrame):
         self.btn_vol_stream.installEventFilter(self)
         self._vol_popup.installEventFilter(self)
 
+        # --- Soundboard (заменяет нерабочую кнопку качества) ---
+        # Иконка та же что в главном окне (bells.svg).
+        # Клик → VideoWindow.open_soundboard() → SoundboardPanel над стримом.
+        self.btn_soundboard = self._make_btn("assets/icon/bells.svg", "Soundboard")
+        self.btn_soundboard.clicked.connect(self.soundboard_clicked)
+
         # --- Разделитель ---
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.VLine)
         sep.setStyleSheet("QFrame { color: rgba(255,255,255,50); }")
         sep.setFixedWidth(2)
         sep.setFixedHeight(32)
-
-        # --- Качество видео (цикличная кнопка: HIGH → MEDIUM → LOW → HIGH) ---
-        self.btn_quality = self._make_btn(None, self._QUALITY_LEVELS[0][2])
-        self.btn_quality.setText(self._QUALITY_LEVELS[0][1])
-        self.btn_quality.setFont(QFont("Segoe UI", 14))
-        self.btn_quality.clicked.connect(self._cycle_quality)
 
         # --- Fullscreen ---
         self.btn_fs = self._make_btn(None, "Полный экран / Оконный режим")
@@ -353,7 +355,7 @@ class VideoOverlay(QFrame):
         layout.addWidget(self.btn_deafen)
         layout.addWidget(self.btn_stop)
         layout.addWidget(self.btn_vol_stream)
-        layout.addWidget(self.btn_quality)
+        layout.addWidget(self.btn_soundboard)
         layout.addWidget(sep, alignment=Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(self.btn_fs)
 
@@ -459,23 +461,6 @@ class VideoOverlay(QFrame):
         """Переключить иконку кнопки fullscreen."""
         self.btn_fs.setText("❐" if is_fullscreen else "⛶")
 
-    def _cycle_quality(self):
-        """Циклически переключает качество HIGH → MEDIUM → LOW → HIGH и эмитит сигнал."""
-        self._quality_idx = (self._quality_idx + 1) % len(self._QUALITY_LEVELS)
-        skip, emoji, tip = self._QUALITY_LEVELS[self._quality_idx]
-        self.btn_quality.setText(emoji)
-        self.btn_quality.setToolTip(tip)
-        self.quality_changed.emit(skip)
-
-    def set_quality_by_skip(self, skip_factor: int):
-        """Синхронизировать иконку кнопки с внешне заданным skip_factor."""
-        for idx, (sf, emoji, tip) in enumerate(self._QUALITY_LEVELS):
-            if sf == skip_factor:
-                self._quality_idx = idx
-                self.btn_quality.setText(emoji)
-                self.btn_quality.setToolTip(tip)
-                break
-
 
 # ---------------------------------------------------------------------------
 # VideoWindow — окно-контейнер: поверхность + оверлей + тулбар статистики
@@ -527,6 +512,8 @@ class VideoWindow(QWidget):
         self._is_fullscreen = False
         self._closing = False        # флаг: окно в процессе закрытия
         self._quality_skip = 1       # текущий skip_factor (1=HIGH, 2=MED, 4=LOW)
+        self._net = None             # NetworkClient — устанавливается через set_net()
+        self._sb_panel = None        # SoundboardPanel поверх стрима (toggle)
 
         self._setup_ui(nick)
         self._setup_hide_timer()
@@ -539,6 +526,40 @@ class VideoWindow(QWidget):
         self._idr_timer.setSingleShot(False)
         self._idr_timer.setInterval(VIDEO_LOW_QUALITY_IDR_INTERVAL_MS)
         self._idr_timer.timeout.connect(self.viewer_keyframe_needed)
+
+    # ------------------------------------------------------------------
+    # Публичный метод: передать NetworkClient для soundboard в оверлее
+    # ------------------------------------------------------------------
+    def set_net(self, net):
+        """Вызывается из MainWindow.open_video_window() после создания окна."""
+        self._net = net
+
+    # ------------------------------------------------------------------
+    # Soundboard поверх стрима
+    # ------------------------------------------------------------------
+    def open_soundboard(self):
+        """
+        Открывает / закрывает SoundboardPanel поверх окна трансляции.
+        Полностью аналогична MainWindow.open_soundboard().
+        """
+        if self._net is None:
+            return
+        from ui_dialogs import SoundboardPanel
+        try:
+            if self._sb_panel is not None:
+                if self._sb_panel.isVisible():
+                    self._sb_panel.close()
+                    self._sb_panel = None
+                    return
+                else:
+                    self._sb_panel.deleteLater()
+                    self._sb_panel = None
+        except RuntimeError:
+            self._sb_panel = None
+
+        panel = SoundboardPanel(self._net, self)
+        self._sb_panel = panel
+        panel.show_above(self.overlay.btn_soundboard)
 
     # ------------------------------------------------------------------
     # Построение UI
@@ -573,6 +594,7 @@ class VideoWindow(QWidget):
         self.overlay.fullscreen_clicked.connect(self.toggle_fullscreen)
         self.overlay.stream_volume_changed.connect(self.overlay_stream_volume_changed)
         self.overlay.quality_changed.connect(self._on_quality_changed)
+        self.overlay.soundboard_clicked.connect(self.open_soundboard)
         self.overlay.hide()  # скрыт по умолчанию
 
         # --- Тулбар статистики (снизу) ---
@@ -795,6 +817,14 @@ class VideoWindow(QWidget):
         self._closing = True         # блокируем sync_audio_state от внешних сигналов
         self._idr_timer.stop()       # останавливаем IDR-таймер
         self._hide_timer.stop()      # останавливаем таймер авто-скрытия
+
+        # Закрываем SoundboardPanel если открыта
+        try:
+            if self._sb_panel is not None:
+                self._sb_panel.close()
+                self._sb_panel = None
+        except (RuntimeError, AttributeError):
+            self._sb_panel = None
 
         # FIX MEM: явно очищаем последний кадр (QImage = ~3.7 МБ для 1280×720 RGB).
         # Без этого _current_image держался до уничтожения VideoSurface объекта,
