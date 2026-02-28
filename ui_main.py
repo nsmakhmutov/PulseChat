@@ -264,6 +264,18 @@ class MainWindow(QMainWindow):
         self._px_vol_off   = QIcon(resource_path("assets/icon/volume_off.svg")).pixmap(self._icon_size)
         self._px_mic_off   = QIcon(resource_path("assets/icon/mic_off.svg")).pixmap(self._icon_size)
         self._px_ban       = QIcon(resource_path("assets/icon/ban.svg")).pixmap(self._icon_size)
+
+        # Кэш пиксмапов иконок статусов пользователей (assets/status/*.svg).
+        # Ключ: имя файла (например 'afk.svg'). Значение: QPixmap 20×20.
+        # Заполняется лениво в update_user_tree() при первом появлении иконки.
+        # Пересоздавать при смене темы не нужно — SVG не зависят от темы.
+        self._status_px_cache: dict = {}
+
+        # Текущий статус пользователя. Загружается из QSettings при старте,
+        # отправляется на сервер при каждом (пере)подключении.
+        # Изменяется через SettingsDialog → вкладка «О себе».
+        self._my_status_icon: str = self.app_settings.value("my_status_icon", "")
+        self._my_status_text: str = self.app_settings.value("my_status_text", "")
         # Создание QFont внутри метода = лишние аллокации при каждом обновлении.
         # Шрифты зависят от custom_font_family, который не меняется в runtime.
         self._font_room    = QFont(self.custom_font_family, 12)
@@ -307,8 +319,8 @@ class MainWindow(QMainWindow):
         layout.setSpacing(10)
 
         self.tree = QTreeWidget()
-        self.tree.setColumnCount(4)
-        self.tree.setHeaderLabels(["Ник", "", "", ""])
+        self.tree.setColumnCount(5)
+        self.tree.setHeaderLabels(["Ник", "", "", "", ""])
         self.tree.setUniformRowHeights(True)
         self.tree.setIconSize(QSize(32, 32))
         self.tree.setSelectionMode(QTreeWidget.SelectionMode.NoSelection)
@@ -317,12 +329,14 @@ class MainWindow(QMainWindow):
         header = self.tree.header()
         header.setStretchLastSection(False)
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
-        header.resizeSection(1, 35)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)  # статус дела
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)  # live/stream
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)  # deaf/vol_off
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)  # mute/mic_off
+        header.resizeSection(1, 30)   # статус — чуть уже (иконка 20×20)
         header.resizeSection(2, 35)
         header.resizeSection(3, 35)
+        header.resizeSection(4, 35)
         header.hide()
 
         self.tree.itemDoubleClicked.connect(self.on_tree_double_click)
@@ -538,6 +552,11 @@ class MainWindow(QMainWindow):
         self._resize_direction = None
         self._resize_start_pos = None
         self._resize_start_geom = None
+        # Сбрасываем курсор ресайза обратно в стандартный.
+        # Без этого курсор «застревал» в форме SizeXxx после отпускания кнопки мыши,
+        # потому что mouseMoveEvent с зажатой кнопкой обновлял курсор только во время
+        # перетаскивания, а setCursor() остаётся в силе пока явно не вызван unsetCursor().
+        self.unsetCursor()
         super().mouseReleaseEvent(e)
 
     def apply_theme(self, theme_name):
@@ -702,6 +721,16 @@ class MainWindow(QMainWindow):
             QTreeWidget::item:hover {{
                 background-color: {hover};
                 border-radius: 0px;
+            }}
+
+            /* Tooltip иконок статусов пользователей — текст без подложки.
+               Прозрачный фон + нет рамки = «парящий» текст над деревом. */
+            QTreeWidget QToolTip {{
+                background-color: transparent;
+                border: none;
+                color: {text};
+                font-size: 13px;
+                padding: 0px;
             }}
 
             QPushButton {{ 
@@ -944,6 +973,13 @@ class MainWindow(QMainWindow):
 
             self._btn_reconnect.setEnabled(True)
             print(f"[DEBUG] on_connected: DONE", flush=True)
+
+            # Восстанавливаем сохранённый статус после переподключения.
+            # Сервер не хранит статусы постоянно — только в рамках сессии,
+            # поэтому при каждом (пере)подключении отправляем сохранённый статус.
+            if self._my_status_icon:
+                self.net.send_presence_update(self._my_status_icon, self._my_status_text)
+
         except Exception as e:
             import traceback
             print(f"[DEBUG] on_connected: EXCEPTION:\n{traceback.format_exc()}", flush=True)
@@ -1036,20 +1072,39 @@ class MainWindow(QMainWindow):
                 if hasattr(self.audio, 'register_ip_mapping'):
                     self.audio.register_ip_mapping(uid, ip_addr)
 
-                item_u = QTreeWidgetItem(item_r, [f"  {u['nick']}", "", "", ""])
+                item_u = QTreeWidgetItem(item_r, [f"  {u['nick']}", "", "", "", ""])
                 item_u.setIcon(0, QIcon(resource_path(f"assets/avatars/{u.get('avatar', '1.svg')}")))
                 item_u.setFont(0, font_u)
                 item_u.setData(0, Qt.ItemDataRole.UserRole, uid)
 
-                item_u.setTextAlignment(1, Qt.AlignmentFlag.AlignCenter)
-                item_u.setTextAlignment(2, Qt.AlignmentFlag.AlignCenter)
-                item_u.setTextAlignment(3, Qt.AlignmentFlag.AlignCenter)
+                # ── Колонка 1: статус дела (иконка SVG из assets/status/) ──────
+                # Показывается только если пользователь выставил статус.
+                # Tooltip показывает text-подпись при наведении мыши.
+                status_icon = u.get('status_icon', '')
+                status_text = u.get('status_text', '')
+                if status_icon:
+                    # Ленивое создание пиксмапа с кэшированием
+                    if status_icon not in self._status_px_cache:
+                        icon_path = resource_path(f"assets/status/{status_icon}")
+                        px = QIcon(icon_path).pixmap(20, 20)
+                        self._status_px_cache[status_icon] = px
+                    item_u.setData(1, Qt.ItemDataRole.DecorationRole, self._status_px_cache[status_icon])
+                    if status_text:
+                        item_u.setToolTip(1, status_text)
+                else:
+                    item_u.setData(1, Qt.ItemDataRole.DecorationRole, None)
+
+                item_u.setTextAlignment(2, Qt.AlignmentFlag.AlignCenter)  # live
+                item_u.setTextAlignment(3, Qt.AlignmentFlag.AlignCenter)  # deaf
+                item_u.setTextAlignment(4, Qt.AlignmentFlag.AlignCenter)  # mute
 
                 self.known_uids[uid] = {
-                    'item': item_u,
-                    'is_m': u.get('mute', False),
-                    'is_d': u.get('deaf', False),
-                    'is_s': u.get('is_streaming', False)
+                    'item':        item_u,
+                    'is_m':        u.get('mute', False),
+                    'is_d':        u.get('deaf', False),
+                    'is_s':        u.get('is_streaming', False),
+                    'status_icon': status_icon,
+                    'status_text': status_text,
                 }
 
                 watchers = u.get('watchers', [])
@@ -1101,32 +1156,32 @@ class MainWindow(QMainWindow):
                     curr_d = self.audio.is_deafened if uid == self.audio.my_uid else is_d
 
                     if curr_s:
-                        item.setData(1, Qt.ItemDataRole.DecorationRole, self._px_live)
-                    else:
-                        item.setData(1, Qt.ItemDataRole.DecorationRole, None)
-
-                    if curr_d:
-                        item.setData(2, Qt.ItemDataRole.DecorationRole, self._px_vol_off)
+                        item.setData(2, Qt.ItemDataRole.DecorationRole, self._px_live)
                     else:
                         item.setData(2, Qt.ItemDataRole.DecorationRole, None)
+
+                    if curr_d:
+                        item.setData(3, Qt.ItemDataRole.DecorationRole, self._px_vol_off)
+                    else:
+                        item.setData(3, Qt.ItemDataRole.DecorationRole, None)
 
                     if uid == self.audio.my_uid:
                         talk = me_talk
                         if self.audio.is_muted:
-                            item.setData(3, Qt.ItemDataRole.DecorationRole, self._px_mic_off)
+                            item.setData(4, Qt.ItemDataRole.DecorationRole, self._px_mic_off)
                         else:
-                            item.setData(3, Qt.ItemDataRole.DecorationRole, None)
+                            item.setData(4, Qt.ItemDataRole.DecorationRole, None)
                     else:
                         u_audio = self.audio.remote_users.get(uid)
                         talk = (now - u_audio.last_packet_time < 0.3) if u_audio else False
                         is_locally_muted = u_audio.is_locally_muted if u_audio else False
 
                         if is_locally_muted:
-                            item.setData(3, Qt.ItemDataRole.DecorationRole, self._px_ban)
+                            item.setData(4, Qt.ItemDataRole.DecorationRole, self._px_ban)
                         elif is_m:
-                            item.setData(3, Qt.ItemDataRole.DecorationRole, self._px_mic_off)
+                            item.setData(4, Qt.ItemDataRole.DecorationRole, self._px_mic_off)
                         else:
-                            item.setData(3, Qt.ItemDataRole.DecorationRole, None)
+                            item.setData(4, Qt.ItemDataRole.DecorationRole, None)
 
                     if talk:
                         item.setForeground(0, self._br_talk)
@@ -1291,6 +1346,24 @@ class MainWindow(QMainWindow):
         if SettingsDialog(self.audio, self).exec():
             self.setup_hotkeys()
             self.audio.start(self.app_settings.value("device_in_name"), self.app_settings.value("device_out_name"))
+
+    # ── Статус пользователя ────────────────────────────────────────────────────
+
+    def open_status_dialog(self):
+        """
+        Открывает диалог выбора статуса (StatusDialog из ui_dialogs).
+        Вызывается из SettingsDialog (вкладка «О себе»).
+        После подтверждения сохраняет статус в QSettings и отправляет на сервер.
+        """
+        from ui_dialogs import StatusDialog
+        dlg = StatusDialog(self._my_status_icon, self._my_status_text, parent=self)
+        if dlg.exec():
+            icon, text = dlg.get_result()
+            self._my_status_icon = icon
+            self._my_status_text = text
+            self.app_settings.setValue("my_status_icon", icon)
+            self.app_settings.setValue("my_status_text", text)
+            self.net.send_presence_update(icon, text)
 
     def open_soundboard(self):
         from ui_dialogs import SoundboardPanel

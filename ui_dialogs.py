@@ -606,6 +606,49 @@ class SettingsDialog(QDialog):
         lay.addWidget(QLabel("Никнейм:"))
         self.ed_nick = QLineEdit(self.mw.nick)
         lay.addWidget(self.ed_nick)
+
+        # ── Статус ─────────────────────────────────────────────────────────────
+        lay.addSpacing(8)
+        sep_st = QFrame()
+        sep_st.setFrameShape(QFrame.Shape.HLine)
+        sep_st.setMaximumHeight(1)
+        lay.addWidget(sep_st)
+        lay.addSpacing(4)
+
+        lay.addWidget(QLabel("Статус:"))
+
+        st_row = QHBoxLayout()
+        st_row.setSpacing(8)
+
+        # Иконка предпросмотра текущего статуса
+        self._st_icon_lbl = QLabel()
+        self._st_icon_lbl.setFixedSize(32, 32)
+        self._st_icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._refresh_status_preview()
+        st_row.addWidget(self._st_icon_lbl)
+
+        # Название / описание текущего статуса
+        self._st_name_lbl = QLabel()
+        self._refresh_status_name()
+        st_row.addWidget(self._st_name_lbl, stretch=1)
+
+        # Кнопка выбора статуса
+        btn_pick_st = QPushButton("Выбрать")
+        btn_pick_st.setFixedHeight(30)
+        btn_pick_st.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_pick_st.clicked.connect(self._open_status_picker)
+        st_row.addWidget(btn_pick_st)
+
+        # Кнопка сброса статуса
+        btn_clr_st = QPushButton("✕")
+        btn_clr_st.setFixedSize(30, 30)
+        btn_clr_st.setToolTip("Убрать статус")
+        btn_clr_st.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_clr_st.clicked.connect(self._clear_status)
+        st_row.addWidget(btn_clr_st)
+
+        lay.addLayout(st_row)
+
         lay.addStretch()
         self.tabs.addTab(tab, "О себе")
 
@@ -1284,7 +1327,54 @@ class SettingsDialog(QDialog):
             on_error=lambda msg: bridge.sig_error.emit(msg),
         )
 
-    # ── Вспомогательные методы ────────────────────────────────────────────────
+    # ── Методы управления статусом (вкладка «О себе») ─────────────────────────
+
+    def _refresh_status_preview(self):
+        """Обновляет иконку-превью текущего статуса (32×32)."""
+        icon = self.app_settings.value("my_status_icon", "")
+        if icon:
+            path = resource_path(f"assets/status/{icon}")
+            self._st_icon_lbl.setPixmap(QIcon(path).pixmap(26, 26))
+            self._st_icon_lbl.setText("")
+        else:
+            self._st_icon_lbl.setPixmap(QIcon().pixmap(0, 0))
+            self._st_icon_lbl.setText("—")
+
+    def _refresh_status_name(self):
+        """Обновляет текстовую подпись рядом с иконкой статуса."""
+        icon = self.app_settings.value("my_status_icon", "")
+        text = self.app_settings.value("my_status_text", "")
+        if icon:
+            name = icon.rsplit('.', 1)[0].replace('_', ' ').capitalize()
+            label = f"{name}  —  {text}" if text else name
+            self._st_name_lbl.setText(label)
+            self._st_name_lbl.setStyleSheet("")
+        else:
+            self._st_name_lbl.setText("Нет статуса")
+            self._st_name_lbl.setStyleSheet("color: #888888;")
+
+    def _open_status_picker(self):
+        """Открывает StatusDialog; после OK сохраняет статус и обновляет превью."""
+        dlg = StatusDialog(
+            self.app_settings.value("my_status_icon", ""),
+            self.app_settings.value("my_status_text", ""),
+            parent=self,
+        )
+        if dlg.exec():
+            new_icon, new_text = dlg.get_result()
+            self.app_settings.setValue("my_status_icon", new_icon)
+            self.app_settings.setValue("my_status_text", new_text)
+            self._refresh_status_preview()
+            self._refresh_status_name()
+
+    def _clear_status(self):
+        """Сбрасывает статус в QSettings и обновляет превью."""
+        self.app_settings.setValue("my_status_icon", "")
+        self.app_settings.setValue("my_status_text", "")
+        self._refresh_status_preview()
+        self._refresh_status_name()
+
+    # ── Вспомогательные методы профиля ───────────────────────────────────────
 
     def open_av_sel(self):
         d = AvatarSelector(self)
@@ -1382,6 +1472,16 @@ class SettingsDialog(QDialog):
         self.mw.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — {self.mw.nick}")
         if hasattr(self.mw, 'net'):
             self.mw.net.update_user_info(self.mw.nick, self.mw.avatar)
+
+        # Синхронизируем статус: QSettings уже обновлён через _open_status_picker/_clear_status.
+        # Обновляем in-memory поля MainWindow и отправляем presence-обновление на сервер.
+        new_icon = self.app_settings.value("my_status_icon", "")
+        new_text = self.app_settings.value("my_status_text", "")
+        if hasattr(self.mw, '_my_status_icon'):
+            self.mw._my_status_icon = new_icon
+            self.mw._my_status_text = new_text
+        if hasattr(self.mw, 'net'):
+            self.mw.net.send_presence_update(new_icon, new_text)
 
         if os.path.exists("user_config.json"):
             try:
@@ -2051,3 +2151,197 @@ class SoundboardPanel(QWidget):
 
 # Backward-compatible alias
 SoundboardDialog = SoundboardPanel
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# StatusDialog — диалог выбора пользовательского статуса
+# ══════════════════════════════════════════════════════════════════════════════
+class StatusDialog(QDialog):
+    """
+    Диалог выбора «статуса дела» пользователя.
+
+    Структура:
+      ┌──────────────────────────────────────────┐
+      │  Выбери статус                           │
+      │  ┌───┐ ┌───┐ ┌───┐ ┌───┐ ┌───┐          │
+      │  │SVG│ │SVG│ │SVG│ │SVG│ │SVG│  ...     │
+      │  └───┘ └───┘ └───┘ └───┘ └───┘          │
+      │  Описание (необязательно):               │
+      │  [ Ушёл пить чай__________________ ]    │
+      │                          0 / 30         │
+      │  [ ✕ Убрать статус ] [Отмена] [Применить]│
+      └──────────────────────────────────────────┘
+
+    Иконки: assets/status/*.svg  (авто-сканирование).
+    Выбранная иконка подсвечивается зелёной рамкой.
+    «Убрать статус» → возвращает ('', '').
+    Tooltip каждой иконки = имя файла без расширения.
+    """
+
+    _COLS   = 5    # иконок в строке
+    _BTN_SZ = 48   # размер кнопки (px)
+
+    def __init__(self, current_icon: str = "", current_text: str = "", parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Мой статус")
+        self.setMinimumWidth(320)
+        self.setModal(True)
+
+        self._selected_icon: str = current_icon
+        self._icon_buttons: dict = {}   # filename → QPushButton
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 12)
+        root.setSpacing(10)
+
+        # ── Заголовок ──────────────────────────────────────────────────────────
+        title_lbl = QLabel("Выбери статус")
+        title_lbl.setStyleSheet("font-weight: bold; font-size: 15px;")
+        root.addWidget(title_lbl)
+
+        # ── Скролл-зона с иконками ─────────────────────────────────────────────
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setMaximumHeight(220)
+
+        icons_w = QWidget()
+        self._grid = QGridLayout(icons_w)
+        self._grid.setSpacing(6)
+        self._grid.setContentsMargins(0, 0, 0, 0)
+        self._load_icons(current_icon)
+        scroll.setWidget(icons_w)
+        root.addWidget(scroll)
+
+        # ── Текстовое описание ─────────────────────────────────────────────────
+        root.addWidget(QLabel("Описание (необязательно):"))
+
+        self._text_edit = QLineEdit()
+        self._text_edit.setMaxLength(30)
+        self._text_edit.setPlaceholderText("Например: ушёл пить чай...")
+        self._text_edit.setText(current_text)
+        self._text_edit.setStyleSheet("padding: 5px 8px; border-radius: 5px;")
+        root.addWidget(self._text_edit)
+
+        self._char_counter = QLabel(f"{len(current_text)} / 30")
+        self._char_counter.setStyleSheet("font-size: 11px; color: #888888;")
+        self._char_counter.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self._text_edit.textChanged.connect(self._on_text_changed)
+        root.addWidget(self._char_counter)
+
+        # ── Разделитель ────────────────────────────────────────────────────────
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        root.addWidget(sep)
+
+        # ── Кнопки ─────────────────────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+
+        btn_clear = QPushButton("✕  Убрать статус")
+        btn_clear.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_clear.setStyleSheet(
+            "QPushButton { background-color: #c0392b; color: white; "
+            "border-radius: 6px; padding: 6px 12px; }"
+            "QPushButton:hover { background-color: #e74c3c; }"
+        )
+        btn_clear.clicked.connect(self._on_clear)
+
+        btn_cancel = QPushButton("Отмена")
+        btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_cancel.setStyleSheet("border-radius: 6px; padding: 6px 12px;")
+        btn_cancel.clicked.connect(self.reject)
+
+        btn_ok = QPushButton("Применить")
+        btn_ok.setDefault(True)
+        btn_ok.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_ok.setStyleSheet(
+            "QPushButton { background-color: #2ecc71; color: white; font-weight: bold; "
+            "border-radius: 6px; padding: 6px 14px; }"
+            "QPushButton:hover { background-color: #27ae60; }"
+        )
+        btn_ok.clicked.connect(self.accept)
+
+        btn_row.addWidget(btn_clear)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_cancel)
+        btn_row.addWidget(btn_ok)
+        root.addLayout(btn_row)
+
+    # ── Внутренние методы ─────────────────────────────────────────────────────
+
+    def _load_icons(self, selected: str):
+        """Сканирует assets/status/ и заполняет сетку кнопками-иконками."""
+        status_dir = resource_path("assets/status")
+        svgs = []
+        if os.path.isdir(status_dir):
+            svgs = sorted(f for f in os.listdir(status_dir) if f.lower().endswith('.svg'))
+
+        if not svgs:
+            lbl = QLabel("Иконки статусов не найдены.\nПоложи SVG-файлы в assets/status/")
+            lbl.setStyleSheet("color: #888888; font-size: 12px;")
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._grid.addWidget(lbl, 0, 0)
+            return
+
+        for idx, fname in enumerate(svgs):
+            row, col = divmod(idx, self._COLS)
+            path = resource_path(f"assets/status/{fname}")
+
+            btn = QPushButton()
+            btn.setFixedSize(self._BTN_SZ, self._BTN_SZ)
+            btn.setIconSize(QSize(30, 30))
+            btn.setIcon(QIcon(path))
+            btn.setCheckable(True)
+            btn.setChecked(fname == selected)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setToolTip(fname.rsplit('.', 1)[0].replace('_', ' ').capitalize())
+
+            if fname == selected:
+                btn.setStyleSheet("border: 2px solid #2ecc71; border-radius: 8px;")
+
+            def _make_handler(fn, b):
+                def _toggled(checked):
+                    if checked:
+                        for other_fn, other_btn in self._icon_buttons.items():
+                            if other_fn != fn:
+                                try:
+                                    other_btn.setChecked(False)
+                                    other_btn.setStyleSheet("")
+                                except RuntimeError:
+                                    pass
+                        self._selected_icon = fn
+                        b.setStyleSheet("border: 2px solid #2ecc71; border-radius: 8px;")
+                    else:
+                        # Повторный клик по той же иконке → снимаем статус
+                        self._selected_icon = ""
+                        b.setStyleSheet("")
+                return _toggled
+
+            btn.toggled.connect(_make_handler(fname, btn))
+            self._grid.addWidget(btn, row, col)
+            self._icon_buttons[fname] = btn
+
+    def _on_text_changed(self, text: str):
+        n = len(text)
+        self._char_counter.setText(f"{n} / 30")
+        self._char_counter.setStyleSheet(
+            f"font-size: 11px; color: {'#e74c3c' if n >= 28 else '#888888'};"
+        )
+
+    def _on_clear(self):
+        """Сбросить статус и сразу закрыть диалог с пустым результатом."""
+        self._selected_icon = ""
+        for btn in self._icon_buttons.values():
+            try:
+                btn.setChecked(False)
+                btn.setStyleSheet("")
+            except RuntimeError:
+                pass
+        self._text_edit.clear()
+        self.accept()
+
+    def get_result(self) -> tuple:
+        """Возвращает (icon_filename, status_text) после exec()."""
+        return self._selected_icon, self._text_edit.text().strip()[:30]

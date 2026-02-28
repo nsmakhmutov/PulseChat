@@ -9,7 +9,8 @@ from config import (
     UDP_HEADER_STRUCT, UDP_HEADER_SIZE, FLAG_VIDEO, FLAG_STREAM_AUDIO,
     CMD_LOGIN, CMD_JOIN_ROOM, CMD_STREAM_START, CMD_STREAM_STOP,
     CMD_SYNC_USERS, CMD_SOUNDBOARD, FLAG_LOOPBACK_AUDIO, FLAG_STREAM_VOICES,
-    FLAG_WHISPER, STREAM_VOICE_HEADER_STRUCT, STREAM_VOICE_HEADER_SIZE
+    FLAG_WHISPER, STREAM_VOICE_HEADER_STRUCT, STREAM_VOICE_HEADER_SIZE,
+    CMD_UPDATE_PRESENCE,
 )
 
 
@@ -48,7 +49,7 @@ class SFUServer:
         self.udp_lock      = threading.Lock()
         self.watchers_lock = threading.Lock()
 
-        # conn → {nick, room, uid, avatar, ip, mute, deaf, is_streaming}
+        # conn → {nick, room, uid, avatar, ip, mute, deaf, is_streaming, status_icon, status_text}
         self.clients = {}
 
         # uid → addr  (UDP-адрес клиента)
@@ -280,11 +281,13 @@ class SFUServer:
                             client_avatar = msg.get('avatar', '1.svg')
                             with self.clients_lock:
                                 self.clients[conn] = {
-                                    'nick':   client_nick,
-                                    'room':   'General',
-                                    'uid':    uid,
-                                    'avatar': client_avatar,
-                                    'ip':     client_ip,
+                                    'nick':         client_nick,
+                                    'room':         'General',
+                                    'uid':          uid,
+                                    'avatar':       client_avatar,
+                                    'ip':           client_ip,
+                                    'status_icon':  '',   # имя SVG-файла из assets/status/ или ''
+                                    'status_text':  '',   # подсказка ≤ 30 символов или ''
                                 }
                             with self.udp_lock:
                                 self.uid_to_room[uid] = 'General'
@@ -320,6 +323,19 @@ class SFUServer:
                                 if conn in self.clients:
                                     self.clients[conn]['mute'] = msg.get('mute', False)
                                     self.clients[conn]['deaf'] = msg.get('deaf', False)
+                            self.send_global_state()
+
+                        elif action == CMD_UPDATE_PRESENCE:
+                            # Пользователь изменил свой «статус дела» (иконка + текст).
+                            # status_icon: имя SVG-файла из assets/status/ или '' (нет статуса).
+                            # status_text: произвольная подпись ≤ 30 символов или ''.
+                            # Сервер только хранит и ретранслирует — не валидирует содержимое.
+                            icon = msg.get('status_icon', '')[:64]   # ограничение длины имени файла
+                            text = msg.get('status_text', '')[:30]   # ≤ 30 символов согласно ТЗ
+                            with self.clients_lock:
+                                if conn in self.clients:
+                                    self.clients[conn]['status_icon'] = icon
+                                    self.clients[conn]['status_text'] = text
                             self.send_global_state()
 
                         elif action == CMD_STREAM_START:
@@ -481,6 +497,8 @@ class SFUServer:
                     'ip':           c.get('ip', ''),
                     'is_streaming': c.get('is_streaming', False),
                     'watchers':     watchers_list,
+                    'status_icon':  c.get('status_icon', ''),
+                    'status_text':  c.get('status_text', ''),
                 })
                 conns_snapshot.append(c_conn)
 

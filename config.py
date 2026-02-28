@@ -109,3 +109,10 @@ CMD_SOUNDBOARD    = 'play_soundboard'
 CMD_UPDATE_STATUS = 'update_status'
 CMD_STREAM_START  = 'stream_start'
 CMD_STREAM_STOP   = 'stream_stop'
+
+# Команда смены пользовательского статуса (иконка + текст).
+# Клиент → сервер при изменении статуса.
+# Сервер ретранслирует через sync_users всем участникам.
+# status_icon: имя SVG-файла из папки assets/status/ (или '' — нет статуса).
+# status_text: произвольный текст ≤ 30 символов (или '' — нет подсказки).
+CMD_UPDATE_PRESENCE = 'update_presence'

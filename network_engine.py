@@ -531,6 +531,25 @@ class NetworkClient(QObject):
     def send_status_update(self, mute, deaf):
         self.send_json({"action": "update_status", "mute": mute, "deaf": deaf})
 
+    def send_presence_update(self, status_icon: str, status_text: str):
+        """
+        Отправляет серверу новый «статус дела» пользователя.
+
+        status_icon: имя SVG-файла из assets/status/ (например 'afk.svg')
+                     или '' чтобы убрать статус.
+        status_text: произвольная подпись ≤ 30 символов, показывается как
+                     всплывающая подсказка (tooltip) рядом с иконкой статуса.
+                     Передавайте '' если подпись не нужна.
+
+        Сервер ретранслирует обновление всем участникам через sync_users,
+        и остальные увидят иконку рядом с ником этого пользователя.
+        """
+        self.send_json({
+            "action":      "update_presence",
+            "status_icon": status_icon,
+            "status_text": status_text,
+        })
+
     def set_video_engine(self, video):
         self.video = video
         print("[Net] VideoEngine registered")
