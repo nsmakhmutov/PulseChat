@@ -770,21 +770,31 @@ class SettingsDialog(QDialog):
 
         # ── Читаем известных пользователей ────────────────────────────────────
         # known_users.json: {ip: {nick, first_seen, last_seen}}
-        # Показываем только ники (без IP) — сортировка по алфавиту.
-        known_nicks: list[str] = []
+        # Строим список (nick, ip) — показываем актуальный ник, ключ — IP.
+        # Это позволяет горячим клавишам работать даже после смены ника у пользователя:
+        # при следующем открытии настроек комбобокс покажет уже новый ник по тому же IP.
+        known_users_by_ip: dict = {}   # ip → nick
         try:
             if os.path.exists("known_users.json"):
                 with open("known_users.json", "r", encoding="utf-8") as f:
                     registry: dict = json.load(f)
-                known_nicks = sorted(
-                    {v.get("nick", "") for v in registry.values() if v.get("nick", "")},
-                    key=str.lower,
-                )
+                known_users_by_ip = {
+                    ip: v.get("nick", "")
+                    for ip, v in registry.items()
+                    if v.get("nick", "")
+                }
         except Exception:
             pass
 
+        # Список (display_nick, ip), отсортированный по нику (без учёта регистра)
+        known_users_list: list[tuple[str, str]] = sorted(
+            known_users_by_ip.items(),   # (ip, nick) → swap to (nick, ip) below
+            key=lambda kv: kv[1].lower()  # sort by nick (value)
+        )
+        # known_users_by_ip.items() → (ip, nick); после sort переворачиваем для удобства
+        known_users_list = [(nick, ip) for ip, nick in known_users_list]
+
         EMPTY = "— не выбрано —"
-        combo_items = [EMPTY] + known_nicks
 
         # ── Заголовки колонок ─────────────────────────────────────────────────
         hdr = QHBoxLayout()
@@ -816,17 +826,33 @@ class SettingsDialog(QDialog):
             num.setStyleSheet("color: #888; font-size: 12px;")
 
             # Комбобокс — собеседник
+            # userData каждого item = IP пользователя (пустая строка для «не выбрано»)
             cb = QComboBox()
             cb.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
             cb.setMinimumWidth(150)
-            for item in combo_items:
-                cb.addItem(item)
+            cb.addItem(EMPTY, "")  # index 0: не выбрано, userData=""
+            for nick_text, ip_addr in known_users_list:
+                cb.addItem(nick_text, ip_addr)  # userData=ip
 
+            # Восстанавливаем сохранённый выбор:
+            # Приоритет — по IP: ник мог смениться, но IP остаётся тем же.
+            saved_ip   = self.app_settings.value(f"whisper_slot_{i}_ip",   "")
             saved_nick = self.app_settings.value(f"whisper_slot_{i}_nick", "")
-            if saved_nick and saved_nick in known_nicks:
-                cb.setCurrentText(saved_nick)
-            else:
-                cb.setCurrentIndex(0)  # «— не выбрано —»
+
+            selected = False
+            if saved_ip:
+                # Ищем item с совпадающим IP в userData
+                for j in range(cb.count()):
+                    if cb.itemData(j) == saved_ip:
+                        cb.setCurrentIndex(j)
+                        selected = True
+                        break
+            if not selected and saved_nick:
+                # Фолбэк: старые сохранения без IP — ищем по нику
+                for j in range(1, cb.count()):
+                    if cb.itemText(j) == saved_nick:
+                        cb.setCurrentIndex(j)
+                        break
 
             # Поле горячей клавиши
             le = QLineEdit()
@@ -1084,10 +1110,16 @@ class SettingsDialog(QDialog):
 
         # Сохраняем слоты PTT-шёпота (до 5)
         for i, (cb, le) in enumerate(self._w_slots):
-            # Если выбрано «не выбрано» (index 0) — сохраняем пустую строку
-            nick = "" if cb.currentIndex() == 0 else cb.currentText()
+            # Если выбрано «не выбрано» (index 0) — сохраняем пустые строки
+            if cb.currentIndex() == 0:
+                nick = ""
+                ip   = ""
+            else:
+                nick = cb.currentText()
+                ip   = cb.currentData() or ""  # userData = IP
             hk   = le.text().strip()
             s.setValue(f"whisper_slot_{i}_nick", nick)
+            s.setValue(f"whisper_slot_{i}_ip",   ip)
             s.setValue(f"whisper_slot_{i}_hk",   hk)
 
         self.mw.nick = self.ed_nick.text()

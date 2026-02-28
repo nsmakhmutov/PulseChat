@@ -7,7 +7,116 @@ import opuslib
 import heapq
 import struct
 import time
-from scipy.signal import butter, sosfilt, sosfilt_zi
+# ── Встроенная замена scipy.signal (butter / sosfilt / sosfilt_zi) ─────────────
+# Причина: scipy.signal при импорте транзитивно подтягивает scipy.stats, которая
+# содержит exec()-генерацию в _distn_infrastructure.py. В замороженном exe
+# (PyInstaller) имя 'obj' теряется из exec()-контекста → NameError на старте.
+# collect_submodules/collect_data_files не устраняют эту проблему.
+#
+# Данная реализация покрывает ровно три вызова этого файла:
+#   butter(4, 1200, btype='low', fs=48000, output='sos')
+#   sosfilt(sos, x, zi=zi)
+#   sosfilt_zi(sos)
+# Алгоритм: аналоговый прототип Баттерворта → bilinear transform → SOS.
+
+def butter(order: int, cutoff_hz, btype: str = 'low',
+           fs: float = None, output: str = 'ba') -> np.ndarray:
+    """
+    Butterworth LP-фильтр → SOS матрица.
+    Поддерживает только btype='low', output='sos'.
+    """
+    if btype != 'low' or output != 'sos':
+        raise NotImplementedError("butter(): только btype='low', output='sos'")
+    if fs is None:
+        raise ValueError("butter(): требуется параметр fs")
+
+    Wn  = float(cutoff_hz) / (fs * 0.5)          # нормированная (0..1, 1=Найквист)
+    wa  = 2.0 * np.tan(np.pi * Wn * 0.5)         # pre-warp → аналоговая частота
+
+    # Аналоговые полюсы Баттерворта (левая полуплоскость, |p|=1)
+    k       = np.arange(order)
+    poles_a = np.exp(1j * np.pi * (2.0*k + order + 1.0) / (2.0 * order))
+    poles_a = poles_a * wa                        # масштаб по частоте среза
+
+    # Bilinear transform z = (1 + s/2) / (1 - s/2)
+    # Все нули аналогового LP → z = -1 после преобразования
+    z_d    = (1.0 + 0.5*poles_a) / (1.0 - 0.5*poles_a)
+    zeros_d = np.full(order, -1.0 + 0j)
+
+    # Сортируем по убыванию Im, чтобы сопряжённые пары стояли рядом
+    idx = np.argsort(-z_d.imag)
+    z_d = z_d[idx]
+
+    n_sec = order // 2
+    sos   = np.zeros((n_sec, 6))
+
+    for i in range(n_sec):
+        p1, p2 = z_d[i],      z_d[-(i+1)]        # сопряжённая пара полюсов
+        z1, z2 = zeros_d[2*i], zeros_d[2*i+1]    # нули (-1, -1)
+
+        b = np.real(np.poly([z1, z2]))             # числитель:  [1, -(z1+z2), z1*z2]
+        a = np.real(np.poly([p1, p2]))             # знаменатель:[1, -(p1+p2), p1*p2]
+
+        sos[i, :3] = b
+        sos[i, 3:] = a
+
+    # Нормируем общий DC-gain (H(z=1)) к 1.0.
+    # Считаем текущий gain и распределяем коррекцию равномерно по секциям.
+    section_gains = np.array([
+        np.sum(sos[i, :3]) / np.sum(sos[i, 3:]) for i in range(n_sec)
+    ])
+    total_gain = np.prod(section_gains)
+    per_sec_corr = total_gain ** (1.0 / n_sec)
+    for i in range(n_sec):
+        sos[i, :3] /= per_sec_corr
+
+    return sos
+
+
+def sosfilt(sos: np.ndarray, x: np.ndarray,
+            zi: np.ndarray = None):
+    """
+    Применяет SOS-фильтр к сигналу x. Возвращает (y, zf).
+    Direct Form II Transposed (DF2T) — совместимо с scipy.signal.sosfilt.
+    """
+    x   = np.asarray(x, dtype=np.float64)
+    n_s = sos.shape[0]
+    zf  = (np.zeros((n_s, 2), dtype=np.float64)
+           if zi is None else np.array(zi, dtype=np.float64))
+    y   = x.copy()
+
+    for i in range(n_s):
+        b0, b1, b2, _, a1, a2 = sos[i]
+        s1, s2 = zf[i, 0], zf[i, 1]
+        out = np.empty_like(y)
+        for n in range(len(y)):                    # hot-path: 960 итераций × 2 секции
+            v      = y[n]
+            out[n] = b0 * v + s1
+            s1     = b1 * v - a1 * out[n] + s2
+            s2     = b2 * v - a2 * out[n]
+        zf[i, 0], zf[i, 1] = s1, s2
+        y = out
+
+    return y, zf
+
+
+def sosfilt_zi(sos: np.ndarray) -> np.ndarray:
+    """
+    Начальные условия для sosfilt (unit step, без переходного процесса).
+    DF2T steady-state при x=1: zi[i] = [s1_ss, s2_ss] для каждой секции.
+    """
+    n_s  = sos.shape[0]
+    zi   = np.zeros((n_s, 2), dtype=np.float64)
+    scale = 1.0                                    # накопленный gain от предыдущих секций
+
+    for i in range(n_s):
+        b0, b1, b2, _, a1, a2 = sos[i]
+        K       = (b0 + b1 + b2) / (1.0 + a1 + a2)   # DC gain этой секции
+        zi[i,1] = (b2 - a2 * K) * scale               # s2 в steady-state
+        zi[i,0] = (b1 - a1 * K) * scale + zi[i,1]     # s1 в steady-state
+        scale  *= K                                    # выход → вход следующей секции
+
+    return zi
 from PyQt6.QtCore import QObject, pyqtSignal, QSettings
 from config import *
 
@@ -745,42 +854,63 @@ class AudioHandler(QObject):
         print(f"[Audio] VAD threshold set to {threshold:.4f} (slider={slider_val})")
 
     def find_device_index_by_name(self, name, is_input=True):
-        if not name: return None
+        direction = "INPUT" if is_input else "OUTPUT"
+        if not name:
+            print(f"[DEBUG] find_device_index_by_name: {direction} name=None → вернём None (дефолт системы)", flush=True)
+            return None
         devices = sd.query_devices()
+        print(f"[DEBUG] find_device_index_by_name: ищем {direction} '{name}'", flush=True)
         for i, d in enumerate(devices):
             try:
                 api_name = sd.query_hostapis(d['hostapi'])['name']
                 full_name = f"{d['name']} ({api_name})"
                 if full_name.strip() == name.strip():
-                    if is_input and d['max_input_channels'] > 0: return i
-                    if not is_input and d['max_output_channels'] > 0: return i
+                    if is_input and d['max_input_channels'] > 0:
+                        print(f"[DEBUG] find_device_index_by_name: найдено {direction} idx={i} '{full_name}'", flush=True)
+                        return i
+                    if not is_input and d['max_output_channels'] > 0:
+                        print(f"[DEBUG] find_device_index_by_name: найдено {direction} idx={i} '{full_name}'", flush=True)
+                        return i
             except:
                 continue
+        print(f"[DEBUG] find_device_index_by_name: {direction} '{name}' НЕ НАЙДЕНО → None (дефолт)", flush=True)
         return None
 
     def start(self, input_name=None, output_name=None):
-        if self.my_uid == 0: return
+        print(f"[DEBUG] AudioHandler.start: BEGIN — input_name={input_name!r}, output_name={output_name!r}", flush=True)
+        if self.my_uid == 0:
+            print("[DEBUG] AudioHandler.start: my_uid==0, выход", flush=True)
+            return
+        print("[DEBUG] AudioHandler.start: вызов stop()...", flush=True)
         self.stop()
         time.sleep(0.1)
+        print("[DEBUG] AudioHandler.start: stop() выполнен", flush=True)
 
+        print("[DEBUG] AudioHandler.start: поиск устройств...", flush=True)
         in_idx = self.find_device_index_by_name(input_name, True)
         out_idx = self.find_device_index_by_name(output_name, False)
+        print(f"[DEBUG] AudioHandler.start: in_idx={in_idx}, out_idx={out_idx}", flush=True)
 
         self._is_running.set()
         try:
+            print("[DEBUG] AudioHandler.start: создание sd.Stream...", flush=True)
             self.stream = sd.Stream(
                 device=(in_idx, out_idx),
                 samplerate=SAMPLE_RATE, blocksize=CHUNK_SIZE,
                 dtype='float32', channels=CHANNELS,
                 callback=self.audio_callback
             )
+            print("[DEBUG] AudioHandler.start: sd.Stream создан, вызов stream.start()...", flush=True)
             self.stream.start()
+            print("[DEBUG] AudioHandler.start: stream.start() выполнен", flush=True)
             self._pkt_thread = threading.Thread(target=self._packet_processor_loop, daemon=True)
             self._stream_pkt_thread = threading.Thread(target=self._stream_packet_processor_loop, daemon=True)
             self._pkt_thread.start()
             self._stream_pkt_thread.start()
+            print("[DEBUG] AudioHandler.start: рабочие потоки запущены — DONE", flush=True)
         except Exception as e:
-            print(f"[Audio] Ошибка старта: {e}")
+            import traceback
+            print(f"[DEBUG] AudioHandler.start: EXCEPTION:\n{traceback.format_exc()}", flush=True)
             self._is_running.clear()
 
     def stop(self):
@@ -962,6 +1092,13 @@ class AudioHandler(QObject):
                 pass
 
     def audio_callback(self, indata, outdata, frames, time_info, status):
+        # Логируем только первый вызов — подтверждает что callback запустился
+        if not getattr(self, '_cb_first_logged', False):
+            self._cb_first_logged = True
+            print("[DEBUG] audio_callback: ПЕРВЫЙ ВЫЗОВ — PortAudio callback работает", flush=True)
+        if status:
+            print(f"[DEBUG] audio_callback: status={status}", flush=True)
+
         if not self._is_running.is_set():
             outdata.fill(0)
             return

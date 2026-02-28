@@ -738,12 +738,13 @@ class MainWindow(QMainWindow):
 
             # ── PTT-хоткеи шёпота (слоты 0–4) ────────────────────────────────
             for i in range(5):
+                ip   = self.app_settings.value(f"whisper_slot_{i}_ip",   "")
                 nick = self.app_settings.value(f"whisper_slot_{i}_nick", "")
                 hk   = self.app_settings.value(f"whisper_slot_{i}_hk",   "")
-                if not nick or not hk:
+                if (not ip and not nick) or not hk:
                     continue
 
-                def _make_ptt(target_nick: str, hotkey_str: str):
+                def _make_ptt(target_ip: str, target_nick: str, hotkey_str: str):
                     active = [False]
 
                     # Триггер-клавиша = последняя в комбо: "alt+1" → "1", "f8" → "f8"
@@ -754,19 +755,30 @@ class MainWindow(QMainWindow):
                         if active[0]:
                             return  # автоповтор ОС — игнорируем
                         uid = None
-                        for u_uid, data in self.known_uids.items():
-                            try:
-                                if data['item'].text(0).strip() == target_nick:
-                                    uid = u_uid
-                                    break
-                            except Exception:
-                                pass
+                        # ── Приоритет 1: поиск по IP (работает при любом нике) ──
+                        if target_ip:
+                            with self.audio.users_lock:
+                                for u_uid, u_ip in self.audio.uid_to_ip.items():
+                                    if u_ip == target_ip:
+                                        uid = u_uid
+                                        break
+                        # ── Приоритет 2: фолбэк по нику (для старых сохранений) ─
+                        if uid is None and target_nick:
+                            for u_uid, data in self.known_uids.items():
+                                try:
+                                    if data['item'].text(0).strip() == target_nick:
+                                        uid = u_uid
+                                        break
+                                except Exception:
+                                    pass
                         if uid is not None:
                             active[0] = True
                             self.audio.start_whisper(uid)
-                            print(f"[HK] Whisper PTT START → {target_nick} (uid={uid})")
+                            display = target_nick or target_ip
+                            print(f"[HK] Whisper PTT START → {display} (uid={uid})")
                         else:
-                            print(f"[HK] Whisper PTT: '{target_nick}' не найден онлайн")
+                            display = target_nick or target_ip
+                            print(f"[HK] Whisper PTT: '{display}' не найден онлайн")
 
                     def _raw_key_up(e):
                         """
@@ -782,17 +794,18 @@ class MainWindow(QMainWindow):
                                 and e.name.lower() == trigger_key):
                             active[0] = False
                             self.audio.stop_whisper()
-                            print(f"[HK] Whisper PTT STOP  ← {target_nick}")
+                            display = target_nick or target_ip
+                            print(f"[HK] Whisper PTT STOP  ← {display}")
 
                     return _press, _raw_key_up
 
-                _press, _raw_key_up = _make_ptt(nick, hk)
+                _press, _raw_key_up = _make_ptt(ip, nick, hk)
                 try:
                     # Только press через add_hotkey (обрабатывает модификаторы корректно)
                     keyboard.add_hotkey(hk, _press, trigger_on_release=False, suppress=False)
                     # Release через raw hook — надёжный физический key-up
                     keyboard.hook(_raw_key_up, suppress=False)
-                    print(f"[HK] Whisper slot {i}: '{nick}' → '{hk}' (trigger_key='{hk.replace(' ','').split('+')[-1].lower()}')")
+                    print(f"[HK] Whisper slot {i}: ip='{ip}' nick='{nick}' → '{hk}' (trigger_key='{hk.replace(' ','').split('+')[-1].lower()}')")
                 except Exception as e:
                     print(f"[HK] Whisper slot {i} error ({hk!r}): {e}")
 
@@ -885,17 +898,36 @@ class MainWindow(QMainWindow):
             self.play_notification("mute" if is_d else "unmute")
 
     def on_connected(self, msg):
-        self.audio.my_uid = msg['uid']
-        self.audio.start(self.app_settings.value("device_in_name"), self.app_settings.value("device_out_name"))
-        self.play_notification("self_move")
-        self._stack.setCurrentIndex(0)
-        self._btn_reconnect.setEnabled(True)
+        print(f"[DEBUG] on_connected: START — uid={msg.get('uid')}", flush=True)
+        try:
+            self.audio.my_uid = msg['uid']
+            print(f"[DEBUG] on_connected: my_uid установлен = {self.audio.my_uid}", flush=True)
+
+            print(f"[DEBUG] on_connected: вызов audio.start() ...", flush=True)
+            self.audio.start(
+                self.app_settings.value("device_in_name"),
+                self.app_settings.value("device_out_name")
+            )
+            print(f"[DEBUG] on_connected: audio.start() завершён", flush=True)
+
+            self.play_notification("self_move")
+            print(f"[DEBUG] on_connected: play_notification выполнен", flush=True)
+
+            self._stack.setCurrentIndex(0)
+            print(f"[DEBUG] on_connected: setCurrentIndex(0) выполнен", flush=True)
+
+            self._btn_reconnect.setEnabled(True)
+            print(f"[DEBUG] on_connected: DONE", flush=True)
+        except Exception as e:
+            import traceback
+            print(f"[DEBUG] on_connected: EXCEPTION:\n{traceback.format_exc()}", flush=True)
 
     def on_video_frame(self, uid, q_image):
         if uid in self.stream_windows and self.stream_windows[uid].isVisible():
             self.stream_windows[uid].update_frame(q_image)
 
     def update_user_tree(self, users_map):
+        print(f"[DEBUG] update_user_tree: START — rooms={list(users_map.keys())}", flush=True)
         user_rooms: dict = {}
         all_active_uids = set() # Исправление 2.1: собираем всех активных пользователей
 
@@ -1006,76 +1038,81 @@ class MainWindow(QMainWindow):
 
         self.tree.expandAll()
         self._update_known_users_registry(users_map)
+        print(f"[DEBUG] update_user_tree: DONE", flush=True)
 
     def refresh_ui(self):
-        ping = self.net.current_ping
-        self.ping_lbl.setText(f"Ping: {ping} ms")
-        col = "#2ecc71" if ping < 60 else "#f1c40f" if ping < 150 else "#e74c3c"
-        self.ping_lbl.setStyleSheet(f"color: {col}; font-weight: bold; font-size: 13px; margin-right: 10px;")
+        try:
+            ping = self.net.current_ping
+            self.ping_lbl.setText(f"Ping: {ping} ms")
+            col = "#2ecc71" if ping < 60 else "#f1c40f" if ping < 150 else "#e74c3c"
+            self.ping_lbl.setStyleSheet(f"color: {col}; font-weight: bold; font-size: 13px; margin-right: 10px;")
 
-        now = time.time()
+            now = time.time()
 
-        # Обновляем кэш цветов при смене темы (меняется редко)
-        theme_now = self.app_settings.value("theme", "Светлая")
-        if theme_now != self._cache_theme:
-            self._cache_theme = theme_now
-            self._c_def  = QColor("#ecf0f1") if theme_now == "Темная" else QColor("#444444")
-            self._br_def = QBrush(self._c_def)   # пересоздаём кисть при смене темы
+            # Обновляем кэш цветов при смене темы (меняется редко)
+            theme_now = self.app_settings.value("theme", "Светлая")
+            if theme_now != self._cache_theme:
+                self._cache_theme = theme_now
+                self._c_def  = QColor("#ecf0f1") if theme_now == "Темная" else QColor("#444444")
+                self._br_def = QBrush(self._c_def)   # пересоздаём кисть при смене темы
 
-        c_talk   = self._c_talk
-        c_mute   = self._c_mute
-        c_stream = self._c_stream
-        c_def    = self._c_def
-        icon_size = self._icon_size
+            c_talk   = self._c_talk
+            c_mute   = self._c_mute
+            c_stream = self._c_stream
+            c_def    = self._c_def
+            icon_size = self._icon_size
 
-        with self.audio.users_lock:
-            me_talk = (now - self.audio.last_voice_time < 0.3) and not self.audio.is_muted
+            with self.audio.users_lock:
+                me_talk = (now - self.audio.last_voice_time < 0.3) and not self.audio.is_muted
 
-            for uid, data in self.known_uids.items():
-                item = data['item']
-                is_m = data['is_m']
-                is_d = data['is_d']
-                is_s = data['is_s']
+                for uid, data in self.known_uids.items():
+                    item = data['item']
+                    is_m = data['is_m']
+                    is_d = data['is_d']
+                    is_s = data['is_s']
 
-                curr_s = self.is_streaming if uid == self.audio.my_uid else is_s
-                curr_d = self.audio.is_deafened if uid == self.audio.my_uid else is_d
+                    curr_s = self.is_streaming if uid == self.audio.my_uid else is_s
+                    curr_d = self.audio.is_deafened if uid == self.audio.my_uid else is_d
 
-                if curr_s:
-                    item.setData(1, Qt.ItemDataRole.DecorationRole, self._px_live)
-                else:
-                    item.setData(1, Qt.ItemDataRole.DecorationRole, None)
-
-                if curr_d:
-                    item.setData(2, Qt.ItemDataRole.DecorationRole, self._px_vol_off)
-                else:
-                    item.setData(2, Qt.ItemDataRole.DecorationRole, None)
-
-                if uid == self.audio.my_uid:
-                    talk = me_talk
-                    if self.audio.is_muted:
-                        item.setData(3, Qt.ItemDataRole.DecorationRole, self._px_mic_off)
+                    if curr_s:
+                        item.setData(1, Qt.ItemDataRole.DecorationRole, self._px_live)
                     else:
-                        item.setData(3, Qt.ItemDataRole.DecorationRole, None)
-                else:
-                    u_audio = self.audio.remote_users.get(uid)
-                    talk = (now - u_audio.last_packet_time < 0.3) if u_audio else False
-                    is_locally_muted = u_audio.is_locally_muted if u_audio else False
+                        item.setData(1, Qt.ItemDataRole.DecorationRole, None)
 
-                    if is_locally_muted:
-                        item.setData(3, Qt.ItemDataRole.DecorationRole, self._px_ban)
-                    elif is_m:
-                        item.setData(3, Qt.ItemDataRole.DecorationRole, self._px_mic_off)
+                    if curr_d:
+                        item.setData(2, Qt.ItemDataRole.DecorationRole, self._px_vol_off)
                     else:
-                        item.setData(3, Qt.ItemDataRole.DecorationRole, None)
+                        item.setData(2, Qt.ItemDataRole.DecorationRole, None)
 
-                if talk:
-                    item.setForeground(0, self._br_talk)
-                elif curr_s:
-                    item.setForeground(0, self._br_stream)
-                elif curr_d or is_m or (uid != self.audio.my_uid and u_audio and is_locally_muted):
-                    item.setForeground(0, self._br_mute)
-                else:
-                    item.setForeground(0, self._br_def)
+                    if uid == self.audio.my_uid:
+                        talk = me_talk
+                        if self.audio.is_muted:
+                            item.setData(3, Qt.ItemDataRole.DecorationRole, self._px_mic_off)
+                        else:
+                            item.setData(3, Qt.ItemDataRole.DecorationRole, None)
+                    else:
+                        u_audio = self.audio.remote_users.get(uid)
+                        talk = (now - u_audio.last_packet_time < 0.3) if u_audio else False
+                        is_locally_muted = u_audio.is_locally_muted if u_audio else False
+
+                        if is_locally_muted:
+                            item.setData(3, Qt.ItemDataRole.DecorationRole, self._px_ban)
+                        elif is_m:
+                            item.setData(3, Qt.ItemDataRole.DecorationRole, self._px_mic_off)
+                        else:
+                            item.setData(3, Qt.ItemDataRole.DecorationRole, None)
+
+                    if talk:
+                        item.setForeground(0, self._br_talk)
+                    elif curr_s:
+                        item.setForeground(0, self._br_stream)
+                    elif curr_d or is_m or (uid != self.audio.my_uid and u_audio and is_locally_muted):
+                        item.setForeground(0, self._br_mute)
+                    else:
+                        item.setForeground(0, self._br_def)
+        except Exception as _e:
+            import traceback
+            print(f"[DEBUG] refresh_ui: EXCEPTION:\n{traceback.format_exc()}", flush=True)
 
     def on_tree_double_click(self, item, col):
         if item.data(0, Qt.ItemDataRole.UserRole) == "ROOM_HEADER":

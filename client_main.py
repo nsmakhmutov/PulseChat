@@ -3,6 +3,25 @@ import json
 import ctypes
 import sys
 import socket
+import traceback
+import faulthandler
+
+# ── CRASH DIAGNOSTICS ────────────────────────────────────────────────────────
+# faulthandler пишет нативный C-стектрейс при SIGSEGV / STATUS_STACK_BUFFER_OVERRUN
+# прямо в файл — даже если Python уже не работает.
+_crash_log = open("crash_native.log", "w", buffering=1)
+faulthandler.enable(file=_crash_log)
+
+# Глобальный перехват необработанных Python-исключений → в файл + консоль
+def _global_excepthook(exc_type, exc_value, exc_tb):
+    msg = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    print(f"[CRASH] Необработанное исключение:\n{msg}", flush=True)
+    with open("crash_python.log", "a", encoding="utf-8") as f:
+        f.write(msg)
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+sys.excepthook = _global_excepthook
+print("[DEBUG] faulthandler активирован → crash_native.log", flush=True)
 
 def resource_path(relative_path):
     """ Получает абсолютный путь к ресурсам, работает для dev и для PyInstaller """
@@ -32,13 +51,14 @@ except Exception:
 
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QLineEdit, QPushButton, QLabel, QCheckBox, QFrame,
-                             QSizePolicy)
-from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal
+                             QSizePolicy, QProgressBar)
+from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QObject
 from PyQt6.QtGui import QIcon, QSurfaceFormat, QPixmap
 
 from config import resource_path, DEFAULT_PORT_TCP
 from ui_main import MainWindow
 from ui_dialogs import AvatarSelector
+from updater import check_for_updates_async, download_and_install
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -93,6 +113,25 @@ class ConnectWorker(QThread):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Сигналы апдейтера (thread-safe: фоновый поток → Qt UI-поток)
+# ══════════════════════════════════════════════════════════════════════════════
+class _UpdaterSignals(QObject):
+    """
+    Мост между callback'ами updater.py (вызываются из фонового потока)
+    и слотами ConnectingScreen (должны работать в UI-потоке).
+
+    PyQt6 гарантирует, что сигналы, испущенные из любого потока,
+    доставляются в UI-поток через event loop — никаких мьютексов не нужно.
+    """
+    update_found = pyqtSignal(str, str)   # (new_version, download_url)
+    no_update    = pyqtSignal()
+    check_error  = pyqtSignal(str)        # message
+    dl_progress  = pyqtSignal(int)        # 0..100
+    dl_done      = pyqtSignal()
+    dl_error     = pyqtSignal(str)        # message
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Экран подключения
 # ══════════════════════════════════════════════════════════════════════════════
 class ConnectingScreen(QWidget):
@@ -105,6 +144,16 @@ class ConnectingScreen(QWidget):
         event loop не завершается.
       - show_login испускается ДО hide(), чтобы новое окно
         успело появиться раньше чем это исчезнет.
+
+    НОВЫЙ ПОТОК (auto-update):
+      _start_probe()
+        └─► _check_for_update_then_connect()
+              ├─ on_update_found → _on_update_found() → _start_download()
+              │     ├─ on_progress → progressbar
+              │     ├─ on_done    → updater вызывает sys.exit(0)
+              │     └─ on_error   → показываем ошибку + кнопку «Пропустить»
+              ├─ on_no_update  → _do_tcp_probe()   (прежняя логика)
+              └─ on_error      → _do_tcp_probe()   (fail-safe: не блокируем)
     """
     show_login = pyqtSignal(str, str, str)   # ip, nick, avatar
 
@@ -116,16 +165,30 @@ class ConnectingScreen(QWidget):
         self._worker: ConnectWorker | None = None
         self._main_window = None  # держим ссылку — GC не убьёт MainWindow
 
+        # Флаг: проверка обновлений уже выполнялась в этой сессии.
+        # При повторном нажатии «Повторить» (retry) мы НЕ проверяем ещё раз —
+        # пользователь просто ждёт сервер, не нужно снова тратить ~1-2 сек.
+        self._update_checked: bool = False
+
+        # Сигналы для безопасного взаимодействия updater-потока с UI
+        self._upd_sigs = _UpdaterSignals()
+        self._upd_sigs.update_found.connect(self._on_update_found)
+        self._upd_sigs.no_update.connect(self._on_no_update)
+        self._upd_sigs.check_error.connect(self._on_update_check_error)
+        self._upd_sigs.dl_progress.connect(self._on_dl_progress)
+        self._upd_sigs.dl_done.connect(self._on_dl_done)
+        self._upd_sigs.dl_error.connect(self._on_dl_error)
+
         self._build_ui()
         self._start_probe()
 
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────────
     # UI
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────────
     def _build_ui(self):
         from version import APP_NAME, APP_VERSION
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
-        self.setFixedSize(420, 430)
+        self.setFixedSize(420, 480)   # +50px для progressbar и кнопки пропуска
         self.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
 
         root = QVBoxLayout(self)
@@ -140,7 +203,7 @@ class ConnectingScreen(QWidget):
         root.addWidget(self.lbl_img)
 
         # ── Статус ────────────────────────────────────────────────────────
-        self.lbl_status = QLabel("Подключение к серверу...")
+        self.lbl_status = QLabel("Проверка обновлений...")
         self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_status.setWordWrap(True)
         self.lbl_status.setStyleSheet(
@@ -153,6 +216,27 @@ class ConnectingScreen(QWidget):
         self.lbl_ip.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_ip.setStyleSheet("color: #7f8c8d; font-size: 13px;")
         root.addWidget(self.lbl_ip)
+
+        # ── Прогресс-бар (скачивание обновления) ──────────────────────────
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFormat("%p%")
+        self.progress_bar.setFixedHeight(22)
+        self.progress_bar.setStyleSheet(
+            "QProgressBar {"
+            "  border: 1px solid #bdc3c7; border-radius: 5px;"
+            "  background: #ecf0f1; text-align: center; font-size: 12px;"
+            "}"
+            "QProgressBar::chunk {"
+            "  background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+            "    stop:0 #27ae60, stop:1 #2ecc71);"
+            "  border-radius: 4px;"
+            "}"
+        )
+        self.progress_bar.hide()
+        root.addWidget(self.progress_bar)
 
         # ── Блок ошибки ────────────────────────────────────────────────────
         self.frm_error = QFrame()
@@ -172,7 +256,7 @@ class ConnectingScreen(QWidget):
         self.frm_error.hide()
         root.addWidget(self.frm_error)
 
-        # ── Кнопки (скрыты до провала) ──────────────────────────────────
+        # ── Кнопки ──────────────────────────────────────────────────────
         btn_row = QHBoxLayout()
         btn_row.setSpacing(10)
 
@@ -200,12 +284,26 @@ class ConnectingScreen(QWidget):
 
         root.addLayout(btn_row)
 
-        # Начальная картинка — логотип / заглушка
+        # ── Кнопка «Пропустить обновление» (отдельная строка) ─────────────
+        # Показывается только если скачивание упало, чтобы пользователь
+        # не завис и мог войти на сервер.
+        self.btn_skip_update = QPushButton("⏭️  Пропустить обновление и войти")
+        self.btn_skip_update.setStyleSheet(
+            "QPushButton { background: #7f8c8d; color: white; height: 36px;"
+            " border-radius: 7px; font-size: 13px; font-weight: bold; }"
+            "QPushButton:hover { background: #95a5a6; }"
+            "QPushButton:pressed { background: #616a6b; }"
+        )
+        self.btn_skip_update.hide()
+        self.btn_skip_update.clicked.connect(self._skip_update)
+        root.addWidget(self.btn_skip_update)
+
+        # Начальная картинка — логотип
         self._set_image("connecting")
 
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────────
     # Картинка
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────────
     def _set_image(self, state: str):
         """
         state = "connecting" | "fail"
@@ -253,11 +351,140 @@ class ConnectingScreen(QWidget):
                 self.lbl_img.setText("🔄")
                 self.lbl_img.setStyleSheet("font-size: 72px;")
 
-    # ------------------------------------------------------------------
-    # Probe
-    # ------------------------------------------------------------------
+    # ──────────────────────────────────────────────────────────────────────────
+    # Главная точка входа (вызывается при старте и при нажатии «Повторить»)
+    # ──────────────────────────────────────────────────────────────────────────
     def _start_probe(self):
-        """Запускает или перезапускает TCP probe."""
+        """
+        Точка входа для каждой попытки подключения.
+
+        Если обновления ещё не проверялись в этой сессии — сначала проверяем.
+        При повторных попытках (retry после падения сервера) проверку пропускаем
+        и сразу идём к TCP-probe, чтобы не раздражать пользователя лишней паузой.
+        """
+        # Сбрасываем UI в исходное состояние
+        self.frm_error.hide()
+        self.btn_retry.hide()
+        self.btn_change_ip.hide()
+        self.btn_skip_update.hide()
+        self.progress_bar.hide()
+        self.progress_bar.setValue(0)
+        self.lbl_ip.setText(f"Адрес:  {self.ip}")
+        self._set_image("connecting")
+
+        if not self._update_checked:
+            # Первый запуск — проверяем обновления перед подключением
+            self._check_for_update_then_connect()
+        else:
+            # Повторная попытка — сразу к TCP-probe
+            self._do_tcp_probe()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # ШАГ 1: Проверка обновлений
+    # ──────────────────────────────────────────────────────────────────────────
+    def _check_for_update_then_connect(self):
+        """Запускает проверку обновлений в фоне. Результат придёт через сигналы."""
+        self.lbl_status.setText("Проверка обновлений...")
+        self.lbl_status.setStyleSheet(
+            "font-size: 18px; font-weight: bold; color: #2c3e50;"
+        )
+
+        sigs = self._upd_sigs
+        check_for_updates_async(
+            on_update_found=lambda v, u: sigs.update_found.emit(v, u),
+            on_no_update=lambda: sigs.no_update.emit(),
+            on_error=lambda msg: sigs.check_error.emit(msg),
+        )
+
+    def _on_no_update(self):
+        """Обновлений нет — переходим к TCP-probe."""
+        self._update_checked = True
+        print("[Updater] Версия актуальна, продолжаем подключение.")
+        self._do_tcp_probe()
+
+    def _on_update_check_error(self, msg: str):
+        """
+        Ошибка при проверке обновлений (нет сети до GitHub, таймаут и т.д.).
+        Не блокируем пользователя — тихо логируем и идём дальше.
+        """
+        self._update_checked = True
+        print(f"[Updater] Ошибка проверки (проигнорирована): {msg}")
+        self._do_tcp_probe()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # ШАГ 2а: Найдено обновление → скачиваем
+    # ──────────────────────────────────────────────────────────────────────────
+    def _on_update_found(self, new_version: str, download_url: str):
+        """Новая версия найдена — показываем статус и запускаем скачивание."""
+        self._update_checked = True
+        print(f"[Updater] Найдена новая версия {new_version}, скачиваем...")
+
+        self.lbl_status.setText(f"⬇️  Обновление {new_version}")
+        self.lbl_status.setStyleSheet(
+            "font-size: 18px; font-weight: bold; color: #8e44ad;"
+        )
+        self.progress_bar.setValue(0)
+        self.progress_bar.show()
+
+        sigs = self._upd_sigs
+        download_and_install(
+            download_url=download_url,
+            on_progress=lambda pct: sigs.dl_progress.emit(pct),
+            on_done=lambda: sigs.dl_done.emit(),
+            on_error=lambda msg: sigs.dl_error.emit(msg),
+        )
+
+    def _on_dl_progress(self, pct: int):
+        """Обновляем прогресс-бар скачивания."""
+        self.progress_bar.setValue(pct)
+        # Показываем мегабайты только если нет — оставим числовой %
+        self.lbl_status.setText(f"⬇️  Скачивание обновления...  {pct}%")
+
+    def _on_dl_done(self):
+        """
+        Скачивание завершено — updater сейчас запустит bat-лончер и вызовет
+        sys.exit(0). Показываем финальный статус на случай небольшой задержки.
+        """
+        self.progress_bar.setValue(100)
+        self.lbl_status.setText("✅  Обновление установлено, перезапуск...")
+        self.lbl_status.setStyleSheet(
+            "font-size: 18px; font-weight: bold; color: #27ae60;"
+        )
+
+    def _on_dl_error(self, msg: str):
+        """
+        Ошибка скачивания/установки — показываем ошибку и даём пользователю
+        войти без обновления через кнопку «Пропустить».
+        """
+        print(f"[Updater] Ошибка скачивания: {msg}")
+        self.progress_bar.hide()
+        self.lbl_status.setText("Ошибка обновления")
+        self.lbl_status.setStyleSheet(
+            "font-size: 18px; font-weight: bold; color: #c0392b;"
+        )
+        self.lbl_error.setText(f"⚠️  {msg}")
+        self.frm_error.show()
+        self.btn_skip_update.show()
+
+    def _skip_update(self):
+        """
+        Пользователь нажал «Пропустить обновление» — сбрасываем UI и
+        переходим сразу к TCP-probe (update_checked уже True, retry не будет
+        снова лезть в updater).
+        """
+        self.frm_error.hide()
+        self.btn_skip_update.hide()
+        self.progress_bar.hide()
+        self.lbl_status.setStyleSheet(
+            "font-size: 18px; font-weight: bold; color: #2c3e50;"
+        )
+        self._do_tcp_probe()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # ШАГ 2б: TCP probe (прежняя логика, без изменений)
+    # ──────────────────────────────────────────────────────────────────────────
+    def _do_tcp_probe(self):
+        """Запускает или перезапускает TCP probe (прежняя логика подключения)."""
         self.lbl_status.setText("Подключение к серверу...")
         self.lbl_status.setStyleSheet(
             "font-size: 18px; font-weight: bold; color: #2c3e50;"
@@ -266,6 +493,8 @@ class ConnectingScreen(QWidget):
         self.frm_error.hide()
         self.btn_retry.hide()
         self.btn_change_ip.hide()
+        self.btn_skip_update.hide()
+        self.progress_bar.hide()
         self._set_image("connecting")
 
         if self._worker and self._worker.isRunning():
@@ -497,6 +726,33 @@ class LoginWindow(QWidget):
 # Точка входа
 # ══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
+    # ── Дамп аудио-устройств до создания QApplication ───────────────────────
+    # Если PortAudio крашится уже при query_devices() — увидим это в логе.
+    try:
+        import sounddevice as _sd
+        print("[DEBUG] Аудио-устройства системы:", flush=True)
+        for _i, _d in enumerate(_sd.query_devices()):
+            _api = _sd.query_hostapis(_d['hostapi'])['name']
+            print(f"  [{_i:2d}] IN={_d['max_input_channels']} OUT={_d['max_output_channels']} "
+                  f"| {_d['name']} ({_api})", flush=True)
+        print(f"[DEBUG] Дефолтное устройство: IN={_sd.default.device[0]}, OUT={_sd.default.device[1]}", flush=True)
+    except Exception as _ex:
+        print(f"[DEBUG] query_devices() упал: {_ex}", flush=True)
+
+    # Перехват исключений в дочерних (не-Qt) потоках
+    import threading as _threading
+    _orig_thread_excepthook = getattr(_threading, 'excepthook', None)
+    def _thread_excepthook(args):
+        import traceback as _tb
+        msg = "".join(_tb.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+        print(f"[CRASH] Исключение в потоке '{args.thread.name}':\n{msg}", flush=True)
+        with open("crash_python.log", "a", encoding="utf-8") as _f:
+            _f.write(f"Thread '{args.thread.name}':\n{msg}")
+        if _orig_thread_excepthook:
+            _orig_thread_excepthook(args)
+    _threading.excepthook = _thread_excepthook
+    print("[DEBUG] threading.excepthook установлен", flush=True)
+
     # ✅ КРИТИЧНО: QSurfaceFormat ДО создания QApplication
     _gl_fmt = QSurfaceFormat()
     _gl_fmt.setSwapBehavior(QSurfaceFormat.SwapBehavior.DoubleBuffer)
