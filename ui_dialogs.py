@@ -1,16 +1,25 @@
 import os
+import io
 import json
 import math
+import base64
+import wave
 import sounddevice as sd
 import dxcam
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QScrollArea,
                              QWidget, QGridLayout, QLabel, QSlider, QTabWidget,
                              QComboBox, QProgressBar, QLineEdit, QCheckBox, QFrame,
-                             QGroupBox, QSizePolicy)
+                             QGroupBox, QSizePolicy, QFileDialog, QMessageBox)
 from PyQt6.QtCore import Qt, QSize, QSettings, QEvent, QPropertyAnimation, QEasingCurve, QRect, QPoint, QTimer
 from PyQt6.QtGui import QIcon, QGuiApplication, QPainter, QColor, QPen, QFont, QPainterPath, QBrush
 from config import resource_path, CMD_SOUNDBOARD
 from audio_engine import PYRNNOISE_AVAILABLE
+
+# ── Максимальный размер кастомного звука (1 MB) ──────────────────────────────
+# 7 секунд MP3 @ 128kbps ≈ 112 KB, @ 320kbps ≈ 280 KB.
+# 1 MB с большим запасом перекрывает любой типичный 7-секундный звук.
+CUSTOM_SOUND_MAX_BYTES = 1 * 1024 * 1024   # 1 MB
+CUSTOM_SOUND_SLOTS     = 3                  # количество кастомных слотов
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -532,10 +541,29 @@ class SettingsDialog(QDialog):
         self.mw = parent  # MainWindow
         self.app_settings = QSettings("MyVoiceChat", "GlobalSettings")
         self.setWindowTitle("Настройки")
-        self.resize(680, 600)
+        # Увеличенное окно — 6 вкладок помещаются без скролла при обычном размере.
+        # При уменьшении окна QTabWidget автоматически покажет стрелки прокрутки.
+        self.resize(780, 660)
+        self.setMinimumSize(480, 520)
 
         main_layout = QVBoxLayout(self)
         self.tabs = QTabWidget()
+        # Прокрутка вкладок при нехватке места (стрелки ◄ ►)
+        self.tabs.setUsesScrollButtons(True)
+        self.tabs.setStyleSheet("""
+            QTabBar::scroller {
+                width: 20px;
+            }
+            QTabBar QToolButton {
+                background: rgba(255,255,255,0.06);
+                border: 1px solid rgba(255,255,255,0.10);
+                border-radius: 4px;
+                color: #cccccc;
+            }
+            QTabBar QToolButton:hover {
+                background: rgba(255,255,255,0.14);
+            }
+        """)
 
         # 1. Профиль
         self.setup_profile_tab()
@@ -549,7 +577,10 @@ class SettingsDialog(QDialog):
         # 4. Шёпот — PTT горячие клавиши
         self.setup_whisper_tab()
 
-        # 5. Версия
+        # 5. SoundBoard — кастомные звуки + громкость
+        self.setup_soundboard_tab()
+
+        # 6. Версия
         self.setup_version_tab()
 
         main_layout.addWidget(self.tabs)
@@ -681,15 +712,10 @@ class SettingsDialog(QDialog):
         aud_lay.addWidget(self.lbl_sys)
         aud_lay.addWidget(self.sl_sys)
 
-        # Soundboard: та же квадратичная кривая. Default 40 → 0.16x (‑16 dB).
-        sb_vol = int(self.app_settings.value("soundboard_volume", 40))
-        self.lbl_sb = QLabel(f"Soundboard: {sb_vol}%")
-        self.sl_sb = QSlider(Qt.Orientation.Horizontal)
-        self.sl_sb.setRange(0, 100)
-        self.sl_sb.setValue(sb_vol)
-        self.sl_sb.valueChanged.connect(lambda v: self.lbl_sb.setText(f"Soundboard: {v}%"))
-        aud_lay.addWidget(self.lbl_sb)
-        aud_lay.addWidget(self.sl_sb)
+        # Примечание: ползунок громкости Soundboard перенесён на вкладку «SoundBoard»
+        hint_sb = QLabel("🎵  Громкость Soundboard — на вкладке «SoundBoard»")
+        hint_sb.setStyleSheet("font-size: 11px; color: #888;")
+        aud_lay.addWidget(hint_sb)
 
         aud_lay.addStretch()
         self.tabs.addTab(aud_tab, "Аудио")
@@ -897,6 +923,235 @@ class SettingsDialog(QDialog):
         for cb, le in self._w_slots:
             cb.setCurrentIndex(0)
             le.clear()
+
+    # ── Вкладка «SoundBoard» ──────────────────────────────────────────────────
+    def setup_soundboard_tab(self):
+        """
+        Вкладка управления Soundboard:
+        - Ползунок громкости (перенесён с вкладки Аудио)
+        - 3 слота кастомных звуков: выбор файла mp3/wav с ПК (макс. 1 МБ),
+          отображение имени, кнопка удаления.
+
+        Хранение: QSettings, ключи custom_sound_{i}_path и custom_sound_{i}_name.
+        Воспроизведение: файл читается в байты → base64 → поле data_b64 в
+        JSON-пакете CMD_SOUNDBOARD. Сервер ретранслирует его без изменений.
+        Клиенты декодируют base64 и воспроизводят из памяти (BytesIO).
+        """
+        tab = QWidget()
+        lay = QVBoxLayout(tab)
+        lay.setSpacing(14)
+        lay.setContentsMargins(16, 16, 16, 16)
+
+        # ── Блок: Громкость Soundboard ────────────────────────────────────────
+        vol_group = QGroupBox("🔊  Громкость Soundboard")
+        vol_group.setStyleSheet("QGroupBox { font-weight: bold; }")
+        vol_lay = QVBoxLayout(vol_group)
+
+        vol_hint = QLabel(
+            "Квадратичная кривая: 40% → –16 dB, 70% → –6 dB, 100% → 0 dB (полная)."
+        )
+        vol_hint.setStyleSheet("font-size: 11px; color: #888; font-weight: normal;")
+        vol_hint.setWordWrap(True)
+        vol_lay.addWidget(vol_hint)
+
+        sb_vol = int(self.app_settings.value("soundboard_volume", 40))
+        self.lbl_sb = QLabel(f"Soundboard: {sb_vol}%")
+        self.sl_sb = QSlider(Qt.Orientation.Horizontal)
+        self.sl_sb.setRange(0, 100)
+        self.sl_sb.setValue(sb_vol)
+        self.sl_sb.valueChanged.connect(lambda v: self.lbl_sb.setText(f"Soundboard: {v}%"))
+        vol_lay.addWidget(self.lbl_sb)
+        vol_lay.addWidget(self.sl_sb)
+        lay.addWidget(vol_group)
+
+        # ── Блок: Кастомные звуки ─────────────────────────────────────────────
+        cust_group = QGroupBox("🎵  Мои звуки (до 3 слотов)")
+        cust_group.setStyleSheet("QGroupBox { font-weight: bold; }")
+        cust_lay = QVBoxLayout(cust_group)
+
+        desc = QLabel(
+            "Добавьте собственные звуки (.mp3 / .wav), максимум 1 МБ (~7 сек).\n"
+            "Звук будет воспроизводиться у всех участников канала при нажатии кнопки."
+        )
+        desc.setStyleSheet("font-size: 11px; color: #aaa; font-weight: normal;")
+        desc.setWordWrap(True)
+        cust_lay.addWidget(desc)
+
+        self._custom_sound_rows: list[dict] = []   # список виджетов каждого слота
+
+        for i in range(CUSTOM_SOUND_SLOTS):
+            saved_path = self.app_settings.value(f"custom_sound_{i}_path", "")
+            saved_name = self.app_settings.value(f"custom_sound_{i}_name", "")
+            self._add_custom_sound_row(cust_lay, i, saved_path, saved_name)
+
+        lay.addWidget(cust_group)
+        lay.addStretch()
+        self.tabs.addTab(tab, "SoundBoard")
+
+    def _add_custom_sound_row(self, parent_lay: QVBoxLayout, idx: int,
+                               saved_path: str = "", saved_name: str = ""):
+        """Создаёт строку кастомного звука с кнопками Browse и Delete."""
+        row_frame = QFrame()
+        row_frame.setStyleSheet("""
+            QFrame {
+                background: rgba(255,255,255,0.04);
+                border: 1px solid rgba(255,255,255,0.09);
+                border-radius: 8px;
+            }
+        """)
+        row_lay = QHBoxLayout(row_frame)
+        row_lay.setContentsMargins(10, 7, 10, 7)
+        row_lay.setSpacing(8)
+
+        # Номер слота
+        num_lbl = QLabel(f"#{idx + 1}")
+        num_lbl.setFixedWidth(24)
+        num_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        num_lbl.setStyleSheet(
+            "font-size: 12px; font-weight: bold; color: #888; "
+            "background: transparent; border: none;"
+        )
+        row_lay.addWidget(num_lbl)
+
+        # Имя файла (или заглушка)
+        name_lbl = QLabel(saved_name if saved_name else "— не выбрано —")
+        name_lbl.setStyleSheet(
+            "font-size: 12px; color: #ccc; background: transparent; border: none;"
+        )
+        name_lbl.setMinimumWidth(160)
+        name_lbl.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        name_lbl.setToolTip(saved_path)
+        row_lay.addWidget(name_lbl, stretch=1)
+
+        # Кнопка «Выбрать»
+        btn_browse = QPushButton("📂  Выбрать")
+        btn_browse.setFixedHeight(28)
+        btn_browse.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_browse.setStyleSheet("""
+            QPushButton {
+                background: rgba(88,101,242,0.25);
+                color: #a0b0ff;
+                border: 1px solid rgba(88,101,242,0.55);
+                border-radius: 6px;
+                padding: 0 10px;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background: rgba(88,101,242,0.45);
+                color: #ffffff;
+            }
+        """)
+        row_lay.addWidget(btn_browse)
+
+        # Кнопка «Удалить»
+        btn_del = QPushButton("🗑")
+        btn_del.setFixedSize(28, 28)
+        btn_del.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_del.setEnabled(bool(saved_path))
+        btn_del.setStyleSheet("""
+            QPushButton {
+                background: rgba(220,60,60,0.18);
+                color: #e87070;
+                border: 1px solid rgba(220,60,60,0.40);
+                border-radius: 6px;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background: rgba(220,60,60,0.38);
+                color: #ffffff;
+            }
+            QPushButton:disabled {
+                background: transparent;
+                color: #555;
+                border-color: rgba(255,255,255,0.08);
+            }
+        """)
+        row_lay.addWidget(btn_del)
+
+        slot = {"path": saved_path, "name": saved_name,
+                "name_lbl": name_lbl, "btn_del": btn_del}
+        self._custom_sound_rows.append(slot)
+
+        # ── Слоты ──────────────────────────────────────────────────────────────
+        def _on_browse(checked=False, _idx=idx, _slot=slot):
+            path, _ = QFileDialog.getOpenFileName(
+                self, f"Выбрать звук для слота #{_idx + 1}",
+                "", "Аудио файлы (*.mp3 *.wav)"
+            )
+            if not path:
+                return
+            # Проверка размера
+            try:
+                fsize = os.path.getsize(path)
+            except OSError:
+                fsize = 0
+            if fsize > CUSTOM_SOUND_MAX_BYTES:
+                QMessageBox.warning(
+                    self, "Файл слишком большой",
+                    f"Максимальный размер — 1 МБ (~7 сек).\n"
+                    f"Выбранный файл: {fsize // 1024} КБ."
+                )
+                return
+            # Проверка длительности для WAV
+            if path.lower().endswith(".wav"):
+                try:
+                    with wave.open(path, 'rb') as wf:
+                        dur = wf.getnframes() / wf.getframerate()
+                    if dur > 7.5:
+                        QMessageBox.warning(
+                            self, "Звук слишком длинный",
+                            f"Максимальная длительность — 7 секунд.\n"
+                            f"Длительность файла: {dur:.1f} сек."
+                        )
+                        return
+                except Exception:
+                    pass  # не WAV-совместимый заголовок — пропускаем проверку
+
+            name = os.path.splitext(os.path.basename(path))[0]
+            _slot["path"] = path
+            _slot["name"] = name
+            _slot["name_lbl"].setText(name)
+            _slot["name_lbl"].setToolTip(path)
+            _slot["name_lbl"].setStyleSheet(
+                "font-size: 12px; color: #7ecf8e; background: transparent; border: none;"
+            )
+            _slot["btn_del"].setEnabled(True)
+            # Сохраняем немедленно — чтобы SoundboardPanel мог перестроиться
+            self.app_settings.setValue(f"custom_sound_{_idx}_path", path)
+            self.app_settings.setValue(f"custom_sound_{_idx}_name", name)
+            # Перестраиваем панель если открыта
+            self._rebuild_sb_panel_if_open()
+
+        def _on_delete(checked=False, _idx=idx, _slot=slot):
+            _slot["path"] = ""
+            _slot["name"] = ""
+            _slot["name_lbl"].setText("— не выбрано —")
+            _slot["name_lbl"].setToolTip("")
+            _slot["name_lbl"].setStyleSheet(
+                "font-size: 12px; color: #ccc; background: transparent; border: none;"
+            )
+            _slot["btn_del"].setEnabled(False)
+            self.app_settings.setValue(f"custom_sound_{_idx}_path", "")
+            self.app_settings.setValue(f"custom_sound_{_idx}_name", "")
+            self._rebuild_sb_panel_if_open()
+
+        btn_browse.clicked.connect(_on_browse)
+        btn_del.clicked.connect(_on_delete)
+
+        parent_lay.addWidget(row_frame)
+
+    def _rebuild_sb_panel_if_open(self):
+        """Перестраивает SoundboardPanel если он сейчас открыт."""
+        try:
+            mw = self.mw
+            if hasattr(mw, '_sb_panel') and mw._sb_panel is not None:
+                try:
+                    if mw._sb_panel.isVisible():
+                        mw._sb_panel.rebuild()
+                except RuntimeError:
+                    pass
+        except Exception:
+            pass
 
     # ── Вкладка «Версия» ──────────────────────────────────────────────────────
     def setup_version_tab(self):
@@ -1395,12 +1650,37 @@ class SoundboardPanel(QWidget):
 
         self.net = net_client
         self._anim: QPropertyAnimation | None = None
+        self._settings = QSettings("MyVoiceChat", "GlobalSettings")
 
         self._build_ui()
+
+    # ── Public: пересборка при изменении кастомных звуков ─────────────────────
+
+    def rebuild(self):
+        """
+        Пересобирает UI панели при добавлении / удалении кастомных звуков
+        из вкладки настроек. Вызывается через _rebuild_sb_panel_if_open().
+        """
+        # Очищаем старый контент
+        old_layout = self.layout()
+        if old_layout:
+            # Удаляем все виджеты
+            while old_layout.count():
+                item = old_layout.takeAt(0)
+                if item.widget():
+                    item.widget().deleteLater()
+            # Удаляем сам layout через замену
+        self._build_ui()
+        self.adjustSize()
 
     # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
+        # Если уже есть layout — очищаем его
+        existing = self.layout()
+        if existing is not None:
+            QWidget().setLayout(existing)   # «уводим» старый layout
+
         outer = QVBoxLayout(self)
         outer.setContentsMargins(8, 8, 8, 8)
 
@@ -1459,15 +1739,26 @@ class SoundboardPanel(QWidget):
         sep.setStyleSheet("background: rgba(255,255,255,0.07); border: none; max-height: 1px;")
         card_lay.addWidget(sep)
 
-        # Список звуков
+        # ── Собираем все звуки ────────────────────────────────────────────────
         sd_dir = resource_path("assets/panel")
-        files = []
+        default_files = []
         if os.path.exists(sd_dir):
-            files = sorted([f for f in os.listdir(sd_dir)
-                            if f.lower().endswith(('.wav', '.mp3', '.ogg'))])
+            default_files = sorted([f for f in os.listdir(sd_dir)
+                                    if f.lower().endswith(('.wav', '.mp3', '.ogg'))])
 
-        if not files:
-            empty_lbl = QLabel("Нет звуковых файлов.\nПоложите .wav/.mp3 в assets/panel/")
+        # Кастомные звуки из QSettings
+        custom_sounds: list[tuple[str, str]] = []   # (name, path)
+        for i in range(CUSTOM_SOUND_SLOTS):
+            path = self._settings.value(f"custom_sound_{i}_path", "")
+            name = self._settings.value(f"custom_sound_{i}_name", "")
+            if path and name and os.path.exists(path):
+                custom_sounds.append((name, path))
+
+        has_default = bool(default_files)
+        has_custom  = bool(custom_sounds)
+
+        if not has_default and not has_custom:
+            empty_lbl = QLabel("Нет звуков.\nДобавьте свои в Настройки → SoundBoard,\nили положите файлы в assets/panel/")
             empty_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
             empty_lbl.setStyleSheet(
                 f"color: {self._TEXT_DIM}; font-size: 12px; background: transparent; border: none;"
@@ -1475,6 +1766,7 @@ class SoundboardPanel(QWidget):
             empty_lbl.setContentsMargins(0, 10, 0, 10)
             card_lay.addWidget(empty_lbl)
         else:
+            # Общий scroll-контейнер для обоих разделов
             scroll = QScrollArea()
             scroll.setWidgetResizable(True)
             scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -1492,54 +1784,154 @@ class SoundboardPanel(QWidget):
                 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
             """)
 
-            grid_widget = QWidget()
-            grid_widget.setStyleSheet("background: transparent;")
-            grid = QGridLayout(grid_widget)
-            grid.setContentsMargins(0, 2, 0, 0)
-            grid.setSpacing(6)
+            content_w = QWidget()
+            content_w.setStyleSheet("background: transparent;")
+            content_lay = QVBoxLayout(content_w)
+            content_lay.setContentsMargins(0, 0, 0, 0)
+            content_lay.setSpacing(10)
 
-            COLS = 2
-            for idx, fname in enumerate(files):
-                name = os.path.splitext(fname)[0]
-                emoji = _pick_emoji(name)
-                display = f"{emoji}  {name}"
-
-                btn = QPushButton(display)
-                btn.setFixedHeight(34)       # ИСПРАВЛЕНО: было setMinimumHeight(46)
-                btn.setCursor(Qt.CursorShape.PointingHandCursor)
-                btn.setStyleSheet(f"""
-                    QPushButton {{
-                        background-color: {self._BTN_BG};
-                        color: {self._TEXT_MAIN};
-                        border: 1px solid rgba(255,255,255,0.06);
-                        border-radius: 7px;
-                        padding: 2px 8px;
-                        font-size: 12px;
-                        text-align: left;
-                    }}
-                    QPushButton:hover {{
-                        background-color: {self._BTN_HOVER};
-                        border: 1px solid rgba(88,101,242,0.6);
-                    }}
-                    QPushButton:pressed {{
-                        background-color: {self._BTN_PRESS};
-                        color: #ffffff;
-                    }}
-                """)
-                btn.clicked.connect(
-                    lambda _ch, f=fname: self._on_sound_clicked(f)
+            # ── Секция: Стандартные звуки ─────────────────────────────────────
+            if has_default:
+                self._add_sounds_section(
+                    content_lay,
+                    title="Стандартные",
+                    buttons_data=[(os.path.splitext(f)[0], f, None) for f in default_files],
+                    accent_color="#5865f2",
+                    is_custom=False
                 )
-                grid.addWidget(btn, idx // COLS, idx % COLS)
 
-            # Не более 5 строк без скролла; высота ряда = 34px кнопка + 6px spacing
+            # ── Секция: Мои звуки ─────────────────────────────────────────────
+            if has_custom:
+                if has_default:
+                    div = QFrame()
+                    div.setFrameShape(QFrame.Shape.HLine)
+                    div.setStyleSheet("background: rgba(255,255,255,0.07); border: none; max-height: 1px;")
+                    content_lay.addWidget(div)
+
+                self._add_sounds_section(
+                    content_lay,
+                    title="Мои звуки",
+                    buttons_data=[(name, None, path) for name, path in custom_sounds],
+                    accent_color="#27ae60",
+                    is_custom=True
+                )
+
+            # Вычисляем высоту с учётом обоих секций
+            total_rows = 0
+            if has_default:
+                total_rows += (len(default_files) + 1) // 2
+            if has_custom:
+                total_rows += (len(custom_sounds) + 1) // 2
+                if has_default:
+                    total_rows += 1  # заголовок второй секции
+
             ROW_H = 34 + 6
-            visible_rows = min(5, (len(files) + COLS - 1) // COLS)
-            scroll.setFixedHeight(visible_rows * ROW_H + 6)
-            scroll.setWidget(grid_widget)
+            visible_rows = min(7, total_rows + (1 if has_default else 0) + (1 if has_custom else 0))
+            scroll.setFixedHeight(max(50, visible_rows * ROW_H + 10))
+            scroll.setWidget(content_w)
             card_lay.addWidget(scroll)
 
         outer.addWidget(self._card)
         self.adjustSize()
+
+    def _add_sounds_section(self, parent_lay: QVBoxLayout,
+                             title: str,
+                             buttons_data: list[tuple[str, str | None, str | None]],
+                             accent_color: str,
+                             is_custom: bool):
+        """
+        Добавляет секцию кнопок звуков в parent_lay.
+
+        buttons_data: list of (display_name, fname_or_None, path_or_None)
+          - fname: имя файла в assets/panel/ (стандартные звуки)
+          - path:  абсолютный путь (кастомные звуки)
+        """
+        # Подзаголовок секции
+        sec_hdr = QLabel(f"  {title}")
+        sec_hdr.setStyleSheet(f"""
+            font-size: 11px;
+            font-weight: bold;
+            color: {accent_color};
+            background: transparent;
+            border: none;
+        """)
+        parent_lay.addWidget(sec_hdr)
+
+        grid_w = QWidget()
+        grid_w.setStyleSheet("background: transparent;")
+        grid = QGridLayout(grid_w)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setSpacing(6)
+
+        COLS = 2
+        hover_col   = "#40444b" if not is_custom else "rgba(39,174,96,0.22)"
+        pressed_col = "#5865f2" if not is_custom else "rgba(39,174,96,0.55)"
+        border_hov  = "rgba(88,101,242,0.6)" if not is_custom else "rgba(39,174,96,0.7)"
+
+        for idx, (name, fname, fpath) in enumerate(buttons_data):
+            emoji    = _pick_emoji(name)
+            display  = f"{emoji}  {name}"
+
+            btn = QPushButton(display)
+            btn.setFixedHeight(34)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {self._BTN_BG};
+                    color: {self._TEXT_MAIN};
+                    border: 1px solid rgba(255,255,255,0.06);
+                    border-radius: 7px;
+                    padding: 2px 8px;
+                    font-size: 12px;
+                    text-align: left;
+                }}
+                QPushButton:hover {{
+                    background-color: {hover_col};
+                    border: 1px solid {border_hov};
+                }}
+                QPushButton:pressed {{
+                    background-color: {pressed_col};
+                    color: #ffffff;
+                }}
+            """)
+
+            if is_custom and fpath:
+                btn.clicked.connect(
+                    lambda _ch, _p=fpath, _n=name: self._on_custom_sound_clicked(_p, _n)
+                )
+            else:
+                btn.clicked.connect(
+                    lambda _ch, f=fname: self._on_sound_clicked(f)
+                )
+            grid.addWidget(btn, idx // COLS, idx % COLS)
+
+        parent_lay.addWidget(grid_w)
+
+    def _on_custom_sound_clicked(self, fpath: str, name: str):
+        """
+        Кастомный звук: читает файл → base64 → отправляет JSON с data_b64.
+
+        Сервер ретранслирует этот JSON всем клиентам без изменений.
+        Клиенты в play_soundboard_file() декодируют data_b64 и воспроизводят
+        из BytesIO (soundfile.read поддерживает файловоподобные объекты).
+
+        Имя файла в поле 'file' помечается префиксом '__custom__:',
+        чтобы получатель не искал этот «файл» в assets/panel/.
+        """
+        try:
+            fsize = os.path.getsize(fpath)
+            if fsize > CUSTOM_SOUND_MAX_BYTES:
+                return  # защита (теоретически уже проверено при добавлении)
+            with open(fpath, 'rb') as f:
+                raw_bytes = f.read()
+            b64 = base64.b64encode(raw_bytes).decode('ascii')
+            self.net.send_json({
+                "action":  CMD_SOUNDBOARD,
+                "file":    f"__custom__:{name}",
+                "data_b64": b64,
+            })
+        except Exception as e:
+            print(f"[SoundboardPanel] Custom sound error: {e}")
 
     def _on_sound_clicked(self, fname: str):
         """Отправляет soundboard-команду серверу. Flash-эффект убран."""

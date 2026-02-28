@@ -102,9 +102,15 @@ class NetworkClient(QObject):
     # ------------------------------------------------------------------
     # Soundboard
     # ------------------------------------------------------------------
-    def play_soundboard_file(self, filename):
+    def play_soundboard_file(self, filename, data_b64=None):
         """
         Воспроизвести soundboard-файл через sounddevice.
+
+        Два режима:
+        1. Стандартный (data_b64 is None): файл ищется в assets/panel/ по имени.
+        2. Кастомный (data_b64 задан): аудио декодируется из base64 и воспроизводится
+           прямо из памяти (BytesIO). Файл на диске не нужен — работает у всех
+           участников без синхронизации файлов.
 
         Защита от спама: новый звук НЕ запускается, пока предыдущий ещё играет.
         Это предотвращает накопление звуков при частых кликах.
@@ -114,24 +120,43 @@ class NetworkClient(QObject):
           slider 70           -> 0.49x (~-6 dB)
           slider 100          -> 1.00x (0 dB)
         """
+        import io
+        import base64 as _b64
         try:
             # Anti-spam: блокируем, пока текущий звук ещё играет
             if self._sb_playing.is_set():
                 print(f"[Net] Soundboard: пропущен {filename!r} — звук ещё играет")
                 return
 
-            path = resource_path(os.path.join("assets/panel", filename))
-            if not os.path.exists(path):
-                print(f"[Net] Soundboard file not found: {path}")
-                return
-
             raw = int(QSettings("MyVoiceChat", "GlobalSettings").value("soundboard_volume", 40)) / 100.0
             vol = raw ** 2  # квадратичная кривая: (raw/100)^2
+
+            # Определяем источник аудио: байты из data_b64 или файл на диске
+            if data_b64:
+                # Кастомный звук: декодируем base64 → BytesIO
+                try:
+                    audio_bytes = _b64.b64decode(data_b64)
+                    audio_source = io.BytesIO(audio_bytes)
+                except Exception as e:
+                    print(f"[Net] Soundboard base64 decode error: {e}")
+                    return
+            else:
+                # Стандартный звук: путь к файлу в assets/panel/
+                # Пропускаем «кастомные» имена без data_b64 (не наш пакет)
+                if filename and filename.startswith("__custom__:"):
+                    print(f"[Net] Soundboard: кастомный звук без data_b64 — пропущен")
+                    return
+                path = resource_path(os.path.join("assets/panel", filename))
+                if not os.path.exists(path):
+                    print(f"[Net] Soundboard file not found: {path}")
+                    return
+                audio_source = path
 
             def _play():
                 try:
                     self._sb_playing.set()
-                    data, sr = sf.read(path, dtype='float32')
+                    import soundfile as sf
+                    data, sr = sf.read(audio_source, dtype='float32')
                     sd.play(data * vol, sr)
                     sd.wait()
                 except Exception as e:
@@ -140,7 +165,7 @@ class NetworkClient(QObject):
                     self._sb_playing.clear()
 
             threading.Thread(target=_play, daemon=True, name="soundboard-play").start()
-            print(f"[Net] Playing soundboard: {filename} (vol={vol:.3f})")
+            print(f"[Net] Playing soundboard: {filename} (vol={vol:.3f}, custom={bool(data_b64)})")
         except Exception as e:
             print(f"[Net] Soundboard error: {e}")
 
@@ -483,7 +508,7 @@ class NetworkClient(QObject):
         elif act == 'sync_users':
             self.global_state_update.emit(msg.get('all_users', {}))
         elif act == 'play_soundboard':
-            self.play_soundboard_file(msg.get('file'))
+            self.play_soundboard_file(msg.get('file'), msg.get('data_b64'))
         elif act == 'request_keyframe':
             if self.video:
                 self.video.force_keyframe()
