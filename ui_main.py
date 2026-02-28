@@ -18,7 +18,7 @@ from PyQt6.QtGui import QIcon, QFont, QFontDatabase, QBrush, QColor
 from config import *
 from audio_engine import AudioHandler
 from network_engine import NetworkClient
-from ui_dialogs import UserOverlayPanel, SettingsDialog, SoundboardDialog, WhisperSystemOverlay
+from ui_dialogs import UserOverlayPanel, SettingsDialog, SoundboardDialog, WhisperSystemOverlay, SelfStatusOverlayPanel
 from version import APP_VERSION, APP_NAME, GITHUB_REPO
 
 
@@ -1205,7 +1205,29 @@ class MainWindow(QMainWindow):
             return
 
         uid = item.data(0, Qt.ItemDataRole.UserRole)
-        if not uid or uid == "ROOM_HEADER" or uid == self.audio.my_uid:
+        if not uid or uid == "ROOM_HEADER":
+            return
+
+        # ── Правый клик по СЕБЕ → оверлей выбора статуса ─────────────────────
+        if uid == self.audio.my_uid:
+            from ui_dialogs import SelfStatusOverlayPanel
+            item_rect = self.tree.visualItemRect(item)
+            global_pos = self.tree.viewport().mapToGlobal(item_rect.bottomLeft())
+
+            def _on_status_save(icon: str, text: str):
+                self._my_status_icon = icon
+                self._my_status_text = text
+                self.app_settings.setValue("my_status_icon", icon)
+                self.app_settings.setValue("my_status_text", text)
+                self.net.send_presence_update(icon, text)
+
+            SelfStatusOverlayPanel(
+                self._my_status_icon,
+                self._my_status_text,
+                global_pos,
+                on_save=_on_status_save,
+                parent=self,
+            ).show()
             return
 
         nick = item.text(0).strip()
@@ -1236,7 +1258,6 @@ class MainWindow(QMainWindow):
             _nick_txt = item.text(0)
             watch_cb = lambda: self.open_video_window(_uid, _nick_txt)
 
-        from ui_dialogs import UserOverlayPanel
         UserOverlayPanel(
             nick, current_vol, uid, self.audio, global_pos,
             parent=self,
@@ -1351,9 +1372,8 @@ class MainWindow(QMainWindow):
 
     def open_status_dialog(self):
         """
-        Открывает диалог выбора статуса (StatusDialog из ui_dialogs).
-        Вызывается из SettingsDialog (вкладка «О себе»).
-        После подтверждения сохраняет статус в QSettings и отправляет на сервер.
+        Программный вызов выбора статуса (резервный метод).
+        Основной UX — правый клик по своему нику в дереве (SelfStatusOverlayPanel).
         """
         from ui_dialogs import StatusDialog
         dlg = StatusDialog(self._my_status_icon, self._my_status_text, parent=self)

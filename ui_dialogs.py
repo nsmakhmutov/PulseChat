@@ -607,48 +607,6 @@ class SettingsDialog(QDialog):
         self.ed_nick = QLineEdit(self.mw.nick)
         lay.addWidget(self.ed_nick)
 
-        # ── Статус ─────────────────────────────────────────────────────────────
-        lay.addSpacing(8)
-        sep_st = QFrame()
-        sep_st.setFrameShape(QFrame.Shape.HLine)
-        sep_st.setMaximumHeight(1)
-        lay.addWidget(sep_st)
-        lay.addSpacing(4)
-
-        lay.addWidget(QLabel("Статус:"))
-
-        st_row = QHBoxLayout()
-        st_row.setSpacing(8)
-
-        # Иконка предпросмотра текущего статуса
-        self._st_icon_lbl = QLabel()
-        self._st_icon_lbl.setFixedSize(32, 32)
-        self._st_icon_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._refresh_status_preview()
-        st_row.addWidget(self._st_icon_lbl)
-
-        # Название / описание текущего статуса
-        self._st_name_lbl = QLabel()
-        self._refresh_status_name()
-        st_row.addWidget(self._st_name_lbl, stretch=1)
-
-        # Кнопка выбора статуса
-        btn_pick_st = QPushButton("Выбрать")
-        btn_pick_st.setFixedHeight(30)
-        btn_pick_st.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_pick_st.clicked.connect(self._open_status_picker)
-        st_row.addWidget(btn_pick_st)
-
-        # Кнопка сброса статуса
-        btn_clr_st = QPushButton("✕")
-        btn_clr_st.setFixedSize(30, 30)
-        btn_clr_st.setToolTip("Убрать статус")
-        btn_clr_st.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_clr_st.clicked.connect(self._clear_status)
-        st_row.addWidget(btn_clr_st)
-
-        lay.addLayout(st_row)
-
         lay.addStretch()
         self.tabs.addTab(tab, "О себе")
 
@@ -1327,53 +1285,6 @@ class SettingsDialog(QDialog):
             on_error=lambda msg: bridge.sig_error.emit(msg),
         )
 
-    # ── Методы управления статусом (вкладка «О себе») ─────────────────────────
-
-    def _refresh_status_preview(self):
-        """Обновляет иконку-превью текущего статуса (32×32)."""
-        icon = self.app_settings.value("my_status_icon", "")
-        if icon:
-            path = resource_path(f"assets/status/{icon}")
-            self._st_icon_lbl.setPixmap(QIcon(path).pixmap(26, 26))
-            self._st_icon_lbl.setText("")
-        else:
-            self._st_icon_lbl.setPixmap(QIcon().pixmap(0, 0))
-            self._st_icon_lbl.setText("—")
-
-    def _refresh_status_name(self):
-        """Обновляет текстовую подпись рядом с иконкой статуса."""
-        icon = self.app_settings.value("my_status_icon", "")
-        text = self.app_settings.value("my_status_text", "")
-        if icon:
-            name = icon.rsplit('.', 1)[0].replace('_', ' ').capitalize()
-            label = f"{name}  —  {text}" if text else name
-            self._st_name_lbl.setText(label)
-            self._st_name_lbl.setStyleSheet("")
-        else:
-            self._st_name_lbl.setText("Нет статуса")
-            self._st_name_lbl.setStyleSheet("color: #888888;")
-
-    def _open_status_picker(self):
-        """Открывает StatusDialog; после OK сохраняет статус и обновляет превью."""
-        dlg = StatusDialog(
-            self.app_settings.value("my_status_icon", ""),
-            self.app_settings.value("my_status_text", ""),
-            parent=self,
-        )
-        if dlg.exec():
-            new_icon, new_text = dlg.get_result()
-            self.app_settings.setValue("my_status_icon", new_icon)
-            self.app_settings.setValue("my_status_text", new_text)
-            self._refresh_status_preview()
-            self._refresh_status_name()
-
-    def _clear_status(self):
-        """Сбрасывает статус в QSettings и обновляет превью."""
-        self.app_settings.setValue("my_status_icon", "")
-        self.app_settings.setValue("my_status_text", "")
-        self._refresh_status_preview()
-        self._refresh_status_name()
-
     # ── Вспомогательные методы профиля ───────────────────────────────────────
 
     def open_av_sel(self):
@@ -1473,8 +1384,8 @@ class SettingsDialog(QDialog):
         if hasattr(self.mw, 'net'):
             self.mw.net.update_user_info(self.mw.nick, self.mw.avatar)
 
-        # Синхронизируем статус: QSettings уже обновлён через _open_status_picker/_clear_status.
-        # Обновляем in-memory поля MainWindow и отправляем presence-обновление на сервер.
+        # Синхронизируем статус: QSettings обновляется через SelfStatusOverlayPanel
+        # (правый клик по нику). Читаем актуальное значение и обновляем MainWindow.
         new_icon = self.app_settings.value("my_status_icon", "")
         new_text = self.app_settings.value("my_status_text", "")
         if hasattr(self.mw, '_my_status_icon'):
@@ -2156,6 +2067,331 @@ SoundboardDialog = SoundboardPanel
 # ══════════════════════════════════════════════════════════════════════════════
 # StatusDialog — диалог выбора пользовательского статуса
 # ══════════════════════════════════════════════════════════════════════════════
+class SelfStatusOverlayPanel(QFrame):
+    """
+    Всплывающий полупрозрачный оверлей выбора собственного статуса.
+    Открывается правым кликом по своему никнейму в дереве.
+
+    Дизайн повторяет UserOverlayPanel: тёмный полупрозрачный card,
+    скруглённые углы, Qt.Popup (автозакрытие при клике вне).
+
+    Содержимое:
+    • Сетка иконок статусов (5 колонок, авто-сканирование assets/status/)
+    • Поле описания (макс. 20 символов) + счётчик
+    • Кнопки «Убрать статус» и «Применить»
+
+    on_save(icon: str, text: str) — вызывается при нажатии «Применить»
+    или «Убрать статус» (с пустыми строками).
+    """
+
+    _COLS   = 5    # иконок в строке
+    _BTN_SZ = 44   # px — размер кнопки иконки
+
+    def __init__(self, current_icon: str, current_text: str,
+                 global_pos, on_save, parent=None):
+        super().__init__(
+            parent,
+            Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint
+        )
+        self._on_save       = on_save
+        self._selected_icon = current_icon
+        self._icon_buttons: dict = {}  # filename → QPushButton
+
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setObjectName("selfStatusOverlay")
+
+        # ── Внешний layout (отступы = «воздух» под тень) ─────────────────────
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # ── Card ──────────────────────────────────────────────────────────────
+        self._card = QFrame(self)
+        self._card.setObjectName("statusCard")
+        self._card.setStyleSheet("""
+            QFrame#statusCard {
+                background-color: rgba(18, 20, 28, 225);
+                border: 1px solid rgba(255,255,255,0.12);
+                border-radius: 14px;
+            }
+            QLabel {
+                color: #d0d0d8;
+                font-size: 12px;
+                background: transparent;
+                border: none;
+            }
+        """)
+        outer.addWidget(self._card)
+
+        card_lay = QVBoxLayout(self._card)
+        card_lay.setContentsMargins(14, 12, 14, 14)
+        card_lay.setSpacing(8)
+
+        # ── Заголовок ─────────────────────────────────────────────────────────
+        title = QLabel("✨  Мой статус")
+        title.setStyleSheet(
+            "font-size: 13px; font-weight: bold; color: #e0e0ec; "
+            "background: transparent; border: none;"
+        )
+        card_lay.addWidget(title)
+
+        # ── Тонкий разделитель ─────────────────────────────────────────────────
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(
+            "background: rgba(255,255,255,0.09); border: none; max-height: 1px;"
+        )
+        sep.setMaximumHeight(1)
+        card_lay.addWidget(sep)
+
+        # ── Скролл-зона с иконками ─────────────────────────────────────────────
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setMaximumHeight(200)
+        scroll.setStyleSheet("""
+            QScrollArea { background: transparent; border: none; }
+            QScrollBar:vertical {
+                background: rgba(255,255,255,0.05);
+                width: 6px; border-radius: 3px;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(255,255,255,0.22);
+                border-radius: 3px;
+                min-height: 20px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+        """)
+
+        icons_w = QWidget()
+        icons_w.setStyleSheet("background: transparent;")
+        self._grid = QGridLayout(icons_w)
+        self._grid.setSpacing(5)
+        self._grid.setContentsMargins(0, 2, 0, 2)
+        self._load_icons(current_icon)
+        scroll.setWidget(icons_w)
+        card_lay.addWidget(scroll)
+
+        # ── Описание ───────────────────────────────────────────────────────────
+        lbl_desc = QLabel("Описание (необязательно):")
+        lbl_desc.setStyleSheet(
+            "font-size: 11px; color: rgba(200,200,210,0.70); "
+            "background: transparent; border: none;"
+        )
+        card_lay.addWidget(lbl_desc)
+
+        self._text_edit = QLineEdit()
+        self._text_edit.setMaxLength(20)
+        self._text_edit.setPlaceholderText("Например: ушёл пить чай...")
+        self._text_edit.setText(current_text)
+        self._text_edit.setStyleSheet("""
+            QLineEdit {
+                background: rgba(255,255,255,0.07);
+                border: 1px solid rgba(255,255,255,0.14);
+                border-radius: 7px;
+                padding: 5px 9px;
+                color: #e0e0ec;
+                font-size: 12px;
+            }
+            QLineEdit:focus {
+                border-color: rgba(91,142,245,0.65);
+                background: rgba(255,255,255,0.10);
+            }
+        """)
+        card_lay.addWidget(self._text_edit)
+
+        self._char_counter = QLabel(f"{len(current_text)} / 20")
+        self._char_counter.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self._char_counter.setStyleSheet(
+            "font-size: 10px; color: rgba(180,180,190,0.55); "
+            "background: transparent; border: none;"
+        )
+        self._text_edit.textChanged.connect(self._on_text_changed)
+        card_lay.addWidget(self._char_counter)
+
+        # ── Кнопки ────────────────────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+
+        btn_clear = QPushButton("✕  Убрать")
+        btn_clear.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_clear.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(192,57,43,0.30);
+                color: #ff9090;
+                border: 1px solid rgba(192,57,43,0.55);
+                border-radius: 7px;
+                padding: 5px 12px;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: rgba(231,76,60,0.45);
+                color: #ffffff;
+            }
+        """)
+        btn_clear.clicked.connect(self._on_clear)
+
+        btn_ok = QPushButton("Применить")
+        btn_ok.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_ok.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(46,204,113,0.28);
+                color: #82e0aa;
+                border: 1px solid rgba(46,204,113,0.50);
+                border-radius: 7px;
+                padding: 5px 16px;
+                font-size: 12px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: rgba(39,174,96,0.45);
+                color: #ffffff;
+            }
+        """)
+        btn_ok.clicked.connect(self._on_apply)
+
+        btn_row.addWidget(btn_clear)
+        btn_row.addStretch()
+        btn_row.addWidget(btn_ok)
+        card_lay.addLayout(btn_row)
+
+        # ── Подгон размера и позиционирование ────────────────────────────────
+        self.adjustSize()
+        self.setFixedWidth(max(self.sizeHint().width(), 280))
+
+        screen = QGuiApplication.screenAt(global_pos)
+        if screen is None:
+            screen = QGuiApplication.primaryScreen()
+        avail = screen.availableGeometry()
+
+        x = global_pos.x()
+        y = global_pos.y()
+        if x + self.width()  > avail.right():
+            x = avail.right() - self.width() - 4
+        if y + self.height() > avail.bottom():
+            y = global_pos.y() - self.height()
+        x = max(avail.left() + 4, x)
+        y = max(avail.top()  + 4, y)
+        self.move(x, y)
+
+    # ── Внутренние методы ─────────────────────────────────────────────────────
+
+    def _load_icons(self, selected: str):
+        """Сканирует assets/status/ и заполняет сетку кнопками-иконками."""
+        status_dir = resource_path("assets/status")
+        svgs = []
+        if os.path.isdir(status_dir):
+            svgs = sorted(f for f in os.listdir(status_dir) if f.lower().endswith('.svg'))
+
+        if not svgs:
+            lbl = QLabel("Иконки не найдены.\nПоложи SVG в assets/status/")
+            lbl.setStyleSheet("color: #888888; font-size: 11px; background:transparent;")
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._grid.addWidget(lbl, 0, 0)
+            return
+
+        for idx, fname in enumerate(svgs):
+            row, col = divmod(idx, self._COLS)
+            path = resource_path(f"assets/status/{fname}")
+
+            btn = QPushButton()
+            btn.setFixedSize(self._BTN_SZ, self._BTN_SZ)
+            btn.setIconSize(QSize(28, 28))
+            btn.setIcon(QIcon(path))
+            btn.setCheckable(True)
+            btn.setChecked(fname == selected)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            # Tooltip = читаемое название иконки (hover-подсказка)
+            readable = fname.rsplit('.', 1)[0].replace('_', ' ').capitalize()
+            btn.setToolTip(readable)
+
+            base_style = (
+                "QPushButton {"
+                "  background: rgba(255,255,255,0.05);"
+                "  border: 1px solid rgba(255,255,255,0.10);"
+                "  border-radius: 8px;"
+                "}"
+                "QPushButton:hover {"
+                "  background: rgba(255,255,255,0.13);"
+                "  border-color: rgba(91,142,245,0.55);"
+                "}"
+            )
+            selected_style = (
+                "QPushButton {"
+                "  background: rgba(46,204,113,0.18);"
+                "  border: 2px solid #2ecc71;"
+                "  border-radius: 8px;"
+                "}"
+                "QPushButton:hover {"
+                "  background: rgba(46,204,113,0.28);"
+                "}"
+            )
+            btn.setStyleSheet(selected_style if fname == selected else base_style)
+
+            def _make_handler(fn, b, b_style=base_style, s_style=selected_style):
+                def _toggled(checked):
+                    if checked:
+                        # Снимаем все остальные
+                        for other_fn, other_btn in self._icon_buttons.items():
+                            if other_fn != fn:
+                                try:
+                                    other_btn.setChecked(False)
+                                    other_btn.setStyleSheet(b_style)
+                                except RuntimeError:
+                                    pass
+                        self._selected_icon = fn
+                        b.setStyleSheet(s_style)
+                    else:
+                        # Повторный клик — снимаем статус
+                        self._selected_icon = ""
+                        b.setStyleSheet(b_style)
+                return _toggled
+
+            btn.toggled.connect(_make_handler(fname, btn))
+            self._grid.addWidget(btn, row, col)
+            self._icon_buttons[fname] = btn
+
+    def _on_text_changed(self, text: str):
+        n = len(text)
+        self._char_counter.setText(f"{n} / 20")
+        self._char_counter.setStyleSheet(
+            "font-size: 10px; background: transparent; border: none; "
+            f"color: {'rgba(231,76,60,0.90)' if n >= 18 else 'rgba(180,180,190,0.55)'};"
+        )
+
+    def _on_clear(self):
+        self._selected_icon = ""
+        for btn in self._icon_buttons.values():
+            try:
+                btn.setChecked(False)
+                btn.setStyleSheet(
+                    "QPushButton {"
+                    "  background: rgba(255,255,255,0.05);"
+                    "  border: 1px solid rgba(255,255,255,0.10);"
+                    "  border-radius: 8px;"
+                    "}"
+                    "QPushButton:hover {"
+                    "  background: rgba(255,255,255,0.13);"
+                    "  border-color: rgba(91,142,245,0.55);"
+                    "}"
+                )
+            except RuntimeError:
+                pass
+        self._text_edit.clear()
+        if self._on_save:
+            self._on_save("", "")
+        self.close()
+
+    def _on_apply(self):
+        icon = self._selected_icon
+        text = self._text_edit.text().strip()[:20]
+        if self._on_save:
+            self._on_save(icon, text)
+        self.close()
+
+
 class StatusDialog(QDialog):
     """
     Диалог выбора «статуса дела» пользователя.
