@@ -712,16 +712,74 @@ class AudioHandler(QObject):
 
     def _apply_whisper_bass_effect(self, s: np.ndarray) -> np.ndarray:
         """
-        Эффект «тёмный бас» для входящего шёпота — 4-й порядок Butterworth LP.
-
-        Реализован через scipy.signal.sosfilt (C-уровень) вместо
-        pure-Python цикла — ~100× быстрее, без аудио-глитчей в колбеке.
-
-        SOS-матрица и начальные условия zi хранятся в self._wlp_sos / _wlp_zi.
-        Состояние сохраняется МЕЖДУ фреймами → нет межфреймовых артефактов.
-        Сброс zi производится в start_whisper().
+        [УСТАРЕЛО — оставлен для совместимости, не вызывается]
+        Эффект «рация» — LP Butterworth 4-го порядка, fc=1200 Гц.
+        Заменён на _apply_anonymous_voice_effect (pitch shift + LP 4 кГц).
         """
         out, self._wlp_zi = sosfilt(self._wlp_sos, s.astype(np.float64), zi=self._wlp_zi)
+        return out.astype(np.float32)
+
+    def _apply_anonymous_voice_effect(self, s: np.ndarray) -> np.ndarray:
+        """
+        Эффект «анонимного голоса» (Dark TV Interview).
+        Использует Vectorized Dual-Tap Delay Line для pitch-shift без артефактов.
+        """
+        N = len(s)
+        max_delay = 1440  # 30 мс при 48kHz — оптимальный размер окна для голоса
+        speed = 2.0 ** (-4.0 / 12.0)  # -4 полутона
+        rate = 1.0 - speed  # Скорость накопления задержки
+
+        # 1. Склеиваем историю и текущий фрейм
+        buf = np.concatenate((self._anon_history, s))
+
+        # 2. Генерируем фазы для двух читающих "головок" (0.0 ... 1.0)
+        phases = self._anon_phase + np.arange(N) * rate / max_delay
+        self._anon_phase = phases[-1] + rate / max_delay
+        self._anon_phase %= 1.0
+
+        p1 = phases % 1.0
+        p2 = (phases + 0.5) % 1.0
+
+        # Задержка в сэмплах
+        d1 = p1 * max_delay
+        d2 = p2 * max_delay
+
+        # 3. Индексы чтения (относительно начала массива buf)
+        base_idx = len(self._anon_history) + np.arange(N)
+        r1 = base_idx - d1
+        r2 = base_idx - d2
+
+        # 4. Линейная интерполяция для плавности
+        i1_floor = np.floor(r1).astype(np.int32)
+        i2_floor = np.floor(r2).astype(np.int32)
+
+        # Безопасный +1 индекс
+        i1_ceil = np.clip(i1_floor + 1, 0, len(buf) - 1)
+        i2_ceil = np.clip(i2_floor + 1, 0, len(buf) - 1)
+
+        frac_1 = r1 - i1_floor
+        frac_2 = r2 - i2_floor
+
+        val_1 = buf[i1_floor] * (1.0 - frac_1) + buf[i1_ceil] * frac_1
+        val_2 = buf[i2_floor] * (1.0 - frac_2) + buf[i2_ceil] * frac_2
+
+        # 5. Кроссфейд (окно Ханна) для устранения щелчков
+        fade_1 = 0.5 - 0.5 * np.cos(2.0 * np.pi * p1)
+        fade_2 = 0.5 - 0.5 * np.cos(2.0 * np.pi * p2)
+
+        shifted = val_1 * fade_1 + val_2 * fade_2
+
+        # 6. Обновляем историю для следующего фрейма
+        self._anon_history = buf[-len(self._anon_history):]
+
+        # 7. LP-фильтр (4 кГц) для "тёмного" окраса (скрывает артефакты формант)
+        out, self._anon_lp_zi = sosfilt(self._anon_lp_sos, shifted, zi=self._anon_lp_zi)
+
+        # 8. Мягкая нормализация пика
+        peak = np.max(np.abs(out))
+        if peak > 0.9:
+            out *= 0.9 / peak
+
         return out.astype(np.float32)
 
     def __init__(self):
@@ -793,6 +851,15 @@ class AudioHandler(QObject):
         # Сброс zi производится в start_whisper().
         self._wlp_sos = butter(4, 1200, btype='low', fs=48000, output='sos')
         self._wlp_zi  = sosfilt_zi(self._wlp_sos).astype(np.float64)
+
+        # ── LP-фильтр для эффекта анонимного голоса (fc=4000 Гц) ──────────────
+        # Мягче чем whisper LP (1200 Гц): сохраняет согласные и зону присутствия.
+        # Используется в _apply_anonymous_voice_effect (получатель шёпота).
+        # Отдельная SOS/zi — не пересекается с _wlp_sos (старый эффект рации).
+        self._anon_lp_sos = butter(4, 4000, btype='low', fs=48000, output='sos')
+        self._anon_lp_zi  = sosfilt_zi(self._anon_lp_sos).astype(np.float64)
+        self._anon_history = np.zeros(2048, dtype=np.float32)
+        self._anon_phase = 0.0
         # Отдельный счётчик для FLAG_STREAM_VOICES пакетов.
         # Нельзя использовать my_sequence: несколько спикеров в одном audio_callback
         # получали бы одинаковый seq → JitterBuffer на стороне зрителя отбрасывал
@@ -1220,7 +1287,7 @@ class AudioHandler(QObject):
                             w_uid = getattr(self, '_whisper_in_uid', 0)
                             w_ts  = getattr(self, '_whisper_in_ts',  0.0)
                             if uid == w_uid and (curr_time - w_ts) < 2.0:
-                                s = self._apply_whisper_bass_effect(s)
+                                s = self._apply_anonymous_voice_effect(s)
 
                             self.mix_buffer += s * user.volume
 
@@ -1328,6 +1395,11 @@ class AudioHandler(QObject):
         # Сбрасываем состояние sosfilt-фильтра чтобы шёпот каждого нового собеседника
         # начинался с чистого состояния (без «хвоста» от предыдущего шёпота).
         self._wlp_zi = sosfilt_zi(self._wlp_sos).astype(np.float64)
+        self._anon_lp_zi = sosfilt_zi(self._anon_lp_sos).astype(np.float64)
+        print(f"[Audio] Whisper START → uid={target_uid}, seq_from={self._whisper_sequence}")
+        self._anon_history.fill(0)
+        self._anon_phase = 0.0
+
         print(f"[Audio] Whisper START → uid={target_uid}, seq_from={self._whisper_sequence}")
 
     def stop_whisper(self):
