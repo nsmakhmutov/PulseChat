@@ -193,6 +193,10 @@ class MainWindow(QMainWindow):
         # Тост «кто включил soundboard» — желтый лейбл поверх окна
         self.net.soundboard_played.connect(self._on_soundboard_played)
 
+        # Сигналы фичи «Пнуть»
+        self.net.nudge_received.connect(self._on_nudge_received)
+        self.net.nudge_triggered.connect(self._on_nudge_triggered)
+
         self.ui_timer = QTimer()
         self.ui_timer.timeout.connect(self.refresh_ui)
         self.ui_timer.start(100)
@@ -588,29 +592,29 @@ class MainWindow(QMainWindow):
         # Светлая тема: молочно-синяя, сохраняет читаемость, чуть прозрачнее.
         # ────────────────────────────────────────────────────────────────────────
         if is_dark:
-            win_bg       = "rgba(18, 20, 30, 255)"      # основной фон окна
-            surface      = "rgba(255,255,255,0.04)"      # фон дерева
-            surface_solid= "#1e2030"                     # для QComboBox dropdown (нет rgba)
-            text         = "#d4d8e8"
-            text_dim     = "#7888a8"
-            border       = "rgba(255,255,255,0.09)"
-            border_solid = "#333648"
-            hover        = "rgba(255,255,255,0.08)"
-            hover_solid  = "#2a2d40"
+            win_bg       = "rgba(28, 32, 50, 255)"      # основной фон окна (было 18,20,30 — слишком тёмно)
+            surface      = "rgba(255,255,255,0.10)"      # фон дерева (было 0.04 — иконки не видны)
+            surface_solid= "#252840"                     # для QComboBox dropdown (нет rgba)
+            text         = "#eaeef8"                     # ярче (было #d4d8e8)
+            text_dim     = "#8898bb"                     # ярче (было #7888a8)
+            border       = "rgba(255,255,255,0.13)"
+            border_solid = "#3d4260"
+            hover        = "rgba(255,255,255,0.12)"
+            hover_solid  = "#363a58"                     # был #2a2d40 — почти не отличался от фона
             accent       = "#5b8ef5"
             accent_red   = "#e74c3c"
-            title_bg     = "rgba(12, 14, 22, 255)"
+            title_bg     = "rgba(16, 18, 32, 255)"
             title_text   = "#cdd6f4"
-            title_sep    = "rgba(255,255,255,0.07)"
-            win_border   = "rgba(255,255,255,0.10)"
-            bottom_bg    = "rgba(0,0,0,0.22)"
-            bottom_sep   = "rgba(255,255,255,0.07)"
-            btn_bg       = "rgba(255,255,255,0.14)"
-            btn_hover    = "rgba(255,255,255,0.22)"
-            btn_border   = "rgba(255,255,255,0.20)"
-            scrollbar    = "rgba(255,255,255,0.15)"
-            sb_track     = "rgba(255,255,255,0.04)"
-            tree_room_bg = "rgba(255,255,255,0.04)"
+            title_sep    = "rgba(255,255,255,0.09)"
+            win_border   = "rgba(255,255,255,0.13)"
+            bottom_bg    = "rgba(0,0,0,0.28)"
+            bottom_sep   = "rgba(255,255,255,0.09)"
+            btn_bg       = "rgba(255,255,255,0.16)"
+            btn_hover    = "rgba(255,255,255,0.26)"
+            btn_border   = "rgba(255,255,255,0.24)"
+            scrollbar    = "rgba(255,255,255,0.22)"
+            sb_track     = "rgba(255,255,255,0.07)"
+            tree_room_bg = "rgba(255,255,255,0.07)"
         else:
             win_bg       = "rgba(210, 215, 225, 255)"
             surface      = "rgba(0,0,0,0.04)"
@@ -869,7 +873,7 @@ class MainWindow(QMainWindow):
         self._br_mute   = QBrush(self._c_mute)
         self._br_stream = QBrush(self._c_stream)
         self._br_def    = QBrush(self._c_def)
-        self._br_gray   = QBrush(QColor("#5a6070") if is_dark else QColor("#8090a8"))
+        self._br_gray   = QBrush(QColor("#6e7a96") if is_dark else QColor("#8090a8"))
 
     def setup_hotkeys(self):
         """
@@ -1488,6 +1492,7 @@ class MainWindow(QMainWindow):
             parent=self,
             is_streaming=is_streaming,
             on_watch_stream=watch_cb,
+            net=self.net,
         ).show()
 
     def open_video_window(self, uid, nick):
@@ -1668,6 +1673,63 @@ class MainWindow(QMainWindow):
                     w._sb_panel.flash_from_nick(from_nick)
             except (RuntimeError, AttributeError):
                 pass
+
+    # ── Слоты фичи «Пнуть» ───────────────────────────────────────────────────
+
+    def _on_nudge_received(self):
+        """
+        Нас пнули — показать красный тост.
+        Звук уже воспроизводится в потоке NetworkClient._play_nudge_sound().
+        """
+        self._show_nudge_toast("👟  Тебя пнули!")
+
+    def _on_nudge_triggered(self, target_nick: str, voter_nick: str):
+        """
+        Broadcast: кого-то пнули в нашей комнате.
+        Показываем информационный тост у ВСЕХ участников, включая инициатора.
+        """
+        self._show_nudge_toast(f"👟  {voter_nick} пнул {target_nick}!")
+
+    def _show_nudge_toast(self, text: str):
+        """
+        Красный тост в правом нижнем углу главного окна на 4 секунды.
+        Создаётся один раз (lazy init) — не аллоцирует при каждом вызове.
+        Если тост уже виден — обновляем текст и перезапускаем таймер.
+        """
+        if not hasattr(self, '_nudge_toast_lbl'):
+            lbl = QLabel(self)
+            lbl.setObjectName("nudgeToast")
+            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            lbl.setStyleSheet("""
+                QLabel#nudgeToast {
+                    background-color: rgba(180, 30, 30, 0.88);
+                    color: #ffffff;
+                    border: 1px solid rgba(255, 80, 80, 0.60);
+                    border-radius: 8px;
+                    padding: 6px 14px;
+                    font-size: 13px;
+                    font-weight: bold;
+                }
+            """)
+            lbl.hide()
+            self._nudge_toast_lbl = lbl
+            self._nudge_toast_timer = QTimer(self)
+            self._nudge_toast_timer.setSingleShot(True)
+            self._nudge_toast_timer.timeout.connect(lbl.hide)
+
+        self._nudge_toast_lbl.setText(text)
+        self._nudge_toast_lbl.adjustSize()
+        mw = self.width()
+        mh = self.height()
+        tw = self._nudge_toast_lbl.width()
+        th = self._nudge_toast_lbl.height()
+        # Правый нижний угол, над панелью управления
+        self._nudge_toast_lbl.move(mw - tw - 14, mh - th - 60)
+        self._nudge_toast_lbl.raise_()
+        self._nudge_toast_lbl.show()
+        self._nudge_toast_timer.stop()
+        self._nudge_toast_timer.start(4000)
 
     def _update_known_users_registry(self, users_map):
         """

@@ -11,6 +11,7 @@ from config import (
     CMD_SYNC_USERS, CMD_SOUNDBOARD, FLAG_LOOPBACK_AUDIO, FLAG_STREAM_VOICES,
     FLAG_WHISPER, STREAM_VOICE_HEADER_STRUCT, STREAM_VOICE_HEADER_SIZE,
     CMD_UPDATE_PRESENCE,
+    CMD_NUDGE_VOTE, CMD_PLAY_NUDGE, CMD_NUDGE_TRIGGERED, NUDGE_COOLDOWN_SEC,
 )
 
 
@@ -63,6 +64,12 @@ class SFUServer:
 
         self.stats = {"packets": 0, "bytes": 0}
         self.start_time = time.time()
+
+        # --- Голосование «Пнуть» (Nudge) ---
+        # Структура: { room_name → { target_uid → { voter_uid → vote_timestamp } } }
+        # Записи живут NUDGE_COOLDOWN_SEC; голоса старше кулдауна не засчитываются.
+        self.nudge_votes = {}
+        self.nudge_lock  = threading.Lock()
 
     # ------------------------------------------------------------------
     # Мониторинг
@@ -421,6 +428,112 @@ class SFUServer:
                                     c.sendall(payload)
                                 except Exception:
                                     pass
+
+                        elif action == CMD_NUDGE_VOTE:
+                            # ── Голосование «Пнуть» ──────────────────────────────────────
+                            # Порог срабатывания: все участники комнаты, кроме цели.
+                            # Пример: 4 человека в комнате, 1 АФК — нужно 3 голоса.
+                            # Кулдаун: один voter может добавить голос не чаще
+                            # NUDGE_COOLDOWN_SEC за одну цель.
+                            target_uid = msg.get('target_uid')
+                            if not isinstance(target_uid, int):
+                                continue
+
+                            now  = time.time()
+                            fire = False
+                            t_conn          = None
+                            broadcaster_conns = []
+                            voter_nick  = '?'
+                            target_nick = '?'
+                            voter_uid_v = None
+                            voter_room  = None
+
+                            with self.clients_lock:
+                                if conn not in self.clients:
+                                    continue
+                                voter_info  = self.clients[conn]
+                                voter_uid_v = voter_info['uid']
+                                voter_room  = voter_info['room']
+                                voter_nick  = voter_info['nick']
+
+                                # uid всех участников комнаты
+                                room_uids = [
+                                    c['uid'] for c in self.clients.values()
+                                    if c['room'] == voter_room
+                                ]
+                                # порог = все в комнате, кроме цели
+                                threshold = max(1, len(room_uids) - 1)
+
+                                # Находим conn и ник цели
+                                for c_conn, c_data in self.clients.items():
+                                    if (c_data['uid'] == target_uid
+                                            and c_data['room'] == voter_room):
+                                        t_conn      = c_conn
+                                        target_nick = c_data['nick']
+                                        break
+
+                                # broadcast-список — все участники комнаты
+                                broadcaster_conns = [
+                                    c_conn for c_conn, c_data in self.clients.items()
+                                    if c_data['room'] == voter_room
+                                ]
+
+                            if t_conn is None:
+                                # цель не в нашей комнате — игнорируем
+                                continue
+
+                            with self.nudge_lock:
+                                room_votes   = self.nudge_votes.setdefault(voter_room, {})
+                                target_votes = room_votes.setdefault(target_uid, {})
+
+                                # Проверяем кулдаун для этого voter
+                                last = target_votes.get(voter_uid_v, 0)
+                                if now - last < NUDGE_COOLDOWN_SEC:
+                                    remaining = int(NUDGE_COOLDOWN_SEC - (now - last))
+                                    print(
+                                        f"[Server] 👟 {voter_nick} → Пнуть {target_nick}"
+                                        f" — кулдаун ещё {remaining} с"
+                                    )
+                                    continue
+
+                                target_votes[voter_uid_v] = now
+
+                                # Считаем только активные (не протухшие) голоса
+                                active = sum(
+                                    1 for uid_v, ts in target_votes.items()
+                                    if now - ts < NUDGE_COOLDOWN_SEC
+                                )
+                                print(
+                                    f"[Server] 👟 {voter_nick} → Пнуть {target_nick}"
+                                    f" ({active}/{threshold} голосов)"
+                                )
+
+                                if active >= threshold:
+                                    # Сбрасываем голоса — следующий пнёт снова через кулдаун
+                                    room_votes.pop(target_uid, None)
+                                    fire = True
+
+                            if fire:
+                                # Отправляем play_nudge только цели
+                                try:
+                                    t_conn.sendall(
+                                        json.dumps({'action': CMD_PLAY_NUDGE}).encode('utf-8')
+                                    )
+                                    print(f"[Server] 👟 NUDGE FIRED → {target_nick}")
+                                except Exception:
+                                    pass
+
+                                # Рассылаем nudge_triggered всем в комнате (тост у всех)
+                                broadcast_payload = json.dumps({
+                                    'action':      CMD_NUDGE_TRIGGERED,
+                                    'target_nick': target_nick,
+                                    'voter_nick':  voter_nick,
+                                }).encode('utf-8')
+                                for bc in broadcaster_conns:
+                                    try:
+                                        bc.sendall(broadcast_payload)
+                                    except Exception:
+                                        pass
 
                     except json.JSONDecodeError:
                         break

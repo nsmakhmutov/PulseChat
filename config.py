@@ -116,3 +116,18 @@ CMD_STREAM_STOP   = 'stream_stop'
 # status_icon: имя SVG-файла из папки assets/status/ (или '' — нет статуса).
 # status_text: произвольный текст ≤ 30 символов (или '' — нет подсказки).
 CMD_UPDATE_PRESENCE = 'update_presence'
+# --- Фича «Пнуть» (Nudge) ---
+# CMD_NUDGE_VOTE      — клиент → сервер: голос за «пнуть» target_uid
+# CMD_PLAY_NUDGE      — сервер → цель: воспроизвести Danger.mp3 + писк
+# CMD_NUDGE_TRIGGERED — сервер → все в комнате: broadcast-тост (кто пнул / кого)
+CMD_NUDGE_VOTE      = 'nudge_vote'
+CMD_PLAY_NUDGE      = 'play_nudge'
+CMD_NUDGE_TRIGGERED = 'nudge_triggered'
+
+# Кулдаун: один voter может проголосовать за одну цель раз в 10 минут.
+# После срабатывания звука голоса сбрасываются, кулдаун остаётся.
+NUDGE_COOLDOWN_SEC  = 600  # 10 минут
+
+# Абсолютный путь к звуковому файлу (проверяется в первую очередь).
+# Если файл не найден — фоллбэк на resource_path("assets/music/Danger.mp3").
+NUDGE_SOUND_PATH = r'E:\Mychat\VoiceChat\assets\music\Danger.mp3'

@@ -19,6 +19,7 @@ from config import (
     CMD_SOUNDBOARD, FLAG_LOOPBACK_AUDIO, FLAG_STREAM_VOICES,
     STREAM_VOICE_HEADER_STRUCT, STREAM_VOICE_HEADER_SIZE,
     VIDEO_PACING_RATE_BYTES_SEC, FLAG_WHISPER,
+    CMD_NUDGE_VOTE, CMD_PLAY_NUDGE, CMD_NUDGE_TRIGGERED, NUDGE_SOUND_PATH,
 )
 
 MAX_SILENT_RECONNECT_ATTEMPTS = 4
@@ -46,6 +47,12 @@ class NetworkClient(QObject):
     # Эмитит (from_nick) при получении soundboard-пакета от сервера.
     # MainWindow показывает тост и обновляет желтую метку в открытой панели.
     soundboard_played   = pyqtSignal(str)
+
+    # Сигналы фичи «Пнуть».
+    # nudge_received  — нас пнули (воспроизведение звука уже запущено в потоке).
+    # nudge_triggered — кого-то пнули в комнате (target_nick, voter_nick) → тост у всех.
+    nudge_received  = pyqtSignal()
+    nudge_triggered = pyqtSignal(str, str)
 
     def __init__(self, audio):
         super().__init__()
@@ -519,6 +526,22 @@ class NetworkClient(QObject):
                 self.video.force_keyframe()
                 print("[Net] IDR keyframe запрошен сервером → передано VideoEngine")
 
+        elif act == CMD_PLAY_NUDGE:
+            # Нас пнули — воспроизводим звук в отдельном потоке.
+            # Звук намеренно обходит deaf/mute — цель фичи «достучаться» до АФК.
+            threading.Thread(
+                target=self._play_nudge_sound,
+                daemon=True,
+                name="nudge-sound",
+            ).start()
+            self.nudge_received.emit()
+
+        elif act == CMD_NUDGE_TRIGGERED:
+            # Broadcast: кого-то пнули в нашей комнате → показываем тост у всех
+            target_nick = msg.get('target_nick', '?')
+            voter_nick  = msg.get('voter_nick',  '?')
+            self.nudge_triggered.emit(target_nick, voter_nick)
+
     def send_json(self, data):
         try:
             self.tcp_sock.sendall(json.dumps(data).encode('utf-8'))
@@ -553,6 +576,301 @@ class NetworkClient(QObject):
     def set_video_engine(self, video):
         self.video = video
         print("[Net] VideoEngine registered")
+
+    # ------------------------------------------------------------------
+    # Фича «Пнуть» — воспроизведение звука и отправка голоса
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Управление системной громкостью Windows (WASAPI IAudioEndpointVolume)
+    # ------------------------------------------------------------------
+
+    def _nudge_get_endpoint_vol(self):
+        """
+        Возвращает указатель на IAudioEndpointVolume дефолтного устройства
+        воспроизведения (мастер-ползунок Windows, тот что в трее).
+
+        Поддерживает ОБЕ версии pycaw:
+          • pycaw < 0.6  — GetSpeakers() возвращает сырой IMMDevice с .Activate()
+          • pycaw >= 0.6 — GetSpeakers() возвращает AudioDevice-обёртку;
+                           сырой IMMDevice лежит в атрибуте ._dev
+
+        Fallback без pycaw — comtypes напрямую (comtypes всегда есть,
+        т.к. является зависимостью pycaw и pywin32).
+
+        Возвращает IAudioEndpointVolume* или None при любой ошибке.
+        """
+        # ── Попытка 1: pycaw (оба поколения API) ─────────────────────────────
+        try:
+            from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+            from comtypes import CLSCTX_ALL
+            from ctypes import cast, POINTER
+
+            device = AudioUtilities.GetSpeakers()
+
+            # Определяем откуда брать сырой IMMDevice:
+            #   pycaw >= 0.6 → AudioDevice-обёртка, IMMDevice внутри ._dev
+            #   pycaw <  0.6 → уже IMMDevice, имеет метод Activate()
+            if hasattr(device, 'Activate'):
+                raw_dev = device          # старый pycaw — сразу IMMDevice
+            elif hasattr(device, '_dev'):
+                raw_dev = device._dev     # новый pycaw — достаём IMMDevice
+            else:
+                raise RuntimeError(
+                    f"[Nudge] Неизвестный тип GetSpeakers(): {type(device).__name__}"
+                )
+
+            iface = raw_dev.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+            return cast(iface, POINTER(IAudioEndpointVolume))
+
+        except ImportError:
+            print("[Nudge] pycaw не установлен — пробуем comtypes напрямую")
+        except Exception as e:
+            print(f"[Nudge] pycaw get_endpoint_vol error: {e}")
+
+        # ── Попытка 2: comtypes напрямую (без pycaw) ─────────────────────────
+        # Вручную определяем COM-интерфейсы WASAPI через comtypes.
+        # comtypes входит в зависимости pycaw → всегда доступен если pycaw установлен.
+        try:
+            import comtypes
+            import comtypes.client
+            from ctypes import cast, POINTER, c_float, c_int, c_uint, HRESULT
+
+            # GUIDs
+            CLSID_MMDeviceEnumerator = comtypes.GUID(
+                '{BCDE0395-E52F-467C-8E3D-C4579291692E}'
+            )
+            IID_IMMDeviceEnumerator = comtypes.GUID(
+                '{A95664D2-9614-4F35-A746-DE8DB63617E6}'
+            )
+            IID_IMMDevice = comtypes.GUID(
+                '{D666063F-1587-4E43-81F1-B948E807363F}'
+            )
+            IID_IAudioEndpointVolume = comtypes.GUID(
+                '{5CDF2C82-841E-4546-9722-0CF74078229A}'
+            )
+
+            # Определяем минимальные COM-интерфейсы
+            class IMMDevice(comtypes.IUnknown):
+                _iid_    = IID_IMMDevice
+                _methods_ = [
+                    comtypes.COMMETHOD(
+                        [], HRESULT, 'Activate',
+                        (['in'],  comtypes.GUID,           'iid'),
+                        (['in'],  c_uint,                  'dwClsCtx'),
+                        (['in'],  comtypes.c_void_p,       'pActivationParams'),
+                        (['out'], POINTER(comtypes.c_void_p), 'ppInterface'),
+                    ),
+                    comtypes.COMMETHOD([], HRESULT, 'OpenPropertyStore',
+                        (['in'],  c_uint, 'stgmAccess'),
+                        (['out'], POINTER(comtypes.IUnknown), 'ppProperties'),
+                    ),
+                    comtypes.COMMETHOD([], HRESULT, 'GetId',
+                        (['out'], POINTER(comtypes.c_wchar_p), 'ppstrId'),
+                    ),
+                    comtypes.COMMETHOD([], HRESULT, 'GetState',
+                        (['out'], POINTER(c_uint), 'pdwState'),
+                    ),
+                ]
+
+            class IMMDeviceEnumerator(comtypes.IUnknown):
+                _iid_    = IID_IMMDeviceEnumerator
+                _methods_ = [
+                    comtypes.COMMETHOD(
+                        [], HRESULT, 'EnumAudioEndpoints',
+                        (['in'],  c_uint, 'dataFlow'),
+                        (['in'],  c_uint, 'dwStateMask'),
+                        (['out'], POINTER(comtypes.IUnknown), 'ppDevices'),
+                    ),
+                    comtypes.COMMETHOD(
+                        [], HRESULT, 'GetDefaultAudioEndpoint',
+                        (['in'],  c_uint,              'dataFlow'),
+                        (['in'],  c_uint,              'role'),
+                        (['out'], POINTER(IMMDevice),  'ppEndpoint'),
+                    ),
+                ]
+
+            class IAudioEndpointVolumeDirect(comtypes.IUnknown):
+                _iid_    = IID_IAudioEndpointVolume
+                _methods_ = [
+                    comtypes.COMMETHOD([], HRESULT, 'RegisterControlChangeNotify',
+                        (['in'], comtypes.IUnknown, 'pNotify')),
+                    comtypes.COMMETHOD([], HRESULT, 'UnregisterControlChangeNotify',
+                        (['in'], comtypes.IUnknown, 'pNotify')),
+                    comtypes.COMMETHOD([], HRESULT, 'GetChannelCount',
+                        (['out'], POINTER(c_uint), 'pnChannelCount')),
+                    comtypes.COMMETHOD([], HRESULT, 'SetMasterVolumeLevel',
+                        (['in'], c_float, 'fLevelDB'),
+                        (['in'], comtypes.c_void_p, 'pguidEventContext')),
+                    comtypes.COMMETHOD([], HRESULT, 'SetMasterVolumeLevelScalar',
+                        (['in'], c_float, 'fLevel'),
+                        (['in'], comtypes.c_void_p, 'pguidEventContext')),
+                    comtypes.COMMETHOD([], HRESULT, 'GetMasterVolumeLevel',
+                        (['out'], POINTER(c_float), 'pfLevelDB')),
+                    comtypes.COMMETHOD([], HRESULT, 'GetMasterVolumeLevelScalar',
+                        (['out'], POINTER(c_float), 'pfLevel')),
+                    comtypes.COMMETHOD([], HRESULT, 'SetChannelVolumeLevel',
+                        (['in'], c_uint, 'nChannel'),
+                        (['in'], c_float, 'fLevelDB'),
+                        (['in'], comtypes.c_void_p, 'pguidEventContext')),
+                    comtypes.COMMETHOD([], HRESULT, 'SetChannelVolumeLevelScalar',
+                        (['in'], c_uint, 'nChannel'),
+                        (['in'], c_float, 'fLevel'),
+                        (['in'], comtypes.c_void_p, 'pguidEventContext')),
+                    comtypes.COMMETHOD([], HRESULT, 'GetChannelVolumeLevel',
+                        (['in'],  c_uint, 'nChannel'),
+                        (['out'], POINTER(c_float), 'pfLevelDB')),
+                    comtypes.COMMETHOD([], HRESULT, 'GetChannelVolumeLevelScalar',
+                        (['in'],  c_uint, 'nChannel'),
+                        (['out'], POINTER(c_float), 'pfLevel')),
+                    comtypes.COMMETHOD([], HRESULT, 'SetMute',
+                        (['in'], c_int, 'bMute'),
+                        (['in'], comtypes.c_void_p, 'pguidEventContext')),
+                    comtypes.COMMETHOD([], HRESULT, 'GetMute',
+                        (['out'], POINTER(c_int), 'pbMute')),
+                ]
+
+            comtypes.CoInitialize()
+            enumerator = comtypes.client.CreateObject(
+                CLSID_MMDeviceEnumerator,
+                interface=IMMDeviceEnumerator,
+            )
+            # eRender=0, eConsole=0 → дефолтное устройство воспроизведения
+            device = enumerator.GetDefaultAudioEndpoint(0, 0)
+            iface  = device.Activate(IID_IAudioEndpointVolume, 0x17, None)
+            return cast(iface, POINTER(IAudioEndpointVolumeDirect))
+
+        except Exception as e:
+            print(f"[Nudge] comtypes direct error: {e}")
+
+        return None
+
+    def _nudge_boost_volume(self) -> tuple:
+        """
+        Снимает системный мьют и поднимает мастер-громкость Windows если нужно.
+        Возвращает (prev_scalar, was_muted) для последующего восстановления.
+
+        NUDGE_MIN_VOL  = 0.30 — ниже считаем «не слышно», поднимаем.
+        NUDGE_BOOST_VOL = 0.80 — до 80% (не 100% — не пугаем соседей).
+        """
+        NUDGE_MIN_VOL   = 0.30
+        NUDGE_BOOST_VOL = 0.80
+
+        prev_scalar = -1.0
+        was_muted   = False
+
+        vol = self._nudge_get_endpoint_vol()
+        if vol is None:
+            print("[Nudge] IAudioEndpointVolume недоступен — громкость не изменена")
+            return prev_scalar, was_muted
+
+        try:
+            prev_scalar = float(vol.GetMasterVolumeLevelScalar())
+            was_muted   = bool(vol.GetMute())
+
+            if was_muted:
+                vol.SetMute(False, None)
+                print("[Nudge] Системный мьют снят")
+
+            if prev_scalar < NUDGE_MIN_VOL:
+                vol.SetMasterVolumeLevelScalar(NUDGE_BOOST_VOL, None)
+                print(f"[Nudge] Громкость {prev_scalar:.0%} → {NUDGE_BOOST_VOL:.0%}")
+
+        except Exception as e:
+            print(f"[Nudge] boost error: {e}")
+
+        return prev_scalar, was_muted
+
+    def _nudge_restore_volume(self, prev_scalar: float, was_muted: bool):
+        """
+        Восстанавливает мастер-громкость Windows и состояние мьюта.
+        Вызывается из finally-блока _play_nudge_sound — гарантированно.
+        """
+        if prev_scalar < 0:
+            return   # не удалось прочитать ранее — нечего восстанавливать
+
+        vol = self._nudge_get_endpoint_vol()
+        if vol is None:
+            return
+
+        try:
+            vol.SetMasterVolumeLevelScalar(prev_scalar, None)
+            if was_muted:
+                vol.SetMute(True, None)
+            print(f"[Nudge] Громкость восстановлена → {prev_scalar:.0%}"
+                  + (" + мьют" if was_muted else ""))
+        except Exception as e:
+            print(f"[Nudge] restore error: {e}")
+
+    def _play_nudge_sound(self):
+        """
+        Воспроизвести Danger.mp3 + системный писк — НЕЗАВИСИМО от deaf/mute.
+
+        Перед воспроизведением:
+          • Форсированно снимает системный мьют Windows (если включён).
+          • Поднимает системную громкость до 80% если она ниже 30%.
+        После воспроизведения (в блоке finally):
+          • Восстанавливает исходную громкость и состояние мьюта.
+
+        Порядок звуков:
+          1. winsound.MessageBeep(MB_ICONEXCLAMATION) — системная звуковая схема.
+          2. winsound.Beep(1200, 400) — тональный сигнал 1.2 кГц / 400 мс
+             (PC Speaker / аудиодрайвер в зависимости от железа).
+          3. sounddevice.play(Danger.mp3, vol=1.0) — в обход AudioHandler.
+        """
+        import winsound as _ws
+
+        # ── Форсируем системную громкость ────────────────────────────────────
+        prev_scalar, was_muted = self._nudge_boost_volume()
+
+        try:
+            # 1. Системный «warning» звук Windows
+            try:
+                _ws.MessageBeep(0x30)   # MB_ICONEXCLAMATION = 0x30
+            except Exception as e:
+                print(f"[Nudge] MessageBeep error: {e}")
+
+            # 2. Тональный писк: 1200 Гц, 400 мс
+            # Блокирует daemon-поток на 400 мс — это ОК.
+            try:
+                _ws.Beep(1200, 400)
+            except Exception as e:
+                print(f"[Nudge] Beep error: {e}")
+
+            # 3. Danger.mp3 через sounddevice (vol=1.0 — без масштабирования)
+            sound_path = None
+            for candidate in (
+                NUDGE_SOUND_PATH,
+                resource_path(os.path.join("assets", "music", "Danger.mp3")),
+            ):
+                if os.path.exists(candidate):
+                    sound_path = candidate
+                    break
+
+            if sound_path is None:
+                print(
+                    f"[Nudge] Danger.mp3 не найден: {NUDGE_SOUND_PATH}"
+                )
+                return
+
+            try:
+                data, sr = sf.read(sound_path, dtype='float32')
+                sd.play(data, sr)
+                sd.wait()
+                print("[Nudge] Danger.mp3 воспроизведён успешно")
+            except Exception as e:
+                print(f"[Nudge] playback error: {e}")
+
+        finally:
+            # ── Восстанавливаем громкость в любом случае ─────────────────────
+            self._nudge_restore_volume(prev_scalar, was_muted)
+
+    def send_nudge_vote(self, target_uid: int):
+        """Отправить серверу голос «Пнуть» для указанного пользователя."""
+        self.send_json({
+            'action':     CMD_NUDGE_VOTE,
+            'target_uid': target_uid,
+        })
+        print(f"[Net] Nudge vote sent → target_uid={target_uid}")
 
     # ------------------------------------------------------------------
     # Заглушки для совместимости с ui_main.py (качество не реализовано).

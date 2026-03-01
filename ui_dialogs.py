@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QSc
                              QWidget, QGridLayout, QLabel, QSlider, QTabWidget,
                              QComboBox, QProgressBar, QLineEdit, QCheckBox, QFrame,
                              QGroupBox, QSizePolicy, QFileDialog, QMessageBox)
-from PyQt6.QtCore import Qt, QSize, QSettings, QEvent, QPropertyAnimation, QEasingCurve, QRect, QPoint, QTimer
+from PyQt6.QtCore import Qt, QSize, QSettings, QEvent, QPropertyAnimation, QEasingCurve, QRect, QPoint, QTimer, pyqtSignal
 from PyQt6.QtGui import QIcon, QGuiApplication, QPainter, QColor, QPen, QFont, QPainterPath, QBrush
 from config import resource_path, CMD_SOUNDBOARD
 from audio_engine import PYRNNOISE_AVAILABLE
@@ -111,6 +111,114 @@ class MicVadWidget(QWidget):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Кнопка с удержанием: заполняется за 3 секунды, эмитит hold_complete
+# ──────────────────────────────────────────────────────────────────────────────
+class NudgeHoldButton(QPushButton):
+    """
+    QPushButton с механикой удержания 3 секунды.
+
+    Логика:
+      • mousePress  → запускает QTimer с шагом _TICK_MS мс.
+      • каждый тик  → _progress растёт 0 → 1, вызывает update() для перерисовки.
+      • mouseRelease / leaveEvent до завершения → сброс (_progress=0).
+      • progress == 1 → emit hold_complete, кнопка блокируется (_fired=True).
+
+    paintEvent:
+      • super().paintEvent() рисует стандартную кнопку (фон, текст, рамка).
+      • Поверх рисуем скруглённый оранжевый fill с alpha=90 (≈35%),
+        шириной progress * rect.width() — текст остаётся читаемым.
+    """
+
+    hold_complete = pyqtSignal()
+
+    _HOLD_MS = 3000   # общее время удержания, мс
+    _TICK_MS = 20     # интервал таймера, мс  → 150 тиков за 3 с, ~50 FPS
+
+    def __init__(self, text: str, parent=None):
+        super().__init__(text, parent)
+        self._progress: float = 0.0   # 0.0–1.0
+        self._holding:  bool  = False
+        self._fired:    bool  = False  # сработал → больше не принимаем нажатия
+
+        self._tick_timer = QTimer(self)
+        self._tick_timer.setInterval(self._TICK_MS)
+        self._tick_timer.timeout.connect(self._on_tick)
+
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    # ── Таймер ────────────────────────────────────────────────────────────────
+    def _on_tick(self):
+        self._progress += self._TICK_MS / self._HOLD_MS
+        if self._progress >= 1.0:
+            self._progress = 1.0
+            self._tick_timer.stop()
+            self._holding = False
+            self._fired = True
+            self.update()
+            self.hold_complete.emit()
+        else:
+            self.update()
+
+    # ── Мышь ──────────────────────────────────────────────────────────────────
+    def mousePressEvent(self, e):
+        if (e.button() == Qt.MouseButton.LeftButton
+                and self.isEnabled()
+                and not self._fired):
+            self._holding = True
+            self._progress = 0.0
+            self._tick_timer.start()
+        super().mousePressEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if self._holding:
+            self._holding = False
+            self._progress = 0.0
+            self._tick_timer.stop()
+            self.update()
+        super().mouseReleaseEvent(e)
+
+    def leaveEvent(self, e):
+        """Отпускаем удержание, если курсор ушёл за пределы кнопки."""
+        if self._holding:
+            self._holding = False
+            self._progress = 0.0
+            self._tick_timer.stop()
+            self.update()
+        super().leaveEvent(e)
+
+    # ── Отрисовка ─────────────────────────────────────────────────────────────
+    def paintEvent(self, e):
+        # 1. Стандартная отрисовка кнопки (фон из stylesheet, текст, рамка)
+        super().paintEvent(e)
+
+        # 2. Оранжевый fill-оверлей поверх — только во время удержания
+        if self._progress <= 0.0 or self._fired:
+            return
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        r = self.rect()
+        fill_w = int(r.width() * self._progress)
+
+        # Скруглённый клип совпадает с border-radius кнопки (7 px)
+        clip = QPainterPath()
+        clip.addRoundedRect(0.0, 0.0, float(r.width()), float(r.height()), 7.0, 7.0)
+        p.setClipPath(clip)
+
+        # alpha растёт от 70 до 130 по ходу заливки — плавно проявляется
+        alpha = int(70 + 60 * self._progress)
+        p.fillRect(0, 0, fill_w, r.height(), QColor(230, 126, 34, alpha))
+
+        # Тонкая светлая граница на краю заливки — визуальный «фронт»
+        pen = QPen(QColor(255, 180, 80, 160), 1.5)
+        p.setPen(pen)
+        p.drawLine(fill_w, 2, fill_w, r.height() - 2)
+
+        p.end()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Всплывающий оверлей управления пользователем (вместо отдельного окна)
 # ──────────────────────────────────────────────────────────────────────────────
 # ──────────────────────────────────────────────────────────────────────────────
@@ -130,7 +238,8 @@ class UserOverlayPanel(QFrame):
     """
 
     def __init__(self, nick: str, current_vol: float, uid: int, audio_handler, global_pos,
-                 parent=None, is_streaming: bool = False, on_watch_stream=None):
+                 parent=None, is_streaming: bool = False, on_watch_stream=None,
+                 net=None):
         super().__init__(
             parent,
             Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint
@@ -140,6 +249,7 @@ class UserOverlayPanel(QFrame):
         self._nick = nick.strip()
         self._whisper_active = False
         self._on_watch_stream = on_watch_stream
+        self._net = net
 
         # ── Прозрачность окна + рисуем фон сами в paintEvent ─────────────────
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -282,6 +392,71 @@ class UserOverlayPanel(QFrame):
         self._lbl_whisper_hint.setStyleSheet(self._lbl_whisper_hint_idle_style)
         card_lay.addWidget(self._lbl_whisper_hint)
 
+        # ── Кнопка: Пнуть (Nudge) — удержание 3 секунды ─────────────────────
+        # NudgeHoldButton: заполняется оранжевым за 3 с, только тогда отправляет.
+        # Защита от случайного нажатия — нельзя задеть мимоходом.
+        if net is not None:
+            sep_n = QFrame()
+            sep_n.setFrameShape(QFrame.Shape.HLine)
+            sep_n.setStyleSheet(
+                "background: rgba(255,255,255,0.08); border: none; max-height: 1px;"
+            )
+            sep_n.setMaximumHeight(1)
+            card_lay.addWidget(sep_n)
+
+            self.btn_nudge = NudgeHoldButton("👟  Пнуть  (держи 3с)")
+            self.btn_nudge.setStyleSheet("""
+                QPushButton {
+                    background-color: rgba(255,255,255,0.06);
+                    color: #f0a060;
+                    border: 1px solid rgba(230, 126, 34, 0.5);
+                    border-radius: 7px;
+                    padding: 5px 10px;
+                    font-size: 12px;
+                    text-align: left;
+                }
+                QPushButton:hover {
+                    background-color: rgba(230, 126, 34, 0.14);
+                    border-color: rgba(230, 126, 34, 0.85);
+                }
+                QPushButton:disabled {
+                    color: rgba(150, 100, 50, 0.55);
+                    border-color: rgba(150, 100, 50, 0.25);
+                    background-color: rgba(255,255,255,0.03);
+                }
+            """)
+
+            # Проверяем кулдаун из QSettings — показываем «через Xм» если ещё активен
+            import time as _nudge_time
+            _s = QSettings("MyVoiceChat", "GlobalSettings")
+            _last = float(_s.value(f"nudge_ts_{uid}", 0))
+            _remaining = int(600 - (_nudge_time.time() - _last))
+            if _remaining > 0:
+                _mins = (_remaining + 59) // 60
+                self.btn_nudge.setEnabled(False)
+                self.btn_nudge.setText(f"👟  Пнуть  (через {_mins}м)")
+
+            self.btn_nudge.hold_complete.connect(self._on_nudge_clicked)
+            card_lay.addWidget(self.btn_nudge)
+
+            # Подсказка под кнопкой — занимает место всегда, видна только при удержании
+            self._lbl_nudge_hint = QLabel("Держи, чтобы отправить голос «Пнуть»")
+            self._lbl_nudge_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._lbl_nudge_hint.setWordWrap(False)
+            self._lbl_nudge_hint_active_style = (
+                "font-size: 10px; color: rgba(240,160,80,0.85); "
+                "background:transparent; border:none;"
+            )
+            self._lbl_nudge_hint_idle_style = (
+                "font-size: 10px; color: transparent; "
+                "background:transparent; border:none;"
+            )
+            self._lbl_nudge_hint.setStyleSheet(self._lbl_nudge_hint_idle_style)
+            card_lay.addWidget(self._lbl_nudge_hint)
+
+            # Показываем / скрываем hint через сигналы таймера кнопки
+            self.btn_nudge._tick_timer.timeout.connect(self._on_nudge_tick_hint)
+
         # Фиксируем размер ПОСЛЕ добавления всех виджетов (включая hint).
         # Это гарантирует, что место под hint уже учтено и панель
         # не будет прыгать при появлении текста.
@@ -375,6 +550,52 @@ class UserOverlayPanel(QFrame):
         self.close()
         if self._on_watch_stream is not None:
             self._on_watch_stream()
+
+    def _on_nudge_tick_hint(self):
+        """
+        Вызывается каждые 20 мс пока кнопка удерживается.
+        Показывает подсказку при старте удержания (первый тик),
+        скрывает при сбросе (holding=False).
+        """
+        if not hasattr(self, '_lbl_nudge_hint'):
+            return
+        if self.btn_nudge._holding:
+            self._lbl_nudge_hint.setStyleSheet(self._lbl_nudge_hint_active_style)
+            # Динамический текст с прогрессом
+            pct = int(self.btn_nudge._progress * 100)
+            self._lbl_nudge_hint.setText(f"Держи… {pct}%")
+        else:
+            self._lbl_nudge_hint.setStyleSheet(self._lbl_nudge_hint_idle_style)
+            self._lbl_nudge_hint.setText("Держи, чтобы отправить голос «Пнуть»")
+
+    def _on_nudge_clicked(self):
+        """
+        Вызывается после успешного 3-секундного удержания (hold_complete).
+
+        Двойная защита от спама:
+          1. QSettings 'nudge_ts_<uid>' — кулдаун хранится между сессиями.
+          2. NudgeHoldButton._fired = True — повторный hold невозможен.
+
+        Кулдаун совпадает с серверным (NUDGE_COOLDOWN_SEC = 600 с).
+        """
+        if self._net is None:
+            return
+        import time as _t
+        _s   = QSettings("MyVoiceChat", "GlobalSettings")
+        _key = f"nudge_ts_{self.uid}"
+        _now = _t.time()
+        # guard: проверяем кулдаун ещё раз
+        if _now - float(_s.value(_key, 0)) < 600:
+            return
+        # Сохраняем оптимистично — до ответа сервера
+        _s.setValue(_key, _now)
+        self._net.send_nudge_vote(self.uid)
+        self.btn_nudge.setEnabled(False)
+        self.btn_nudge.setText("👟  Проголосовал ✓")
+        # Скрываем hint
+        if hasattr(self, '_lbl_nudge_hint'):
+            self._lbl_nudge_hint.setStyleSheet(self._lbl_nudge_hint_idle_style)
+        print(f"[UI] Nudge vote → uid={self.uid} nick={self._nick!r}")
 
     def hideEvent(self, event):
         """Если панель закрылась пока шептали — останавливаем шёпот."""
@@ -1252,8 +1473,8 @@ class SettingsDialog(QDialog):
         aud_lay.addWidget(QLabel("Качество звука (Битрейт):"))
         self.cb_bitrate = QComboBox()
         bitrate_options = {
-            "8 kbps (Рация)": 8,
-            "24 kbps (Стандарт)": 24,
+            "24 kbps (Рация)": 24,
+            "48 kbps (Стандарт)": 48,
             "64 kbps (Хорошее)": 64
         }
         for text, val in bitrate_options.items():
