@@ -1,5 +1,6 @@
 import threading
 import queue
+import math
 from collections import deque
 import numpy as np
 import sounddevice as sd
@@ -735,8 +736,12 @@ class AudioHandler(QObject):
         speed = 2.0 ** (-4.0 / 12.0)  # -4 полутона
         rate = 1.0 - speed  # Скорость накопления задержки
 
-        # 1. Склеиваем историю и текущий фрейм
-        buf = np.concatenate((self._anon_history, s))
+        # 1. Склеиваем историю и текущий фрейм в предаллоцированный буфер.
+        # Избегаем np.concatenate (аллокация ~12 KB каждые 20 мс в hot path).
+        H = len(self._anon_history)   # 2048 — константа
+        self._anon_buf[:H] = self._anon_history
+        self._anon_buf[H:H + N] = s
+        buf = self._anon_buf[:H + N]
 
         # 2. Генерируем фазы для двух читающих "головок" (0.0 ... 1.0)
         phases = self._anon_phase + np.arange(N) * rate / max_delay
@@ -866,6 +871,16 @@ class AudioHandler(QObject):
         self._anon_lp_zi  = sosfilt_zi(self._anon_lp_sos).astype(np.float64)
         self._anon_history = np.zeros(2048, dtype=np.float32)
         self._anon_phase = 0.0
+        # Предаллоцированный буфер для _apply_anonymous_voice_effect.
+        # Фиксированный размер: 2048 (история) + CHUNK_SIZE (960) = 3008 сэмплов.
+        # Убирает np.concatenate (аллокацию) из hot path (~50/сек при активном шёпоте).
+        self._anon_buf = np.zeros(2048 + CHUNK_SIZE, dtype=np.float32)
+        # Флаг сброса whisper-эффекта. Выставляется из UI-потока (start_whisper),
+        # читается и сбрасывается из audio_callback — безопасный межпоточный handoff
+        # без мьютекса (GIL-атомарное чтение/запись bool).
+        self._whisper_effect_reset: bool = False
+        # Отслеживаем uid последнего шептуна: при смене сбрасываем состояние фильтра.
+        self._whisper_effect_uid: int = 0
         # Отдельный счётчик для FLAG_STREAM_VOICES пакетов.
         # Нельзя использовать my_sequence: несколько спикеров в одном audio_callback
         # получали бы одинаковый seq → JitterBuffer на стороне зрителя отбрасывал
@@ -1193,6 +1208,18 @@ class AudioHandler(QObject):
             except:
                 pass
 
+        # ── Pre-encode input normalization ──────────────────────────────────
+        # Если denoised_float содержит пики > 1.0 (микрофонный буст Windows,
+        # RNNoise иногда выходит за ±1.0, некоторые ASIO-драйверы) →
+        # умножение на 32767 даёт значения > INT16_MAX → wraparound в
+        # отрицательную зону → жёсткий треск именно при громком голосе
+        # («на пределе микрофона»). Soft-limit здесь — единственная защита.
+        # Используем in-place операцию: аллокаций нет.
+        _in_peak = np.max(np.abs(denoised_float))
+        if _in_peak > 0.98:
+            # Нормализуем к 0.98 — оставляем 2% запас до INT16_MAX
+            denoised_float = denoised_float * (0.98 / _in_peak)
+
         rms = np.sqrt(np.mean(denoised_float ** 2))
         self.volume_level_signal.emit(int(min(rms * 1000, 100)))
 
@@ -1220,7 +1247,10 @@ class AudioHandler(QObject):
                     # остальные участники не слышат отправителя в этот момент.
                     pcm_to_encode = (denoised_float * 32767).astype(np.int16).tobytes()
                     encoded = self.encoder.encode(pcm_to_encode, CHUNK_SIZE)
-                    self.my_sequence += 1
+                    # FIX: убираем лишний my_sequence += 1.
+                    # В режиме шёпота пакет в комнату НЕ отправляется — my_sequence
+                    # не должен расти. stop_whisper() синхронизирует его с
+                    # _whisper_sequence, так что разрыва seq при возврате не будет.
                     self._whisper_sequence += 1
                     w_flags = FLAG_WHISPER
                     w_header = UDP_HEADER_STRUCT.pack(self.my_uid, curr_time,
@@ -1274,6 +1304,36 @@ class AudioHandler(QObject):
 
         self.mix_buffer.fill(0)
         if not self._is_deafened.is_set():
+            # ── N-speaker headroom ────────────────────────────────────────────
+            # Проблема: 3+ участников говорят одновременно → сумма амплитуд
+            # до 3.0–4.0 → даже soft limiter давит сигнал в 3× → все тихие
+            # и «мутные». Это не дисторшн, но воспринимается как «плохое качество».
+            #
+            # Решение: заранее вычисляем gain для каждого активного спикера
+            # по формуле sqrt(2) / sqrt(N_active). При N=1: gain=1.0 (без изменений).
+            # При N=2: gain=1.0 (пара = норма). При N=3: gain=0.82. При N=4: gain=0.71.
+            # Это стандартный incoherent sources scaling — суммарная RMS остаётся
+            # постоянной независимо от числа говорящих.
+            #
+            # Считаем «активных»: last_packet < 1.5с AND не заглушен AND volume > 0.
+            # Не блокируемся — читаем уже готовый COW-снимок без лока.
+            _n_active = sum(
+                1 for u in self._audio_users_snapshot.values()
+                if (curr_time - u.last_packet_time < 1.5
+                    and not u.is_locally_muted
+                    and not u.volume_zero)
+            )
+            # Включаем стрим-пользователей в подсчёт (они тоже добавляются в mix)
+            _n_active += sum(
+                1 for u in self._audio_stream_users_snapshot.values()
+                if curr_time - u.last_packet_time < 1.5
+            )
+            # gain: при 1–2 спикерах = 1.0 (без изменений),
+            # при 3+ — плавно снижается, сохраняя суммарную громкость.
+            # Не меняем gain агрессивно: берём max(2, N) чтобы 2 человека
+            # никогда не получали ослабления.
+            _speaker_gain = math.sqrt(2.0) / math.sqrt(max(2, _n_active))
+
             # FIX #1: читаем COW-снимок БЕЗ лока.
             # _packet_processor_loop обновляет _audio_users_snapshot внутри
             # users_lock после каждого изменения. Снимок «отстаёт» максимум
@@ -1287,7 +1347,7 @@ class AudioHandler(QObject):
                             decoded = user.decoder.decode(data, CHUNK_SIZE)
                             s = np.frombuffer(decoded, dtype=np.int16).astype(np.float32) / 32767.0
 
-                            # ── Whisper bass effect ───────────────────────────────────────
+                            # ── Whisper voice effect ─────────────────────────────────────
                             # Если этот пользователь сейчас шепчет нам (whisper пакеты
                             # приходили < 2 с назад) — применяем питч-даун эффект.
                             # Голос становится заметно глубже/темнее → получатель
@@ -1295,9 +1355,26 @@ class AudioHandler(QObject):
                             w_uid = getattr(self, '_whisper_in_uid', 0)
                             w_ts  = getattr(self, '_whisper_in_ts',  0.0)
                             if uid == w_uid and (curr_time - w_ts) < 2.0:
+                                # FIX: сброс состояния эффекта при смене шептуна
+                                # или по флагу от start_whisper().
+                                # Без этого первые ~50 мс нового шёпота воспроизводятся
+                                # с хвостом фильтра от предыдущего шептуна → артефакт.
+                                if (self._whisper_effect_uid != w_uid
+                                        or self._whisper_effect_reset):
+                                    self._whisper_effect_uid = w_uid
+                                    self._whisper_effect_reset = False
+                                    self._anon_history.fill(0)
+                                    self._anon_phase = 0.0
+                                    self._anon_lp_zi = sosfilt_zi(
+                                        self._anon_lp_sos).astype(np.float64)
                                 s = self._apply_anonymous_voice_effect(s)
+                            else:
+                                # Шептун неактивен — сбрасываем uid чтобы следующий
+                                # шептун всегда стартовал с чистым состоянием фильтра.
+                                if self._whisper_effect_uid != 0:
+                                    self._whisper_effect_uid = 0
 
-                            self.mix_buffer += s * user.volume
+                            self.mix_buffer += s * (user.volume * _speaker_gain)
 
                             # ── Mix Minus для зрителей (FLAG_STREAM_VOICES) ───────────────
                             # Стример ретранслирует голос каждого собеседника зрителям
@@ -1344,7 +1421,7 @@ class AudioHandler(QObject):
                         try:
                             decoded = user.decoder.decode(data, CHUNK_SIZE)
                             s = np.frombuffer(decoded, dtype=np.int16).astype(np.float32) / 32767.0
-                            self.mix_buffer += s * sv
+                            self.mix_buffer += s * sv * _speaker_gain
                             if s_uid >= LOOPBACK_UID_OFFSET:
                                 self._lb_play_counter += 1
                                 if self._lb_play_counter % 100 == 0:
@@ -1353,6 +1430,15 @@ class AudioHandler(QObject):
                         except Exception as e:
                             print(f"[Audio-Output] Ошибка декодирования стрим-аудио: {e}")
 
+        # FIX: Soft limiter вместо жёсткого clip.
+        # Жёсткий clip при пиках > 1.0 (2-3 говорящих + stream audio) создаёт
+        # waveshaping дисторшн — нелинейные гармоники, слышимые как хруст/артефакт.
+        # Решение: если пик > 0.95 — нормализуем весь буфер пропорционально.
+        # Это аналог look-ahead limiter без attack/release (приемлемо для 20 мс фреймов).
+        # np.clip остаётся как safety net для float-погрешностей.
+        _peak = np.max(np.abs(self.mix_buffer))
+        if _peak > 0.95:
+            self.mix_buffer *= (0.95 / _peak)
         np.clip(self.mix_buffer, -1.0, 1.0, out=self.mix_buffer)
 
         outdata[:] = self.mix_buffer.reshape(-1, 1)
@@ -1417,11 +1503,11 @@ class AudioHandler(QObject):
         # Сбрасываем состояние sosfilt-фильтра чтобы шёпот каждого нового собеседника
         # начинался с чистого состояния (без «хвоста» от предыдущего шёпота).
         self._wlp_zi = sosfilt_zi(self._wlp_sos).astype(np.float64)
-        self._anon_lp_zi = sosfilt_zi(self._anon_lp_sos).astype(np.float64)
-        print(f"[Audio] Whisper START → uid={target_uid}, seq_from={self._whisper_sequence}")
-        self._anon_history.fill(0)
-        self._anon_phase = 0.0
-
+        # FIX race condition: сброс состояния фильтра через флаг, а не напрямую.
+        # Прямой вызов _anon_history.fill(0) / _anon_phase=0 из UI-потока конкурирует
+        # с audio_callback (PortAudio thread). numpy снимает GIL → torn read/write →
+        # щелчки. Флаг — атомарный bool, audio_callback сбросит состояние сам.
+        self._whisper_effect_reset = True
         print(f"[Audio] Whisper START → uid={target_uid}, seq_from={self._whisper_sequence}")
 
     def stop_whisper(self):

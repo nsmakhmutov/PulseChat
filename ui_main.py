@@ -251,7 +251,7 @@ class MainWindow(QMainWindow):
         self._c_mute   = QColor("#e74c3c")
         self._c_stream = QColor("#3498db")
         self._c_def    = QColor("#ecf0f1") if self._cache_theme == "Темная" else QColor("#444444")
-        self._icon_size = QSize(20, 20)
+        self._icon_size = QSize(26, 26)
 
         # ── Кэш QBrush для refresh_ui() ────────────────────────────────────────
         # QBrush(QColor) создавался на КАЖДЫЙ вызов refresh_ui() (10 раз/сек)
