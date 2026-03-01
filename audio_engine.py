@@ -724,10 +724,14 @@ class AudioHandler(QObject):
     # точно так же как при нажатии кнопки «Заглушить».
     user_volume_zero = pyqtSignal(int, bool)
 
-    def _apply_anonymous_voice_effect(self, s: np.ndarray) -> np.ndarray:
+    def _apply_anonymous_voice_effect(self, s: np.ndarray, state: dict) -> np.ndarray:
         """
         Эффект «анонимного голоса» (Dark TV Interview).
         Использует Vectorized Dual-Tap Delay Line для pitch-shift без артефактов.
+
+        state — per-uid словарь {'history', 'phase', 'lp_zi', 'buf'}.
+        Разделение состояний по uid позволяет одновременно обрабатывать
+        нескольких шептунов без взаимного наложения и phase-артефактов.
         """
         N = len(s)
         max_delay = 1440  # 30 мс при 48kHz — оптимальный размер окна для голоса
@@ -736,15 +740,18 @@ class AudioHandler(QObject):
 
         # 1. Склеиваем историю и текущий фрейм в предаллоцированный буфер.
         # Избегаем np.concatenate (аллокация ~12 KB каждые 20 мс в hot path).
-        H = len(self._anon_history)   # 2048 — константа
-        self._anon_buf[:H] = self._anon_history
-        self._anon_buf[H:H + N] = s
-        buf = self._anon_buf[:H + N]
+        # state['history'] = 2048 сэмплов при «тёплом» старте содержит реальный
+        # сигнал, поэтому pitch-shifter сразу читает данные, не ноль → нет click.
+        H = 2048
+        history = state['history']
+        buf     = state['buf']         # предаллоц. буфер размером H + CHUNK_SIZE
+        buf[:H]      = history
+        buf[H:H + N] = s
+        buf_view = buf[:H + N]
 
         # 2. Генерируем фазы для двух читающих "головок" (0.0 ... 1.0)
-        phases = self._anon_phase + np.arange(N) * rate / max_delay
-        self._anon_phase = phases[-1] + rate / max_delay
-        self._anon_phase %= 1.0
+        phases = state['phase'] + np.arange(N) * rate / max_delay
+        state['phase'] = float((phases[-1] + rate / max_delay) % 1.0)
 
         p1 = phases % 1.0
         p2 = (phases + 0.5) % 1.0
@@ -753,8 +760,8 @@ class AudioHandler(QObject):
         d1 = p1 * max_delay
         d2 = p2 * max_delay
 
-        # 3. Индексы чтения (относительно начала массива buf)
-        base_idx = len(self._anon_history) + np.arange(N)
+        # 3. Индексы чтения (относительно начала массива buf_view)
+        base_idx = H + np.arange(N)
         r1 = base_idx - d1
         r2 = base_idx - d2
 
@@ -763,14 +770,15 @@ class AudioHandler(QObject):
         i2_floor = np.floor(r2).astype(np.int32)
 
         # Безопасный +1 индекс
-        i1_ceil = np.clip(i1_floor + 1, 0, len(buf) - 1)
-        i2_ceil = np.clip(i2_floor + 1, 0, len(buf) - 1)
+        buf_last = H + N - 1
+        i1_ceil = np.clip(i1_floor + 1, 0, buf_last)
+        i2_ceil = np.clip(i2_floor + 1, 0, buf_last)
 
         frac_1 = r1 - i1_floor
         frac_2 = r2 - i2_floor
 
-        val_1 = buf[i1_floor] * (1.0 - frac_1) + buf[i1_ceil] * frac_1
-        val_2 = buf[i2_floor] * (1.0 - frac_2) + buf[i2_ceil] * frac_2
+        val_1 = buf_view[i1_floor] * (1.0 - frac_1) + buf_view[i1_ceil] * frac_1
+        val_2 = buf_view[i2_floor] * (1.0 - frac_2) + buf_view[i2_ceil] * frac_2
 
         # 5. Кроссфейд (окно Ханна) для устранения щелчков
         fade_1 = 0.5 - 0.5 * np.cos(2.0 * np.pi * p1)
@@ -778,11 +786,12 @@ class AudioHandler(QObject):
 
         shifted = val_1 * fade_1 + val_2 * fade_2
 
-        # 6. Обновляем историю для следующего фрейма
-        self._anon_history[:] = buf[-len(self._anon_history):]  # in-place: избегаем self-copy через view
+        # 6. Обновляем историю для следующего фрейма (in-place: нет аллокации)
+        # buf_view[-H:] == buf_view[N:] — последние H сэмплов окна истории
+        history[:] = buf_view[N:]
 
         # 7. LP-фильтр (4 кГц) для "тёмного" окраса (скрывает артефакты формант)
-        out, self._anon_lp_zi = sosfilt(self._anon_lp_sos, shifted, zi=self._anon_lp_zi)
+        out, state['lp_zi'] = sosfilt(self._anon_lp_sos, shifted, zi=state['lp_zi'])
 
         # 8. Мягкая нормализация пика
         peak = np.max(np.abs(out))
@@ -865,19 +874,30 @@ class AudioHandler(QObject):
         # Мягче чем whisper LP (1200 Гц): сохраняет согласные и зону присутствия.
         # SOS-матрица предвычислена как модульная константа _ANON_LP_SOS.
         self._anon_lp_sos = _ANON_LP_SOS
-        self._anon_lp_zi  = sosfilt_zi(self._anon_lp_sos).astype(np.float64)
-        self._anon_history = np.zeros(2048, dtype=np.float32)
-        self._anon_phase = 0.0
-        # Предаллоцированный буфер для _apply_anonymous_voice_effect.
-        # Фиксированный размер: 2048 (история) + CHUNK_SIZE (960) = 3008 сэмплов.
-        # Убирает np.concatenate (аллокацию) из hot path (~50/сек при активном шёпоте).
-        self._anon_buf = np.zeros(2048 + CHUNK_SIZE, dtype=np.float32)
-        # Флаг сброса whisper-эффекта. Выставляется из UI-потока (start_whisper),
-        # читается и сбрасывается из audio_callback — безопасный межпоточный handoff
-        # без мьютекса (GIL-атомарное чтение/запись bool).
+
+        # ── Whisper effect: per-uid состояния ───────────────────────────────────
+        # Ключ: uid шептуна. Значение: dict с полями:
+        #   'history' — np.ndarray(2048, float32): буфер предыстории pitch-shifter
+        #   'phase'   — float: текущая фаза читающей головки
+        #   'lp_zi'   — np.ndarray(n_sec, 2, float64): состояние LP-фильтра
+        #   'buf'     — np.ndarray(2048+CHUNK_SIZE, float32): предаллоц. рабочий буфер
+        #
+        # Создаётся лениво при первом пакете шептуна с «тёплым» стартом:
+        # history заполняется реальным сигналом (не нулями) → питч-шифтер сразу
+        # читает данные из обеих головок без перехода ноль→сигнал → нет click/треск.
+        #
+        # Поддержка 2+ одновременных шептунов: каждый uid имеет независимое
+        # состояние, смешиваются через общий mix_buffer без взаимных артефактов.
+        self._whisper_states: dict = {}    # uid → state dict (см. выше)
+        self._active_whispers: dict = {}   # uid → float (последний timestamp пакета)
+
+        # Backward compat для UI-сигнала: последний шептун и его время
+        self._whisper_in_uid: int = 0
+        self._whisper_in_ts: float = 0.0
+
+        # Флаг для start_whisper() — sender-side legacy (сбрасывает _wlp_zi отправителя)
+        # На стороне получателя не используется (заменён ленивым созданием per-uid state).
         self._whisper_effect_reset: bool = False
-        # Отслеживаем uid последнего шептуна: при смене сбрасываем состояние фильтра.
-        self._whisper_effect_uid: int = 0
         # Отдельный счётчик для FLAG_STREAM_VOICES пакетов.
         # Нельзя использовать my_sequence: несколько спикеров в одном audio_callback
         # получали бы одинаковый seq → JitterBuffer на стороне зрителя отбрасывал
@@ -1347,32 +1367,42 @@ class AudioHandler(QObject):
                             decoded = user.decoder.decode(data, CHUNK_SIZE)
                             s = np.frombuffer(decoded, dtype=np.int16).astype(np.float32) / 32767.0
 
-                            # ── Whisper voice effect ─────────────────────────────────────
-                            # Если этот пользователь сейчас шепчет нам (whisper пакеты
-                            # приходили < 2 с назад) — применяем питч-даун эффект.
-                            # Голос становится заметно глубже/темнее → получатель
-                            # слышит «другой тип разговора» без каких-либо UI подсказок.
-                            w_uid = getattr(self, '_whisper_in_uid', 0)
-                            w_ts  = getattr(self, '_whisper_in_ts',  0.0)
-                            if uid == w_uid and (curr_time - w_ts) < 2.0:
-                                # FIX: сброс состояния эффекта при смене шептуна
-                                # или по флагу от start_whisper().
-                                # Без этого первые ~50 мс нового шёпота воспроизводятся
-                                # с хвостом фильтра от предыдущего шептуна → артефакт.
-                                if (self._whisper_effect_uid != w_uid
-                                        or self._whisper_effect_reset):
-                                    self._whisper_effect_uid = w_uid
-                                    self._whisper_effect_reset = False
-                                    self._anon_history.fill(0)
-                                    self._anon_phase = 0.0
-                                    self._anon_lp_zi = sosfilt_zi(
-                                        self._anon_lp_sos).astype(np.float64)
-                                s = self._apply_anonymous_voice_effect(s)
+                            # ── Per-uid whisper effect ───────────────────────────────────
+                            # _active_whispers[uid] обновляется в add_incoming_whisper_packet
+                            # на каждый входящий пакет шёпота (~50 раз/сек).
+                            #
+                            # «Тёплый старт» при первом пакете (uid не в _whisper_states):
+                            # history заполняем текущим фреймом s (повторённым до 2048).
+                            # Обе читающие головки pitch-shifter'а сразу попадают в реальный
+                            # сигнал — переход ноль→сигнал отсутствует → нет треска/click.
+                            #
+                            # LP-фильтр: нулевые начальные условия оптимальны для голосового
+                            # сигнала (mean ≈ 0); sosfilt_zi(sos)*0 == zeros.
+                            #
+                            # Два шептуна одновременно: каждый uid имеет свой state dict →
+                            # независимые history/phase/lp_zi/buf → нет взаимных артефактов →
+                            # оба смешиваются в mix_buffer без потерь.
+                            _w_ts = self._active_whispers.get(uid, 0.0)
+                            if _w_ts and (curr_time - _w_ts) < 2.0:
+                                if uid not in self._whisper_states:
+                                    # Ленивое создание: тёплый старт с реальным сигналом
+                                    _warm_history = np.resize(
+                                        s.astype(np.float32), 2048).copy()
+                                    self._whisper_states[uid] = {
+                                        'history': _warm_history,
+                                        'phase':   0.0,
+                                        'lp_zi':   np.zeros(
+                                            (self._anon_lp_sos.shape[0], 2),
+                                            dtype=np.float64),
+                                        'buf':     np.zeros(
+                                            2048 + CHUNK_SIZE, dtype=np.float32),
+                                    }
+                                s = self._apply_anonymous_voice_effect(
+                                    s, self._whisper_states[uid])
                             else:
-                                # Шептун неактивен — сбрасываем uid чтобы следующий
-                                # шептун всегда стартовал с чистым состоянием фильтра.
-                                if self._whisper_effect_uid != 0:
-                                    self._whisper_effect_uid = 0
+                                # Шептун неактивен: освобождаем state (нет утечки памяти)
+                                self._active_whispers.pop(uid, None)
+                                self._whisper_states.pop(uid, None)
 
                             self.mix_buffer += s * (user.volume * _speaker_gain)
 
@@ -1547,15 +1577,20 @@ class AudioHandler(QObject):
           мерцания. Пока идут пакеты — таймер никогда не истекает.
         """
         now = time.time()
-        prev_uid = getattr(self, '_whisper_in_uid', 0)
 
-        # Обновляем метаданные шёпота
+        # Обновляем реестр активных шептунов — dict lookup O(1), GIL-safe.
+        # audio_callback читает self._active_whispers[uid] без лока:
+        # dict.__setitem__ с существующим ключом (update float значения) GIL-атомарно.
+        # При новом uid — новый ключ; audio_callback увидит его на следующем фрейме
+        # (max 20 мс опоздания), что приемлемо.
+        self._active_whispers[uid] = now
+
+        # Backward compat: UI-сигнал и таймер скрытия оверлея ориентируются на
+        # _whisper_in_uid / _whisper_in_ts. Показываем последнего шептуна.
         self._whisper_in_uid = uid
         self._whisper_in_ts  = now
 
-        # Эмитим на каждый пакет: UI-таймер перезапускается, оверлей не гаснет.
-        # MainWindow._on_whisper_received сам решает нужно ли показывать оверлей заново
-        # (только если uid изменился или оверлей ещё не виден).
+        # Эмитим на каждый пакет — UI-таймер перезапускается, оверлей не гаснет.
         self.whisper_received.emit(uid)
 
         self.add_incoming_packet(uid, seq, data, 0)

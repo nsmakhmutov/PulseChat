@@ -377,11 +377,38 @@ def download_and_install(download_url: str, on_progress=None, on_done=None, on_e
             target_exe = os.path.join(install_dir, exe_name)
 
             bat_path = os.path.join(tempfile.gettempdir(), "pulse_update_launcher.bat")
+
+            # ── Защита пользовательских данных при обновлении ─────────────────
+            # xcopy /E перезапишет ВСЕ файлы из архива, включая дефолтные
+            # user_config.json / known_users.json если они там присутствуют.
+            # Стратегия: backup → xcopy → restore.
+            # Работает только для файлов которые реально существуют (команды с if exist).
+            _user_data_files = ["user_config.json", "known_users.json"]
+            _backup_dir = os.path.join(tempfile.gettempdir(), "pulse_update_backup")
+
+            backup_cmds = [
+                f'if not exist "{_backup_dir}" mkdir "{_backup_dir}"',
+            ]
+            restore_cmds = []
+            for _fname in _user_data_files:
+                _src = os.path.join(install_dir, _fname)
+                _bak = os.path.join(_backup_dir, _fname)
+                _dst = os.path.join(install_dir, _fname)
+                backup_cmds.append(
+                    f'if exist "{_src}" copy /Y "{_src}" "{_bak}" >nul 2>&1'
+                )
+                restore_cmds.append(
+                    f'if exist "{_bak}" copy /Y "{_bak}" "{_dst}" >nul 2>&1'
+                )
+
             # taskkill /PID — убивает старый процесс принудительно
             # ping -n 3   — пауза ~2 сек пока процесс гарантированно умрёт
+            # backup      — сохраняем user_config.json, known_users.json во временную папку
             # xcopy       — копирует ВСЕ новые файлы поверх папки установки
             #               /E = включая подпапки, /Y = перезаписывать без вопросов
             #               /I = цель — папка, /Q = без вывода имён файлов
+            # restore     — возвращаем пользовательские данные (перезаписываем дефолты из архива)
+            # rmdir /S /Q — удаляем временную папку backup
             # start ""    — запускает обновлённый exe из оригинального места
             # ping -n 2   — минимальная пауза перед самоудалением
             # del         — батник удаляет сам себя
@@ -389,7 +416,10 @@ def download_and_install(download_url: str, on_progress=None, on_done=None, on_e
                 "@echo off",
                 f"taskkill /PID {current_pid} /F >nul 2>&1",
                 "ping -n 3 127.0.0.1 >nul",
+                *backup_cmds,
                 f'xcopy /E /Y /I /Q "{new_files_dir}\\*" "{install_dir}\\" >nul 2>&1',
+                *restore_cmds,
+                f'if exist "{_backup_dir}" rmdir /S /Q "{_backup_dir}" >nul 2>&1',
                 f'start "" "{target_exe}"',
                 "ping -n 2 127.0.0.1 >nul",
                 'del "%~f0"',
