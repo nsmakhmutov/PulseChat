@@ -19,7 +19,7 @@ from audio_engine import PYRNNOISE_AVAILABLE
 # 7 секунд MP3 @ 128kbps ≈ 112 KB, @ 320kbps ≈ 280 KB.
 # 1 MB с большим запасом перекрывает любой типичный 7-секундный звук.
 CUSTOM_SOUND_MAX_BYTES = 1 * 1024 * 1024   # 1 MB
-CUSTOM_SOUND_SLOTS     = 3                  # количество кастомных слотов
+CUSTOM_SOUND_SLOTS     = 4                  # количество кастомных слотов
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -35,7 +35,12 @@ CUSTOM_SOUND_SLOTS     = 3                  # количество кастом�
 #     slider 200 → 10.00x  (+20 дБ)   — максимальный буст для тихих микрофонов
 # При слайдере 100 пользователь слышит ровно то же что раньше — совместимость.
 def _slider_to_vol(slider_int: int) -> float:
-    """Слайдер 0-200 → коэффициент громкости по экспоненциальной кривой."""
+    """Слайдер 0-200 → коэффициент громкости по экспоненциальной кривой.
+    Особый случай: slider=0 → 0.0 (полная тишина).
+    Без этой проверки 10^((0-100)/100) = 10^-1 = 0.1, то есть 10% — не ноль!
+    """
+    if slider_int == 0:
+        return 0.0
     return 10.0 ** ((slider_int - 100) / 100.0)
 
 
@@ -194,6 +199,9 @@ class UserOverlayPanel(QFrame):
         self.sl_vol = QSlider(Qt.Orientation.Horizontal)
         self.sl_vol.setRange(0, 200)
         self.sl_vol.setValue(_vol_to_slider(current_vol))
+        # Хороший шаг: стрелки ±5%, клик по треку ±25%
+        self.sl_vol.setSingleStep(5)
+        self.sl_vol.setPageStep(25)
         self.lbl_vol = QLabel(f"{self.sl_vol.value()}%")
         self.lbl_vol.setFixedWidth(38)
         self.lbl_vol.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
@@ -331,9 +339,14 @@ class UserOverlayPanel(QFrame):
     # ── Слоты ─────────────────────────────────────────────────────────────────
 
     def _on_vol_changed(self, v: int):
-        self.lbl_vol.setText(f"{v}%")
+        # При v=0 показываем "Mute" вместо "0%" — понятнее пользователю
+        if v == 0:
+            self.lbl_vol.setText("🔇")
+        else:
+            self.lbl_vol.setText(f"{v}%")
         # Экспоненциальная кривая: slider 100 = 1.0x (нейтрально),
         # slider 200 = 10.0x (+20 дБ) — позволяет поднять тихие микрофоны.
+        # slider 0 → 0.0 (полная тишина, _slider_to_vol гарантирует это).
         self.audio.set_user_volume(self.uid, _slider_to_vol(v))
 
     def _on_toggle_mute(self):
@@ -372,36 +385,163 @@ class UserOverlayPanel(QFrame):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Выбор аватара (без изменений)
+# Выбор аватара — стеклянный тёмный дизайн (единый стиль с SettingsDialog)
 # ──────────────────────────────────────────────────────────────────────────────
 class AvatarSelector(QDialog):
+    """
+    Диалог выбора аватарки.
+    Дизайн: безрамочный, тёмное стекло, кастомный title bar (_DialogTitleBar).
+    Кнопки аватарок подсвечиваются синим при hover и зелёной рамкой при выборе.
+    """
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Выбор аватара")
-        self.setFixedSize(500, 400)
         self.selected_avatar = None
-        layout = QVBoxLayout(self)
+
+        # ── Безрамочное окно с прозрачным фоном ──────────────────────────────
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setWindowTitle("Выбор аватара")
+        self.setFixedSize(520, 430)
+
+        # ── Корневой layout (прозрачный) ──────────────────────────────────────
+        root_lay = QVBoxLayout(self)
+        root_lay.setContentsMargins(0, 0, 0, 0)
+        root_lay.setSpacing(0)
+
+        # ── Карточка: тёмный полупрозрачный фон со скруглёнными углами ────────
+        self._card = QFrame(self)
+        self._card.setObjectName("avatarCard")
+        self._card.setStyleSheet("""
+            QFrame#avatarCard {
+                background-color: rgba(26, 28, 38, 252);
+                border: 1px solid rgba(255,255,255,0.10);
+                border-radius: 12px;
+            }
+            QLabel {
+                color: #c8d0e0;
+                background: transparent;
+                border: none;
+            }
+            QPushButton.avatarBtn {
+                background-color: rgba(255,255,255,0.05);
+                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 10px;
+            }
+            QPushButton.avatarBtn:hover {
+                background-color: rgba(91,142,245,0.18);
+                border: 1px solid rgba(91,142,245,0.55);
+            }
+            QScrollBar:vertical {
+                background: rgba(255,255,255,0.04);
+                width: 6px; border-radius: 3px; margin: 0;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(255,255,255,0.18);
+                border-radius: 3px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+            QScrollArea { background: transparent; border: none; }
+        """)
+        root_lay.addWidget(self._card)
+
+        card_lay = QVBoxLayout(self._card)
+        card_lay.setContentsMargins(0, 0, 0, 0)
+        card_lay.setSpacing(0)
+
+        # ── Кастомный title bar ───────────────────────────────────────────────
+        self._title_bar = _DialogTitleBar(self, "🖼  Выбор аватара")
+        card_lay.addWidget(self._title_bar)
+
+        _sep = QFrame()
+        _sep.setFrameShape(QFrame.Shape.HLine)
+        _sep.setFixedHeight(1)
+        _sep.setStyleSheet("background: rgba(255,255,255,0.08); border: none;")
+        card_lay.addWidget(_sep)
+
+        # ── Контент ───────────────────────────────────────────────────────────
+        content_w = QWidget()
+        content_w.setStyleSheet("background: transparent;")
+        content_lay = QVBoxLayout(content_w)
+        content_lay.setContentsMargins(16, 14, 16, 14)
+        content_lay.setSpacing(10)
+        card_lay.addWidget(content_w, stretch=1)
+
+        hint = QLabel("Нажмите на аватарку чтобы выбрать её")
+        hint.setStyleSheet("font-size: 12px; color: rgba(200,208,224,0.55);")
+        content_lay.addWidget(hint)
+
+        # ── Скролл-зона с сеткой аватарок ─────────────────────────────────────
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        container = QWidget()
-        grid = QGridLayout(container)
-        av_dir = resource_path("assets/avatars")
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
+        container = QWidget()
+        container.setStyleSheet("background: transparent;")
+        grid = QGridLayout(container)
+        grid.setSpacing(8)
+        grid.setContentsMargins(0, 0, 0, 0)
+
+        av_dir = resource_path("assets/avatars")
         if os.path.exists(av_dir):
             files = sorted([f for f in os.listdir(av_dir) if f.endswith('.svg')])
             for i, f in enumerate(files):
                 btn = QPushButton()
-                btn.setFixedSize(80, 80)
+                btn.setProperty("class", "avatarBtn")
+                btn.setFixedSize(82, 82)
                 btn.setIcon(QIcon(os.path.join(av_dir, f)))
                 btn.setIconSize(QSize(60, 60))
+                btn.setCursor(Qt.CursorShape.PointingHandCursor)
+                btn.setToolTip(f.rsplit('.', 1)[0])
+                btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: rgba(255,255,255,0.05);
+                        border: 1px solid rgba(255,255,255,0.08);
+                        border-radius: 10px;
+                    }
+                    QPushButton:hover {
+                        background-color: rgba(91,142,245,0.18);
+                        border: 1px solid rgba(91,142,245,0.55);
+                    }
+                    QPushButton:pressed {
+                        background-color: rgba(46,204,113,0.22);
+                        border: 2px solid rgba(46,204,113,0.70);
+                    }
+                """)
                 btn.clicked.connect(lambda ch, fname=f: self.select_and_close(fname))
                 grid.addWidget(btn, i // 5, i % 5)
-        container.setLayout(grid)
+
         scroll.setWidget(container)
-        layout.addWidget(scroll)
+        content_lay.addWidget(scroll, stretch=1)
+
+        # ── Кнопка «Отмена» ────────────────────────────────────────────────────
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.Shape.HLine)
+        sep2.setStyleSheet("background: rgba(255,255,255,0.08); border: none; max-height: 1px;")
+        content_lay.addWidget(sep2)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
         btn_cancel = QPushButton("Отмена")
+        btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_cancel.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(255,255,255,0.06);
+                color: #8899bb;
+                border: 1px solid rgba(255,255,255,0.10);
+                border-radius: 6px;
+                padding: 7px 20px;
+                font-size: 13px;
+            }
+            QPushButton:hover {
+                background-color: rgba(255,255,255,0.12);
+                color: #c8d0e0;
+            }
+        """)
         btn_cancel.clicked.connect(self.reject)
-        layout.addWidget(btn_cancel)
+        btn_row.addWidget(btn_cancel)
+        content_lay.addLayout(btn_row)
 
     def select_and_close(self, filename):
         self.selected_avatar = filename
@@ -532,6 +672,283 @@ class WhisperSystemOverlay(QWidget):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Кастомный title bar для безрамочных диалогов
+# ──────────────────────────────────────────────────────────────────────────────
+class _DialogTitleBar(QWidget):
+    """
+    Компактный кастомный title bar для безрамочных QDialog.
+    Поддерживает: перетаскивание, сворачивание (опционально), закрытие.
+    Дизайн в едином стиле со SoundboardPanel и UserOverlayPanel.
+    """
+
+    def __init__(self, parent_dialog, title: str = "", show_minimize: bool = False):
+        super().__init__(parent_dialog)
+        self._dlg = parent_dialog
+        self._drag_pos = None
+        self.setFixedHeight(38)
+        self.setObjectName("dlgTitleBar")
+
+        self.setStyleSheet("""
+            QWidget#dlgTitleBar {
+                background-color: rgba(18, 20, 30, 245);
+                border-top-left-radius: 12px;
+                border-top-right-radius: 12px;
+                border: none;
+            }
+            QLabel#dlgTitleText {
+                color: #cdd6f4;
+                font-size: 13px;
+                font-weight: bold;
+                background: transparent;
+                border: none;
+                padding-left: 6px;
+            }
+            QPushButton {
+                background: transparent;
+                border: none;
+                border-radius: 5px;
+                color: #8890a0;
+                font-size: 14px;
+                min-width: 28px;
+                max-width: 28px;
+                min-height: 26px;
+                max-height: 26px;
+            }
+            QPushButton:hover { background: rgba(255,255,255,0.10); color: #cdd6f4; }
+            QPushButton#dlgBtnClose:hover { background: #e74c3c; color: white; }
+        """)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(12, 0, 6, 0)
+        lay.setSpacing(4)
+
+        ico_lbl = QLabel()
+        ico_lbl.setFixedSize(18, 18)
+        try:
+            from config import resource_path
+            ico_lbl.setPixmap(QIcon(resource_path("assets/icon/logo.ico")).pixmap(18, 18))
+        except Exception:
+            pass
+        ico_lbl.setStyleSheet("background:transparent; border:none;")
+        lay.addWidget(ico_lbl)
+
+        self._title_lbl = QLabel(title)
+        self._title_lbl.setObjectName("dlgTitleText")
+        lay.addWidget(self._title_lbl, stretch=1)
+
+        if show_minimize:
+            btn_min = QPushButton("─")
+            btn_min.clicked.connect(parent_dialog.showMinimized)
+            lay.addWidget(btn_min)
+
+        btn_close = QPushButton("✕")
+        btn_close.setObjectName("dlgBtnClose")
+        btn_close.clicked.connect(parent_dialog.reject)
+        lay.addWidget(btn_close)
+
+    def set_title(self, title: str):
+        self._title_lbl.setText(title)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._drag_pos = e.globalPosition().toPoint() - self._dlg.frameGeometry().topLeft()
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if e.buttons() == Qt.MouseButton.LeftButton and self._drag_pos is not None:
+            self._dlg.move(e.globalPosition().toPoint() - self._drag_pos)
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        self._drag_pos = None
+        super().mouseReleaseEvent(e)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Виджет перехвата нажатия горячих клавиш
+# ──────────────────────────────────────────────────────────────────────────────
+class HotkeyCaptureEdit(QLineEdit):
+    """
+    Поле для записи горячей клавиши кликом.
+
+    Поведение:
+      • Кликни → поле подсвечивается фиолетовым, появляется «Нажми клавишу…»
+      • Нажми любую клавишу (одиночную или с модификаторами) → записывается
+        строка вида «ctrl+shift+a», «alt+f4», «f8» и т.д.
+      • Escape во время захвата → отменяет, восстанавливает прежнее значение
+      • Повторный клик по занятому полю → очищает и снова ждёт ввода
+
+    Формат совпадает с форматом keyboard-библиотеки (строчные, '+' как разделитель).
+    """
+
+    _WAIT_SS = (
+        "QLineEdit {"
+        "  background: rgba(100,60,200,0.22);"
+        "  border: 1px solid rgba(130,80,230,0.70);"
+        "  border-radius: 6px;"
+        "  color: #c8b0ff;"
+        "  padding: 4px 8px;"
+        "}"
+    )
+    _FILLED_SS = (
+        "QLineEdit {"
+        "  background: rgba(46,204,113,0.12);"
+        "  border: 1px solid rgba(46,204,113,0.45);"
+        "  border-radius: 6px;"
+        "  color: #82e0aa;"
+        "  padding: 4px 8px;"
+        "}"
+    )
+    _EMPTY_SS = (
+        "QLineEdit {"
+        "  background: rgba(255,255,255,0.06);"
+        "  border: 1px solid rgba(255,255,255,0.13);"
+        "  border-radius: 6px;"
+        "  color: #c8d0e0;"
+        "  padding: 4px 8px;"
+        "}"
+    )
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._capturing = False
+        self._prev_value = ""
+        self.setReadOnly(True)
+        self.setPlaceholderText("Кликни для задания клавиши")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setStyleSheet(self._EMPTY_SS)
+        self.setMinimumWidth(180)
+        self.setFixedHeight(30)
+
+    # ── публичный API ─────────────────────────────────────────────────────────
+
+    def set_hotkey(self, text: str):
+        """Программно задать значение (без перехода в режим захвата)."""
+        self._prev_value = text
+        self.setText(text)
+        self.setStyleSheet(self._FILLED_SS if text else self._EMPTY_SS)
+
+    def get_hotkey(self) -> str:
+        return self.text()
+
+    # ── события ───────────────────────────────────────────────────────────────
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._start_capture()
+        super().mousePressEvent(event)
+
+    def _start_capture(self):
+        self._prev_value = self.text()
+        self._capturing = True
+        self.setText("")
+        self.setPlaceholderText("Нажми клавишу…")
+        self.setStyleSheet(self._WAIT_SS)
+        self.setFocus()
+
+    def keyPressEvent(self, event):
+        if not self._capturing:
+            super().keyPressEvent(event)
+            return
+
+        key = event.key()
+
+        # Escape — отмена
+        if key == Qt.Key.Key_Escape:
+            self._capturing = False
+            self.setText(self._prev_value)
+            self.setPlaceholderText("Кликни для задания клавиши")
+            self.setStyleSheet(self._FILLED_SS if self._prev_value else self._EMPTY_SS)
+            self.clearFocus()
+            return
+
+        # Игнорируем нажатие одних модификаторов — ждём основную клавишу
+        if key in (Qt.Key.Key_Control, Qt.Key.Key_Shift, Qt.Key.Key_Alt,
+                   Qt.Key.Key_Meta, Qt.Key.Key_AltGr):
+            return
+
+        # Собираем строку модификаторов
+        mods = event.modifiers()
+        parts = []
+        if mods & Qt.KeyboardModifier.ControlModifier:
+            parts.append("ctrl")
+        if mods & Qt.KeyboardModifier.AltModifier:
+            parts.append("alt")
+        if mods & Qt.KeyboardModifier.ShiftModifier:
+            parts.append("shift")
+
+        # Название основной клавиши
+        key_name = self._key_to_str(key)
+        if key_name:
+            parts.append(key_name)
+
+        combo = "+".join(parts) if parts else ""
+        self._capturing = False
+        self.setText(combo)
+        self.setPlaceholderText("Кликни для задания клавиши")
+        self.setStyleSheet(self._FILLED_SS if combo else self._EMPTY_SS)
+        self.clearFocus()
+
+    def focusOutEvent(self, event):
+        """Отмена захвата при потере фокуса."""
+        if self._capturing:
+            self._capturing = False
+            self.setText(self._prev_value)
+            self.setPlaceholderText("Кликни для задания клавиши")
+            self.setStyleSheet(self._FILLED_SS if self._prev_value else self._EMPTY_SS)
+        super().focusOutEvent(event)
+
+    @staticmethod
+    def _key_to_str(key: int) -> str:
+        """Qt.Key → строка совместимая с keyboard-библиотекой."""
+        # Буквы
+        if Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
+            return chr(key).lower()
+        # Цифры
+        if Qt.Key.Key_0 <= key <= Qt.Key.Key_9:
+            return chr(key)
+        # F-клавиши
+        if Qt.Key.Key_F1 <= key <= Qt.Key.Key_F24:
+            n = key - Qt.Key.Key_F1 + 1
+            return f"f{n}"
+        # Специальные
+        _MAP = {
+            Qt.Key.Key_Space:       "space",
+            Qt.Key.Key_Return:      "enter",
+            Qt.Key.Key_Enter:       "enter",
+            Qt.Key.Key_Tab:         "tab",
+            Qt.Key.Key_Backspace:   "backspace",
+            Qt.Key.Key_Delete:      "delete",
+            Qt.Key.Key_Insert:      "insert",
+            Qt.Key.Key_Home:        "home",
+            Qt.Key.Key_End:         "end",
+            Qt.Key.Key_PageUp:      "page up",
+            Qt.Key.Key_PageDown:    "page down",
+            Qt.Key.Key_Left:        "left",
+            Qt.Key.Key_Right:       "right",
+            Qt.Key.Key_Up:          "up",
+            Qt.Key.Key_Down:        "down",
+            Qt.Key.Key_BracketLeft:  "[",
+            Qt.Key.Key_BracketRight: "]",
+            Qt.Key.Key_Semicolon:   ";",
+            Qt.Key.Key_Apostrophe:  "'",
+            Qt.Key.Key_Comma:       ",",
+            Qt.Key.Key_Period:      ".",
+            Qt.Key.Key_Slash:       "/",
+            Qt.Key.Key_Backslash:   "\\",
+            Qt.Key.Key_Minus:       "-",
+            Qt.Key.Key_Equal:       "=",
+            Qt.Key.Key_QuoteLeft:   "`",
+            Qt.Key.Key_NumLock:     "num lock",
+            Qt.Key.Key_ScrollLock:  "scroll lock",
+            Qt.Key.Key_CapsLock:    "caps lock",
+            Qt.Key.Key_Print:       "print screen",
+            Qt.Key.Key_Pause:       "pause",
+        }
+        return _MAP.get(key, "")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Диалог настроек
 # ──────────────────────────────────────────────────────────────────────────────
 class SettingsDialog(QDialog):
@@ -540,30 +957,210 @@ class SettingsDialog(QDialog):
         self.audio = audio_engine
         self.mw = parent  # MainWindow
         self.app_settings = QSettings("MyVoiceChat", "GlobalSettings")
+
+        # ── Безрамочный стеклянный дизайн (единый стиль с SoundboardPanel) ──
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setWindowTitle("Настройки")
-        # Увеличенное окно — 6 вкладок помещаются без скролла при обычном размере.
-        # При уменьшении окна QTabWidget автоматически покажет стрелки прокрутки.
         self.resize(780, 660)
         self.setMinimumSize(480, 520)
 
-        main_layout = QVBoxLayout(self)
-        self.tabs = QTabWidget()
-        # Прокрутка вкладок при нехватке места (стрелки ◄ ►)
-        self.tabs.setUsesScrollButtons(True)
-        self.tabs.setStyleSheet("""
-            QTabBar::scroller {
-                width: 20px;
+        # ── Корневой layout: прозрачный фон, карточка с border-radius ─────────
+        root_lay = QVBoxLayout(self)
+        root_lay.setContentsMargins(0, 0, 0, 0)
+        root_lay.setSpacing(0)
+
+        # Карточка — полупрозрачный тёмный фон, скруглённые углы
+        self._card = QFrame(self)
+        self._card.setObjectName("settingsCard")
+        self._card.setStyleSheet("""
+            QFrame#settingsCard {
+                background-color: rgba(26, 28, 38, 252);
+                border: 1px solid rgba(255,255,255,0.10);
+                border-radius: 12px;
             }
+            QLabel {
+                color: #c8d0e0;
+                background: transparent;
+                border: none;
+            }
+            QGroupBox {
+                color: #c8d0e0;
+                border: 1px solid rgba(255,255,255,0.10);
+                border-radius: 6px;
+                margin-top: 8px;
+                padding-top: 6px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                padding: 0 6px;
+                color: #8899bb;
+                font-weight: bold;
+            }
+            QComboBox {
+                background-color: rgba(255,255,255,0.07);
+                border: 1px solid rgba(255,255,255,0.13);
+                border-radius: 6px;
+                padding: 5px 10px;
+                color: #c8d0e0;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #1e2130;
+                color: #c8d0e0;
+                border: 1px solid #333648;
+                selection-background-color: #2c3252;
+                selection-color: #ffffff;
+                outline: none;
+            }
+            QComboBox::drop-down { border: none; }
+            QLineEdit {
+                background-color: rgba(255,255,255,0.07);
+                border: 1px solid rgba(255,255,255,0.13);
+                border-radius: 6px;
+                padding: 5px 10px;
+                color: #c8d0e0;
+            }
+            QCheckBox { color: #c8d0e0; background: transparent; }
+            QCheckBox::indicator {
+                width: 16px; height: 16px;
+                border: 1px solid rgba(255,255,255,0.20);
+                border-radius: 4px;
+                background: rgba(255,255,255,0.06);
+            }
+            QCheckBox::indicator:checked {
+                background: #5b8ef5;
+                border-color: #5b8ef5;
+            }
+            QSlider::groove:horizontal {
+                height: 5px;
+                background: rgba(255,255,255,0.12);
+                border-radius: 2px;
+            }
+            QSlider::handle:horizontal {
+                width: 14px; height: 14px;
+                margin: -5px 0;
+                background: #5b8ef5;
+                border-radius: 7px;
+            }
+            QSlider::sub-page:horizontal {
+                background: #5b8ef5;
+                border-radius: 2px;
+            }
+            QTabWidget::pane {
+                border: 1px solid rgba(255,255,255,0.10);
+                background-color: rgba(255,255,255,0.03);
+                border-radius: 6px;
+            }
+            QTabBar::tab {
+                background-color: rgba(255,255,255,0.05);
+                color: #8899bb;
+                padding: 8px 16px;
+                border-top-left-radius: 5px;
+                border-top-right-radius: 5px;
+                margin-right: 2px;
+                border: 1px solid rgba(255,255,255,0.07);
+                border-bottom: none;
+            }
+            QTabBar::tab:selected {
+                background-color: rgba(255,255,255,0.10);
+                color: #cdd6f4;
+                font-weight: bold;
+            }
+            QTabBar::tab:hover:!selected {
+                background-color: rgba(255,255,255,0.08);
+                color: #aabbcc;
+            }
+            QTabBar::scroller { width: 20px; }
             QTabBar QToolButton {
                 background: rgba(255,255,255,0.06);
                 border: 1px solid rgba(255,255,255,0.10);
                 border-radius: 4px;
                 color: #cccccc;
             }
-            QTabBar QToolButton:hover {
-                background: rgba(255,255,255,0.14);
+            QTabBar QToolButton:hover { background: rgba(255,255,255,0.14); }
+            QPushButton {
+                background-color: rgba(255,255,255,0.07);
+                color: #c8d0e0;
+                border: 1px solid rgba(255,255,255,0.12);
+                border-radius: 7px;
+                padding: 6px 14px;
+                font-size: 13px;
+            }
+            QPushButton:hover {
+                background-color: rgba(255,255,255,0.13);
+                border-color: rgba(255,255,255,0.22);
+            }
+            QPushButton:checked {
+                background-color: rgba(220,60,60,0.35);
+                border-color: rgba(220,60,60,0.6);
+                color: #ff9090;
+            }
+            #btn_nr { background-color: rgba(214,93,78,0.30); color: #ff9090; }
+            #btn_nr:checked { background-color: rgba(39,174,96,0.30); color: #82e0aa; }
+            QScrollBar:vertical {
+                background: rgba(255,255,255,0.04);
+                width: 6px; border-radius: 3px; margin: 0;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(255,255,255,0.18);
+                border-radius: 3px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+            QScrollBar:horizontal {
+                background: rgba(255,255,255,0.04);
+                height: 6px; border-radius: 3px; margin: 0;
+            }
+            QScrollBar::handle:horizontal {
+                background: rgba(255,255,255,0.18);
+                border-radius: 3px;
+            }
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+            QScrollArea { background: transparent; border: none; }
+            QFrame[frameShape="4"], QFrame[frameShape="5"] {
+                background: rgba(255,255,255,0.08);
+                border: none;
+                max-height: 1px;
+            }
+            QProgressBar {
+                background: rgba(255,255,255,0.08);
+                border: 1px solid rgba(255,255,255,0.12);
+                border-radius: 4px;
+                color: #c8d0e0;
+                text-align: center;
+            }
+            QProgressBar::chunk {
+                background: #5b8ef5;
+                border-radius: 3px;
             }
         """)
+        root_lay.addWidget(self._card)
+
+        card_lay = QVBoxLayout(self._card)
+        card_lay.setContentsMargins(0, 0, 0, 0)
+        card_lay.setSpacing(0)
+
+        # ── Кастомный title bar ───────────────────────────────────────────────
+        self._title_bar = _DialogTitleBar(self, "⚙  Настройки")
+        card_lay.addWidget(self._title_bar)
+
+        # Разделитель под title bar
+        _sep = QFrame()
+        _sep.setFrameShape(QFrame.Shape.HLine)
+        _sep.setFixedHeight(1)
+        _sep.setStyleSheet("background: rgba(255,255,255,0.08); border: none;")
+        card_lay.addWidget(_sep)
+
+        # ── Основной контент ──────────────────────────────────────────────────
+        content_w = QWidget()
+        content_w.setStyleSheet("background: transparent;")
+        content_lay = QVBoxLayout(content_w)
+        content_lay.setContentsMargins(16, 14, 16, 14)
+        content_lay.setSpacing(10)
+        card_lay.addWidget(content_w, stretch=1)
+
+        self.tabs = QTabWidget()
+        self.tabs.setUsesScrollButtons(True)
 
         # 1. Профиль
         self.setup_profile_tab()
@@ -571,22 +1168,45 @@ class SettingsDialog(QDialog):
         # 2. Аудио
         self.setup_audio_tab()
 
-        # 3. Персонализация (Тема + Хоткеи в одной вкладке)
+        # 3. Персонализация (Хоткеи + бывший Шёпот)
         self.setup_personalization_tab()
 
-        # 4. Шёпот — PTT горячие клавиши
-        self.setup_whisper_tab()
-
-        # 5. SoundBoard — кастомные звуки + громкость
+        # 4. SoundBoard — кастомные звуки + громкость
         self.setup_soundboard_tab()
 
-        # 6. Версия
+        # 5. Версия
         self.setup_version_tab()
 
-        main_layout.addWidget(self.tabs)
-        btn_save = QPushButton("Сохранить")
+        content_lay.addWidget(self.tabs)
+
+        # Кнопка «Сохранить» внизу карточки
+        btn_save = QPushButton("✔  Сохранить")
+        btn_save.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(46,204,113,0.25);
+                color: #82e0aa;
+                border: 1px solid rgba(46,204,113,0.50);
+                border-radius: 7px;
+                padding: 8px 20px;
+                font-size: 14px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: rgba(46,204,113,0.40);
+                border-color: rgba(46,204,113,0.75);
+                color: #ffffff;
+            }
+        """)
         btn_save.clicked.connect(self.save_all)
-        main_layout.addWidget(btn_save)
+        content_lay.addWidget(btn_save)
+
+        # ── Фикс прозрачности выпадающих списков на Windows ──────────────────
+        # QComboBox-popup — отдельное top-level окно. Если родитель имеет
+        # WA_TranslucentBackground, Windows-compositor рендерит popup тоже
+        # прозрачным, игнорируя background-color из CSS.
+        # Решение: явно задаём solid-stylesheet непосредственно на view-виджете
+        # каждого комбобокса и снимаем флаг TranslucentBackground с его окна.
+        QTimer.singleShot(0, self._fix_combo_popups)
 
     # ── Вкладка «О себе» ──────────────────────────────────────────────────────
     def setup_profile_tab(self):
@@ -713,217 +1333,277 @@ class SettingsDialog(QDialog):
         aud_lay.addWidget(self.lbl_sys)
         aud_lay.addWidget(self.sl_sys)
 
-        # Примечание: ползунок громкости Soundboard перенесён на вкладку «SoundBoard»
-        hint_sb = QLabel("🎵  Громкость Soundboard — на вкладке «SoundBoard»")
-        hint_sb.setStyleSheet("font-size: 11px; color: #888;")
-        aud_lay.addWidget(hint_sb)
-
         aud_lay.addStretch()
         self.tabs.addTab(aud_tab, "Аудио")
 
-    # ── Вкладка «Персонализация» (Тема + Хоткеи) ──────────────────────────────
+    # ── Вкладка «Персонализация» (Горячие клавиши) ────────────────────────────
     def setup_personalization_tab(self):
+        """
+        Вкладка объединяет:
+        • Горячие клавиши для mute/deafen (раньше были статическими QLineEdit)
+        • PTT-шёпот по нику (раньше вкладка «Шёпот»)
+        • Горячие клавиши для звуков Soundboard
+
+        Дизайн: динамическая таблица строк.
+        Каждая строка = [Функция (ComboBox)] + [Горячая клавиша (HotkeyCaptureEdit)] + [✕]
+        По умолчанию — 1 пустая строка. Кнопка «+» добавляет ещё (макс 8).
+        """
         tab = QWidget()
-        lay = QVBoxLayout(tab)
-        lay.setSpacing(12)
+        outer = QVBoxLayout(tab)
+        outer.setSpacing(10)
+        outer.setContentsMargins(16, 16, 16, 16)
 
-        # ─── Секция: Тема оформления ──────────────────────────────────────────
-        theme_group = QGroupBox("🎨  Тема оформления")
-        theme_lay = QVBoxLayout(theme_group)
+        # ── GroupBox «Горячие клавиши» (как «Громкость Soundboard» на вкладке SoundBoard) ─
+        hk_group = QGroupBox("🎹  Горячие клавиши")
+        hk_group.setStyleSheet("QGroupBox { font-weight: bold; }")
+        hk_group_lay = QVBoxLayout(hk_group)
+        hk_group_lay.setSpacing(8)
+        hk_group_lay.setContentsMargins(10, 14, 10, 10)
+        outer.addWidget(hk_group, stretch=1)
 
-        self.theme_combo = QComboBox()
-        self.theme_combo.addItems(["Светлая", "Темная"])
-        self.theme_combo.setCurrentText(self.app_settings.value("theme", "Светлая"))
-        self.theme_combo.currentTextChanged.connect(self.mw.apply_theme)
-        theme_lay.addWidget(QLabel("Цветовая схема приложения:"))
-        theme_lay.addWidget(self.theme_combo)
-        lay.addWidget(theme_group)
+        # ── Заголовки колонок ─────────────────────────────────────────────────
+        hdr_row = QHBoxLayout()
+        hdr_row.setContentsMargins(4, 0, 36, 0)   # 36 = ширина кнопки «✕»
+        hdr_row.setSpacing(8)
+        lbl_func = QLabel("Действие")
+        lbl_func.setStyleSheet("font-weight: bold; font-size: 12px;")
+        lbl_key  = QLabel("Горячая клавиша (кликни для записи)")
+        lbl_key.setStyleSheet("font-weight: bold; font-size: 12px;")
+        hdr_row.addWidget(lbl_func, stretch=4)
+        hdr_row.addWidget(lbl_key,  stretch=5)
+        hk_group_lay.addLayout(hdr_row)
 
-        # ─── Секция: Горячие клавиши ──────────────────────────────────────────
-        hk_group = QGroupBox("⌨  Горячие клавиши")
-        hk_lay = QVBoxLayout(hk_group)
+        # ── Скролл-область со строками ────────────────────────────────────────
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
-        hk_lay.addWidget(QLabel("Mute микрофона:"))
-        self.hk_mute = QLineEdit(self.app_settings.value("hk_mute", "alt+["))
-        hk_lay.addWidget(self.hk_mute)
+        self._hk_rows_container = QWidget()
+        self._hk_rows_container.setStyleSheet("background: transparent;")
+        self._hk_rows_layout = QVBoxLayout(self._hk_rows_container)
+        self._hk_rows_layout.setSpacing(5)
+        self._hk_rows_layout.setContentsMargins(0, 0, 0, 0)
+        self._hk_rows_layout.addStretch()   # прижимаем строки сверху
+        scroll.setWidget(self._hk_rows_container)
+        hk_group_lay.addWidget(scroll, stretch=1)
 
-        hk_lay.addWidget(QLabel("Deafen (динамики):"))
-        self.hk_deafen = QLineEdit(self.app_settings.value("hk_deafen", "alt+]"))
-        hk_lay.addWidget(self.hk_deafen)
+        # ── Кнопка «Добавить» — жёстко прибита к низу вкладки (вне GroupBox) ──
+        # Находится в outer, ПОСЛЕ группы → всегда видна в одном месте,
+        # не зависит от количества строк и не уезжает вверх при пустом списке.
+        self._btn_hk_add = QPushButton("＋  Добавить назначение")
+        self._btn_hk_add.setStyleSheet("""
+            QPushButton {
+                background: rgba(88,101,242,0.20);
+                color: #a0b0ff;
+                border: 1px solid rgba(88,101,242,0.50);
+                border-radius: 7px;
+                padding: 6px 16px;
+            }
+            QPushButton:hover {
+                background: rgba(88,101,242,0.38);
+                color: #ffffff;
+            }
+            QPushButton:disabled {
+                background: rgba(255,255,255,0.04);
+                color: #555;
+                border-color: rgba(255,255,255,0.08);
+            }
+        """)
+        self._btn_hk_add.clicked.connect(self._add_hk_row)
+        outer.addWidget(self._btn_hk_add, alignment=Qt.AlignmentFlag.AlignLeft)
 
-        hint = QLabel("Формат: alt+[, ctrl+m, f9 и т.д.")
-        hint.setStyleSheet("font-size: 11px; color: #888;")
-        hk_lay.addWidget(hint)
+        # ── Список строк (модель) ─────────────────────────────────────────────
+        # Каждый элемент: {"cb": QComboBox, "hk": HotkeyCaptureEdit, "frame": QFrame}
+        self._hk_rows: list[dict] = []
 
-        btn_res = QPushButton("Сбросить к значениям по умолчанию")
-        btn_res.clicked.connect(lambda: (
-            self.hk_mute.setText("alt+["),
-            self.hk_deafen.setText("alt+]")
-        ))
-        hk_lay.addWidget(btn_res)
-        lay.addWidget(hk_group)
+        # ── Загружаем сохранённые строки ──────────────────────────────────────
+        self._load_hk_rows()
 
-        lay.addStretch()
         self.tabs.addTab(tab, "Персонализация")
 
-    # ── Вкладка «Шёпот» ──────────────────────────────────────────────────────
-    def setup_whisper_tab(self):
+    # ── Вспомогательные методы новой таблицы горячих клавиш ──────────────────
+
+    def _build_function_options(self) -> list[tuple[str, str, str]]:
         """
-        5 PTT-слотов: каждый — выбор собеседника (из known_users.json) +
-        сочетание клавиш. Тема применяется автоматически через QDialog stylesheet
-        родителя (MainWindow.apply_theme): QComboBox, QLineEdit, QPushButton,
-        QLabel, QGroupBox наследуют bg/text/border от него.
+        Возвращает список (display_text, func_type, func_data) для ComboBox.
+
+        func_type:
+          "none"      — не задано
+          "mute_mic"  — замутить микрофон
+          "deafen"    — замутить динамики
+          "whisper"   — шёпот; func_data = IP пользователя
+          "sound"     — soundboard; func_data = имя звука (строка из QSettings)
         """
-        tab = QWidget()
-        lay = QVBoxLayout(tab)
-        lay.setSpacing(10)
-        lay.setContentsMargins(16, 16, 16, 16)
+        opts: list[tuple[str, str, str]] = [
+            ("— не задано —",                  "none",     ""),
+            ("🎙  Замутить микрофон",           "mute_mic", ""),
+            ("🔇  Замутить динамики (Deafen)",  "deafen",   ""),
+        ]
 
-        # ── Описание ──────────────────────────────────────────────────────────
-        desc = QLabel(
-            "Удерживай клавишу → голос идёт только этому собеседнику (PTT-шёпот).\n"
-            "Работает поверх любых окон (игр, браузера и т.д.).\n"
-            "Формат клавиш: <b>alt+1</b>, <b>ctrl+shift+w</b>, <b>f8</b> и т.д."
-        )
-        desc.setTextFormat(Qt.TextFormat.RichText)
-        desc.setWordWrap(True)
-        desc.setStyleSheet("font-size: 12px; line-height: 1.5;")
-        lay.addWidget(desc)
-
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setFrameShadow(QFrame.Shadow.Sunken)
-        lay.addWidget(sep)
-
-        # ── Читаем известных пользователей ────────────────────────────────────
-        # known_users.json: {ip: {nick, first_seen, last_seen}}
-        # Строим список (nick, ip) — показываем актуальный ник, ключ — IP.
-        # Это позволяет горячим клавишам работать даже после смены ника у пользователя:
-        # при следующем открытии настроек комбобокс покажет уже новый ник по тому же IP.
-        known_users_by_ip: dict = {}   # ip → nick
+        # ── Пользователи из known_users.json (для шёпота) ─────────────────────
         try:
             if os.path.exists("known_users.json"):
                 with open("known_users.json", "r", encoding="utf-8") as f:
                     registry: dict = json.load(f)
-                known_users_by_ip = {
-                    ip: v.get("nick", "")
-                    for ip, v in registry.items()
-                    if v.get("nick", "")
-                }
+                users = sorted(
+                    ((v.get("nick", ""), ip)
+                     for ip, v in registry.items() if v.get("nick", "")),
+                    key=lambda x: x[0].lower()
+                )
+                for nick, ip in users:
+                    opts.append((f"🤫  Шёпот → {nick}", "whisper", ip))
         except Exception:
             pass
 
-        # Список (display_nick, ip), отсортированный по нику (без учёта регистра)
-        known_users_list: list[tuple[str, str]] = sorted(
-            known_users_by_ip.items(),   # (ip, nick) → swap to (nick, ip) below
-            key=lambda kv: kv[1].lower()  # sort by nick (value)
-        )
-        # known_users_by_ip.items() → (ip, nick); после sort переворачиваем для удобства
-        known_users_list = [(nick, ip) for ip, nick in known_users_list]
+        # ── Кастомные звуки soundboard ────────────────────────────────────────
+        s = self.app_settings
+        for i in range(CUSTOM_SOUND_SLOTS):
+            name = s.value(f"custom_sound_{i}_name", "")
+            if name:
+                opts.append((f"🎵  Звук: {name}", "sound", name))
 
-        EMPTY = "— не выбрано —"
+        return opts
 
-        # ── Заголовки колонок ─────────────────────────────────────────────────
-        hdr = QHBoxLayout()
-        hdr.setContentsMargins(4, 0, 4, 0)
-        n_lbl = QLabel("#")
-        n_lbl.setFixedWidth(20)
-        n_lbl.setStyleSheet("font-weight: bold; font-size: 12px;")
-        p_lbl = QLabel("Собеседник")
-        p_lbl.setStyleSheet("font-weight: bold; font-size: 12px;")
-        k_lbl = QLabel("Горячая клавиша (удерживать)")
-        k_lbl.setStyleSheet("font-weight: bold; font-size: 12px;")
-        hdr.addWidget(n_lbl)
-        hdr.addWidget(p_lbl, stretch=3)
-        hdr.addSpacing(8)
-        hdr.addWidget(k_lbl, stretch=4)
-        lay.addLayout(hdr)
+    def _add_hk_row(self, func_type: str = "none", func_data: str = "",
+                    hotkey: str = "") -> None:
+        """Добавляет одну строку в таблицу горячих клавиш."""
+        MAX_ROWS = 7
+        if len(self._hk_rows) >= MAX_ROWS:
+            self._btn_hk_add.setEnabled(False)
+            return
 
-        # ── 5 слотов ──────────────────────────────────────────────────────────
-        self._w_slots: list[tuple[QComboBox, QLineEdit]] = []
+        opts = self._build_function_options()
 
-        for i in range(5):
-            row = QHBoxLayout()
-            row.setSpacing(8)
-            row.setContentsMargins(0, 0, 0, 0)
+        # ── Фрейм строки ──────────────────────────────────────────────────────
+        frame = QFrame()
+        frame.setStyleSheet("""
+            QFrame {
+                background: rgba(255,255,255,0.04);
+                border: 1px solid rgba(255,255,255,0.09);
+                border-radius: 8px;
+            }
+        """)
+        row_lay = QHBoxLayout(frame)
+        row_lay.setContentsMargins(8, 5, 8, 5)
+        row_lay.setSpacing(8)
 
-            num = QLabel(str(i + 1))
-            num.setFixedWidth(20)
-            num.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            num.setStyleSheet("color: #888; font-size: 12px;")
+        # Колонка 1: выбор функции
+        cb = QComboBox()
+        cb.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        for text, ftype, fdata in opts:
+            cb.addItem(text, (ftype, fdata))
 
-            # Комбобокс — собеседник
-            # userData каждого item = IP пользователя (пустая строка для «не выбрано»)
-            cb = QComboBox()
-            cb.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-            cb.setMinimumWidth(150)
-            cb.addItem(EMPTY, "")  # index 0: не выбрано, userData=""
-            for nick_text, ip_addr in known_users_list:
-                cb.addItem(nick_text, ip_addr)  # userData=ip
+        # Восстанавливаем выбор
+        selected_idx = 0
+        for j in range(cb.count()):
+            d = cb.itemData(j)
+            if d and d[0] == func_type and d[1] == func_data:
+                selected_idx = j
+                break
+        cb.setCurrentIndex(selected_idx)
 
-            # Восстанавливаем сохранённый выбор:
-            # Приоритет — по IP: ник мог смениться, но IP остаётся тем же.
-            saved_ip   = self.app_settings.value(f"whisper_slot_{i}_ip",   "")
-            saved_nick = self.app_settings.value(f"whisper_slot_{i}_nick", "")
+        # ── Фикс прозрачности выпадающего списка на Windows ──────────────────
+        # QComboBox popup — отдельное top-level окно, которое при
+        # WA_TranslucentBackground родителя рендерится прозрачным.
+        # Решение: явно задаём solid-фон на view-виджете и убираем флаг у его окна.
+        def _fix_this_cb_popup(combo=cb):
+            try:
+                v = combo.view()
+                v.setStyleSheet(
+                    "QAbstractItemView {"
+                    "  background-color: #1e2130;"
+                    "  color: #c8d0e0;"
+                    "  selection-background-color: #2c3252;"
+                    "  selection-color: #ffffff;"
+                    "  border: 1px solid #333648;"
+                    "  outline: none;"
+                    "}"
+                )
+                win = v.window()
+                win.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+                win.setStyleSheet("background-color: #1e2130;")
+            except Exception:
+                pass
+        QTimer.singleShot(0, _fix_this_cb_popup)
 
-            selected = False
-            if saved_ip:
-                # Ищем item с совпадающим IP в userData
-                for j in range(cb.count()):
-                    if cb.itemData(j) == saved_ip:
-                        cb.setCurrentIndex(j)
-                        selected = True
-                        break
-            if not selected and saved_nick:
-                # Фолбэк: старые сохранения без IP — ищем по нику
-                for j in range(1, cb.count()):
-                    if cb.itemText(j) == saved_nick:
-                        cb.setCurrentIndex(j)
-                        break
+        # Колонка 2: захват клавиши
+        hk_edit = HotkeyCaptureEdit()
+        hk_edit.set_hotkey(hotkey)
 
-            # Поле горячей клавиши
-            le = QLineEdit()
-            le.setPlaceholderText("напр. alt+1, ctrl+shift+w, f8")
-            le.setMinimumWidth(180)
-            saved_hk = self.app_settings.value(f"whisper_slot_{i}_hk", "")
-            le.setText(saved_hk)
+        # Кнопка удаления
+        btn_del = QPushButton("✕")
+        btn_del.setFixedSize(28, 28)
+        btn_del.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_del.setStyleSheet("""
+            QPushButton {
+                background: rgba(220,60,60,0.15);
+                color: #e87070;
+                border: 1px solid rgba(220,60,60,0.35);
+                border-radius: 6px;
+                font-size: 13px;
+                padding: 0;
+            }
+            QPushButton:hover {
+                background: rgba(220,60,60,0.35);
+                color: #ffffff;
+            }
+        """)
 
-            row.addWidget(num)
-            row.addWidget(cb, stretch=3)
-            row.addWidget(le, stretch=4)
-            lay.addLayout(row)
+        row_lay.addWidget(cb, stretch=4)
+        row_lay.addWidget(hk_edit, stretch=5)
+        row_lay.addWidget(btn_del)
 
-            self._w_slots.append((cb, le))
+        slot = {"cb": cb, "hk": hk_edit, "frame": frame}
+        self._hk_rows.append(slot)
 
-        # ── Кнопка очистки ────────────────────────────────────────────────────
-        lay.addSpacing(4)
-        btn_clear = QPushButton("Очистить все слоты")
-        btn_clear.setStyleSheet(
-            "QPushButton { color: #e74c3c; border: 1px solid #e74c3c; "
-            "border-radius: 6px; padding: 4px 14px; }"
-            "QPushButton:hover { background-color: rgba(231,76,60,0.12); }"
-        )
-        btn_clear.setFixedWidth(200)
-        btn_clear.clicked.connect(self._clear_whisper_slots)
-        lay.addWidget(btn_clear, alignment=Qt.AlignmentFlag.AlignLeft)
+        # Вставляем перед последним stretch
+        stretch_idx = self._hk_rows_layout.count() - 1
+        self._hk_rows_layout.insertWidget(stretch_idx, frame)
 
-        # ── Примечание о формате ──────────────────────────────────────────────
-        note = QLabel(
-            "ℹ  Если нужный собеседник не появляется — он ещё не был в сессии.\n"
-            "    Зайди в канал вместе с ним, список обновится автоматически."
-        )
-        note.setStyleSheet("font-size: 11px; color: #888;")
-        note.setWordWrap(True)
-        lay.addSpacing(6)
-        lay.addWidget(note)
+        # Кнопка «+» — недоступна при максимуме
+        self._btn_hk_add.setEnabled(len(self._hk_rows) < MAX_ROWS)
 
-        lay.addStretch()
-        self.tabs.addTab(tab, "Шёпот")
+        # ── Удаление строки ───────────────────────────────────────────────────
+        # ВАЖНО: btn_del.clicked передаёт checked:bool первым аргументом.
+        # Принимаем его явно, чтобы он не попал в _slot и list.remove() не падал.
+        def _remove(checked: bool = False, _slot=slot):
+            if _slot not in self._hk_rows:
+                return   # защита от двойного срабатывания
+            self._hk_rows.remove(_slot)
+            _slot["frame"].setParent(None)
+            _slot["frame"].deleteLater()
+            # Если строк не осталось — добавляем одну пустую
+            if not self._hk_rows:
+                self._add_hk_row()
+            self._btn_hk_add.setEnabled(len(self._hk_rows) < MAX_ROWS)
 
-    def _clear_whisper_slots(self):
-        for cb, le in self._w_slots:
-            cb.setCurrentIndex(0)
-            le.clear()
+        btn_del.clicked.connect(_remove)
+
+    def _load_hk_rows(self) -> None:
+        """
+        Загружает строки горячих клавиш из QSettings.
+        Если сохранённых строк нет (первый запуск или всё удалено) —
+        добавляет одну пустую строку-шаблон.
+        """
+        s = self.app_settings
+        count = s.value("hk_table_count", None)
+
+        if count is None or int(count) == 0:
+            # Первый запуск или пустая таблица — одна пустая строка
+            self._add_hk_row()
+            return
+
+        for i in range(int(count)):
+            ftype = s.value(f"hk_table_{i}_type", "none")
+            fdata = s.value(f"hk_table_{i}_data", "")
+            fhk   = s.value(f"hk_table_{i}_key",  "")
+            self._add_hk_row(ftype, fdata, fhk)
+
+    # ── Старая вкладка «Шёпот» — удалена (логика перенесена в Персонализацию) ─
+    # setup_whisper_tab — метод намеренно отсутствует.
+    # _clear_whisper_slots — метод намеренно отсутствует.
+
 
     # ── Вкладка «SoundBoard» ──────────────────────────────────────────────────
     def setup_soundboard_tab(self):
@@ -948,13 +1628,6 @@ class SettingsDialog(QDialog):
         vol_group.setStyleSheet("QGroupBox { font-weight: bold; }")
         vol_lay = QVBoxLayout(vol_group)
 
-        vol_hint = QLabel(
-            "Квадратичная кривая: 40% → –16 dB, 70% → –6 dB, 100% → 0 dB (полная)."
-        )
-        vol_hint.setStyleSheet("font-size: 11px; color: #888; font-weight: normal;")
-        vol_hint.setWordWrap(True)
-        vol_lay.addWidget(vol_hint)
-
         sb_vol = int(self.app_settings.value("soundboard_volume", 40))
         self.lbl_sb = QLabel(f"Soundboard: {sb_vol}%")
         self.sl_sb = QSlider(Qt.Orientation.Horizontal)
@@ -966,13 +1639,12 @@ class SettingsDialog(QDialog):
         lay.addWidget(vol_group)
 
         # ── Блок: Кастомные звуки ─────────────────────────────────────────────
-        cust_group = QGroupBox("🎵  Мои звуки (до 3 слотов)")
+        cust_group = QGroupBox("🎵  Мои звуки")
         cust_group.setStyleSheet("QGroupBox { font-weight: bold; }")
         cust_lay = QVBoxLayout(cust_group)
 
         desc = QLabel(
-            "Добавьте собственные звуки (.mp3 / .wav), максимум 1 МБ (~7 сек).\n"
-            "Звук будет воспроизводиться у всех участников канала при нажатии кнопки."
+            "Добавьте собственные звуки (.mp3 / .wav), максимум 1 МБ (~7 сек)."
         )
         desc.setStyleSheet("font-size: 11px; color: #aaa; font-weight: normal;")
         desc.setWordWrap(True)
@@ -1045,20 +1717,21 @@ class SettingsDialog(QDialog):
         row_lay.addWidget(btn_browse)
 
         # Кнопка «Удалить»
-        btn_del = QPushButton("🗑")
+        btn_del = QPushButton("✕")
         btn_del.setFixedSize(28, 28)
         btn_del.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_del.setEnabled(bool(saved_path))
         btn_del.setStyleSheet("""
             QPushButton {
-                background: rgba(220,60,60,0.18);
+                background: rgba(220,60,60,0.15);
                 color: #e87070;
-                border: 1px solid rgba(220,60,60,0.40);
+                border: 1px solid rgba(220,60,60,0.35);
                 border-radius: 6px;
-                font-size: 14px;
+                font-size: 13px;
+                padding: 0;
             }
             QPushButton:hover {
-                background: rgba(220,60,60,0.38);
+                background: rgba(220,60,60,0.35);
                 color: #ffffff;
             }
             QPushButton:disabled {
@@ -1350,6 +2023,35 @@ class SettingsDialog(QDialog):
         if self.parent():
             self.parent().app_settings.setValue("noise_reduction", self.audio.use_noise_reduction)
 
+    def _fix_combo_popups(self):
+        """
+        Устраняет прозрачность выпадающих меню QComboBox на Windows.
+
+        Причина: диалог имеет WA_TranslucentBackground, и Windows-compositor
+        рендерит popup-окно комбобокса тоже прозрачным, несмотря на CSS.
+        Решение: для каждого QComboBox явно ставим solid-stylesheet на view-виджет
+        и снимаем WA_TranslucentBackground с его top-level окна.
+        """
+        from PyQt6.QtWidgets import QComboBox as _QCB
+        _VIEW_SS = (
+            "QAbstractItemView {"
+            "  background-color: #1e2130;"
+            "  color: #c8d0e0;"
+            "  selection-background-color: #2c3252;"
+            "  selection-color: #ffffff;"
+            "  border: 1px solid #333648;"
+            "}"
+        )
+        for cb in self.findChildren(_QCB):
+            try:
+                v = cb.view()
+                v.setStyleSheet(_VIEW_SS)
+                win = v.window()
+                win.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+                win.setStyleSheet("background-color: #1e2130;")
+            except Exception:
+                pass
+
     def get_devices(self):
         return self.cb_in.currentText(), self.cb_out.currentText()
 
@@ -1357,26 +2059,52 @@ class SettingsDialog(QDialog):
         s = self.app_settings
         s.setValue("device_in_name", self.cb_in.currentText())
         s.setValue("device_out_name", self.cb_out.currentText())
-        s.setValue("hk_mute", self.hk_mute.text())
-        s.setValue("hk_deafen", self.hk_deafen.text())
         s.setValue("system_sound_volume", self.sl_sys.value())
         s.setValue("soundboard_volume", self.sl_sb.value())
         s.setValue("vad_threshold_slider", self.sl_vad.value())
-        s.setValue("theme", self.theme_combo.currentText())
 
-        # Сохраняем слоты PTT-шёпота (до 5)
-        for i, (cb, le) in enumerate(self._w_slots):
-            # Если выбрано «не выбрано» (index 0) — сохраняем пустые строки
-            if cb.currentIndex() == 0:
+        # ── Сохраняем таблицу горячих клавиш ─────────────────────────────────
+        s.setValue("hk_table_count", len(self._hk_rows))
+        whisper_slot_idx = 0   # счётчик для обратносовместимых ключей шёпота
+
+        # Сбрасываем прежние значения mute/deafen — перезапишем из таблицы
+        s.setValue("hk_mute", "")
+        s.setValue("hk_deafen", "")
+        # Сбрасываем старые whisper-слоты
+        for i in range(8):
+            s.setValue(f"whisper_slot_{i}_nick", "")
+            s.setValue(f"whisper_slot_{i}_ip",   "")
+            s.setValue(f"whisper_slot_{i}_hk",   "")
+
+        for i, row in enumerate(self._hk_rows):
+            data = row["cb"].currentData()   # (func_type, func_data)
+            hk   = row["hk"].get_hotkey()
+            ftype = data[0] if data else "none"
+            fdata = data[1] if data else ""
+
+            s.setValue(f"hk_table_{i}_type", ftype)
+            s.setValue(f"hk_table_{i}_data", fdata)
+            s.setValue(f"hk_table_{i}_key",  hk)
+
+            # Обратносовместимые ключи для остального кода приложения
+            if ftype == "mute_mic" and not s.value("hk_mute", ""):
+                s.setValue("hk_mute", hk)
+            elif ftype == "deafen" and not s.value("hk_deafen", ""):
+                s.setValue("hk_deafen", hk)
+            elif ftype == "whisper" and whisper_slot_idx < 8 and hk:
+                # Восстанавливаем nick из known_users.json по IP
                 nick = ""
-                ip   = ""
-            else:
-                nick = cb.currentText()
-                ip   = cb.currentData() or ""  # userData = IP
-            hk   = le.text().strip()
-            s.setValue(f"whisper_slot_{i}_nick", nick)
-            s.setValue(f"whisper_slot_{i}_ip",   ip)
-            s.setValue(f"whisper_slot_{i}_hk",   hk)
+                try:
+                    if os.path.exists("known_users.json"):
+                        with open("known_users.json", "r", encoding="utf-8") as f:
+                            reg = json.load(f)
+                        nick = reg.get(fdata, {}).get("nick", "")
+                except Exception:
+                    pass
+                s.setValue(f"whisper_slot_{whisper_slot_idx}_ip",   fdata)
+                s.setValue(f"whisper_slot_{whisper_slot_idx}_nick", nick)
+                s.setValue(f"whisper_slot_{whisper_slot_idx}_hk",   hk)
+                whisper_slot_idx += 1
 
         self.mw.nick = self.ed_nick.text()
         self.mw.avatar = self.cur_av
@@ -1413,9 +2141,84 @@ class SettingsDialog(QDialog):
 class StreamSettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
+        # ── Безрамочный стеклянный дизайн ────────────────────────────────────
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setWindowTitle("Настройки трансляции")
         self.setMinimumWidth(360)
-        layout = QVBoxLayout(self)
+
+        root_lay = QVBoxLayout(self)
+        root_lay.setContentsMargins(0, 0, 0, 0)
+        root_lay.setSpacing(0)
+
+        self._card = QFrame(self)
+        self._card.setObjectName("streamCard")
+        self._card.setStyleSheet("""
+            QFrame#streamCard {
+                background-color: rgba(26, 28, 38, 252);
+                border: 1px solid rgba(255,255,255,0.10);
+                border-radius: 12px;
+            }
+            QLabel { color: #c8d0e0; background: transparent; border: none; }
+            QComboBox {
+                background-color: rgba(255,255,255,0.07);
+                border: 1px solid rgba(255,255,255,0.13);
+                border-radius: 6px;
+                padding: 5px 10px;
+                color: #c8d0e0;
+            }
+            QComboBox QAbstractItemView {
+                background-color: rgba(30,33,48,255);
+                color: #c8d0e0;
+                border: 1px solid rgba(255,255,255,0.13);
+                selection-background-color: #3d5c9e;
+                selection-color: #ffffff;
+                outline: none;
+            }
+            QComboBox::drop-down { border: none; }
+            QCheckBox { color: #c8d0e0; background: transparent; }
+            QCheckBox::indicator {
+                width: 16px; height: 16px;
+                border: 1px solid rgba(255,255,255,0.20);
+                border-radius: 4px;
+                background: rgba(255,255,255,0.06);
+            }
+            QCheckBox::indicator:checked { background: #5b8ef5; border-color: #5b8ef5; }
+            QPushButton {
+                background-color: rgba(255,255,255,0.07);
+                color: #c8d0e0;
+                border: 1px solid rgba(255,255,255,0.12);
+                border-radius: 7px;
+                padding: 6px 14px;
+            }
+            QPushButton:hover {
+                background-color: rgba(255,255,255,0.13);
+                border-color: rgba(255,255,255,0.22);
+            }
+        """)
+        root_lay.addWidget(self._card)
+
+        card_lay = QVBoxLayout(self._card)
+        card_lay.setContentsMargins(0, 0, 0, 0)
+        card_lay.setSpacing(0)
+
+        # Title bar
+        self._title_bar = _DialogTitleBar(self, "📺  Настройки трансляции")
+        card_lay.addWidget(self._title_bar)
+
+        _sep = QFrame()
+        _sep.setFrameShape(QFrame.Shape.HLine)
+        _sep.setFixedHeight(1)
+        _sep.setStyleSheet("background: rgba(255,255,255,0.08); border: none;")
+        card_lay.addWidget(_sep)
+
+        # Контент
+        content_w = QWidget()
+        content_w.setStyleSheet("background: transparent;")
+        layout = QVBoxLayout(content_w)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(8)
+        card_lay.addWidget(content_w)
 
         layout.addWidget(QLabel("Выберите монитор:"))
         self.monitor_combo = QComboBox()
@@ -1451,6 +2254,31 @@ class StreamSettingsDialog(QDialog):
         self.fps_combo.addItems(["15", "30", "60"])
         self.fps_combo.setCurrentText("30")
         layout.addWidget(self.fps_combo)
+
+        # ── Фикс прозрачного popup у всех трёх комбобоксов ───────────────────
+        # QComboBox popup — отдельный top-level виджет: при WA_TranslucentBackground
+        # родителя он рендерится прозрачным. Задаём solid-фон напрямую на view().
+        def _fix_stream_combo(combo):
+            try:
+                v = combo.view()
+                v.setStyleSheet(
+                    "QAbstractItemView {"
+                    "  background-color: #1e2130;"
+                    "  color: #c8d0e0;"
+                    "  selection-background-color: #3d5c9e;"
+                    "  selection-color: #ffffff;"
+                    "  border: 1px solid #333648;"
+                    "  outline: none;"
+                    "}"
+                )
+                win = v.window()
+                win.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+                win.setStyleSheet("background-color: #1e2130;")
+            except Exception:
+                pass
+        QTimer.singleShot(0, lambda: _fix_stream_combo(self.monitor_combo))
+        QTimer.singleShot(0, lambda: _fix_stream_combo(self.res_combo))
+        QTimer.singleShot(0, lambda: _fix_stream_combo(self.fps_combo))
 
         layout.addSpacing(10)
 
@@ -1491,14 +2319,39 @@ class StreamSettingsDialog(QDialog):
 
         layout.addSpacing(8)
 
-        btn_start = QPushButton("Запустить трансляцию")
-        btn_start.setStyleSheet(
-            "background-color: #2ecc71; color: white; font-weight: bold; height: 40px;"
-        )
+        btn_start = QPushButton("▶  Запустить трансляцию")
+        btn_start.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(46,204,113,0.25);
+                color: #82e0aa;
+                border: 1px solid rgba(46,204,113,0.50);
+                border-radius: 7px;
+                font-weight: bold;
+                height: 40px;
+            }
+            QPushButton:hover {
+                background-color: rgba(46,204,113,0.40);
+                border-color: rgba(46,204,113,0.80);
+                color: #ffffff;
+            }
+        """)
         btn_start.clicked.connect(self.accept)
         layout.addWidget(btn_start)
 
         btn_cancel = QPushButton("Отмена")
+        btn_cancel.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(255,255,255,0.06);
+                color: #8899bb;
+                border: 1px solid rgba(255,255,255,0.10);
+                border-radius: 7px;
+                height: 34px;
+            }
+            QPushButton:hover {
+                background-color: rgba(255,255,255,0.11);
+                color: #c8d0e0;
+            }
+        """)
         btn_cancel.clicked.connect(self.reject)
         layout.addWidget(btn_cancel)
 
@@ -1738,17 +2591,11 @@ class SoundboardPanel(QWidget):
         """)
 
         # Жёлтая метка «▶ [ник]» — кто последний включил звук.
-        # Скрыта по умолчанию, показывается 4 с через flash_from_nick().
+        # Живёт в заголовке панели, но скрыта: уведомление теперь
+        # показывается тостом в MainWindow (над нижней панелью, по центру).
+        # Оставляем объект для flash_from_nick() — чтобы не ломать вызовы из MainWindow.
         self._from_nick_lbl = QLabel("")
-        self._from_nick_lbl.setStyleSheet("""
-            color: #f5c518;
-            font-size: 12px;
-            font-weight: bold;
-            background: transparent;
-            border: none;
-            padding: 0 6px;
-        """)
-        self._from_nick_lbl.setVisible(False)
+        self._from_nick_lbl.setVisible(False)   # всегда скрыта в заголовке панели
 
         # Таймер скрытия метки (single-shot, 4 с)
         self._from_nick_timer = QTimer(self)
@@ -1756,17 +2603,17 @@ class SoundboardPanel(QWidget):
         self._from_nick_timer.timeout.connect(self._hide_from_nick_lbl)
 
         btn_close = QPushButton("✕")
-        btn_close.setFixedSize(22, 22)
+        btn_close.setFixedSize(30, 30)
         btn_close.setStyleSheet(f"""
             QPushButton {{
                 background: transparent;
                 color: {self._TEXT_DIM};
                 border: none;
-                font-size: 12px;
-                border-radius: 11px;
+                font-size: 15px;
+                border-radius: 6px;
             }}
             QPushButton:hover {{
-                background: rgba(255,255,255,0.1);
+                background: rgba(255,255,255,0.12);
                 color: {self._TEXT_MAIN};
             }}
         """)
@@ -2419,6 +3266,9 @@ class StatusDialog(QDialog):
 
     def __init__(self, current_icon: str = "", current_text: str = "", parent=None):
         super().__init__(parent)
+        # ── Безрамочный стеклянный дизайн ────────────────────────────────────
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setWindowTitle("Мой статус")
         self.setMinimumWidth(320)
         self.setModal(True)
@@ -2426,13 +3276,76 @@ class StatusDialog(QDialog):
         self._selected_icon: str = current_icon
         self._icon_buttons: dict = {}   # filename → QPushButton
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(16, 16, 16, 12)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self._card = QFrame(self)
+        self._card.setObjectName("statusCard")
+        self._card.setStyleSheet("""
+            QFrame#statusCard {
+                background-color: rgba(26, 28, 38, 252);
+                border: 1px solid rgba(255,255,255,0.10);
+                border-radius: 12px;
+            }
+            QLabel { color: #c8d0e0; background: transparent; border: none; }
+            QLineEdit {
+                background-color: rgba(255,255,255,0.07);
+                border: 1px solid rgba(255,255,255,0.13);
+                border-radius: 6px;
+                padding: 5px 10px;
+                color: #c8d0e0;
+            }
+            QPushButton {
+                background-color: rgba(255,255,255,0.07);
+                color: #c8d0e0;
+                border: 1px solid rgba(255,255,255,0.12);
+                border-radius: 7px;
+                padding: 5px 12px;
+            }
+            QPushButton:hover {
+                background-color: rgba(255,255,255,0.13);
+                border-color: rgba(255,255,255,0.22);
+            }
+            QScrollArea { background: transparent; border: none; }
+            QScrollBar:vertical {
+                background: rgba(255,255,255,0.04);
+                width: 5px; border-radius: 2px; margin: 0;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(255,255,255,0.18); border-radius: 2px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+            QFrame[frameShape="4"] {
+                background: rgba(255,255,255,0.08); border: none; max-height: 1px;
+            }
+        """)
+        outer.addWidget(self._card)
+
+        card_lay = QVBoxLayout(self._card)
+        card_lay.setContentsMargins(0, 0, 0, 0)
+        card_lay.setSpacing(0)
+
+        # Title bar
+        self._title_bar = _DialogTitleBar(self, "😊  Мой статус")
+        card_lay.addWidget(self._title_bar)
+        _sep0 = QFrame()
+        _sep0.setFrameShape(QFrame.Shape.HLine)
+        _sep0.setFixedHeight(1)
+        _sep0.setStyleSheet("background: rgba(255,255,255,0.08); border: none;")
+        card_lay.addWidget(_sep0)
+
+        # Контент
+        content_w = QWidget()
+        content_w.setStyleSheet("background: transparent;")
+        root = QVBoxLayout(content_w)
+        root.setContentsMargins(16, 14, 16, 14)
         root.setSpacing(10)
+        card_lay.addWidget(content_w)
 
         # ── Заголовок ──────────────────────────────────────────────────────────
         title_lbl = QLabel("Выбери статус")
-        title_lbl.setStyleSheet("font-weight: bold; font-size: 15px;")
+        title_lbl.setStyleSheet("font-weight: bold; font-size: 14px; color: #cdd6f4; background:transparent;")
         root.addWidget(title_lbl)
 
         # ── Скролл-зона с иконками ─────────────────────────────────────────────
@@ -2443,14 +3356,13 @@ class StatusDialog(QDialog):
         scroll.setMaximumHeight(220)
 
         icons_w = QWidget()
+        icons_w.setStyleSheet("background: transparent;")
         self._grid = QGridLayout(icons_w)
         self._grid.setSpacing(6)
         self._grid.setContentsMargins(0, 0, 0, 0)
         self._load_icons(current_icon)
         scroll.setWidget(icons_w)
         root.addWidget(scroll)
-
-        # ── Текстовое описание ─────────────────────────────────────────────────
         root.addWidget(QLabel("Описание (необязательно):"))
 
         self._text_edit = QLineEdit()
@@ -2477,26 +3389,52 @@ class StatusDialog(QDialog):
 
         btn_clear = QPushButton("✕  Убрать статус")
         btn_clear.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_clear.setStyleSheet(
-            "QPushButton { background-color: #c0392b; color: white; "
-            "border-radius: 6px; padding: 6px 12px; }"
-            "QPushButton:hover { background-color: #e74c3c; }"
-        )
+        btn_clear.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(192,57,43,0.30);
+                color: #ff9090;
+                border: 1px solid rgba(231,76,60,0.50);
+                border-radius: 6px; padding: 6px 12px;
+            }
+            QPushButton:hover {
+                background-color: rgba(231,76,60,0.45);
+                color: #ffffff;
+            }
+        """)
         btn_clear.clicked.connect(self._on_clear)
 
         btn_cancel = QPushButton("Отмена")
         btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_cancel.setStyleSheet("border-radius: 6px; padding: 6px 12px;")
+        btn_cancel.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(255,255,255,0.06);
+                color: #8899bb;
+                border: 1px solid rgba(255,255,255,0.10);
+                border-radius: 6px; padding: 6px 12px;
+            }
+            QPushButton:hover {
+                background-color: rgba(255,255,255,0.11);
+                color: #c8d0e0;
+            }
+        """)
         btn_cancel.clicked.connect(self.reject)
 
-        btn_ok = QPushButton("Применить")
+        btn_ok = QPushButton("✔  Применить")
         btn_ok.setDefault(True)
         btn_ok.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_ok.setStyleSheet(
-            "QPushButton { background-color: #2ecc71; color: white; font-weight: bold; "
-            "border-radius: 6px; padding: 6px 14px; }"
-            "QPushButton:hover { background-color: #27ae60; }"
-        )
+        btn_ok.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(46,204,113,0.25);
+                color: #82e0aa;
+                border: 1px solid rgba(46,204,113,0.50);
+                border-radius: 6px; padding: 6px 14px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: rgba(46,204,113,0.40);
+                color: #ffffff;
+            }
+        """)
         btn_ok.clicked.connect(self.accept)
 
         btn_row.addWidget(btn_clear)

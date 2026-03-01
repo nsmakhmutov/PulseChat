@@ -185,6 +185,9 @@ class MainWindow(QMainWindow):
         self.audio.status_changed.connect(self.on_audio_status_changed)
         self.audio.status_changed.connect(self.net.send_status_update)
         self.audio.whisper_received.connect(self._on_whisper_received)
+        # Сигнал из audio_engine: ползунок громкости пользователя достиг/покинул 0.
+        # Обновляем ban-иконку немедленно, не дожидаясь следующего refresh_ui() (100 мс).
+        self.audio.user_volume_zero.connect(self._on_user_volume_zero)
         self.video.frame_received.connect(self.on_video_frame)
 
         # Тост «кто включил soundboard» — желтый лейбл поверх окна
@@ -288,11 +291,17 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(450, 600)
         self.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
+        # Прозрачность по краям окна — углы и 4px внешний отступ становятся
+        # полностью прозрачными, создавая эффект «парящего» окна без жёстких
+        # прямоугольных краёв. Требует border-radius в #windowRoot stylesheet.
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
         # ── Корневой контейнер окна ──────────────────────────────────────────
         _root = QWidget()
         _root.setObjectName("windowRoot")
         _root_layout = QVBoxLayout(_root)
+        # 4px внешний отступ: прозрачная «аура» вокруг окна,
+        # в которой видна тень и скруглённые углы (см. border-radius в apply_theme).
         _root_layout.setContentsMargins(0, 0, 0, 0)
         _root_layout.setSpacing(0)
 
@@ -315,8 +324,8 @@ class MainWindow(QMainWindow):
         main_page = QWidget()
         main_page.setObjectName("centralWidget")
         layout = QVBoxLayout(main_page)
-        layout.setContentsMargins(15, 15, 15, 15)
-        layout.setSpacing(10)
+        layout.setContentsMargins(12, 10, 12, 0)
+        layout.setSpacing(8)
 
         self.tree = QTreeWidget()
         self.tree.setColumnCount(5)
@@ -346,11 +355,8 @@ class MainWindow(QMainWindow):
 
         # ── Баннер автообновления (скрыт до обнаружения новой версии) ─────────
         self._update_banner = QPushButton()
+        self._update_banner.setObjectName("updateBanner")
         self._update_banner.setVisible(False)
-        self._update_banner.setStyleSheet(
-            "background-color: #2ecc71; color: white; font-weight: bold; "
-            "border-radius: 6px; padding: 6px; text-align: center;"
-        )
         self._update_banner.clicked.connect(self.open_settings)  # откроет вкладку Версия
         layout.addWidget(self._update_banner)
 
@@ -366,35 +372,46 @@ class MainWindow(QMainWindow):
         self._whisper_banner.setFixedHeight(40)
         layout.addWidget(self._whisper_banner)
 
-        btns = QHBoxLayout()
-        btns.setSpacing(15)
+        # ── Нижняя панель кнопок управления ─────────────────────────────────
+        # Отдельный QFrame с собственным фоном — визуальная иерархия:
+        # область чата (дерево) vs панель управления (кнопки), как в Discord.
+        self._bottom_bar = QFrame()
+        self._bottom_bar.setObjectName("bottomBar")
+        self._bottom_bar.setFixedHeight(72)
+
+        btns = QHBoxLayout(self._bottom_bar)
+        btns.setContentsMargins(12, 0, 12, 0)
+        btns.setSpacing(8)
 
         self.btn_mute = QPushButton()
         self.btn_mute.setCheckable(True)
-        self.btn_mute.setFixedSize(50, 50)
+        self.btn_mute.setFixedSize(46, 46)
+        self.btn_mute.setObjectName("barBtn")
         self.btn_mute.setIcon(QIcon(resource_path("assets/icon/mic_on.svg")))
-        self.btn_mute.setIconSize(QSize(30, 30))
+        self.btn_mute.setIconSize(QSize(26, 26))
         self.btn_mute.clicked.connect(self.toggle_mute)
 
         self.btn_deafen = QPushButton()
         self.btn_deafen.setCheckable(True)
-        self.btn_deafen.setFixedSize(50, 50)
+        self.btn_deafen.setFixedSize(46, 46)
+        self.btn_deafen.setObjectName("barBtn")
         self.btn_deafen.setIcon(QIcon(resource_path("assets/icon/volume_on.svg")))
-        self.btn_deafen.setIconSize(QSize(30, 30))
+        self.btn_deafen.setIconSize(QSize(26, 26))
         self.btn_deafen.clicked.connect(self.toggle_deafen)
 
         self.btn_sb = QPushButton()
-        self.btn_sb.setFixedSize(50, 50)
+        self.btn_sb.setFixedSize(46, 46)
+        self.btn_sb.setObjectName("barBtn")
         self.btn_sb.setIcon(QIcon(resource_path("assets/icon/bells.svg")))
-        self.btn_sb.setIconSize(QSize(30, 30))
+        self.btn_sb.setIconSize(QSize(26, 26))
         self.btn_sb.clicked.connect(self.open_soundboard)
 
         self.btn_stream = QPushButton()
-        self.btn_stream.setFixedSize(50, 50)
-        self.btn_stream.setIconSize(QSize(30, 30))
+        self.btn_stream.setFixedSize(46, 46)
+        self.btn_stream.setObjectName("btnStream")
+        self.btn_stream.setIconSize(QSize(26, 26))
         self.btn_stream.setIcon(QIcon(resource_path("assets/icon/stream_off.svg")))
         self.btn_stream.setCheckable(True)
-        self.btn_stream.setObjectName("btnStream")
         self.btn_stream.clicked.connect(self.toggle_stream)
 
         self.ping_lbl = QLabel("0 ms")
@@ -402,9 +419,10 @@ class MainWindow(QMainWindow):
         self.ping_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         btn_set = QPushButton()
-        btn_set.setFixedSize(50, 50)
+        btn_set.setFixedSize(46, 46)
+        btn_set.setObjectName("barBtn")
         btn_set.setIcon(QIcon(resource_path("assets/icon/settings.svg")))
-        btn_set.setIconSize(QSize(30, 30))
+        btn_set.setIconSize(QSize(26, 26))
         btn_set.clicked.connect(self.open_settings)
 
         btns.addWidget(self.btn_mute)
@@ -414,7 +432,8 @@ class MainWindow(QMainWindow):
         btns.addStretch()
         btns.addWidget(self.ping_lbl)
         btns.addWidget(btn_set)
-        layout.addLayout(btns)
+
+        layout.addWidget(self._bottom_bar)
 
         self._stack.addWidget(main_page)
 
@@ -563,39 +582,77 @@ class MainWindow(QMainWindow):
         font_f = self.custom_font_family
         is_dark = (theme_name == "Темная")
 
-        # ── Светлая тема чуть темнее — не слепит ──────────────────────────────
-        bg      = "#2b2b2b" if is_dark else "#c8cacc"   # было #e6e6e6
-        surface = "#3c3f41" if is_dark else "#d6d8da"   # было #f2f2f2
-        text        = "#e0e0e0" if is_dark else "#1a1a1a"
-        header_bg   = "#4e5254" if is_dark else "#b8bbbe"
-        border      = "#515151" if is_dark else "#a0a4a8"
-        accent_red  = "#e74c3c" if is_dark else "#d32f2f"
-        hover       = "#505457" if is_dark else "#adb0b3"
-        tab_inactive= "#323537" if is_dark else "#c4c7ca"
-        grad_s      = "#45494a" if is_dark else "#e0e2e4"
-        grad_e      = "#323232" if is_dark else "#c5c8cb"
-
-        # ── Title bar — одинаково тёмный в обеих темах ─────────────────────
-        title_bg   = "#1e1e2e" if is_dark else "#1e2a35"   # тёмно-синий в обоих случаях
-        title_text = "#cdd6f4" if is_dark else "#dce6f0"   # светлый текст всегда
-        title_sep  = "#414559" if is_dark else "#16212b"
-        win_border = "#414559" if is_dark else "#5d6d7e"
+        # ────────────────────────────────────────────────────────────────────────
+        # Палитра — единый «стеклянный» язык дизайна.
+        # Тёмная тема: глубокий navy-dark, rgba-слои, как в SoundboardPanel.
+        # Светлая тема: молочно-синяя, сохраняет читаемость, чуть прозрачнее.
+        # ────────────────────────────────────────────────────────────────────────
+        if is_dark:
+            win_bg       = "rgba(18, 20, 30, 255)"      # основной фон окна
+            surface      = "rgba(255,255,255,0.04)"      # фон дерева
+            surface_solid= "#1e2030"                     # для QComboBox dropdown (нет rgba)
+            text         = "#d4d8e8"
+            text_dim     = "#7888a8"
+            border       = "rgba(255,255,255,0.09)"
+            border_solid = "#333648"
+            hover        = "rgba(255,255,255,0.08)"
+            hover_solid  = "#2a2d40"
+            accent       = "#5b8ef5"
+            accent_red   = "#e74c3c"
+            title_bg     = "rgba(12, 14, 22, 255)"
+            title_text   = "#cdd6f4"
+            title_sep    = "rgba(255,255,255,0.07)"
+            win_border   = "rgba(255,255,255,0.10)"
+            bottom_bg    = "rgba(0,0,0,0.22)"
+            bottom_sep   = "rgba(255,255,255,0.07)"
+            btn_bg       = "rgba(255,255,255,0.14)"
+            btn_hover    = "rgba(255,255,255,0.22)"
+            btn_border   = "rgba(255,255,255,0.20)"
+            scrollbar    = "rgba(255,255,255,0.15)"
+            sb_track     = "rgba(255,255,255,0.04)"
+            tree_room_bg = "rgba(255,255,255,0.04)"
+        else:
+            win_bg       = "rgba(210, 215, 225, 255)"
+            surface      = "rgba(0,0,0,0.04)"
+            surface_solid= "#e8eaee"
+            text         = "#1a1e2a"
+            text_dim     = "#667088"
+            border       = "rgba(0,0,0,0.12)"
+            border_solid = "#b8bcc8"
+            hover        = "rgba(0,0,0,0.07)"
+            hover_solid  = "#c8cad4"
+            accent       = "#3a6fd8"
+            accent_red   = "#d32f2f"
+            title_bg     = "rgba(30, 42, 55, 255)"
+            title_text   = "#dce6f0"
+            title_sep    = "rgba(0,0,0,0.15)"
+            win_border   = "rgba(0,0,0,0.20)"
+            bottom_bg    = "rgba(0,0,0,0.10)"
+            bottom_sep   = "rgba(0,0,0,0.12)"
+            btn_bg       = "rgba(255,255,255,0.45)"
+            btn_hover    = "rgba(255,255,255,0.70)"
+            btn_border   = "rgba(0,0,0,0.15)"
+            scrollbar    = "rgba(0,0,0,0.25)"
+            sb_track     = "rgba(0,0,0,0.06)"
+            tree_room_bg = "rgba(0,0,0,0.05)"
 
         self.setStyleSheet(f"""
-            * {{ font-family: '{font_f}'; font-size: 18px; color: {text}; }}
+            * {{ font-family: '{font_f}'; font-size: 15px; color: {text}; }}
 
-            /* Внешняя рамка безрамочного окна */
+            /* ── Корневой контейнер окна ─────────────────────────────────────── */
             #windowRoot {{
-                background-color: {bg};
+                background-color: {win_bg};
                 border: 1px solid {win_border};
+                border-radius: 10px;
             }}
 
-            /* Кастомный title bar */
+            /* ── Кастомный title bar ─────────────────────────────────────────── */
             #customTitleBar {{
                 background-color: {title_bg};
                 border: none;
+                border-top-left-radius: 10px;
+                border-top-right-radius: 10px;
             }}
-            /* Иконка и потомки title bar без собственного stylesheet */
             #customTitleBar QLabel {{
                 background: transparent;
                 border: none;
@@ -634,124 +691,185 @@ class MainWindow(QMainWindow):
                 border: none;
             }}
 
-            QMainWindow, QDialog, #centralWidget, QTabWidget, QScrollArea {{ 
-                background-color: {bg}; 
+            /* ── Главная область контента ───────────────────────────────────── */
+            QMainWindow, #centralWidget {{
+                background-color: transparent;
             }}
 
-            QDialog QWidget {{ background-color: transparent; }}
-            QDialog QPushButton {{ background-color: {header_bg}; }}
-
-            QHeaderView::section {{
-                background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {grad_s}, stop:1 {grad_e});
-                color: {text}; 
-                padding: 12px; 
-                height: 40px; 
-                border: none; 
-                border-bottom: 1px solid {border};
-                font-weight: bold; 
-                font-size: 22px;
-            }}
-
-            QTabWidget::pane {{ 
-                border: 1px solid {border}; 
-                background-color: {surface}; 
-                border-radius: 5px; 
-            }}
-            QTabBar::tab {{ 
-                background-color: {tab_inactive}; 
-                padding: 10px 20px; 
-                border-top-left-radius: 5px; 
-                border-top-right-radius: 5px; 
-                margin-right: 2px; 
-                color: {text}; 
-            }}
-            QTabBar::tab:selected {{ 
-                background-color: {surface}; 
-                border: 1px solid {border}; 
-                border-bottom: none; 
-                font-weight: bold; 
-            }}
-
-            QComboBox {{ 
-                background-color: {surface}; 
-                border: 1px solid {border}; 
-                border-radius: 5px; 
-                padding: 5px 10px; 
-                color: {text}; 
-            }}
-            QComboBox QAbstractItemView {{
+            /* ── Дерево пользователей ───────────────────────────────────────── */
+            QTreeWidget {{
                 background-color: {surface};
                 color: {text};
                 border: 1px solid {border};
-                selection-background-color: {hover};
-                selection-color: {text};
+                border-radius: 8px;
                 outline: none;
+                padding: 0px;
             }}
-
-            QTreeWidget {{ 
-                background-color: {surface}; 
-                color: {text}; 
-                border: 1px solid {border};
-                border-radius: 0px; 
-                outline: none; 
-                padding: 0px; 
-            }}
-
             QTreeWidget::item {{
                 outline: none;
                 border: none;
-                padding-left: 5px;
-            }}
-
-            QTreeWidget::item:!has-children {{ 
-                height: 45px; 
-            }}
-
-            QTreeWidget::item:selected {{ 
-                background-color: transparent; 
-                border-radius: 0px; 
-                color: {text}; 
-            }}
-
-            QTreeWidget::item:selected:hover {{
-                background-color: {hover};
                 border-radius: 0px;
+                padding-left: 4px;
+                /* Нет border-radius — иначе Qt рисует закруглённый клип поверх
+                   прозрачного фона и при hover видны «просветы» по углам. */
             }}
-
+            QTreeWidget::item:!has-children {{
+                height: 44px;
+            }}
+            QTreeWidget::item:has-children {{
+                height: 30px;
+                background-color: transparent;
+                border-radius: 0px;
+                color: {text_dim};
+                font-size: 12px;
+                font-weight: bold;
+                letter-spacing: 0.5px;
+            }}
+            QTreeWidget::item:selected {{
+                background-color: transparent;
+                color: {text};
+            }}
+            /* Hover — сплошная полоса на всю ширину, без border-radius.
+               Убираем rgba-прозрачность: при быстром движении мыши Qt не успевает
+               перерисовать соседние итемы → между ними мерцает тонкая серая линия.
+               Используем чуть более непрозрачный цвет чтобы перекрывать фон дерева. */
             QTreeWidget::item:hover {{
-                background-color: {hover};
+                background-color: {hover_solid};
                 border-radius: 0px;
             }}
-
-            /* Tooltip иконок статусов пользователей — текст без подложки.
-               Прозрачный фон + нет рамки = «парящий» текст над деревом. */
+            QTreeWidget::item:selected:hover {{
+                background-color: {hover_solid};
+                border-radius: 0px;
+            }}
+            QTreeWidget::branch {{
+                background: transparent;
+                border-radius: 0px;
+            }}
+            /* Tooltip иконок статусов — «парящий» текст */
             QTreeWidget QToolTip {{
                 background-color: transparent;
                 border: none;
                 color: {text};
-                font-size: 13px;
+                font-size: 12px;
                 padding: 0px;
             }}
-
-            QPushButton {{ 
-                background-color: {header_bg}; 
-                border: 1px solid {border}; 
-                border-radius: 8px; 
-                padding: 5px; 
+            /* Скроллбар в дереве */
+            QTreeWidget QScrollBar:vertical {{
+                background: {sb_track};
+                width: 5px;
+                border-radius: 2px;
+                margin: 0;
             }}
-            QPushButton:hover {{ 
-                background-color: {hover}; 
+            QTreeWidget QScrollBar::handle:vertical {{
+                background: {scrollbar};
+                border-radius: 2px;
             }}
-            QPushButton:checked {{ 
-                background-color: {accent_red}; 
-                color: white; 
+            QTreeWidget QScrollBar::add-line:vertical,
+            QTreeWidget QScrollBar::sub-line:vertical {{ height: 0; }}
+
+            /* ── Нижняя панель кнопок ───────────────────────────────────────── */
+            #bottomBar {{
+                background-color: {bottom_bg};
+                border-top: 1px solid {bottom_sep};
+                border-bottom-left-radius: 9px;
+                border-bottom-right-radius: 9px;
             }}
 
-            #btn_nr {{ background-color: #d65d4e; color: white; }}
-            #btn_nr:checked {{ background-color: #27ae60; color: white; }}
+            /* Все кнопки в bottomBar */
+            #barBtn {{
+                background-color: {btn_bg};
+                border: 1px solid {btn_border};
+                border-radius: 10px;
+                padding: 4px;
+            }}
+            #barBtn:hover {{
+                background-color: {btn_hover};
+                border-color: {accent};
+            }}
+            #barBtn:checked {{
+                background-color: rgba(231,76,60,0.45);
+                border-color: rgba(231,76,60,0.75);
+            }}
 
-            #pingLabel {{ font-size: 13px; margin-right: 10px; opacity: 0.8; }}
+            /* Кнопка трансляции — отдельный objectName (управляется из toggle_stream) */
+            #btnStream {{
+                background-color: {btn_bg};
+                border: 1px solid {btn_border};
+                border-radius: 10px;
+                padding: 4px;
+            }}
+            #btnStream:hover {{
+                background-color: {btn_hover};
+                border-color: {accent};
+            }}
+
+            #pingLabel {{
+                font-size: 12px;
+                color: {text_dim};
+                background: transparent;
+                border: none;
+            }}
+
+            /* ── Баннер обновления ──────────────────────────────────────────── */
+            QPushButton#updateBanner {{
+                background-color: rgba(46,204,113,0.20);
+                color: #82e0aa;
+                font-weight: bold;
+                border: 1px solid rgba(46,204,113,0.45);
+                border-radius: 7px;
+                padding: 6px;
+                text-align: center;
+            }}
+            QPushButton#updateBanner:hover {{
+                background-color: rgba(46,204,113,0.35);
+            }}
+
+            /* ── Fallback: обычные QPushButton вне bottomBar (reconnect и т.п.) */
+            QPushButton {{
+                background-color: {btn_bg};
+                border: 1px solid {btn_border};
+                border-radius: 8px;
+                padding: 5px 10px;
+                color: {text};
+            }}
+            QPushButton:hover {{
+                background-color: {btn_hover};
+                border-color: {accent};
+            }}
+            QPushButton:checked {{
+                background-color: rgba(231,76,60,0.30);
+                border-color: rgba(231,76,60,0.55);
+                color: #ff9090;
+            }}
+
+            /* Кнопка переподключения на экране ошибки */
+            #btn_reconnect_green {{
+                background-color: rgba(46,204,113,0.25);
+                color: #82e0aa;
+                font-size: 16px;
+                font-weight: bold;
+                border-radius: 8px;
+                border: 1px solid rgba(46,204,113,0.50);
+            }}
+            #btn_reconnect_green:hover {{
+                background-color: rgba(46,204,113,0.40);
+            }}
+
+            /* QDialog / QScrollArea / etc. — не трогаем стиль диалогов отсюда */
+            QDialog {{ background: transparent; }}
         """)
+
+        # ── Кэш цветов для refresh_ui: пересоздаём при смене темы ────────────
+        self._cache_theme = theme_name
+        self._c_talk   = QColor("#2ecc71")
+        self._c_mute   = QColor("#e74c3c")
+        self._c_stream = QColor("#3498db")
+        self._c_def    = QColor("#d4d8e8") if is_dark else QColor("#1a1e2a")
+        self._br_talk   = QBrush(self._c_talk)
+        self._br_mute   = QBrush(self._c_mute)
+        self._br_stream = QBrush(self._c_stream)
+        self._br_def    = QBrush(self._c_def)
+        self._br_gray   = QBrush(QColor("#5a6070") if is_dark else QColor("#8090a8"))
 
     def setup_hotkeys(self):
         """
@@ -864,6 +982,60 @@ class MainWindow(QMainWindow):
                 except Exception as e:
                     print(f"[HK] Whisper slot {i} error ({hk!r}): {e}")
 
+            # ── Хоткеи кастомных звуков soundboard ───────────────────────────
+            # Читаем hk_table_* и для каждой записи с ftype=="sound" регистрируем
+            # hotkey, который ищет путь к файлу по имени и отправляет его через сеть.
+            hk_count = int(self.app_settings.value("hk_table_count", 0))
+            for i in range(hk_count):
+                ftype = self.app_settings.value(f"hk_table_{i}_type", "none")
+                if ftype != "sound":
+                    continue
+                fdata = self.app_settings.value(f"hk_table_{i}_data", "")  # имя звука
+                hk    = self.app_settings.value(f"hk_table_{i}_key",  "")
+                if not fdata or not hk:
+                    continue
+
+                # Ищем путь к файлу по имени среди сохранённых кастомных слотов
+                sound_path = ""
+                for j in range(10):  # >= CUSTOM_SOUND_SLOTS, с запасом
+                    n = self.app_settings.value(f"custom_sound_{j}_name", "")
+                    p = self.app_settings.value(f"custom_sound_{j}_path", "")
+                    if n == fdata and p:
+                        sound_path = p
+                        break
+
+                if not sound_path:
+                    print(f"[HK] Sound hk slot {i}: файл для '{fdata}' не найден")
+                    continue
+
+                def _make_sound_hk(path: str, name: str):
+                    def _play():
+                        try:
+                            import os, base64
+                            from config import CMD_SOUNDBOARD
+                            fsize = os.path.getsize(path)
+                            if fsize > 1 * 1024 * 1024:
+                                return
+                            with open(path, 'rb') as f:
+                                raw = f.read()
+                            b64 = base64.b64encode(raw).decode('ascii')
+                            self.net.send_json({
+                                "action":   CMD_SOUNDBOARD,
+                                "file":     f"__custom__:{name}",
+                                "data_b64": b64,
+                            })
+                            print(f"[HK] Sound fired: '{name}'")
+                        except Exception as ex:
+                            print(f"[HK] Sound play error '{name}': {ex}")
+                    return _play
+
+                try:
+                    keyboard.add_hotkey(hk, _make_sound_hk(sound_path, fdata),
+                                        trigger_on_release=False, suppress=False)
+                    print(f"[HK] Sound slot {i}: name='{fdata}' hk='{hk}'")
+                except Exception as e:
+                    print(f"[HK] Sound hk slot {i} error ({hk!r}): {e}")
+
         except Exception as e:
             print(f"[HK] setup_hotkeys error: {e}")
 
@@ -933,6 +1105,56 @@ class MainWindow(QMainWindow):
         self._current_whisper_uid = None
         self._whisper_banner.setVisible(False)
         self._whisper_overlay.hide_overlay()
+
+    def _on_user_volume_zero(self, uid: int, is_zero: bool):
+        """
+        Вызывается немедленно когда ползунок громкости пользователя
+        выставляется в 0 или уходит от 0.
+
+        Логика иконки:
+          is_zero=True  → ban-иконка (тот же визуал что и у кнопки «Заглушить»)
+          is_zero=False → убираем ban-иконку, НО только если кнопка «Заглушить»
+                          тоже не нажата — чтобы не конфликтовать с ней.
+
+        Цвет ника:
+          is_zero=True  → красный (_br_mute), как у заглушённых.
+          is_zero=False → стандартный (_br_def), если нет других причин краснеть.
+
+        Важно: refresh_ui() тоже проверяет volume_zero каждые 100 мс.
+        Этот слот нужен для мгновенного отклика (без задержки 0..100 мс),
+        который пользователь заметит при быстром движении ползунком.
+        """
+        data = self.known_uids.get(uid)
+        if data is None:
+            return
+
+        item = data['item']
+
+        try:
+            with self.audio.users_lock:
+                u_audio = self.audio.remote_users.get(uid)
+                is_muted_btn = u_audio.is_locally_muted if u_audio else False
+                is_m_remote  = data.get('is_m', False)
+
+            # ── Иконка (колонка 4) ──────────────────────────────────────────────
+            if is_zero or is_muted_btn:
+                # Выставлен в 0 ИЛИ нажата кнопка «Заглушить» → ban
+                item.setData(4, Qt.ItemDataRole.DecorationRole, self._px_ban)
+            elif is_m_remote:
+                # Сам заглушил себя на сервере → mic_off
+                item.setData(4, Qt.ItemDataRole.DecorationRole, self._px_mic_off)
+            else:
+                item.setData(4, Qt.ItemDataRole.DecorationRole, None)
+
+            # ── Цвет ника (колонка 0) ───────────────────────────────────────────
+            if is_zero or is_muted_btn:
+                item.setForeground(0, self._br_mute)
+            else:
+                item.setForeground(0, self._br_def)
+
+        except RuntimeError:
+            # item уже удалён Qt (дерево пересоздалось) — просто игнорируем
+            pass
 
     def toggle_mute(self):
         self.audio.is_muted = self.btn_mute.isChecked()
@@ -1175,8 +1397,11 @@ class MainWindow(QMainWindow):
                         u_audio = self.audio.remote_users.get(uid)
                         talk = (now - u_audio.last_packet_time < 0.3) if u_audio else False
                         is_locally_muted = u_audio.is_locally_muted if u_audio else False
+                        # volume_zero=True когда ползунок выставлен в 0 — визуально
+                        # неотличимо от кнопки «заглушить»: та же ban-иконка.
+                        is_vol_zero = (u_audio.volume_zero if u_audio else False)
 
-                        if is_locally_muted:
+                        if is_locally_muted or is_vol_zero:
                             item.setData(4, Qt.ItemDataRole.DecorationRole, self._px_ban)
                         elif is_m:
                             item.setData(4, Qt.ItemDataRole.DecorationRole, self._px_mic_off)
@@ -1187,7 +1412,7 @@ class MainWindow(QMainWindow):
                         item.setForeground(0, self._br_talk)
                     elif curr_s:
                         item.setForeground(0, self._br_stream)
-                    elif curr_d or is_m or (uid != self.audio.my_uid and u_audio and is_locally_muted):
+                    elif curr_d or is_m or (uid != self.audio.my_uid and u_audio and (is_locally_muted or is_vol_zero)):
                         item.setForeground(0, self._br_mute)
                     else:
                         item.setForeground(0, self._br_def)
@@ -1418,10 +1643,12 @@ class MainWindow(QMainWindow):
         # ── Тост поверх главного окна ─────────────────────────────────────────
         self._sb_toast.setText(f"🎵  {from_nick}  включил звук")
         self._sb_toast.adjustSize()
-        # Центрируем по ширине окна, над кнопкой btn_sb
+        # Центрируем по ширине окна, над нижней панелью.
+        # Используем _bottom_bar.y() — btn_sb.y() даёт позицию внутри bottomBar (~13px),
+        # а не относительно окна → тост позиционировался почти у заголовка.
         tw = self._sb_toast.width()
         tx = (self.width() - tw) // 2
-        ty = self.btn_sb.y() - self._sb_toast.height() - 8
+        ty = self._bottom_bar.y() - self._sb_toast.height() - 8
         self._sb_toast.move(tx, max(4, ty))
         self._sb_toast.raise_()
         self._sb_toast.setVisible(True)
@@ -1539,11 +1766,15 @@ class MainWindow(QMainWindow):
         if self.is_streaming:
             path = resource_path("assets/icon/stream_on.svg")
             self.btn_stream.setIcon(QIcon(path))
-            self.btn_stream.setStyleSheet("background-color: #2ecc71; border: 1px solid #27ae60;")
+            self.btn_stream.setStyleSheet(
+                "background-color: rgba(46,204,113,0.28); "
+                "border: 1px solid rgba(46,204,113,0.65); "
+                "border-radius: 10px;"
+            )
         else:
             path = resource_path("assets/icon/stream_off.svg")
             self.btn_stream.setIcon(QIcon(path))
-            self.btn_stream.setStyleSheet("")
+            self.btn_stream.setStyleSheet("")  # вернуть к CSS из apply_theme
 
     def toggle_stream(self):
         from ui_dialogs import StreamSettingsDialog

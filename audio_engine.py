@@ -697,6 +697,11 @@ class RemoteUser:
         self.last_packet_time = 0
         self.volume = 1.0
         self.is_locally_muted = False
+        # volume_zero=True когда vol==0.0 (ползунок в 0).
+        # Отдельный флаг — не конфликтует с кнопкой is_locally_muted.
+        # audio_callback использует его чтобы пропустить Opus-decode (экономия CPU).
+        # UI использует его чтобы показать ban-иконку, как при заглушении.
+        self.volume_zero = False
         self.remote_muted = False
         self.remote_deafened = False
 
@@ -704,11 +709,12 @@ class RemoteUser:
 class AudioHandler(QObject):
     volume_level_signal = pyqtSignal(int)
     status_changed = pyqtSignal(bool, bool)
-    # Испускается при получении первого пакета шёпота от нового отправителя.
-    # Аргумент — uid отправителя. MainWindow использует для уведомления получателя.
     whisper_received = pyqtSignal(int)
-    # Испускается когда пакеты шёпота перестали приходить (тайм-аут).
     whisper_ended = pyqtSignal()
+    # Испускается когда ползунок громкости пользователя достигает/покидает 0.
+    # (uid, is_zero) — UI показывает ban-иконку при is_zero=True,
+    # точно так же как при нажатии кнопки «Заглушить».
+    user_volume_zero = pyqtSignal(int, bool)
 
     def _apply_whisper_bass_effect(self, s: np.ndarray) -> np.ndarray:
         """
@@ -1038,7 +1044,9 @@ class AudioHandler(QObject):
                             val = self.pending_volumes.pop(uid)
                         else:
                             val = 1.0
-                        self.remote_users[uid].volume = float(val)
+                        val = float(val)
+                        self.remote_users[uid].volume = val
+                        self.remote_users[uid].volume_zero = (val == 0.0)
 
                     user = self.remote_users[uid]
                     user.remote_muted = bool(flags & 1)
@@ -1274,7 +1282,7 @@ class AudioHandler(QObject):
             for uid, user in self._audio_users_snapshot.items():
                 if curr_time - user.last_packet_time < 1.5:
                     data = user.jitter_buffer.get()
-                    if data and not user.is_locally_muted:
+                    if data and not user.is_locally_muted and not user.volume_zero:
                         try:
                             decoded = user.decoder.decode(data, CHUNK_SIZE)
                             s = np.frombuffer(decoded, dtype=np.int16).astype(np.float32) / 32767.0
@@ -1358,18 +1366,32 @@ class AudioHandler(QObject):
                 saved_vol = float(saved_vol)
                 if uid in self.remote_users:
                     self.remote_users[uid].volume = saved_vol
+                    self.remote_users[uid].volume_zero = (saved_vol == 0.0)
                 else:
                     self.pending_volumes[uid] = saved_vol
 
     def set_user_volume(self, uid, vol):
+        # Зажимаем в [0.0 … 2.0]. vol=0.0 → «тихий мут» через ползунок.
+        vol = max(0.0, min(2.0, float(vol)))
+        emit_zero_state = None  # None = состояние не изменилось
+
         with self.users_lock:
             if uid in self.remote_users:
-                self.remote_users[uid].volume = vol
+                user = self.remote_users[uid]
+                prev_zero = user.volume_zero
+                user.volume = vol
+                user.volume_zero = (vol == 0.0)
+                if user.volume_zero != prev_zero:
+                    emit_zero_state = user.volume_zero
                 ip = self.uid_to_ip.get(uid)
                 if ip:
                     self.settings.setValue(f"vol_ip_{ip}", vol)
                 else:
                     self.settings.setValue(f"volume_{uid}", vol)
+
+        # Эмитируем сигнал ВНЕ лока — не блокируем аудиопоток
+        if emit_zero_state is not None:
+            self.user_volume_zero.emit(uid, emit_zero_state)
 
     def toggle_user_mute(self, uid):
         with self.users_lock:
