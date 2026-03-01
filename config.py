@@ -67,8 +67,7 @@ FLAG_WHISPER        = 64
 FLAG_STREAM_VOICES  = 32  # Подтип: голоса чата из стрима, бит поверх FLAG_STREAM_AUDIO
 
 # Struct для извлечения speaker_uid из voice-stream пакета
-import struct as _struct
-STREAM_VOICE_HEADER_STRUCT = _struct.Struct("!I")   # 4 байта: speaker_uid
+STREAM_VOICE_HEADER_STRUCT = struct.Struct("!I")   # 4 байта: speaker_uid
 STREAM_VOICE_HEADER_SIZE   = STREAM_VOICE_HEADER_STRUCT.size
 
 # Смещение UID для хранения loopback-потоков в словаре stream_remote_users.
@@ -85,9 +84,8 @@ VIDEO_HEADER_SIZE = VIDEO_CHUNK_HEADER.size
 OPUS_APPLICATION = 2048
 DEFAULT_BITRATE = 64000
 
-# Структура для видео-пакетов
-# FrameID (I), PartIdx (H), TotalParts (H)
-VIDEO_CHUNK_STRUCT = struct.Struct("!IHH")
+# Структура для видео-пакетов (псевдоним VIDEO_CHUNK_HEADER — идентичный формат "!IHH")
+VIDEO_CHUNK_STRUCT = VIDEO_CHUNK_HEADER
 
 # --- Структура заголовка UDP пакета ---
 # UID (I) + Timestamp (d) + Sequence (I) + Flags (B)
@@ -128,6 +126,5 @@ CMD_NUDGE_TRIGGERED = 'nudge_triggered'
 # После срабатывания звука голоса сбрасываются, кулдаун остаётся.
 NUDGE_COOLDOWN_SEC  = 600  # 10 минут
 
-# Абсолютный путь к звуковому файлу (проверяется в первую очередь).
-# Если файл не найден — фоллбэк на resource_path("assets/music/Danger.mp3").
-NUDGE_SOUND_PATH = r'E:\Mychat\VoiceChat\assets\music\Danger.mp3'
+# Путь к звуковому файлу «Пнуть» — всегда через resource_path (работает и в dev, и в exe).
+NUDGE_SOUND_PATH = resource_path(os.path.join("assets", "music", "Danger.mp3"))

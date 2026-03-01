@@ -3,6 +3,8 @@ import threading
 import json
 import time
 import queue
+import io
+import base64
 import sounddevice as sd
 import soundfile as sf
 import numpy as np
@@ -127,8 +129,6 @@ class NetworkClient(QObject):
 
         Защита от спама: новый звук НЕ запускается, пока предыдущий ещё играет.
         """
-        import io
-        import base64 as _b64
         try:
             # Anti-spam: блокируем, пока текущий звук ещё играет
             if self._sb_playing.is_set():
@@ -142,7 +142,7 @@ class NetworkClient(QObject):
             if data_b64:
                 # Кастомный звук: декодируем base64 → BytesIO
                 try:
-                    audio_bytes = _b64.b64decode(data_b64)
+                    audio_bytes = base64.b64decode(data_b64)
                     audio_source = io.BytesIO(audio_bytes)
                 except Exception as e:
                     print(f"[Net] Soundboard base64 decode error: {e}")
@@ -167,7 +167,6 @@ class NetworkClient(QObject):
             def _play():
                 try:
                     self._sb_playing.set()
-                    import soundfile as sf
                     data, sr = sf.read(audio_source, dtype='float32')
                     sd.play(data * vol, sr)
                     sd.wait()
@@ -334,7 +333,7 @@ class NetworkClient(QObject):
         # Интервал между пакетами в секундах
         pacing_interval  = avg_packet_bytes / VIDEO_PACING_RATE_BYTES_SEC  # ~1.39 мс
 
-        SLEEP_THRESHOLD = 0.0005  # 0.5 мс — ниже этого busy-wait точнее sleep()
+        SLEEP_THRESHOLD = 0.0003  # 0.3 мс — busy-wait точнее sleep(), но дешевле чем 0.5 мс
 
         last_send_t = time.perf_counter()
 
@@ -837,14 +836,7 @@ class NetworkClient(QObject):
                 print(f"[Nudge] Beep error: {e}")
 
             # 3. Danger.mp3 через sounddevice (vol=1.0 — без масштабирования)
-            sound_path = None
-            for candidate in (
-                NUDGE_SOUND_PATH,
-                resource_path(os.path.join("assets", "music", "Danger.mp3")),
-            ):
-                if os.path.exists(candidate):
-                    sound_path = candidate
-                    break
+            sound_path = NUDGE_SOUND_PATH if os.path.exists(NUDGE_SOUND_PATH) else None
 
             if sound_path is None:
                 print(

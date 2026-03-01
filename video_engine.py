@@ -477,12 +477,12 @@ class VideoEngine(QObject):
             # который может откладываться на неопределённое время (или не вызываться
             # вообще пока heap не вырастет достаточно). Каждый цикл вкл/выкл
             # трансляции добавлял ~60-100 МБ "зависшей" памяти.
-            try:
-                codec.close()
-                print("[Video] Энкодер закрыт, FFmpeg-буферы освобождены")
-            except Exception as ex:
-                print(f"[Video] Ошибка при закрытии энкодера: {ex}")
+            # av.VideoCodecContext не имеет метода close() в актуальных версиях PyAV.
+            # Flush уже выполнен через encode(None) выше.
+            # del codec снимает Python-ссылку → FFmpeg avcodec_free_context() вызывается
+            # деструктором Cython-обёртки (PyAV гарантирует это для write-контекстов).
             del codec
+            print("[Video] Энкодер закрыт, FFmpeg-буферы освобождены")
 
     def _fragment_and_send(self, data):
         if not self.net or not self.net.udp_socket_bound:
@@ -674,10 +674,8 @@ class VideoEngine(QObject):
         finally:
             # Явное освобождение FFmpeg контекста.
             # С thread_count=2 вместо AUTO освобождает ~10MB вместо ~40MB.
-            try:
-                decoder.close()
-            except Exception:
-                pass
+            # av.CodecContext.close() отсутствует в актуальных версиях PyAV —
+            # del достаточно: Cython-деструктор вызывает avcodec_free_context().
             del decoder
             gc.collect()
             print(f"[Video] decode_worker uid={uid} завершён, FFmpeg контекст освобождён")

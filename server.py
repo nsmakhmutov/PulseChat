@@ -156,23 +156,7 @@ class SFUServer:
 
                 elif is_video:
                     # ВИДЕО → только зрители стримера
-                    # Копируем список адресов под коротким локом
-                    with self.watchers_lock:
-                        watcher_uids = list(self.watchers.get(sender_uid, {}).keys())
-
-                    with self.udp_lock:
-                        target_addrs = [
-                            self.udp_map[uid]
-                            for uid in watcher_uids
-                            if uid in self.udp_map
-                        ]
-
-                    # sendto — вне любых локов
-                    for target_addr in target_addrs:
-                        try:
-                            self.udp_sock.sendto(data, target_addr)
-                        except Exception:
-                            pass
+                    self._send_to_watchers(sender_uid, data)
 
                 elif is_stream_audio and is_stream_voices:
                     # ГОЛОСОВОЙ ПОТОК СТРИМА → только зрители стримера.
@@ -184,46 +168,12 @@ class SFUServer:
                     # Сервер не фильтрует по speaker_uid, т.к.:
                     # 1) Не знает my_uid каждого зрителя в момент маршрутизации без доп. лока.
                     # 2) Это O(1) на клиенте vs O(N зрителей) на сервере.
-                    with self.watchers_lock:
-                        watcher_uids = list(self.watchers.get(sender_uid, {}).keys())
-
-                    with self.udp_lock:
-                        target_addrs = [
-                            self.udp_map[uid]
-                            for uid in watcher_uids
-                            if uid in self.udp_map
-                        ]
-
-                    for target_addr in target_addrs:
-                        try:
-                            self.udp_sock.sendto(data, target_addr)
-                        except Exception:
-                            pass
+                    self._send_to_watchers(sender_uid, data)
 
                 elif is_stream_audio:
-                    # СТРИМ-АУДИО → только зрители стримера (аналогично видео)
-                    # Зрители сами отфильтруют голоса своих собеседников на клиенте
-                    with self.watchers_lock:
-                        watcher_uids = list(self.watchers.get(sender_uid, {}).keys())
-
-                    with self.udp_lock:
-                        target_addrs = [
-                            self.udp_map[uid]
-                            for uid in watcher_uids
-                            if uid in self.udp_map
-                        ]
-
-                        # --- ДОБАВЛЕННЫЙ ЛОГ ---
-                    is_loopback = bool(flags & FLAG_LOOPBACK_AUDIO)
-                    if seq % 50 == 0:
-                        print(f"[Server-UDP] Роутинг стрим-аудио (loopback={is_loopback}) "
-                              f"от {sender_uid} для {len(target_addrs)} зрителей")
-
-                    for target_addr in target_addrs:
-                        try:
-                            self.udp_sock.sendto(data, target_addr)
-                        except Exception:
-                            pass
+                    # СТРИМ-АУДИО → только зрители стримера (аналогично видео).
+                    # Зрители сами отфильтруют голоса своих собеседников на клиенте.
+                    self._send_to_watchers(sender_uid, data)
 
                 else:
                     # АУДИО → все в той же комнате, кроме отправителя.
@@ -272,7 +222,7 @@ class SFUServer:
         _decoder = json.JSONDecoder()
         try:
             while True:
-                chunk_bytes = conn.recv(BUFFER_SIZE)
+                chunk_bytes = conn.recv(4096)  # TCP: JSON-команды редко превышают 1 КБ
                 if not chunk_bytes:
                     break
                 buffer += chunk_bytes.decode('utf-8', errors='ignore')
@@ -576,31 +526,59 @@ class SFUServer:
             self.send_global_state()
 
     # ------------------------------------------------------------------
+    # Вспомогательный метод: отправка пакета всем зрителям стримера
+    # ------------------------------------------------------------------
+    def _send_to_watchers(self, sender_uid: int, data: bytes):
+        """
+        Отправляет UDP-пакет всем зрителям стримера sender_uid.
+
+        Порядок локов намеренно фиксирован: watchers_lock → udp_lock.
+        sendto() выполняется вне любых локов.
+        """
+        with self.watchers_lock:
+            watcher_uids = list(self.watchers.get(sender_uid, {}).keys())
+
+        with self.udp_lock:
+            target_addrs = [
+                self.udp_map[uid]
+                for uid in watcher_uids
+                if uid in self.udp_map
+            ]
+
+        for addr in target_addrs:
+            try:
+                self.udp_sock.sendto(data, addr)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
     # Рассылка глобального состояния по TCP
     # ------------------------------------------------------------------
     def send_global_state(self):
         """
         FIX #2: sendall() выполняется вне clients_lock.
+        FIX nested-lock: watchers_lock больше не захватывается ВНУТРИ clients_lock.
 
         Было:
-            with self.lock:
-                for conn in self.clients:
-                    conn.sendall(payload)   # блокирует лок на время всех TCP-отправок
+            with clients_lock:
+                with watchers_lock: ...   # риск дедлока при инверсии порядка
 
         Стало:
-            1. Берём лок → быстро строим payload и список коннектов → отпускаем лок
-            2. Отправляем sendall() без какого-либо лока
-
-        Это гарантирует, что UDP-поток никогда не ждёт TCP I/O.
+            1. Под watchers_lock берём полный снимок watchers.
+            2. Под clients_lock строим payload, используя уже готовый снимок.
+            3. sendall() без каких-либо локов.
         """
-        # Шаг 1: собрать состояние и список получателей — быстро, под локом
+        # Шаг 1: снимок watchers под своим локом (без clients_lock)
+        with self.watchers_lock:
+            watchers_snapshot = {uid: dict(ws) for uid, ws in self.watchers.items()}
+
+        # Шаг 2: собрать состояние и список получателей — быстро, под clients_lock
         with self.clients_lock:
             state = {}
             conns_snapshot = []
             for c_conn, c in self.clients.items():
                 c_uid = c['uid']
-                with self.watchers_lock:
-                    watchers_list = list(self.watchers.get(c_uid, {}).values())
+                watchers_list = list(watchers_snapshot.get(c_uid, {}).values())
                 state.setdefault(c['room'], []).append({
                     'nick':         c['nick'],
                     'uid':          c_uid,
@@ -617,7 +595,7 @@ class SFUServer:
 
         payload = json.dumps({'action': CMD_SYNC_USERS, 'all_users': state}).encode('utf-8')
 
-        # Шаг 2: отправить — без лока, медленный клиент не тормозит UDP
+        # Шаг 3: отправить — без лока, медленный клиент не тормозит UDP
         for c_conn in conns_snapshot:
             try:
                 c_conn.sendall(payload)

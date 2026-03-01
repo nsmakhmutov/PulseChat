@@ -247,6 +247,7 @@ class MainWindow(QMainWindow):
         # внутри метода = 10 аллокаций/сек × N_users без необходимости.
         # Кэшируем один раз здесь, обновляем только при смене темы.
         self._cache_theme = self.app_settings.value("theme", "Светлая")
+        self._theme_dirty = False  # ВАЖН-6: флаг вместо QSettings.value() каждые 100 мс
         self._c_talk   = QColor("#2ecc71")
         self._c_mute   = QColor("#e74c3c")
         self._c_stream = QColor("#3498db")
@@ -865,6 +866,7 @@ class MainWindow(QMainWindow):
 
         # ── Кэш цветов для refresh_ui: пересоздаём при смене темы ────────────
         self._cache_theme = theme_name
+        self._theme_dirty = True   # сигнал refresh_ui: обновить _c_def / _br_def
         self._c_talk   = QColor("#2ecc71")
         self._c_mute   = QColor("#e74c3c")
         self._c_stream = QColor("#3498db")
@@ -1179,26 +1181,19 @@ class MainWindow(QMainWindow):
             self.play_notification("mute" if is_d else "unmute")
 
     def on_connected(self, msg):
-        print(f"[DEBUG] on_connected: START — uid={msg.get('uid')}", flush=True)
         try:
             self.audio.my_uid = msg['uid']
-            print(f"[DEBUG] on_connected: my_uid установлен = {self.audio.my_uid}", flush=True)
 
-            print(f"[DEBUG] on_connected: вызов audio.start() ...", flush=True)
             self.audio.start(
                 self.app_settings.value("device_in_name"),
                 self.app_settings.value("device_out_name")
             )
-            print(f"[DEBUG] on_connected: audio.start() завершён", flush=True)
 
             self.play_notification("self_move")
-            print(f"[DEBUG] on_connected: play_notification выполнен", flush=True)
 
             self._stack.setCurrentIndex(0)
-            print(f"[DEBUG] on_connected: setCurrentIndex(0) выполнен", flush=True)
 
             self._btn_reconnect.setEnabled(True)
-            print(f"[DEBUG] on_connected: DONE", flush=True)
 
             # Восстанавливаем сохранённый статус после переподключения.
             # Сервер не хранит статусы постоянно — только в рамках сессии,
@@ -1208,14 +1203,13 @@ class MainWindow(QMainWindow):
 
         except Exception as e:
             import traceback
-            print(f"[DEBUG] on_connected: EXCEPTION:\n{traceback.format_exc()}", flush=True)
+            print(f"[on_connected] EXCEPTION:\n{traceback.format_exc()}", flush=True)
 
     def on_video_frame(self, uid, q_image):
         if uid in self.stream_windows and self.stream_windows[uid].isVisible():
             self.stream_windows[uid].update_frame(q_image)
 
     def update_user_tree(self, users_map):
-        print(f"[DEBUG] update_user_tree: START — rooms={list(users_map.keys())}", flush=True)
         user_rooms: dict = {}
         all_active_uids = set() # Исправление 2.1: собираем всех активных пользователей
 
@@ -1345,7 +1339,6 @@ class MainWindow(QMainWindow):
 
         self.tree.expandAll()
         self._update_known_users_registry(users_map)
-        print(f"[DEBUG] update_user_tree: DONE", flush=True)
 
     def refresh_ui(self):
         try:
@@ -1356,12 +1349,12 @@ class MainWindow(QMainWindow):
 
             now = time.time()
 
-            # Обновляем кэш цветов при смене темы (меняется редко)
-            theme_now = self.app_settings.value("theme", "Светлая")
-            if theme_now != self._cache_theme:
-                self._cache_theme = theme_now
-                self._c_def  = QColor("#ecf0f1") if theme_now == "Темная" else QColor("#444444")
-                self._br_def = QBrush(self._c_def)   # пересоздаём кисть при смене темы
+            # ВАЖН-6: тема меняется только через apply_theme() → флаг _theme_dirty.
+            # Избегаем QSettings.value() (обращение к реестру) 10 раз/сек.
+            if self._theme_dirty:
+                self._theme_dirty = False
+                self._c_def  = QColor("#ecf0f1") if self._cache_theme == "Темная" else QColor("#444444")
+                self._br_def = QBrush(self._c_def)
 
             c_talk   = self._c_talk
             c_mute   = self._c_mute
@@ -1369,57 +1362,70 @@ class MainWindow(QMainWindow):
             c_def    = self._c_def
             icon_size = self._icon_size
 
+            # ВАЖН-5: Быстрый снимок под локом — только примитивы, без Qt-вызовов.
+            # users_lock не удерживается во время setData/setForeground: Qt может
+            # вызвать перерисовку внутри этих методов и заблокировать _packet_processor_loop.
             with self.audio.users_lock:
                 me_talk = (now - self.audio.last_voice_time < 0.3) and not self.audio.is_muted
+                remote_snapshot = {
+                    uid: (
+                        u.last_packet_time,
+                        u.is_locally_muted,
+                        u.volume_zero,
+                    )
+                    for uid, u in self.audio.remote_users.items()
+                }
+                my_uid       = self.audio.my_uid
+                is_muted     = self.audio.is_muted
+                is_deafened  = self.audio.is_deafened
 
-                for uid, data in self.known_uids.items():
-                    item = data['item']
-                    is_m = data['is_m']
-                    is_d = data['is_d']
-                    is_s = data['is_s']
+            # Обновляем Qt-дерево БЕЗ лока
+            for uid, data in self.known_uids.items():
+                item = data['item']
+                is_m = data['is_m']
+                is_d = data['is_d']
+                is_s = data['is_s']
 
-                    curr_s = self.is_streaming if uid == self.audio.my_uid else is_s
-                    curr_d = self.audio.is_deafened if uid == self.audio.my_uid else is_d
+                curr_s = self.is_streaming if uid == my_uid else is_s
+                curr_d = is_deafened       if uid == my_uid else is_d
 
-                    if curr_s:
-                        item.setData(2, Qt.ItemDataRole.DecorationRole, self._px_live)
+                if curr_s:
+                    item.setData(2, Qt.ItemDataRole.DecorationRole, self._px_live)
+                else:
+                    item.setData(2, Qt.ItemDataRole.DecorationRole, None)
+
+                if curr_d:
+                    item.setData(3, Qt.ItemDataRole.DecorationRole, self._px_vol_off)
+                else:
+                    item.setData(3, Qt.ItemDataRole.DecorationRole, None)
+
+                if uid == my_uid:
+                    talk = me_talk
+                    if is_muted:
+                        item.setData(4, Qt.ItemDataRole.DecorationRole, self._px_mic_off)
                     else:
-                        item.setData(2, Qt.ItemDataRole.DecorationRole, None)
+                        item.setData(4, Qt.ItemDataRole.DecorationRole, None)
+                else:
+                    u_vals = remote_snapshot.get(uid)
+                    talk             = (now - u_vals[0] < 0.3) if u_vals else False
+                    is_locally_muted = u_vals[1]               if u_vals else False
+                    is_vol_zero      = u_vals[2]               if u_vals else False
 
-                    if curr_d:
-                        item.setData(3, Qt.ItemDataRole.DecorationRole, self._px_vol_off)
+                    if is_locally_muted or is_vol_zero:
+                        item.setData(4, Qt.ItemDataRole.DecorationRole, self._px_ban)
+                    elif is_m:
+                        item.setData(4, Qt.ItemDataRole.DecorationRole, self._px_mic_off)
                     else:
-                        item.setData(3, Qt.ItemDataRole.DecorationRole, None)
+                        item.setData(4, Qt.ItemDataRole.DecorationRole, None)
 
-                    if uid == self.audio.my_uid:
-                        talk = me_talk
-                        if self.audio.is_muted:
-                            item.setData(4, Qt.ItemDataRole.DecorationRole, self._px_mic_off)
-                        else:
-                            item.setData(4, Qt.ItemDataRole.DecorationRole, None)
-                    else:
-                        u_audio = self.audio.remote_users.get(uid)
-                        talk = (now - u_audio.last_packet_time < 0.3) if u_audio else False
-                        is_locally_muted = u_audio.is_locally_muted if u_audio else False
-                        # volume_zero=True когда ползунок выставлен в 0 — визуально
-                        # неотличимо от кнопки «заглушить»: та же ban-иконка.
-                        is_vol_zero = (u_audio.volume_zero if u_audio else False)
-
-                        if is_locally_muted or is_vol_zero:
-                            item.setData(4, Qt.ItemDataRole.DecorationRole, self._px_ban)
-                        elif is_m:
-                            item.setData(4, Qt.ItemDataRole.DecorationRole, self._px_mic_off)
-                        else:
-                            item.setData(4, Qt.ItemDataRole.DecorationRole, None)
-
-                    if talk:
-                        item.setForeground(0, self._br_talk)
-                    elif curr_s:
-                        item.setForeground(0, self._br_stream)
-                    elif curr_d or is_m or (uid != self.audio.my_uid and u_audio and (is_locally_muted or is_vol_zero)):
-                        item.setForeground(0, self._br_mute)
-                    else:
-                        item.setForeground(0, self._br_def)
+                if talk:
+                    item.setForeground(0, self._br_talk)
+                elif curr_s:
+                    item.setForeground(0, self._br_stream)
+                elif curr_d or is_m or (uid != my_uid and u_vals and (is_locally_muted or is_vol_zero)):
+                    item.setForeground(0, self._br_mute)
+                else:
+                    item.setForeground(0, self._br_def)
         except Exception as _e:
             import traceback
             print(f"[DEBUG] refresh_ui: EXCEPTION:\n{traceback.format_exc()}", flush=True)

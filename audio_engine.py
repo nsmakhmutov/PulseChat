@@ -121,6 +121,16 @@ def sosfilt_zi(sos: np.ndarray) -> np.ndarray:
 from PyQt6.QtCore import QObject, pyqtSignal, QSettings
 from config import *
 
+# ---------------------------------------------------------------------------
+# Предвычисленные SOS-матрицы фильтров — константы модуля.
+# Вычисляются ОДИН РАЗ при импорте (не при каждом __init__ AudioHandler).
+# Параметры фиксированы: SAMPLE_RATE=48000 Гц, order=4, Butterworth LP.
+#   _WLP_SOS    — fc=1200 Гц, для эффекта «рация» (legacy, не используется в prod)
+#   _ANON_LP_SOS — fc=4000 Гц, для эффекта «анонимный голос» (whisper receiver side)
+# ---------------------------------------------------------------------------
+_WLP_SOS     = butter(4, 1200, btype='low', fs=48000, output='sos')
+_ANON_LP_SOS = butter(4, 4000, btype='low', fs=48000, output='sos')
+
 try:
     from pyrnnoise import RNNoise
 
@@ -649,9 +659,6 @@ class StreamAudioCapture:
                     packet = UDP_HEADER_STRUCT.pack(uid, time.time(), self._sequence, flags) + encoded
                     self.send_queue.put_nowait(packet)
 
-                    if self._sequence % 50 == 0:
-                        print(f"[StreamAudio-Capture] Захвачен и отправлен системный звук (seq={self._sequence})")
-
         except Exception as e:
             pass
 
@@ -717,15 +724,6 @@ class AudioHandler(QObject):
     # точно так же как при нажатии кнопки «Заглушить».
     user_volume_zero = pyqtSignal(int, bool)
 
-    def _apply_whisper_bass_effect(self, s: np.ndarray) -> np.ndarray:
-        """
-        [УСТАРЕЛО — оставлен для совместимости, не вызывается]
-        Эффект «рация» — LP Butterworth 4-го порядка, fc=1200 Гц.
-        Заменён на _apply_anonymous_voice_effect (pitch shift + LP 4 кГц).
-        """
-        out, self._wlp_zi = sosfilt(self._wlp_sos, s.astype(np.float64), zi=self._wlp_zi)
-        return out.astype(np.float32)
-
     def _apply_anonymous_voice_effect(self, s: np.ndarray) -> np.ndarray:
         """
         Эффект «анонимного голоса» (Dark TV Interview).
@@ -781,7 +779,7 @@ class AudioHandler(QObject):
         shifted = val_1 * fade_1 + val_2 * fade_2
 
         # 6. Обновляем историю для следующего фрейма
-        self._anon_history = buf[-len(self._anon_history):]
+        self._anon_history[:] = buf[-len(self._anon_history):]  # in-place: избегаем self-copy через view
 
         # 7. LP-фильтр (4 кГц) для "тёмного" окраса (скрывает артефакты формант)
         out, self._anon_lp_zi = sosfilt(self._anon_lp_sos, shifted, zi=self._anon_lp_zi)
@@ -857,17 +855,16 @@ class AudioHandler(QObject):
         self._whisper_sequence: int = 0
 
         # ── IIR-фильтр для whisper-эффекта (4-й порядок Butterworth LP, fc=1200 Гц) ──
-        # Реализован через scipy sosfilt (C-уровень) вместо pure-Python цикла.
-        # SOS-матрица постоянна, начальные условия zi хранят состояние между фреймами.
+        # SOS-матрица предвычислена как модульная константа _WLP_SOS (один раз при импорте).
+        # Начальные условия zi хранят состояние между фреймами.
         # Сброс zi производится в start_whisper().
-        self._wlp_sos = butter(4, 1200, btype='low', fs=48000, output='sos')
+        self._wlp_sos = _WLP_SOS
         self._wlp_zi  = sosfilt_zi(self._wlp_sos).astype(np.float64)
 
         # ── LP-фильтр для эффекта анонимного голоса (fc=4000 Гц) ──────────────
         # Мягче чем whisper LP (1200 Гц): сохраняет согласные и зону присутствия.
-        # Используется в _apply_anonymous_voice_effect (получатель шёпота).
-        # Отдельная SOS/zi — не пересекается с _wlp_sos (старый эффект рации).
-        self._anon_lp_sos = butter(4, 4000, btype='low', fs=48000, output='sos')
+        # SOS-матрица предвычислена как модульная константа _ANON_LP_SOS.
+        self._anon_lp_sos = _ANON_LP_SOS
         self._anon_lp_zi  = sosfilt_zi(self._anon_lp_sos).astype(np.float64)
         self._anon_history = np.zeros(2048, dtype=np.float32)
         self._anon_phase = 0.0
@@ -1127,8 +1124,6 @@ class AudioHandler(QObject):
                         if data:
                             user.jitter_buffer.add(seq, data)
                             user.last_packet_time = time.time()
-                            if seq % 50 == 0:
-                                print(f"[AudioHandler] Системный звук от uid={uid} добавлен в джиттер-буфер")
                         # FIX #1: COW-снимок для audio_callback
                         self._audio_stream_users_snapshot = dict(self.stream_remote_users)
                 else:
@@ -1202,7 +1197,12 @@ class AudioHandler(QObject):
                 pcm_int16 = (raw_input * 32767).astype(np.int16)
                 processed = [f for p, f in self.denoiser.denoise_chunk(pcm_int16)]
                 if processed:
-                    denoised_float = np.concatenate(processed).astype(np.float32) / 32767.0
+                    # Оптимизация: RNNoise чаще всего возвращает ровно 1 фрейм.
+                    # Проверяем сначала — избегаем np.concatenate (аллокацию) 50 раз/сек.
+                    if len(processed) == 1:
+                        denoised_float = processed[0].astype(np.float32) / 32767.0
+                    else:
+                        denoised_float = np.concatenate(processed).astype(np.float32) / 32767.0
                     if len(denoised_float) != len(raw_input):
                         denoised_float = np.resize(denoised_float, len(raw_input))
             except:
