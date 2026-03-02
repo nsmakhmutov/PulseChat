@@ -49,6 +49,19 @@ _SUPPORTED_EXTENSIONS = (".zip", ".7z")
 _ZIP_MAGIC = b"PK\x03\x04"
 _7Z_MAGIC  = b"7z\xbc\xaf\x27\x1c"
 
+# Имя stamp-файла, который сигнализирует «только что установлено обновление».
+# Создаётся в папке установки ДО запуска bat-лончера.
+# check_for_updates() находит его при старте нового exe, удаляет и пропускает
+# GitHub-запрос — это разрывает петлю бесконечного обновления.
+_STAMP_FILENAME = ".pulse_just_updated"
+
+
+def _get_install_dir() -> str:
+    """Папка, где лежит исполняемый файл приложения (работает в frozen и dev)."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(sys.argv[0]))
+
 
 def _parse_version(tag: str) -> str:
     """Убирает префикс 'v' из тега релиза -> '1.2.3'."""
@@ -176,6 +189,21 @@ def check_for_updates(on_update_found=None, on_no_update=None, on_error=None):
         on_no_update()                                     - версия актуальна
         on_error(message: str)                             - ошибка сети/API
     """
+    # ── Stamp-файл: защита от петли бесконечного обновления ──────────────────
+    # Если bat-лончер только что установил обновление, он оставил stamp-файл.
+    # Мы находим его при старте нового exe, удаляем и пропускаем GitHub-запрос.
+    # Без этого: новый exe запускается → _update_checked=False → идёт на GitHub →
+    # (если xcopy не успел перезаписать exe) находит «обновление» → петля.
+    _stamp = os.path.join(_get_install_dir(), _STAMP_FILENAME)
+    if os.path.exists(_stamp):
+        try:
+            os.remove(_stamp)
+            print("[Updater] Stamp-файл найден — пропускаем проверку после обновления.")
+        except Exception:
+            pass
+        if on_no_update:
+            on_no_update()
+        return
     if not GITHUB_REPO or "/" not in GITHUB_REPO:
         if on_error:
             on_error("GITHUB_REPO не настроен в version.py")
@@ -402,7 +430,10 @@ def download_and_install(download_url: str, on_progress=None, on_done=None, on_e
                 )
 
             # taskkill /PID — убивает старый процесс принудительно
-            # ping -n 3   — пауза ~2 сек пока процесс гарантированно умрёт
+            # ping -n 6   — пауза ~5 сек: достаточно для Qt-cleanup + снятия файловых
+            #               блокировок Windows на exe. ping -n 3 (~2 сек) не хватало:
+            #               xcopy падал на заблокированном exe → копировал старый exe →
+            #               новый запуск снова видел «обновление» → бесконечная петля.
             # backup      — сохраняем user_config.json, known_users.json во временную папку
             # xcopy       — копирует ВСЕ новые файлы поверх папки установки
             #               /E = включая подпапки, /Y = перезаписывать без вопросов
@@ -415,7 +446,7 @@ def download_and_install(download_url: str, on_progress=None, on_done=None, on_e
             bat_lines = [
                 "@echo off",
                 f"taskkill /PID {current_pid} /F >nul 2>&1",
-                "ping -n 3 127.0.0.1 >nul",
+                "ping -n 6 127.0.0.1 >nul",
                 *backup_cmds,
                 f'xcopy /E /Y /I /Q "{new_files_dir}\\*" "{install_dir}\\" >nul 2>&1',
                 *restore_cmds,
@@ -433,6 +464,18 @@ def download_and_install(download_url: str, on_progress=None, on_done=None, on_e
             print(f"[Updater] target_exe   : {target_exe}")
 
             print(f"[Updater] Лончер: {bat_path}")
+
+            # Записываем stamp ДО запуска батника.
+            # Новый exe при старте найдёт его, удалит и пропустит GitHub-запрос.
+            # Stamp пишем именно сейчас: если bat по какой-то причине не запустится,
+            # stamp не появится — следующий запуск старого exe проверит обновления штатно.
+            try:
+                _stamp = os.path.join(install_dir, _STAMP_FILENAME)
+                open(_stamp, "w").close()
+                print(f"[Updater] Stamp записан: {_stamp}")
+            except Exception as _se:
+                print(f"[Updater] Не удалось записать stamp (не критично): {_se}")
+
             subprocess.Popen(
                 ["cmd", "/c", bat_path],
                 creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
