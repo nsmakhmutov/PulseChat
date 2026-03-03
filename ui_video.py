@@ -1,24 +1,3 @@
-# ui_video.py — GPU-accelerated видеоплеер на QOpenGLWidget
-#
-# Архитектура:
-#   VideoSurface  — QOpenGLWidget, рендерит кадры через OpenGL текстуры (GPU)
-#   VideoOverlay  — QFrame-оверлей с панелью управления (авто-скрытие по мышке)
-#   VideoWindow   — QWidget-обёртка: склеивает VideoSurface + VideoOverlay
-#
-# Публичный API (совместим со старым кодом):
-#   VideoWindow(nick)           — создать окно
-#   window.uid                  — UID стримера (устанавливается снаружи)
-#   window.update_frame(QImage) — слот для приёма нового кадра
-#
-# Новые сигналы VideoWindow (подключать в MainWindow при необходимости):
-#   overlay_mute_toggled   () — зритель нажал кнопку mic в оверлее
-#   overlay_deafen_toggled () — зритель нажал кнопку volume в оверлее
-#   overlay_stop_watch     () — зритель нажал «Прекратить просмотр»
-#
-# Полноэкранный режим:
-#   — Кнопка ⛶ в оверлее / двойной клик / F / F11 → переключить fullscreen
-#   — Escape → выйти из fullscreen
-
 import time
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QSizePolicy, QPushButton, QFrame, QSlider,
@@ -31,33 +10,19 @@ from PyQt6.QtGui import QImage, QPainter, QColor, QFont, QIcon, QLinearGradient
 
 from config import resource_path
 
-# ВАЖНО: QSurfaceFormat.setDefaultFormat() вызывается в client_main.py
-# ДО создания QApplication. Здесь его быть НЕ должно — иначе краш 0xC0000409.
+# QSurfaceFormat.setDefaultFormat() вызывается в client_main.py до создания QApplication
 
-# Таймаут авто-скрытия оверлея и курсора (мс)
 _HIDE_TIMEOUT_MS = 3000
-
-# Высота оверлей-панели
 _OVERLAY_H = 60
 
 
-# ---------------------------------------------------------------------------
-# VideoSurface — "холст" OpenGL, отвечает только за рендеринг кадров
-# ---------------------------------------------------------------------------
 class VideoSurface(QOpenGLWidget):
-    """
-    QOpenGLWidget, который принимает QImage и рисует его через QPainter
-    поверх OpenGL-контекста. QPainter на QOpenGLWidget использует GPU
-    (OpenGL paint engine), поэтому масштабирование и блиттинг идут без CPU.
+    """QOpenGLWidget для рендеринга кадров через QPainter на GPU.
 
-    Почему QPainter, а не голые glTexImage2D-вызовы?
-      — Полная совместимость с PyQt6 без PyOpenGL/OpenGL32 зависимостей.
-      — Qt автоматически загружает QImage как GL-текстуру и делает
-        texSubImage при обновлении, что даёт те же преимущества GPU.
-      — В дальнейшем сюда легко добавить шейдеры через QOpenGLShaderProgram.
+    QPainter на QOpenGLWidget использует OpenGL paint engine —
+    масштабирование и блиттинг выполняются без нагрузки на CPU.
     """
 
-    # Двойной клик → запрос переключения fullscreen
     fullscreen_requested = pyqtSignal()
 
     def __init__(self, parent=None):
@@ -69,23 +34,18 @@ class VideoSurface(QOpenGLWidget):
         self.setMouseTracking(True)
         self._placeholder_font = QFont("Segoe UI", 20)
 
-    # ------------------------------------------------------------------
-    # Публичный интерфейс
-    # ------------------------------------------------------------------
     def set_frame(self, q_img: QImage):
-        """Принять новый кадр. Вызывать только из GUI-потока."""
-        self._current_image = q_img
-        self.update()  # запросить перерисовку (не блокирует)
+        """Принять новый кадр и запросить перерисовку. Только из GUI-потока.
 
-    # ------------------------------------------------------------------
-    # Переопределения QOpenGLWidget
-    # ------------------------------------------------------------------
+        :param q_img: новый кадр
+        """
+        self._current_image = q_img
+        self.update()
+
     def initializeGL(self):
-        """QPainter управляет контекстом самостоятельно — ручные glClear не нужны."""
-        pass  # Не вызываем context().functions() — это конфликтует с QPainter
+        pass
 
     def resizeGL(self, w: int, h: int):
-        """QPainter сам обновляет viewport при каждом paintGL()."""
         pass
 
     def paintGL(self):
@@ -101,16 +61,17 @@ class VideoSurface(QOpenGLWidget):
         painter.end()
 
     def mouseDoubleClickEvent(self, event):
-        """Двойной клик ЛКМ — переключить полноэкранный режим."""
         if event.button() == Qt.MouseButton.LeftButton:
             self.fullscreen_requested.emit()
         super().mouseDoubleClickEvent(event)
 
-    # ------------------------------------------------------------------
-    # Приватные методы рисования
-    # ------------------------------------------------------------------
     def _draw_frame(self, painter: QPainter, w: int, h: int):
-        """Рисует кадр с сохранением пропорций (letterbox / pillarbox)."""
+        """Нарисовать кадр с сохранением пропорций (letterbox / pillarbox).
+
+        :param painter: активный QPainter
+        :param w: ширина виджета
+        :param h: высота виджета
+        """
         img = self._current_image
         img_w, img_h = img.width(), img.height()
         if img_w <= 0 or img_h <= 0:
@@ -123,25 +84,26 @@ class VideoSurface(QOpenGLWidget):
         painter.drawImage(QRect(dest_x, dest_y, dest_w, dest_h), img)
 
     def _draw_placeholder(self, painter: QPainter, w: int, h: int):
-        """Рисует заглушку 'Ожидание видео...' по центру."""
+        """Нарисовать заглушку по центру виджета.
+
+        :param painter: активный QPainter
+        :param w: ширина виджета
+        :param h: высота виджета
+        """
         painter.setFont(self._placeholder_font)
         painter.setPen(QColor(160, 160, 160))
         painter.drawText(0, 0, w, h, Qt.AlignmentFlag.AlignCenter, self._placeholder_text)
 
 
-# ---------------------------------------------------------------------------
-# StreamVolumePopup — всплывающий вертикальный слайдер громкости стрима
-# ---------------------------------------------------------------------------
 class StreamVolumePopup(QFrame):
-    """
-    Всплывающий вертикальный слайдер громкости стрима в стиле Discord.
+    """Всплывающий вертикальный слайдер громкости стрима (0.0–2.0).
+
     Появляется над кнопкой volume_stream при hover/клике.
-    Закрашиваемая область снизу вверх (как уровень заполнения).
     """
 
-    volume_changed = pyqtSignal(float)  # 0.0 – 2.0
+    volume_changed = pyqtSignal(float)
 
-    _FILL_COLOR   = QColor(88, 101, 242)   # Discord-синий
+    _FILL_COLOR   = QColor(88, 101, 242)
     _TRACK_COLOR  = QColor(60, 60, 80)
     _HANDLE_COLOR = QColor(255, 255, 255)
     _HANDLE_R     = 7
@@ -151,7 +113,6 @@ class StreamVolumePopup(QFrame):
         self.setFixedSize(36, 140)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         self.setMouseTracking(True)
-
         self.setStyleSheet("""
             StreamVolumePopup {
                 background-color: rgba(18, 18, 32, 230);
@@ -159,23 +120,23 @@ class StreamVolumePopup(QFrame):
                 border: 1px solid rgba(255,255,255,40);
             }
         """)
-
-        self._value   = 1.0   # 0.0–2.0
+        self._value    = 1.0
         self._dragging = False
-
-        # Геометрия трека (с отступами сверху и снизу)
         self._pad_top    = 14
         self._pad_bottom = 14
 
-    # --- Публичный API ---
     def set_value(self, v: float):
+        """Установить значение слайдера.
+
+        :param v: громкость в диапазоне 0.0–2.0
+        """
         self._value = max(0.0, min(2.0, v))
         self.update()
 
     def get_value(self) -> float:
+        """Вернуть текущее значение слайдера."""
         return self._value
 
-    # --- Рисование ---
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -188,16 +149,13 @@ class StreamVolumePopup(QFrame):
         track_bottom = self.height() - self._pad_bottom
         track_h      = track_bottom - track_top
 
-        # Трек (фон)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(self._TRACK_COLOR)
         p.drawRoundedRect(track_x, track_top, track_w, track_h, 3, 3)
 
-        # Заполненная часть (снизу вверх)
-        # value 0.0 → y=track_bottom (пусто), value 2.0 → y=track_top (полно)
-        ratio      = self._value / 2.0
-        fill_h     = int(track_h * ratio)
-        fill_y     = track_bottom - fill_h
+        ratio  = self._value / 2.0
+        fill_h = int(track_h * ratio)
+        fill_y = track_bottom - fill_h
 
         grad = QLinearGradient(0, fill_y, 0, track_bottom)
         grad.setColorAt(0.0, QColor(120, 135, 255))
@@ -205,18 +163,15 @@ class StreamVolumePopup(QFrame):
         p.setBrush(grad)
         p.drawRoundedRect(track_x, fill_y, track_w, fill_h, 3, 3)
 
-        # Ручка
         handle_y = fill_y - self._HANDLE_R
         p.setBrush(self._HANDLE_COLOR)
         p.setPen(Qt.PenStyle.NoPen)
         p.drawEllipse(cx - self._HANDLE_R, handle_y, self._HANDLE_R * 2, self._HANDLE_R * 2)
 
-        # Текст процентов
         p.setPen(QColor(180, 180, 200))
         p.setFont(QFont("Segoe UI", 8))
         pct = int(self._value * 100)
         p.drawText(0, 0, w, self._pad_top, Qt.AlignmentFlag.AlignCenter, f"{pct}%")
-
         p.end()
 
     def _y_to_value(self, y: int) -> float:
@@ -250,34 +205,21 @@ class StreamVolumePopup(QFrame):
         self.volume_changed.emit(self._value)
 
 
-# ---------------------------------------------------------------------------
-# VideoOverlay — плавающая панель управления поверх видео
-# ---------------------------------------------------------------------------
 class VideoOverlay(QFrame):
-    """
-    Полупрозрачная панель с кнопками управления.
-    Располагается снизу-по-центру поверх VideoSurface.
-    Появляется при движении мыши, скрывается через _HIDE_TIMEOUT_MS.
+    """Полупрозрачная панель управления поверх видео.
 
-    Кнопки (слева направо):
-        🎤  Заглушить микрофон    (mic_on / mic_off)
-        🔊  Заглушить динамики   (volume_on / volume_off)
-        🛑  Прекратить просмотр  (stop_stream_watch)
-      | sep |
-        ⛶   Полный экран         (справа)
+    Располагается снизу по центру, появляется при движении мыши.
+    Кнопки: mic, volume, stop, stream volume, soundboard, fullscreen.
     """
 
-    # Сигналы — чистые клики, состояние хранит VideoWindow
-    mute_clicked       = pyqtSignal()
-    deafen_clicked     = pyqtSignal()
-    stop_watch_clicked = pyqtSignal()
-    fullscreen_clicked = pyqtSignal()
-    stream_volume_changed = pyqtSignal(float)   # 0.0–2.0
-    quality_changed    = pyqtSignal(int)         # skip_factor: 1, 2, 4
-    # Клик по кнопке soundboard в оверлее стрима → VideoWindow.open_soundboard()
-    soundboard_clicked = pyqtSignal()
+    mute_clicked          = pyqtSignal()
+    deafen_clicked        = pyqtSignal()
+    stop_watch_clicked    = pyqtSignal()
+    fullscreen_clicked    = pyqtSignal()
+    stream_volume_changed = pyqtSignal(float)
+    quality_changed       = pyqtSignal(int)
+    soundboard_clicked    = pyqtSignal()
 
-    # Циклические уровни качества: (skip_factor, emoji-метка, tooltip)
     _QUALITY_LEVELS = [
         (1, "🎯", "Высокое HD (1280×720, ~30fps)"),
         (2, "⚡", "Среднее SD (640×360, ~15fps, меньше трафика)"),
@@ -288,7 +230,7 @@ class VideoOverlay(QFrame):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         self.setMouseTracking(True)
-        self._quality_idx = 0   # текущий индекс в _QUALITY_LEVELS (по умолчанию HIGH)
+        self._quality_idx = 0
 
         self.setStyleSheet("""
             VideoOverlay {
@@ -302,27 +244,22 @@ class VideoOverlay(QFrame):
         layout.setContentsMargins(18, 8, 18, 8)
         layout.setSpacing(10)
 
-        # --- Микрофон ---
         self.btn_mute = self._make_btn("assets/icon/mic_on.svg", "Заглушить микрофон")
         self.btn_mute.setCheckable(True)
         self.btn_mute.clicked.connect(self._on_mute_clicked)
 
-        # --- Динамики ---
         self.btn_deafen = self._make_btn("assets/icon/volume_on.svg", "Заглушить динамики")
         self.btn_deafen.setCheckable(True)
         self.btn_deafen.clicked.connect(self._on_deafen_clicked)
 
-        # --- Прекратить просмотр ---
         self.btn_stop = self._make_btn("assets/icon/stream_off.svg", "Прекратить просмотр")
         self.btn_stop.clicked.connect(self.stop_watch_clicked)
 
-        # --- Громкость стрима ---
         self.btn_vol_stream = self._make_btn("assets/icon/volume_stream.svg", "Громкость стрима")
         self._vol_popup = StreamVolumePopup(parent.parent() if parent else self)
         self._vol_popup.setVisible(False)
         self._vol_popup.volume_changed.connect(self.stream_volume_changed)
 
-        # Таймер скрытия попапа после потери фокуса мышки
         self._vol_hide_timer = QTimer(self)
         self._vol_hide_timer.setSingleShot(True)
         self._vol_hide_timer.setInterval(400)
@@ -332,20 +269,15 @@ class VideoOverlay(QFrame):
         self.btn_vol_stream.installEventFilter(self)
         self._vol_popup.installEventFilter(self)
 
-        # --- Soundboard (заменяет нерабочую кнопку качества) ---
-        # Иконка та же что в главном окне (bells.svg).
-        # Клик → VideoWindow.open_soundboard() → SoundboardPanel над стримом.
         self.btn_soundboard = self._make_btn("assets/icon/bells.svg", "Soundboard")
         self.btn_soundboard.clicked.connect(self.soundboard_clicked)
 
-        # --- Разделитель ---
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.VLine)
         sep.setStyleSheet("QFrame { color: rgba(255,255,255,50); }")
         sep.setFixedWidth(2)
         sep.setFixedHeight(32)
 
-        # --- Fullscreen ---
         self.btn_fs = self._make_btn(None, "Полный экран / Оконный режим")
         self.btn_fs.setText("⛶")
         self.btn_fs.setFont(QFont("Segoe UI", 16))
@@ -359,10 +291,13 @@ class VideoOverlay(QFrame):
         layout.addWidget(sep, alignment=Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(self.btn_fs)
 
-    # ------------------------------------------------------------------
-    # Фабричный метод кнопки в стиле главного меню
-    # ------------------------------------------------------------------
     def _make_btn(self, icon_path: str | None, tooltip: str) -> QPushButton:
+        """Создать кнопку оверлея в едином стиле.
+
+        :param icon_path: путь к иконке или None для текстовой кнопки
+        :param tooltip: подсказка при наведении
+        :return: готовая кнопка
+        """
         btn = QPushButton()
         btn.setFixedSize(44, 44)
         btn.setToolTip(tooltip)
@@ -388,9 +323,6 @@ class VideoOverlay(QFrame):
             btn.setIconSize(QSize(26, 26))
         return btn
 
-    # ------------------------------------------------------------------
-    # Громкость стрима: попап
-    # ------------------------------------------------------------------
     def _toggle_vol_popup(self):
         if self._vol_popup.isVisible():
             self._hide_vol_popup()
@@ -398,9 +330,8 @@ class VideoOverlay(QFrame):
             self._show_vol_popup()
 
     def _show_vol_popup(self):
-        """Позиционировать и показать попап над кнопкой."""
+        """Позиционировать и показать попап громкости над кнопкой."""
         self._vol_hide_timer.stop()
-        # Координаты кнопки в родительском виджете (VideoWindow/_video_container)
         btn_pos = self.btn_vol_stream.mapTo(self._vol_popup.parent(), QPoint(0, 0))
         popup_x = btn_pos.x() + (self.btn_vol_stream.width() - self._vol_popup.width()) // 2
         popup_y = btn_pos.y() - self._vol_popup.height() - 8
@@ -412,7 +343,7 @@ class VideoOverlay(QFrame):
         self._vol_popup.setVisible(False)
 
     def eventFilter(self, obj, event):
-        """Скрываем попап при уходе мышки с кнопки или самого попапа."""
+        """Скрывать попап при уходе мышки с кнопки или самого попапа."""
         t = event.type()
         if obj in (self.btn_vol_stream, self._vol_popup):
             if t == QEvent.Type.Enter:
@@ -423,9 +354,6 @@ class VideoOverlay(QFrame):
                 self._vol_hide_timer.start()
         return False
 
-    # ------------------------------------------------------------------
-    # Обработка кликов с обновлением иконок
-    # ------------------------------------------------------------------
     def _on_mute_clicked(self):
         is_muted = self.btn_mute.isChecked()
         icon = "assets/icon/mic_off.svg" if is_muted else "assets/icon/mic_on.svg"
@@ -438,11 +366,11 @@ class VideoOverlay(QFrame):
         self.btn_deafen.setIcon(QIcon(resource_path(icon)))
         self.deafen_clicked.emit()
 
-    # ------------------------------------------------------------------
-    # Публичные методы синхронизации состояния (вызываются из VideoWindow)
-    # ------------------------------------------------------------------
     def sync_mute_state(self, is_muted: bool):
-        """Обновить иконку/состояние кнопки без эмита сигнала."""
+        """Обновить иконку/состояние кнопки mic без эмита сигнала.
+
+        :param is_muted: текущее состояние микрофона
+        """
         self.btn_mute.blockSignals(True)
         self.btn_mute.setChecked(is_muted)
         icon = "assets/icon/mic_off.svg" if is_muted else "assets/icon/mic_on.svg"
@@ -450,7 +378,10 @@ class VideoOverlay(QFrame):
         self.btn_mute.blockSignals(False)
 
     def sync_deafen_state(self, is_deafened: bool):
-        """Обновить иконку/состояние кнопки без эмита сигнала."""
+        """Обновить иконку/состояние кнопки volume без эмита сигнала.
+
+        :param is_deafened: текущее состояние звука
+        """
         self.btn_deafen.blockSignals(True)
         self.btn_deafen.setChecked(is_deafened)
         icon = "assets/icon/volume_off.svg" if is_deafened else "assets/icon/volume_on.svg"
@@ -458,48 +389,39 @@ class VideoOverlay(QFrame):
         self.btn_deafen.blockSignals(False)
 
     def set_fullscreen_icon(self, is_fullscreen: bool):
-        """Переключить иконку кнопки fullscreen."""
+        """Переключить иконку кнопки fullscreen.
+
+        :param is_fullscreen: True — режим fullscreen активен
+        """
         self.btn_fs.setText("❐" if is_fullscreen else "⛶")
 
 
-# ---------------------------------------------------------------------------
-# VideoWindow — окно-контейнер: поверхность + оверлей + тулбар статистики
-# ---------------------------------------------------------------------------
 class VideoWindow(QWidget):
+    """Окно воспроизведения стрима: VideoSurface + VideoOverlay + тулбар статистики.
+
+    Публичный API:
+        uid                           — UID стримера (устанавливается снаружи)
+        update_frame(QImage)          — слот приёма кадра от VideoEngine
+        sync_audio_state(muted, deaf) — синхронизировать иконки оверлея
+        set_net(net)                  — передать NetworkClient для soundboard
+
+    Сигналы:
+        window_closed(int)            — закрытие окна (uid стримера)
+        overlay_mute_toggled()        — нажата кнопка mic в оверлее
+        overlay_deafen_toggled()      — нажата кнопка volume в оверлее
+        overlay_stop_watch()          — нажата кнопка «Прекратить просмотр»
+        overlay_stream_volume_changed(float) — изменена громкость стрима
+        quality_changed(int)          — изменено качество (skip_factor)
+        viewer_keyframe_needed()      — запрос IDR-кадра
     """
-    Полноценное окно воспроизведения стрима.
 
-    Публичный API (совместим со старым кодом):
-        window.uid                  (int)   — UID стримера, ставится снаружи
-        window.update_frame(img)    (slot)  — принять QImage от VideoEngine
-        window.window_closed        (signal, int uid) — испускается при закрытии окна
-
-    Новые сигналы (опционально подключать в MainWindow):
-        overlay_mute_toggled   () — зритель переключил микрофон
-        overlay_deafen_toggled () — зритель переключил динамики
-        overlay_stop_watch     () — зритель нажал «Прекратить просмотр»
-
-    Публичные методы:
-        sync_audio_state(muted, deafened) — синхронизировать иконки оверлея
-    """
-
-    # --- Совместимый сигнал ---
-    window_closed = pyqtSignal(int)
-
-    # --- Новые сигналы от оверлея ---
-    overlay_mute_toggled   = pyqtSignal()
-    overlay_deafen_toggled = pyqtSignal()
-    overlay_stop_watch     = pyqtSignal()
-    overlay_stream_volume_changed = pyqtSignal(float)   # 0.0–2.0
-
-    # --- Качество видео ---
-    # Эмитит skip_factor при смене пользователем качества (1/2/4).
-    # MainWindow подключает к net.send_quality_request().
-    quality_changed        = pyqtSignal(int)
-
-    # Эмитит при необходимости получить свежий IDR-кадр (в low-quality режиме).
-    # MainWindow подключает к net.request_viewer_keyframe(streamer_uid).
-    viewer_keyframe_needed = pyqtSignal()
+    window_closed                 = pyqtSignal(int)
+    overlay_mute_toggled          = pyqtSignal()
+    overlay_deafen_toggled        = pyqtSignal()
+    overlay_stop_watch            = pyqtSignal()
+    overlay_stream_volume_changed = pyqtSignal(float)
+    quality_changed               = pyqtSignal(int)
+    viewer_keyframe_needed        = pyqtSignal()
 
     def __init__(self, nick: str):
         super().__init__()
@@ -510,38 +432,29 @@ class VideoWindow(QWidget):
         self._fps_last_time = time.monotonic()
         self._current_fps = 0.0
         self._is_fullscreen = False
-        self._closing = False        # флаг: окно в процессе закрытия
-        self._quality_skip = 1       # текущий skip_factor (1=HIGH, 2=MED, 4=LOW)
-        self._net = None             # NetworkClient — устанавливается через set_net()
-        self._sb_panel = None        # SoundboardPanel поверх стрима (toggle)
+        self._closing = False
+        self._quality_skip = 1
+        self._net = None
+        self._sb_panel = None
 
         self._setup_ui(nick)
         self._setup_hide_timer()
 
-        # IDR-таймер: в режимах MEDIUM/LOW периодически запрашиваем I-frame,
-        # чтобы P-frame артефакты от пропущенных кадров очищались регулярно.
-        # При HIGH (skip=1) таймер не запущен — пакеты не пропускаются.
         from config import VIDEO_LOW_QUALITY_IDR_INTERVAL_MS
         self._idr_timer = QTimer(self)
         self._idr_timer.setSingleShot(False)
         self._idr_timer.setInterval(VIDEO_LOW_QUALITY_IDR_INTERVAL_MS)
         self._idr_timer.timeout.connect(self.viewer_keyframe_needed)
 
-    # ------------------------------------------------------------------
-    # Публичный метод: передать NetworkClient для soundboard в оверлее
-    # ------------------------------------------------------------------
     def set_net(self, net):
-        """Вызывается из MainWindow.open_video_window() после создания окна."""
+        """Передать NetworkClient для soundboard-панели в оверлее.
+
+        :param net: NetworkClient
+        """
         self._net = net
 
-    # ------------------------------------------------------------------
-    # Soundboard поверх стрима
-    # ------------------------------------------------------------------
     def open_soundboard(self):
-        """
-        Открывает / закрывает SoundboardPanel поверх окна трансляции.
-        Полностью аналогична MainWindow.open_soundboard().
-        """
+        """Открыть или закрыть SoundboardPanel поверх окна трансляции (toggle)."""
         if self._net is None:
             return
         from ui_dialogs import SoundboardPanel
@@ -561,10 +474,11 @@ class VideoWindow(QWidget):
         self._sb_panel = panel
         panel.show_above(self.overlay.btn_soundboard)
 
-    # ------------------------------------------------------------------
-    # Построение UI
-    # ------------------------------------------------------------------
     def _setup_ui(self, nick: str):
+        """Построить структуру окна: video container, surface, overlay, тулбар.
+
+        :param nick: ник стримера для заголовка окна
+        """
         self.setWindowTitle(f"Стрим: {nick}")
         self.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
         self.resize(1280, 720)
@@ -576,17 +490,14 @@ class VideoWindow(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # --- Контейнер для видео + оверлея (нужен для абсолютного позиционирования) ---
         self._video_container = QWidget(self)
         self._video_container.setMouseTracking(True)
         self._video_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         root.addWidget(self._video_container, stretch=1)
 
-        # OpenGL-поверхность заполняет весь контейнер
         self.surface = VideoSurface(self._video_container)
         self.surface.fullscreen_requested.connect(self.toggle_fullscreen)
 
-        # Оверлей поверх видео (абсолютное позиционирование внутри контейнера)
         self.overlay = VideoOverlay(self._video_container)
         self.overlay.mute_clicked.connect(self.overlay_mute_toggled)
         self.overlay.deafen_clicked.connect(self.overlay_deafen_toggled)
@@ -595,9 +506,8 @@ class VideoWindow(QWidget):
         self.overlay.stream_volume_changed.connect(self.overlay_stream_volume_changed)
         self.overlay.quality_changed.connect(self._on_quality_changed)
         self.overlay.soundboard_clicked.connect(self.open_soundboard)
-        self.overlay.hide()  # скрыт по умолчанию
+        self.overlay.hide()
 
-        # --- Тулбар статистики (снизу) ---
         self._bar = QWidget(self)
         self._bar.setFixedHeight(28)
         self._bar.setStyleSheet("background: #1a1a2e;")
@@ -622,14 +532,11 @@ class VideoWindow(QWidget):
         root.addWidget(self._bar)
 
     def _setup_hide_timer(self):
-        """Таймер авто-скрытия оверлея / курсора."""
+        """Инициализировать таймер авто-скрытия оверлея и курсора."""
         self._hide_timer = QTimer(self)
         self._hide_timer.setSingleShot(True)
         self._hide_timer.timeout.connect(self._on_hide_timeout)
 
-    # ------------------------------------------------------------------
-    # Геометрия: surface и overlay обновляются при каждом resizeEvent
-    # ------------------------------------------------------------------
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._reposition_surface()
@@ -640,11 +547,7 @@ class VideoWindow(QWidget):
         self.surface.setGeometry(0, 0, c.width(), c.height())
 
     def _reposition_overlay(self):
-        """
-        Центрировать оверлей горизонтально.
-        Прижать к нижнему краю контейнера с отступом 24 px.
-        Ширина подстраивается под содержимое (sizeHint).
-        """
+        """Центрировать оверлей горизонтально и прижать к нижнему краю контейнера."""
         c = self._video_container
         if c.width() <= 0 or c.height() <= 0:
             return
@@ -655,46 +558,37 @@ class VideoWindow(QWidget):
         self.overlay.setFixedWidth(ow)
         self.overlay.setGeometry(ox, oy, ow, oh)
 
-    # ------------------------------------------------------------------
-    # Авто-показ / авто-скрытие
-    # ------------------------------------------------------------------
     def _show_overlay(self):
         """Показать оверлей и перезапустить таймер скрытия."""
         self.setCursor(Qt.CursorShape.ArrowCursor)
         if not self.overlay.isVisible():
-            self._reposition_overlay()   # пересчитать позицию — на случай resize
+            self._reposition_overlay()
             self.overlay.show()
-            self.overlay.raise_()        # поверх surface
+            self.overlay.raise_()
         self._hide_timer.start(_HIDE_TIMEOUT_MS)
 
     def _on_hide_timeout(self):
-        """Скрыть оверлей по таймеру. В fullscreen — ещё и курсор."""
+        """Скрыть оверлей по таймеру. В fullscreen — также скрыть курсор."""
         self.overlay.hide()
         if self._is_fullscreen:
             self.setCursor(Qt.CursorShape.BlankCursor)
 
-    # ------------------------------------------------------------------
-    # Перехват mouseMoveEvent со всех дочерних виджетов через eventFilter
-    # ------------------------------------------------------------------
     def showEvent(self, event):
         super().showEvent(event)
-        # Устанавливаем фильтр на все виджеты, которые могут «поглощать» move
         for w in (self.surface, self.overlay, self._video_container):
             w.installEventFilter(self)
 
     def eventFilter(self, obj, event):
         if event.type() == QEvent.Type.MouseMove:
             self._show_overlay()
-        return False  # не поглощаем — пусть Qt продолжает обработку
+        return False
 
     def mouseMoveEvent(self, event):
         self._show_overlay()
         super().mouseMoveEvent(event)
 
-    # ------------------------------------------------------------------
-    # Полноэкранный режим
-    # ------------------------------------------------------------------
     def toggle_fullscreen(self):
+        """Переключить полноэкранный режим."""
         if self._is_fullscreen:
             self._exit_fullscreen()
         else:
@@ -713,9 +607,6 @@ class VideoWindow(QWidget):
         self.setCursor(Qt.CursorShape.ArrowCursor)
         self.showNormal()
 
-    # ------------------------------------------------------------------
-    # Клавиатура
-    # ------------------------------------------------------------------
     def keyPressEvent(self, event):
         key = event.key()
         if key in (Qt.Key.Key_F, Qt.Key.Key_F11):
@@ -725,66 +616,41 @@ class VideoWindow(QWidget):
         else:
             super().keyPressEvent(event)
 
-    # ------------------------------------------------------------------
-    # Кнопка «Прекратить просмотр»: сигнал + закрытие окна
-    # ------------------------------------------------------------------
     def _on_overlay_stop(self):
+        """Обработать нажатие «Прекратить просмотр» — эмитить сигнал и закрыть окно."""
         self.overlay_stop_watch.emit()
         self.close()
 
-    # ------------------------------------------------------------------
-    # Управление качеством видео
-    # ------------------------------------------------------------------
     def _on_quality_changed(self, skip_factor: int):
-        """
-        Вызывается при нажатии кнопки качества в оверлее.
-        Обновляет внутреннее состояние, метку тулбара,
-        затем пробрасывает skip_factor наружу через quality_changed.
+        """Обработать смену качества видео в оверлее.
 
-        Примечание: периодический IDR-таймер убран (FIX #6).
-        net.request_viewer_keyframe() — stub-метод, качество-маршрутизация
-        не реализована. Таймер каждые 2 сек вызывал no-op, создавая
-        бессмысленный шум в логах. Одиночный IDR-запрос при смене качества
-        (viewer_keyframe_needed.emit ниже) оставлен — он срабатывает через
-        реальный путь: сервер → request_keyframe → VideoEngine.force_keyframe().
+        :param skip_factor: коэффициент пропуска кадров (1=HD, 2=SD, 4=LQ)
         """
         self._quality_skip = skip_factor
         labels = {1: "🎯 HD", 2: "⚡ SD", 4: "📉 LQ"}
         self._lbl_quality.setText(f"Качество: {labels.get(skip_factor, str(skip_factor))}")
-
-        # Немедленный IDR-запрос: зритель сразу получит чистый I-frame
         self.viewer_keyframe_needed.emit()
-        # Уведомляем MainWindow → net.send_quality_request()
         self.quality_changed.emit(skip_factor)
 
-    # ------------------------------------------------------------------
-    # Публичный метод синхронизации состояния аудио с иконками оверлея
-    # ------------------------------------------------------------------
     def sync_audio_state(self, is_muted: bool, is_deafened: bool):
+        """Синхронизировать иконки оверлея с состоянием аудио.
+
+        :param is_muted: состояние микрофона
+        :param is_deafened: состояние звука
         """
-        Вызывать из MainWindow при изменении AudioHandler.is_muted / is_deafened,
-        чтобы иконки в оверлее отражали реальное состояние.
-        """
-        # Защита от гонки: сигнал может прийти уже после того, как Qt
-        # уничтожил C++ объекты (окно закрыто, но Python-лямбда ещё жива).
         if self._closing:
             return
         try:
             self.overlay.sync_mute_state(is_muted)
             self.overlay.sync_deafen_state(is_deafened)
         except RuntimeError:
-            # C++ объект уже удалён — игнорируем
             pass
 
-    # ------------------------------------------------------------------
-    # Публичный слот (совместим со старым кодом в ui_main.py)
-    # ------------------------------------------------------------------
     @pyqtSlot(QImage)
     def update_frame(self, q_img: QImage):
-        """
-        Потокобезопасный слот для приёма кадра от VideoEngine.
-        VideoEngine эмитит frame_received(int uid, QImage) —
-        MainWindow подключает сигнал к этому слоту.
+        """Принять кадр от VideoEngine и обновить статистику.
+
+        :param q_img: новый кадр
         """
         if q_img.isNull():
             return
@@ -809,16 +675,12 @@ class VideoWindow(QWidget):
         except Exception as e:
             print(f"[VideoWindow] Error updating frame: {e}")
 
-    # ------------------------------------------------------------------
-    # Вспомогательное
-    # ------------------------------------------------------------------
     def closeEvent(self, event):
-        """Перехватываем закрытие окна, испускаем сигнал до уничтожения объекта."""
-        self._closing = True         # блокируем sync_audio_state от внешних сигналов
-        self._idr_timer.stop()       # останавливаем IDR-таймер
-        self._hide_timer.stop()      # останавливаем таймер авто-скрытия
+        """Освободить ресурсы и эмитить window_closed при закрытии окна."""
+        self._closing = True
+        self._idr_timer.stop()
+        self._hide_timer.stop()
 
-        # Закрываем SoundboardPanel если открыта
         try:
             if self._sb_panel is not None:
                 self._sb_panel.close()
@@ -826,17 +688,12 @@ class VideoWindow(QWidget):
         except (RuntimeError, AttributeError):
             self._sb_panel = None
 
-        # FIX MEM: явно очищаем последний кадр (QImage = ~3.7 МБ для 1280×720 RGB).
-        # Без этого _current_image держался до уничтожения VideoSurface объекта,
-        # что при deleteLater() может произойти не сразу.
-        # После очистки OpenGL текстура тоже освобождается при следующем paintGL().
         if hasattr(self, 'surface') and self.surface is not None:
             try:
                 self.surface._current_image = None
             except RuntimeError:
                 pass
 
-        # Останавливаем таймер попапа громкости
         if hasattr(self, 'overlay') and self.overlay is not None:
             try:
                 self.overlay._vol_hide_timer.stop()
@@ -850,4 +707,4 @@ class VideoWindow(QWidget):
         super().closeEvent(event)
 
     def sizeHint(self) -> QSize:
-        return QSize(1280, 748)  # 720 + 28px тулбар
+        return QSize(1280, 748)

@@ -1,73 +1,72 @@
 import threading
 import queue
 import math
+import struct
+import time
 from collections import deque
+from typing import Optional
+
 import numpy as np
 import sounddevice as sd
 import opuslib
 import heapq
-import struct
-import time
-# ── Встроенная замена scipy.signal (butter / sosfilt / sosfilt_zi) ─────────────
-# Причина: scipy.signal при импорте транзитивно подтягивает scipy.stats, которая
-# содержит exec()-генерацию в _distn_infrastructure.py. В замороженном exe
-# (PyInstaller) имя 'obj' теряется из exec()-контекста → NameError на старте.
-# collect_submodules/collect_data_files не устраняют эту проблему.
-#
-# Данная реализация покрывает ровно три вызова этого файла:
-#   butter(4, 1200, btype='low', fs=48000, output='sos')
+
+from PyQt6.QtCore import QObject, pyqtSignal, QSettings
+from config import *
+
+# ── Встроенная замена scipy.signal (butter / sosfilt / sosfilt_zi) ──────────
+# scipy.stats содержит exec()-генерацию в _distn_infrastructure.py,
+# которая ломает замороженный exe (PyInstaller) с NameError на старте.
+# Покрывает ровно три вызова этого файла:
+#   butter(4, 1200/4000, btype='low', fs=48000, output='sos')
 #   sosfilt(sos, x, zi=zi)
 #   sosfilt_zi(sos)
-# Алгоритм: аналоговый прототип Баттерворта → bilinear transform → SOS.
 
-def butter(order: int, cutoff_hz, btype: str = 'low',
+
+def butter(order: int, cutoff_hz: float, btype: str = 'low',
            fs: float = None, output: str = 'ba') -> np.ndarray:
-    """
-    Butterworth LP-фильтр → SOS матрица.
-    Поддерживает только btype='low', output='sos'.
+    """Butterworth низкочастотный фильтр → SOS-матрица.
+
+        :param order: порядок фильтра
+        :param cutoff_hz: частота среза в Гц
+        :param btype: тип фильтра (только 'low')
+        :param fs: частота дискретизации в Гц
+        :param output: формат вывода (только 'sos')
+        :return: SOS-матрица (n_sec, 6)
     """
     if btype != 'low' or output != 'sos':
         raise NotImplementedError("butter(): только btype='low', output='sos'")
     if fs is None:
         raise ValueError("butter(): требуется параметр fs")
 
-    Wn  = float(cutoff_hz) / (fs * 0.5)          # нормированная (0..1, 1=Найквист)
-    wa  = 2.0 * np.tan(np.pi * Wn * 0.5)         # pre-warp → аналоговая частота
+    Wn = float(cutoff_hz) / (fs * 0.5)
+    wa = 2.0 * np.tan(np.pi * Wn * 0.5)          # pre-warp → аналоговая частота
 
-    # Аналоговые полюсы Баттерворта (левая полуплоскость, |p|=1)
-    k       = np.arange(order)
-    poles_a = np.exp(1j * np.pi * (2.0*k + order + 1.0) / (2.0 * order))
-    poles_a = poles_a * wa                        # масштаб по частоте среза
+    # Аналоговые полюсы Баттерворта (левая полуплоскость)
+    k = np.arange(order)
+    poles_a = np.exp(1j * np.pi * (2.0 * k + order + 1.0) / (2.0 * order)) * wa
 
-    # Bilinear transform z = (1 + s/2) / (1 - s/2)
-    # Все нули аналогового LP → z = -1 после преобразования
-    z_d    = (1.0 + 0.5*poles_a) / (1.0 - 0.5*poles_a)
+    # Bilinear transform; все нули LP → z = -1
+    z_d = (1.0 + 0.5 * poles_a) / (1.0 - 0.5 * poles_a)
     zeros_d = np.full(order, -1.0 + 0j)
 
-    # Сортируем по убыванию Im, чтобы сопряжённые пары стояли рядом
     idx = np.argsort(-z_d.imag)
     z_d = z_d[idx]
 
     n_sec = order // 2
-    sos   = np.zeros((n_sec, 6))
+    sos = np.zeros((n_sec, 6))
 
     for i in range(n_sec):
-        p1, p2 = z_d[i],      z_d[-(i+1)]        # сопряжённая пара полюсов
-        z1, z2 = zeros_d[2*i], zeros_d[2*i+1]    # нули (-1, -1)
-
-        b = np.real(np.poly([z1, z2]))             # числитель:  [1, -(z1+z2), z1*z2]
-        a = np.real(np.poly([p1, p2]))             # знаменатель:[1, -(p1+p2), p1*p2]
-
+        p1, p2 = z_d[i], z_d[-(i + 1)]
+        z1, z2 = zeros_d[2 * i], zeros_d[2 * i + 1]
+        b = np.real(np.poly([z1, z2]))
+        a = np.real(np.poly([p1, p2]))
         sos[i, :3] = b
         sos[i, 3:] = a
 
-    # Нормируем общий DC-gain (H(z=1)) к 1.0.
-    # Считаем текущий gain и распределяем коррекцию равномерно по секциям.
-    section_gains = np.array([
-        np.sum(sos[i, :3]) / np.sum(sos[i, 3:]) for i in range(n_sec)
-    ])
-    total_gain = np.prod(section_gains)
-    per_sec_corr = total_gain ** (1.0 / n_sec)
+    # Нормируем DC-gain к 1.0 равномерно по секциям
+    section_gains = np.array([np.sum(sos[i, :3]) / np.sum(sos[i, 3:]) for i in range(n_sec)])
+    per_sec_corr = np.prod(section_gains) ** (1.0 / n_sec)
     for i in range(n_sec):
         sos[i, :3] /= per_sec_corr
 
@@ -75,26 +74,29 @@ def butter(order: int, cutoff_hz, btype: str = 'low',
 
 
 def sosfilt(sos: np.ndarray, x: np.ndarray,
-            zi: np.ndarray = None):
+            zi: np.ndarray = None) -> tuple:
+    """Применяет SOS-фильтр (Direct Form II Transposed).
+
+        :param sos: SOS-матрица коэффициентов
+        :param x: входной сигнал
+        :param zi: начальные условия фильтра
+        :return: (y, zf) — отфильтрованный сигнал и конечные условия
     """
-    Применяет SOS-фильтр к сигналу x. Возвращает (y, zf).
-    Direct Form II Transposed (DF2T) — совместимо с scipy.signal.sosfilt.
-    """
-    x   = np.asarray(x, dtype=np.float64)
+    x = np.asarray(x, dtype=np.float64)
     n_s = sos.shape[0]
-    zf  = (np.zeros((n_s, 2), dtype=np.float64)
-           if zi is None else np.array(zi, dtype=np.float64))
-    y   = x.copy()
+    zf = (np.zeros((n_s, 2), dtype=np.float64)
+          if zi is None else np.array(zi, dtype=np.float64))
+    y = x.copy()
 
     for i in range(n_s):
         b0, b1, b2, _, a1, a2 = sos[i]
         s1, s2 = zf[i, 0], zf[i, 1]
         out = np.empty_like(y)
-        for n in range(len(y)):                    # hot-path: 960 итераций × 2 секции
-            v      = y[n]
+        for n in range(len(y)):
+            v = y[n]
             out[n] = b0 * v + s1
-            s1     = b1 * v - a1 * out[n] + s2
-            s2     = b2 * v - a2 * out[n]
+            s1 = b1 * v - a1 * out[n] + s2
+            s2 = b2 * v - a2 * out[n]
         zf[i, 0], zf[i, 1] = s1, s2
         y = out
 
@@ -102,47 +104,36 @@ def sosfilt(sos: np.ndarray, x: np.ndarray,
 
 
 def sosfilt_zi(sos: np.ndarray) -> np.ndarray:
+    """Начальные условия для sosfilt (steady-state при unit step, DF2T).
+
+        :param sos: SOS-матрица коэффициентов
+        :return: начальные условия формы (n_sections, 2)
     """
-    Начальные условия для sosfilt (unit step, без переходного процесса).
-    DF2T steady-state при x=1: zi[i] = [s1_ss, s2_ss] для каждой секции.
-    """
-    n_s  = sos.shape[0]
-    zi   = np.zeros((n_s, 2), dtype=np.float64)
-    scale = 1.0                                    # накопленный gain от предыдущих секций
+    n_s = sos.shape[0]
+    zi = np.zeros((n_s, 2), dtype=np.float64)
+    scale = 1.0
 
     for i in range(n_s):
         b0, b1, b2, _, a1, a2 = sos[i]
-        K       = (b0 + b1 + b2) / (1.0 + a1 + a2)   # DC gain этой секции
-        zi[i,1] = (b2 - a2 * K) * scale               # s2 в steady-state
-        zi[i,0] = (b1 - a1 * K) * scale + zi[i,1]     # s1 в steady-state
-        scale  *= K                                    # выход → вход следующей секции
+        K = (b0 + b1 + b2) / (1.0 + a1 + a2)
+        zi[i, 1] = (b2 - a2 * K) * scale
+        zi[i, 0] = (b1 - a1 * K) * scale + zi[i, 1]
+        scale *= K
 
     return zi
-from PyQt6.QtCore import QObject, pyqtSignal, QSettings
-from config import *
 
-# ---------------------------------------------------------------------------
-# Предвычисленные SOS-матрицы фильтров — константы модуля.
-# Вычисляются ОДИН РАЗ при импорте (не при каждом __init__ AudioHandler).
-# Параметры фиксированы: SAMPLE_RATE=48000 Гц, order=4, Butterworth LP.
-#   _WLP_SOS    — fc=1200 Гц, для эффекта «рация» (legacy, не используется в prod)
-#   _ANON_LP_SOS — fc=4000 Гц, для эффекта «анонимный голос» (whisper receiver side)
-# ---------------------------------------------------------------------------
-_WLP_SOS     = butter(4, 1200, btype='low', fs=48000, output='sos')
-_ANON_LP_SOS = butter(4, 4000, btype='low', fs=48000, output='sos')
+
+# Предвычисленные SOS-матрицы — один раз при импорте модуля
+_WLP_SOS = butter(4, 1200, btype='low', fs=48000, output='sos')   # whisper-эффект
+_ANON_LP_SOS = butter(4, 4000, btype='low', fs=48000, output='sos')  # анонимный голос
 
 try:
     from pyrnnoise import RNNoise
-
     PYRNNOISE_AVAILABLE = True
 except ImportError:
     PYRNNOISE_AVAILABLE = False
     print("[Audio] Внимание: Модуль pyrnnoise не найден.")
 
-# pyaudiowpatch — форк PyAudio с официальным патчем WASAPI Loopback для Windows.
-# Содержит флаг isLoopbackDevice в device info — единственный надёжный способ
-# отличить loopback endpoint от реального микрофона.
-# Установка: pip install pyaudiowpatch
 try:
     import pyaudiowpatch as _pyaudio
     PYAUDIOWPATCH_AVAILABLE = True
@@ -155,52 +146,44 @@ except ImportError:
 
 
 class StreamAudioCapture:
-    """
-    Захват системного аудио через WASAPI Loopback для трансляции зрителям.
+    """Захват системного аудио через WASAPI Loopback для трансляции зрителям.
 
-    Открывает loopback-поток на выбранном устройстве вывода Windows (динамики /
-    наушники), кодирует в Opus и кладёт готовые пакеты в send_queue с флагом
-    FLAG_STREAM_AUDIO. Зрители слышат именно то, что играет на экране стримера
-    (игры, музыку, системные звуки).
+    Открывает loopback-поток на выбранном устройстве вывода Windows,
+    кодирует в Opus и кладёт пакеты в send_queue с флагом FLAG_STREAM_AUDIO.
 
-    Жизненный цикл:
-        capture = StreamAudioCapture(send_queue, lambda: audio.my_uid)
-        capture.start(device_idx=2)   # перед стримом
-        capture.stop()                # после остановки стрима
+    Приоритет стратегий захвата:
+        0. VB-CABLE (CABLE Output) — чистый звук без AEC
+        A. pyaudiowpatch (WASAPI Loopback, isLoopbackDevice)
+        B. sounddevice WasapiSettings(loopback=True)
     """
 
-    def __init__(self, send_queue, uid_getter):
+    def __init__(self, send_queue: queue.Queue, uid_getter):
         self.send_queue = send_queue
         self.get_uid = uid_getter
         self._running = threading.Event()
-        self._thread = None
+        self._thread: Optional[threading.Thread] = None
         self.encoder = opuslib.Encoder(SAMPLE_RATE, CHANNELS, OPUS_APPLICATION)
         self.encoder.bitrate = DEFAULT_BITRATE
         self.encoder.complexity = 5
         self._sequence = 0
         self._native_sr: int = SAMPLE_RATE
+        self._using_vbcable: bool = False
 
-        # Промежуточный буфер для сборки точных 20ms фреймов (CHUNK_SIZE).
-        # Предаллоцируем с запасом 8× CHUNK_SIZE — ни разу не растём при обычной работе.
-        # self._pcm_len — логическая длина данных в буфере (не size буфера).
-        # Это устраняет np.concatenate (50x/сек) → 0 аллокаций в hot path.
+        # Предаллоцированный буфер для сборки точных 20 мс фреймов (CHUNK_SIZE)
         self._pcm_buf = np.empty(CHUNK_SIZE * 8, dtype=np.float32)
         self._pcm_len = 0
         self._buffer_lock = threading.Lock()
-        # True когда захват идёт из CABLE Output (VB-CABLE).
-        # В этом режиме AEC полностью отключён — голосов в CABLE Output нет физически.
-        self._using_vbcable: bool = False
 
-        # Локальный мониторинг VB-CABLE: очередь сырых PCM-фреймов,
-        # которые параллельно с отправкой зрителям воспроизводятся
-        # в реальные наушники стримера.  None — мониторинг не запущен.
-        self._vbcable_monitor_queue: "queue.Queue | None" = None
-        # Громкость локального мониторинга: 1.0 = оригинал.
-        # Можно снизить если стример хочет слышать игру тише чем зрители.
+        # Очередь локального мониторинга VB-CABLE; None — мониторинг не запущен
+        self._vbcable_monitor_queue: Optional[queue.Queue] = None
         self.monitor_volume: float = 1.0
 
     @staticmethod
-    def list_wasapi_output_devices():
+    def list_wasapi_output_devices() -> list:
+        """Возвращает список WASAPI output-устройств.
+
+            :return: список кортежей (имя, индекс)
+        """
         result = []
         try:
             apis = sd.query_hostapis()
@@ -215,9 +198,12 @@ class StreamAudioCapture:
             print(f"[StreamAudio] list_wasapi_output_devices error: {e}")
         return result
 
-    def start(self, device_idx=None):
+    def start(self, device_idx: Optional[int] = None):
+        """Запускает захват в фоновом потоке.
+
+            :param device_idx: индекс WASAPI output-устройства; None — автовыбор
+        """
         self.stop()
-        # Сброс буфера при старте — данные от прошлого сеанса не нужны
         with self._buffer_lock:
             self._pcm_len = 0
         self._running.set()
@@ -230,17 +216,24 @@ class StreamAudioCapture:
         self._thread.start()
 
     def stop(self):
+        """Останавливает захват и ждёт завершения потока."""
         self._running.clear()
         if self._thread:
             self._thread.join(timeout=2)
             self._thread = None
 
-    def _resolve_device(self, device_idx):
+    def _resolve_device(self, device_idx: Optional[int]) -> Optional[int]:
+        """Находит валидный WASAPI output-индекс.
+
+            :param device_idx: предпочтительный индекс; None — автовыбор
+            :return: индекс устройства или None
+        """
         try:
             apis = sd.query_hostapis()
             devs = sd.query_devices()
             w_idx = next((i for i, a in enumerate(apis) if 'WASAPI' in a['name']), None)
-            if w_idx is None: return None
+            if w_idx is None:
+                return None
 
             if device_idx is not None and device_idx < len(devs):
                 d = devs[device_idx]
@@ -262,19 +255,11 @@ class StreamAudioCapture:
             pass
         return None
 
-    # ------------------------------------------------------------------
-    # Стратегия A: pyaudiowpatch (главная — единственная надёжная)
-    # ------------------------------------------------------------------
     def _try_pyaudiowpatch(self, target_name: str) -> bool:
-        """
-        Использует pyaudiowpatch для захвата WASAPI Loopback.
+        """Захват WASAPI Loopback через pyaudiowpatch (стратегия A).
 
-        pyaudiowpatch патчирует PortAudio на уровне IAudioClient и добавляет
-        флаг isLoopbackDevice в device_info — только так можно достоверно
-        отличить loopback endpoint от реального микрофона.
-
-        target_name — имя OUTPUT-устройства, чей loopback нужно захватить.
-        Возвращает True если поток успешно открыт и отработал до stop().
+            :param target_name: имя OUTPUT-устройства для захвата
+            :return: True если захват успешно запущен и отработал до stop()
         """
         if not PYAUDIOWPATCH_AVAILABLE:
             return False
@@ -284,7 +269,6 @@ class StreamAudioCapture:
         try:
             pa = _pyaudio.PyAudio()
 
-            # 1. Найти WASAPI host API
             wasapi_idx = None
             for i in range(pa.get_host_api_count()):
                 info = pa.get_host_api_info_by_index(i)
@@ -295,39 +279,27 @@ class StreamAudioCapture:
                 print("[StreamAudio] [A] WASAPI host API не найден в pyaudiowpatch")
                 return False
 
-            # 2. Найти loopback device, соответствующий target output
-            #    Порядок: точное совпадение → частичное → первый попавшийся isLoopback
-            loopback_dev = None
-            target_lower = target_name.lower()
-
-            candidates = []
-            for i in range(pa.get_device_count()):
-                d = pa.get_device_info_by_index(i)
-                if not d.get('isLoopbackDevice', False):
-                    continue
-                if d.get('hostApi') != wasapi_idx:
-                    continue
-                candidates.append(d)
+            candidates = [
+                pa.get_device_info_by_index(i)
+                for i in range(pa.get_device_count())
+                if pa.get_device_info_by_index(i).get('isLoopbackDevice', False)
+                and pa.get_device_info_by_index(i).get('hostApi') == wasapi_idx
+            ]
 
             if not candidates:
                 print("[StreamAudio] [A] pyaudiowpatch: loopback-устройства не найдены")
                 return False
 
-            # Точное совпадение имени
-            for d in candidates:
-                if d['name'].lower() == target_lower:
-                    loopback_dev = d
-                    break
-            # Частичное совпадение
-            if loopback_dev is None:
-                for d in candidates:
-                    dev_lower = d['name'].lower()
-                    if target_lower in dev_lower or dev_lower in target_lower:
-                        loopback_dev = d
-                        break
-            # Первый доступный
-            if loopback_dev is None:
-                loopback_dev = candidates[0]
+            target_lower = target_name.lower()
+            loopback_dev = next(
+                (d for d in candidates if d['name'].lower() == target_lower), None
+            ) or next(
+                (d for d in candidates
+                 if target_lower in d['name'].lower() or d['name'].lower() in target_lower),
+                None
+            ) or candidates[0]
+
+            if loopback_dev == candidates[0] and loopback_dev['name'].lower() != target_lower:
                 print(f"[StreamAudio] [A] Точного совпадения нет, берём первый loopback: "
                       f"«{loopback_dev['name']}»")
 
@@ -335,17 +307,14 @@ class StreamAudioCapture:
             sr = int(loopback_dev.get('defaultSampleRate', SAMPLE_RATE))
             self._native_sr = sr
 
-            print(f"[StreamAudio] [A] pyaudiowpatch loopback device: "
+            print(f"[StreamAudio] [A] pyaudiowpatch loopback: "
                   f"«{loopback_dev['name']}» idx={loopback_dev['index']} ch={ch} sr={sr}")
 
-            # 3. Открыть поток с callback
             def _pa_callback(in_data, frame_count, time_info, status):
                 if not self._running.is_set():
                     return (None, _pyaudio.paComplete)
                 try:
-                    arr = np.frombuffer(in_data, dtype=np.float32).copy()
-                    # reshape к (frames, channels) чтобы _audio_cb мог усреднить каналы
-                    arr = arr.reshape(-1, ch)
+                    arr = np.frombuffer(in_data, dtype=np.float32).copy().reshape(-1, ch)
                     self._audio_cb(arr, frame_count, time_info, status)
                 except Exception:
                     pass
@@ -387,20 +356,13 @@ class StreamAudioCapture:
                 except Exception:
                     pass
 
-    # ------------------------------------------------------------------
-    # Стратегия B: sounddevice + WasapiSettings(loopback=True)
-    # Работает только если PortAudio собран с поддержкой WASAPI loopback.
-    # На Sound Blaster Play! 4 и многих других картах ПАДАЕТ с -9998,
-    # потому что PortAudio проверяет max_input_channels==0 ДО того как
-    # применить loopback-флаг к IAudioClient.
-    # ------------------------------------------------------------------
     def _try_sounddevice_loopback(self, resolved: int, native_ch: int) -> bool:
+        """Захват WASAPI Loopback через sounddevice WasapiSettings (стратегия B).
+
+            :param resolved: индекс sounddevice OUTPUT-устройства
+            :param native_ch: число каналов устройства
+            :return: True если захват успешно запущен и отработал до stop()
         """
-        Пробует открыть OUTPUT-устройство как loopback через sounddevice.
-        Перебирает несколько сигнатур WasapiSettings и несколько channel counts.
-        Возвращает True если успешно.
-        """
-        # Построить WasapiSettings — перебираем сигнатуры (разные версии sd)
         wasapi_settings = None
         for factory in [
             lambda: sd.WasapiSettings(loopback=True),
@@ -426,12 +388,12 @@ class StreamAudioCapture:
         for ch in list(dict.fromkeys([native_ch, 2, 1])):
             try:
                 with sd.InputStream(
-                        device=resolved,
-                        samplerate=self._native_sr,
-                        channels=ch,
-                        dtype='float32',
-                        extra_settings=wasapi_settings,
-                        callback=self._audio_cb,
+                    device=resolved,
+                    samplerate=self._native_sr,
+                    channels=ch,
+                    dtype='float32',
+                    extra_settings=wasapi_settings,
+                    callback=self._audio_cb,
                 ):
                     print(f"[StreamAudio] ✔ [B] sounddevice loopback (ch={ch} sr={self._native_sr})")
                     while self._running.is_set():
@@ -441,36 +403,25 @@ class StreamAudioCapture:
                 print(f"[StreamAudio] [B] Не удалось с channels={ch}: {e}")
         return False
 
-    # ------------------------------------------------------------------
-    # Стратегия 0: VB-CABLE — приоритет над всеми остальными методами
-    # ------------------------------------------------------------------
     def _try_vbcable(self) -> bool:
-        """
-        Захватывает звук из «CABLE Output» как обычное INPUT-устройство.
+        """Захват звука из «CABLE Output» как обычного INPUT-устройства (стратегия 0).
 
-        Архитектура VB-CABLE:
-          «CABLE Input»  — виртуальный ВЫВОД (куда игра выводит звук)
-          «CABLE Output» — виртуальный ВВОД  (откуда мы читаем)
+        VB-CABLE: CABLE Input — виртуальный вывод (игра), CABLE Output — виртуальный ввод.
+        Голоса зрителей физически отсутствуют в CABLE Output → AEC не нужен.
 
-        Связь между ними: всё что подаётся на CABLE Input,
-        сразу появляется на CABLE Output. Голоса зрителей НЕ подаются
-        на CABLE Input никогда → CABLE Output математически чист → AEC не нужен,
-        ducking не нужен, эхо невозможно как явление.
-
-        device_idx игнорируется — устройство находится по имени автоматически.
-        Возвращает True если поток открыт и проработал до stop().
+            :return: True если захват успешно запущен и отработал до stop()
         """
         cable_idx = None
-        cable_ch  = 2
-        cable_sr  = SAMPLE_RATE
+        cable_ch = 2
+        cable_sr = SAMPLE_RATE
 
         try:
             devs = sd.query_devices()
             for i, d in enumerate(devs):
                 if 'cable output' in d['name'].lower() and d['max_input_channels'] > 0:
                     cable_idx = i
-                    cable_ch  = max(1, int(d['max_input_channels']))
-                    cable_sr  = int(d.get('default_samplerate', SAMPLE_RATE))
+                    cable_ch = max(1, int(d['max_input_channels']))
+                    cable_sr = int(d.get('default_samplerate', SAMPLE_RATE))
                     print(f"[StreamAudio] [VB-CABLE] Найден: «{d['name']}» "
                           f"idx={i} ch={cable_ch} sr={cable_sr}")
                     break
@@ -480,36 +431,28 @@ class StreamAudioCapture:
                       "пробуем WASAPI Loopback")
                 return False
 
-            self._native_sr     = cable_sr
+            self._native_sr = cable_sr
             self._using_vbcable = True
 
-            # ── Локальный мониторинг: стример слышит игру в наушниках ──────────
-            # Открываем OutputStream на устройство вывода по умолчанию.
-            # Callback читает сырые фреймы из _vbcable_monitor_queue (заполняется
-            # в _audio_cb) и прокидывает их в наушники. Если очередь пуста —
-            # тишина (не блокируемся). cable_ch и cable_sr совпадают с InputStream,
-            # поэтому ресемплинг не нужен.
-            monitor_q: "queue.Queue" = queue.Queue(maxsize=80)
+            monitor_q: queue.Queue = queue.Queue(maxsize=80)
             self._vbcable_monitor_queue = monitor_q
-            _mon_vol_ref = [self.monitor_volume]  # mutable ref для closure
 
             def _monitor_out_cb(outdata, frames, time_info, status):
                 try:
-                    raw = monitor_q.get_nowait()  # shape: (frames, cable_ch)
+                    raw = monitor_q.get_nowait()
                     vol = self.monitor_volume
                     if raw.shape == outdata.shape:
                         np.multiply(raw, vol, out=outdata)
                     else:
-                        # Разное кол-во каналов: микшируем в mono и раскладываем
-                        mono = np.mean(raw, axis=1, keepdims=True) if raw.ndim > 1 else raw.reshape(-1, 1)
+                        mono = (np.mean(raw, axis=1, keepdims=True)
+                                if raw.ndim > 1 else raw.reshape(-1, 1))
                         outdata[:] = np.repeat(mono, outdata.shape[1], axis=1) * vol
                 except Exception:
-                    outdata.fill(0)  # очередь пуста или ошибка — тишина
+                    outdata.fill(0)
 
-            # Определяем кол-во каналов дефолтного вывода
             try:
                 _out_ch = max(1, int(sd.query_devices(kind='output')['max_output_channels']))
-                _out_ch = min(_out_ch, cable_ch)  # не больше чем захватываем
+                _out_ch = min(_out_ch, cable_ch)
             except Exception:
                 _out_ch = cable_ch
 
@@ -521,8 +464,7 @@ class StreamAudioCapture:
                 blocksize=CHUNK_SIZE,
                 callback=self._audio_cb,
             ):
-                print("[StreamAudio] ✔ [VB-CABLE] Захват запущен — "
-                      "чистый звук без AEC и ducking")
+                print("[StreamAudio] ✔ [VB-CABLE] Захват запущен — чистый звук без AEC и ducking")
                 try:
                     with sd.OutputStream(
                         samplerate=cable_sr,
@@ -532,13 +474,12 @@ class StreamAudioCapture:
                         callback=_monitor_out_cb,
                     ):
                         print(f"[StreamAudio] ✔ [VB-CABLE] Локальный мониторинг запущен "
-                              f"(ch={_out_ch} sr={cable_sr}) — стример слышит игру в наушниках")
+                              f"(ch={_out_ch} sr={cable_sr})")
                         while self._running.is_set():
                             time.sleep(0.05)
                 except Exception as e_mon:
-                    # Мониторинг не удался (редкий случай) — стрим продолжается без него
                     print(f"[StreamAudio] [VB-CABLE] Мониторинг недоступен: {e_mon}\n"
-                          f"  Захват зрителям продолжается, но стример не слышит игру локально.")
+                          f"  Захват зрителям продолжается без локального мониторинга.")
                     while self._running.is_set():
                         time.sleep(0.05)
             return True
@@ -548,16 +489,17 @@ class StreamAudioCapture:
             return False
         finally:
             self._using_vbcable = False
-            self._vbcable_monitor_queue = None  # сбрасываем ссылку на очередь
+            self._vbcable_monitor_queue = None
 
-    def _capture_loop(self, device_idx):
-        # ── Стратегия 0: VB-CABLE (ПРИОРИТЕТ) ─────────────────────────────────
-        # CABLE Output = чистый игровой звук, голосов зрителей там нет → эхо невозможно.
+    def _capture_loop(self, device_idx: Optional[int]):
+        """Основной цикл захвата — перебирает стратегии по приоритету.
+
+            :param device_idx: предпочтительный индекс WASAPI output-устройства
+        """
         if self._try_vbcable():
             print("[StreamAudio] Захват остановлен [0/VB-CABLE]")
             return
 
-        # ── Стратегии A/B: WASAPI Loopback (запасной путь) ────────────────────
         resolved = self._resolve_device(device_idx)
         if resolved is None:
             print("[StreamAudio] Подходящее WASAPI OUTPUT-устройство не найдено")
@@ -571,28 +513,25 @@ class StreamAudioCapture:
         print(f"[StreamAudio] Целевое устройство: «{output_name}» "
               f"(sd_idx={resolved}, ch={native_ch}, sr={self._native_sr})")
 
-        # ── Стратегия A: pyaudiowpatch ─────────────────────────────────────
-        # Единственный надёжный метод: использует isLoopbackDevice,
-        # не захватывает микрофоны случайно.
         if self._try_pyaudiowpatch(output_name):
             print("[StreamAudio] Loopback поток остановлен [A/pyaudiowpatch]")
             return
 
-        # ── Стратегия B: sounddevice WasapiSettings(loopback=True) ─────────
-        # Работает на части конфигураций, падает с -9998 на Sound Blaster и др.
         if self._try_sounddevice_loopback(resolved, native_ch):
             print("[StreamAudio] Loopback поток остановлен [B/sounddevice]")
             return
 
-        # ── Ничего не сработало ─────────────────────────────────────────────
         print(
             "[StreamAudio] ✖ WASAPI Loopback захватить не удалось.\n"
             "  Решение: pip install pyaudiowpatch\n"
             "  Подробнее: https://github.com/s0d3s/PyAudioWPatch"
         )
-        print("[StreamAudio] Loopback поток остановлен")
 
-    def _audio_cb(self, indata, frames, time_info, status):
+    def _audio_cb(self, indata: np.ndarray, frames, time_info, status):
+        """PortAudio callback — конвертирует фреймы в Opus и кладёт в send_queue.
+
+            :param indata: входные PCM-данные (frames, channels) float32
+        """
         if not self._running.is_set():
             return
 
@@ -600,25 +539,17 @@ class StreamAudioCapture:
         if uid == 0:
             return
 
-        # ── Локальный мониторинг VB-CABLE ──────────────────────────────────────
-        # Сырой фрейм (до любой обработки) кладём в очередь мониторинга.
-        # Параллельный sd.OutputStream в _try_vbcable читает её и воспроизводит
-        # в реальные наушники стримера — он слышит игру так же как и зрители,
-        # но через отдельный путь без задержки encode/decode.
-        # Блок работает ТОЛЬКО когда _using_vbcable=True и очередь создана.
+        # Локальный мониторинг VB-CABLE: сырой фрейм → наушники стримера
         if self._using_vbcable and self._vbcable_monitor_queue is not None:
             try:
                 self._vbcable_monitor_queue.put_nowait(indata.copy())
             except Exception:
-                pass  # очередь полна — дроп, не критично (20ms потери)
+                pass
 
         try:
-            if indata.ndim > 1 and indata.shape[1] > 1:
-                mono = np.mean(indata, axis=1)
-            else:
-                mono = indata.flatten()
+            mono = np.mean(indata, axis=1) if (indata.ndim > 1 and indata.shape[1] > 1) \
+                else indata.flatten()
 
-            # Ресемплинг
             if self._native_sr != SAMPLE_RATE:
                 target_len = int(round(len(mono) * SAMPLE_RATE / self._native_sr))
                 if target_len > 0:
@@ -627,12 +558,9 @@ class StreamAudioCapture:
                     mono = np.interp(x_new, x_old, mono).astype(np.float32)
 
             with self._buffer_lock:
-                # ── Записываем семплы в предаллоцированный буфер ────────────────
-                # Аллокации нет — просто копируем в уже существующий массив.
                 incoming = len(mono)
                 needed = self._pcm_len + incoming
                 if needed > len(self._pcm_buf):
-                    # Буфер переполнен (редко): увеличиваем вдвое
                     new_size = max(needed, len(self._pcm_buf) * 2)
                     new_buf = np.empty(new_size, dtype=np.float32)
                     new_buf[:self._pcm_len] = self._pcm_buf[:self._pcm_len]
@@ -640,31 +568,29 @@ class StreamAudioCapture:
                 self._pcm_buf[self._pcm_len:self._pcm_len + incoming] = mono
                 self._pcm_len += incoming
 
-                # Откусываем строго по CHUNK_SIZE (960 семплов = 20мс) и отправляем
                 while self._pcm_len >= CHUNK_SIZE:
                     chunk = self._pcm_buf[:CHUNK_SIZE].copy()
-                    # Сдвигаем остаток влево (numpy делает это на C-уровне)
                     self._pcm_len -= CHUNK_SIZE
                     self._pcm_buf[:self._pcm_len] = self._pcm_buf[CHUNK_SIZE:CHUNK_SIZE + self._pcm_len]
 
-                    # ── Отправляем чанк зрителям ───────────────────────────
-                    # VB-CABLE физически не содержит голосов зрителей →
-                    # AEC не нужен, эхо невозможно как явление.
                     pcm = (chunk * 32767).astype(np.int16).tobytes()
                     encoded = self.encoder.encode(pcm, CHUNK_SIZE)
-
                     self._sequence += 1
                     flags = FLAG_STREAM_AUDIO | FLAG_LOOPBACK_AUDIO
-                    # Используем прекомпилированный struct вместо struct.pack('!IdIB', ...)
                     packet = UDP_HEADER_STRUCT.pack(uid, time.time(), self._sequence, flags) + encoded
                     self.send_queue.put_nowait(packet)
 
-        except Exception as e:
+        except Exception:
             pass
 
 
 class JitterBuffer:
-    def __init__(self, target_delay=4):
+    """Буфер с сортировкой по sequence number для компенсации джиттера сети."""
+
+    def __init__(self, target_delay: int = 4):
+        """
+            :param target_delay: минимальное накопленное число пакетов перед воспроизведением
+        """
         self.buffer = []
         self.target_delay = target_delay
         self.last_seq = -1
@@ -672,7 +598,12 @@ class JitterBuffer:
         self.is_buffering = True
         self.max_size = 50
 
-    def add(self, seq, data):
+    def add(self, seq: int, data: bytes):
+        """Добавляет пакет в буфер; дубли и устаревшие пакеты отбрасываются.
+
+            :param seq: порядковый номер пакета
+            :param data: Opus-данные
+        """
         with self._lock:
             if seq <= self.last_seq and self.last_seq != -1:
                 return
@@ -680,7 +611,11 @@ class JitterBuffer:
             if len(self.buffer) > self.max_size:
                 heapq.heappop(self.buffer)
 
-    def get(self):
+    def get(self) -> Optional[bytes]:
+        """Извлекает следующий пакет с наименьшим seq.
+
+            :return: Opus-данные или None если буфер пуст/накапливается
+        """
         with self._lock:
             if not self.buffer:
                 self.is_buffering = True
@@ -698,78 +633,69 @@ class JitterBuffer:
 
 
 class RemoteUser:
-    def __init__(self, uid):
+    """Состояние удалённого участника: буфер, декодер, громкость."""
+
+    def __init__(self, uid: int):
+        """
+            :param uid: уникальный идентификатор пользователя
+        """
         self.uid = uid
         self.jitter_buffer = JitterBuffer()
         self.decoder = opuslib.Decoder(SAMPLE_RATE, CHANNELS)
         self.last_packet_time = 0
         self.volume = 1.0
+        self.volume_zero = False   # True когда vol==0.0; CPU-оптимизация: пропускаем decode
         self.is_locally_muted = False
-        # volume_zero=True когда vol==0.0 (ползунок в 0).
-        # Отдельный флаг — не конфликтует с кнопкой is_locally_muted.
-        # audio_callback использует его чтобы пропустить Opus-decode (экономия CPU).
-        # UI использует его чтобы показать ban-иконку, как при заглушении.
-        self.volume_zero = False
         self.remote_muted = False
         self.remote_deafened = False
 
 
 class AudioHandler(QObject):
+    """Основной аудио-движок: захват микрофона, кодирование, декодирование и микширование."""
+
     volume_level_signal = pyqtSignal(int)
     status_changed = pyqtSignal(bool, bool)
     whisper_received = pyqtSignal(int)
     whisper_ended = pyqtSignal()
-    # Испускается когда ползунок громкости пользователя достигает/покидает 0.
-    # (uid, is_zero) — UI показывает ban-иконку при is_zero=True,
-    # точно так же как при нажатии кнопки «Заглушить».
     user_volume_zero = pyqtSignal(int, bool)
 
     def _apply_anonymous_voice_effect(self, s: np.ndarray, state: dict) -> np.ndarray:
-        """
-        Эффект «анонимного голоса» (Dark TV Interview).
-        Использует Vectorized Dual-Tap Delay Line для pitch-shift без артефактов.
+        """Эффект «анонимного голоса» — pitch-shift -4 полутона + LP 4 кГц.
 
+        Использует Vectorized Dual-Tap Delay Line без аллокаций в hot path.
         state — per-uid словарь {'history', 'phase', 'lp_zi', 'buf'}.
-        Разделение состояний по uid позволяет одновременно обрабатывать
-        нескольких шептунов без взаимного наложения и phase-артефактов.
+
+            :param s: входной PCM float32 (CHUNK_SIZE)
+            :param state: изменяемое состояние pitch-shifter для данного uid
+            :return: обработанный PCM float32
         """
         N = len(s)
-        max_delay = 1440  # 30 мс при 48kHz — оптимальный размер окна для голоса
-        speed = 2.0 ** (-4.0 / 12.0)  # -4 полутона
-        rate = 1.0 - speed  # Скорость накопления задержки
+        max_delay = 1440          # 30 мс при 48 кГц
+        speed = 2.0 ** (-4.0 / 12.0)
+        rate = 1.0 - speed
 
-        # 1. Склеиваем историю и текущий фрейм в предаллоцированный буфер.
-        # Избегаем np.concatenate (аллокация ~12 KB каждые 20 мс в hot path).
-        # state['history'] = 2048 сэмплов при «тёплом» старте содержит реальный
-        # сигнал, поэтому pitch-shifter сразу читает данные, не ноль → нет click.
         H = 2048
         history = state['history']
-        buf     = state['buf']         # предаллоц. буфер размером H + CHUNK_SIZE
-        buf[:H]      = history
+        buf = state['buf']
+        buf[:H] = history
         buf[H:H + N] = s
         buf_view = buf[:H + N]
 
-        # 2. Генерируем фазы для двух читающих "головок" (0.0 ... 1.0)
         phases = state['phase'] + np.arange(N) * rate / max_delay
         state['phase'] = float((phases[-1] + rate / max_delay) % 1.0)
 
         p1 = phases % 1.0
         p2 = (phases + 0.5) % 1.0
-
-        # Задержка в сэмплах
         d1 = p1 * max_delay
         d2 = p2 * max_delay
 
-        # 3. Индексы чтения (относительно начала массива buf_view)
         base_idx = H + np.arange(N)
         r1 = base_idx - d1
         r2 = base_idx - d2
 
-        # 4. Линейная интерполяция для плавности
         i1_floor = np.floor(r1).astype(np.int32)
         i2_floor = np.floor(r2).astype(np.int32)
 
-        # Безопасный +1 индекс
         buf_last = H + N - 1
         i1_ceil = np.clip(i1_floor + 1, 0, buf_last)
         i2_ceil = np.clip(i2_floor + 1, 0, buf_last)
@@ -780,20 +706,15 @@ class AudioHandler(QObject):
         val_1 = buf_view[i1_floor] * (1.0 - frac_1) + buf_view[i1_ceil] * frac_1
         val_2 = buf_view[i2_floor] * (1.0 - frac_2) + buf_view[i2_ceil] * frac_2
 
-        # 5. Кроссфейд (окно Ханна) для устранения щелчков
+        # Кроссфейд окном Ханна для устранения щелчков
         fade_1 = 0.5 - 0.5 * np.cos(2.0 * np.pi * p1)
         fade_2 = 0.5 - 0.5 * np.cos(2.0 * np.pi * p2)
-
         shifted = val_1 * fade_1 + val_2 * fade_2
 
-        # 6. Обновляем историю для следующего фрейма (in-place: нет аллокации)
-        # buf_view[-H:] == buf_view[N:] — последние H сэмплов окна истории
         history[:] = buf_view[N:]
 
-        # 7. LP-фильтр (4 кГц) для "тёмного" окраса (скрывает артефакты формант)
         out, state['lp_zi'] = sosfilt(self._anon_lp_sos, shifted, zi=state['lp_zi'])
 
-        # 8. Мягкая нормализация пика
         peak = np.max(np.abs(out))
         if peak > 0.9:
             out *= 0.9 / peak
@@ -805,13 +726,12 @@ class AudioHandler(QObject):
 
         self.settings = QSettings("MyVoiceChat", "UserVolumes")
         self.global_settings = QSettings("MyVoiceChat", "GlobalSettings")
-        self.uid_to_ip = {}
-        self.pending_volumes = {}
-        self.remote_users = {}
+        self.uid_to_ip: dict = {}
+        self.pending_volumes: dict = {}
+        self.remote_users: dict = {}
         self.users_lock = threading.Lock()
 
         self.encoder = opuslib.Encoder(SAMPLE_RATE, CHANNELS, OPUS_APPLICATION)
-
         saved_bitrate = int(self.global_settings.value("audio_bitrate", DEFAULT_BITRATE))
         self.encoder.bitrate = saved_bitrate
         self.encoder.complexity = 5
@@ -829,21 +749,11 @@ class AudioHandler(QObject):
         self.incoming_stream_packets = queue.Queue(maxsize=500)
         self.send_queue = queue.Queue(maxsize=100)
 
-        # --- Стрим-аудио ---
-        # uid → RemoteUser  (зрительская сторона: стримеры из других комнат)
-        self.stream_remote_users = {}
-        # КРИТИЧНО: отдельный лок для stream_remote_users, чтобы не блокировать
-        # audio_callback (high-priority поток) ожиданием _stream_packet_processor_loop
+        self.stream_remote_users: dict = {}
         self.stream_users_lock = threading.Lock()
-        # Громкость стрима (0.0 - 2.0), регулируется зрителем из оверлея
-        self.stream_volume = 1.0
-        # FIX #5: threading.Event вместо простого bool.
-        # bool-присваивание GIL-атомарно, но Event явно выражает намерение и
-        # согласуется со стилем _is_muted / _is_deafened в этом же классе.
+        self.stream_volume: float = 1.0
         self._stream_audio_sending = threading.Event()
-        # AEC удалён: при использовании VB-CABLE (CABLE Output) эхо физически
-        # невозможно — голоса зрителей никогда не попадают в CABLE Output.
-        # Захват системного аудио
+
         self.stream_audio_capture = StreamAudioCapture(self.send_queue, lambda: self.my_uid)
         self._is_running = threading.Event()
         self._is_muted = threading.Event()
@@ -857,171 +767,130 @@ class AudioHandler(QObject):
         self.my_uid = 0
         self.my_sequence = 0
 
-        # ── Шёпот (приватная передача одному пользователю) ─────────────────
-        # Пока whisper_target_uid != 0 — голос идёт только этому uid,
-        # остальные участники комнаты отправителя не слышат.
+        # Шёпот (приватная передача одному пользователю)
         self.whisper_target_uid: int = 0
         self._whisper_sequence: int = 0
 
-        # ── IIR-фильтр для whisper-эффекта (4-й порядок Butterworth LP, fc=1200 Гц) ──
-        # SOS-матрица предвычислена как модульная константа _WLP_SOS (один раз при импорте).
-        # Начальные условия zi хранят состояние между фреймами.
-        # Сброс zi производится в start_whisper().
+        # IIR-фильтр для whisper-эффекта (Butterworth LP fc=1200 Гц)
         self._wlp_sos = _WLP_SOS
-        self._wlp_zi  = sosfilt_zi(self._wlp_sos).astype(np.float64)
+        self._wlp_zi = sosfilt_zi(self._wlp_sos).astype(np.float64)
 
-        # ── LP-фильтр для эффекта анонимного голоса (fc=4000 Гц) ──────────────
-        # Мягче чем whisper LP (1200 Гц): сохраняет согласные и зону присутствия.
-        # SOS-матрица предвычислена как модульная константа _ANON_LP_SOS.
+        # LP-фильтр для эффекта анонимного голоса (fc=4000 Гц)
         self._anon_lp_sos = _ANON_LP_SOS
 
-        # ── Whisper effect: per-uid состояния ───────────────────────────────────
-        # Ключ: uid шептуна. Значение: dict с полями:
-        #   'history' — np.ndarray(2048, float32): буфер предыстории pitch-shifter
-        #   'phase'   — float: текущая фаза читающей головки
-        #   'lp_zi'   — np.ndarray(n_sec, 2, float64): состояние LP-фильтра
-        #   'buf'     — np.ndarray(2048+CHUNK_SIZE, float32): предаллоц. рабочий буфер
-        #
-        # Создаётся лениво при первом пакете шептуна с «тёплым» стартом:
-        # history заполняется реальным сигналом (не нулями) → питч-шифтер сразу
-        # читает данные из обеих головок без перехода ноль→сигнал → нет click/треск.
-        #
-        # Поддержка 2+ одновременных шептунов: каждый uid имеет независимое
-        # состояние, смешиваются через общий mix_buffer без взаимных артефактов.
-        self._whisper_states: dict = {}    # uid → state dict (см. выше)
-        self._active_whispers: dict = {}   # uid → float (последний timestamp пакета)
+        # Per-uid состояния pitch-shifter для входящих шёпотов
+        self._whisper_states: dict = {}
+        self._active_whispers: dict = {}   # uid → timestamp последнего пакета
 
-        # Backward compat для UI-сигнала: последний шептун и его время
         self._whisper_in_uid: int = 0
         self._whisper_in_ts: float = 0.0
-
-        # Флаг для start_whisper() — sender-side legacy (сбрасывает _wlp_zi отправителя)
-        # На стороне получателя не используется (заменён ленивым созданием per-uid state).
         self._whisper_effect_reset: bool = False
-        # Отдельный счётчик для FLAG_STREAM_VOICES пакетов.
-        # Нельзя использовать my_sequence: несколько спикеров в одном audio_callback
-        # получали бы одинаковый seq → JitterBuffer на стороне зрителя отбрасывал
-        # второй и последующие пакеты (seq <= last_seq → return), зрители слышали
-        # только первого спикера. Отдельный монотонный счётчик решает проблему.
+
+        # Отдельный seq-счётчик для FLAG_STREAM_VOICES пакетов
         self._sv_sequence = 0
-        # FIX #3: deque(maxlen=5) вместо list.
-        # vad_pre_buffer.pop(0) на list — O(n): сдвигает все элементы влево.
-        # deque.popleft() — O(1), что важно для audio_callback hot path.
-        # maxlen=5 заменяет ручную проверку `if len > 5: pop(0)`.
+
+        # deque(maxlen=5): O(1) popleft вместо O(n) list.pop(0) в audio_callback
         self.vad_pre_buffer = deque(maxlen=5)
         self.was_talking = False
         self.stream = None
-        # Счётчик воспроизведённых loopback-кадров (для периодического лога).
-        # Инициализируем здесь чтобы убрать hasattr() из audio_callback hot path.
         self._lb_play_counter = 0
-        # Ссылки на рабочие потоки — нужны для корректного join() в stop().
-        # Без явного join() повторные вызовы start() (переподключение, смена
-        # устройства) накапливают «зомби»-потоки: каждый поток висит в памяти
-        # пока не завершится _is_running.wait(), что может занять до 0.1 сек
-        # после clear(). За 10 переподключений = 20 лишних потоков.
-        self._pkt_thread: threading.Thread | None = None
-        self._stream_pkt_thread: threading.Thread | None = None
 
-        # -------------------------------------------------------------------
-        # FIX #1: Copy-on-Write снимки для audio_callback.
-        #
-        # Проблема: audio_callback — реалтайм-поток с дедлайном 20 мс.
-        # Захват users_lock / stream_users_lock внутри callback'а блокировал
-        # его на время работы _packet_processor_loop (удерживает тот же лок).
-        # Результат: пропуск дедлайна → слышимые щелчки и глитчи в аудио.
-        #
-        # Решение: _packet_processor_loop берёт снимок dict после каждого
-        # изменения remote_users (внутри того же with users_lock).
-        # audio_callback читает _audio_users_snapshot БЕЗ лока:
-        #   - Присваивание ссылки dict GIL-атомарно → нет torn read.
-        #   - Снимок «отстаёт» максимум на 1 пакет (~20 мс) — для аудио незаметно.
-        #   - RemoteUser.jitter_buffer имеет собственный лок → thread-safe.
-        #   - RemoteUser.volume / .is_locally_muted — простые примитивы, GIL-safe.
-        # -------------------------------------------------------------------
+        self._pkt_thread: Optional[threading.Thread] = None
+        self._stream_pkt_thread: Optional[threading.Thread] = None
+
+        # Copy-on-Write снимки для audio_callback — читаются без лока
         self._audio_users_snapshot: dict = {}
         self._audio_stream_users_snapshot: dict = {}
 
-    def set_bitrate(self, bitrate_kbps):
+    def set_bitrate(self, bitrate_kbps: int):
+        """Устанавливает битрейт Opus-энкодера.
+
+            :param bitrate_kbps: битрейт в кбит/с
+        """
         bitrate_bps = int(bitrate_kbps) * 1000
         try:
             with self.users_lock:
-                if hasattr(self, 'encoder'):
-                    self.encoder.bitrate = bitrate_bps
-                    self.global_settings.setValue("audio_bitrate", bitrate_bps)
-                    print(f"[Audio] Bitrate changed to {bitrate_kbps} kbps")
+                self.encoder.bitrate = bitrate_bps
+                self.global_settings.setValue("audio_bitrate", bitrate_bps)
+                print(f"[Audio] Bitrate changed to {bitrate_kbps} kbps")
         except Exception as e:
             print(f"[Audio] Error setting bitrate: {e}")
 
     def set_vad_threshold(self, slider_val: int):
+        """Устанавливает порог Voice Activity Detection.
+
+            :param slider_val: значение ползунка (1–50), делится на 1000 → порог RMS
+        """
         threshold = max(1, min(50, slider_val)) / 1000.0
         self.vad_threshold = threshold
         self.global_settings.setValue("vad_threshold_slider", slider_val)
         print(f"[Audio] VAD threshold set to {threshold:.4f} (slider={slider_val})")
 
-    def find_device_index_by_name(self, name, is_input=True):
-        direction = "INPUT" if is_input else "OUTPUT"
+    def find_device_index_by_name(self, name: Optional[str], is_input: bool = True) -> Optional[int]:
+        """Ищет устройство sounddevice по полному имени «Name (API)».
+
+            :param name: полное имя устройства; None → вернёт None (системный дефолт)
+            :param is_input: True — искать input-устройство, False — output
+            :return: индекс устройства или None
+        """
         if not name:
-            print(f"[DEBUG] find_device_index_by_name: {direction} name=None → вернём None (дефолт системы)", flush=True)
             return None
         devices = sd.query_devices()
-        print(f"[DEBUG] find_device_index_by_name: ищем {direction} '{name}'", flush=True)
         for i, d in enumerate(devices):
             try:
                 api_name = sd.query_hostapis(d['hostapi'])['name']
                 full_name = f"{d['name']} ({api_name})"
-                if full_name.strip() == name.strip():
-                    if is_input and d['max_input_channels'] > 0:
-                        print(f"[DEBUG] find_device_index_by_name: найдено {direction} idx={i} '{full_name}'", flush=True)
-                        return i
-                    if not is_input and d['max_output_channels'] > 0:
-                        print(f"[DEBUG] find_device_index_by_name: найдено {direction} idx={i} '{full_name}'", flush=True)
-                        return i
-            except:
+                if full_name.strip() != name.strip():
+                    continue
+                if is_input and d['max_input_channels'] > 0:
+                    return i
+                if not is_input and d['max_output_channels'] > 0:
+                    return i
+            except Exception:
                 continue
-        print(f"[DEBUG] find_device_index_by_name: {direction} '{name}' НЕ НАЙДЕНО → None (дефолт)", flush=True)
         return None
 
-    def start(self, input_name=None, output_name=None):
-        print(f"[DEBUG] AudioHandler.start: BEGIN — input_name={input_name!r}, output_name={output_name!r}", flush=True)
+    def start(self, input_name: Optional[str] = None, output_name: Optional[str] = None):
+        """Запускает аудио-поток и рабочие потоки обработки пакетов.
+
+            :param input_name: полное имя input-устройства; None — системный дефолт
+            :param output_name: полное имя output-устройства; None — системный дефолт
+        """
         if self.my_uid == 0:
-            print("[DEBUG] AudioHandler.start: my_uid==0, выход", flush=True)
             return
-        print("[DEBUG] AudioHandler.start: вызов stop()...", flush=True)
         self.stop()
         time.sleep(0.1)
-        print("[DEBUG] AudioHandler.start: stop() выполнен", flush=True)
 
-        print("[DEBUG] AudioHandler.start: поиск устройств...", flush=True)
         in_idx = self.find_device_index_by_name(input_name, True)
         out_idx = self.find_device_index_by_name(output_name, False)
-        print(f"[DEBUG] AudioHandler.start: in_idx={in_idx}, out_idx={out_idx}", flush=True)
+        print(f"[Audio] start: in_idx={in_idx}, out_idx={out_idx}")
 
         self._is_running.set()
         try:
-            print("[DEBUG] AudioHandler.start: создание sd.Stream...", flush=True)
             self.stream = sd.Stream(
                 device=(in_idx, out_idx),
-                samplerate=SAMPLE_RATE, blocksize=CHUNK_SIZE,
-                dtype='float32', channels=CHANNELS,
-                callback=self.audio_callback
+                samplerate=SAMPLE_RATE,
+                blocksize=CHUNK_SIZE,
+                dtype='float32',
+                channels=CHANNELS,
+                callback=self.audio_callback,
             )
-            print("[DEBUG] AudioHandler.start: sd.Stream создан, вызов stream.start()...", flush=True)
             self.stream.start()
-            print("[DEBUG] AudioHandler.start: stream.start() выполнен", flush=True)
-            self._pkt_thread = threading.Thread(target=self._packet_processor_loop, daemon=True)
-            self._stream_pkt_thread = threading.Thread(target=self._stream_packet_processor_loop, daemon=True)
+            self._pkt_thread = threading.Thread(
+                target=self._packet_processor_loop, daemon=True)
+            self._stream_pkt_thread = threading.Thread(
+                target=self._stream_packet_processor_loop, daemon=True)
             self._pkt_thread.start()
             self._stream_pkt_thread.start()
-            print("[DEBUG] AudioHandler.start: рабочие потоки запущены — DONE", flush=True)
-        except Exception as e:
+            print("[Audio] start: аудио-поток и рабочие потоки запущены")
+        except Exception:
             import traceback
-            print(f"[DEBUG] AudioHandler.start: EXCEPTION:\n{traceback.format_exc()}", flush=True)
+            print(f"[Audio] start: EXCEPTION:\n{traceback.format_exc()}")
             self._is_running.clear()
 
     def stop(self):
+        """Останавливает аудио-поток и рабочие потоки."""
         self._is_running.clear()
-        # Дожидаемся завершения рабочих потоков — иначе повторный start()
-        # создаст дублирующие потоки (утечка памяти и CPU)
         for attr in ('_pkt_thread', '_stream_pkt_thread'):
             t = getattr(self, attr, None)
             if t is not None and t.is_alive():
@@ -1032,53 +901,49 @@ class AudioHandler(QObject):
                 self.stream.stop()
                 self.stream.close()
                 self.stream = None
-            except:
+            except Exception:
                 pass
 
-    def cleanup_users(self, active_uids):
-        """ Очистка памяти от отключившихся юзеров """
+    def cleanup_users(self, active_uids: set):
+        """Удаляет из памяти отключившихся пользователей.
+
+            :param active_uids: множество uid активных участников
+        """
         with self.users_lock:
             for uid in list(self.remote_users.keys()):
                 if uid not in active_uids:
                     del self.remote_users[uid]
-
             for uid in list(self.uid_to_ip.keys()):
                 if uid not in active_uids:
                     del self.uid_to_ip[uid]
             for uid in list(self.pending_volumes.keys()):
                 if uid not in active_uids:
                     del self.pending_volumes[uid]
-
-            # FIX #1: обновляем COW-снимок после удаления пользователей
             self._audio_users_snapshot = dict(self.remote_users)
 
-        # stream_remote_users — под отдельным локом (не блокировать audio_callback)
         with self.stream_users_lock:
             for uid in list(self.stream_remote_users.keys()):
                 real_uid = uid - LOOPBACK_UID_OFFSET if uid >= LOOPBACK_UID_OFFSET else uid
                 if real_uid not in active_uids:
                     del self.stream_remote_users[uid]
-            # FIX #1: обновляем COW-снимок после удаления
             self._audio_stream_users_snapshot = dict(self.stream_remote_users)
 
     def _packet_processor_loop(self):
+        """Фоновый поток: разбирает incoming_packets и раскладывает по JitterBuffer."""
         while self._is_running.is_set():
             try:
-                packet_data = self.incoming_packets.get(timeout=0.1)
-                uid, seq, data, flags = packet_data
-                if uid == self.my_uid: continue
+                uid, seq, data, flags = self.incoming_packets.get(timeout=0.1)
+                if uid == self.my_uid:
+                    continue
 
                 with self.users_lock:
                     if uid not in self.remote_users:
                         self.remote_users[uid] = RemoteUser(uid)
-                        # Исправление 1.2: убрано чтение QSettings(диск) из high-priority ловушки
-                        if uid in self.pending_volumes:
-                            val = self.pending_volumes.pop(uid)
-                        else:
-                            val = 1.0
-                        val = float(val)
+                        val = float(self.pending_volumes.pop(uid, 1.0))
                         self.remote_users[uid].volume = val
                         self.remote_users[uid].volume_zero = (val == 0.0)
+
+                        self._audio_users_snapshot = dict(self.remote_users)
 
                     user = self.remote_users[uid]
                     user.remote_muted = bool(flags & 1)
@@ -1088,98 +953,48 @@ class AudioHandler(QObject):
                         user.jitter_buffer.add(seq, data)
                         user.last_packet_time = time.time()
 
-                    # FIX #1: обновляем COW-снимок внутри лока — согласованное состояние.
-                    # dict() копирует только ссылки (не RemoteUser объекты) — это быстро.
-                    # audio_callback читает снимок без лока, опираясь на GIL-атомарность
-                    # присваивания ссылки.
-                    self._audio_users_snapshot = dict(self.remote_users)
-
             except queue.Empty:
                 continue
             except Exception:
                 pass
 
     def _stream_packet_processor_loop(self):
-        """
-        Обрабатывает входящие пакеты стрим-аудио (FLAG_STREAM_AUDIO).
+        """Фоновый поток: разбирает incoming_stream_packets (FLAG_STREAM_AUDIO).
 
-        Различает два типа потоков по флагу FLAG_LOOPBACK_AUDIO:
-
-        ① Loopback (системный звук, flags & FLAG_LOOPBACK_AUDIO):
-           • Всегда воспроизводим — это игры, музыка с экрана стримера.
-           • Хранится под ключом uid + LOOPBACK_UID_OFFSET, чтобы не смешиваться
-             с голосовым каналом того же пользователя.
-           • Единственное исключение: свой собственный loopback (uid == my_uid)
-             сервер и так не отсылает обратно стримеру, но фильтруем на всякий случай.
-
-        ② Микрофон стримера (только FLAG_STREAM_AUDIO, без FLAG_LOOPBACK_AUDIO):
-           • uid == my_uid          → отбрасываем (нет эха своего голоса)
-           • uid in remote_users    → отбрасываем (уже слышим в той же комнате — не дублируем)
-           • иначе                  → воспроизводим (стример из другой комнаты)
+        Различает два типа по флагу FLAG_LOOPBACK_AUDIO:
+          - Loopback (системный звук): хранится под uid + LOOPBACK_UID_OFFSET
+          - Микрофон стримера: подавляется если uid уже активен в remote_users < 1.5 с
         """
         while self._is_running.is_set():
             try:
-                packet_data = self.incoming_stream_packets.get(timeout=0.1)
-                uid, seq, data, flags = packet_data
-
+                uid, seq, data, flags = self.incoming_stream_packets.get(timeout=0.1)
                 is_loopback = bool(flags & FLAG_LOOPBACK_AUDIO)
 
                 if is_loopback:
-                    # --- Системный звук (WASAPI Loopback) ---
-                    # Свой loopback сервер не шлёт назад, но фильтруем на всякий случай
                     if uid == self.my_uid:
                         continue
-
-                    # ── VAD-ГЕЙТ: запоминаем что loopback этого стримера активен ─────
-                    # Дропать пакеты здесь НЕЛЬЗЯ — это вызывает полную тишину во время речи.
-                    # Вместо этого audio_callback применит duck-множитель (15%) при микшировании.
-                    # Сам факт «зритель говорит» audio_callback читает из self.last_voice_time.
-
                     storage_uid = uid + LOOPBACK_UID_OFFSET
                     with self.stream_users_lock:
                         if storage_uid not in self.stream_remote_users:
                             self.stream_remote_users[storage_uid] = RemoteUser(storage_uid)
-                            print(f"[AudioHandler] Создан буфер для системного звука (storage_uid={storage_uid})")
+                            print(f"[AudioHandler] Создан буфер системного звука (storage_uid={storage_uid})")
                         user = self.stream_remote_users[storage_uid]
                         if data:
                             user.jitter_buffer.add(seq, data)
                             user.last_packet_time = time.time()
-                        # FIX #1: COW-снимок для audio_callback
                         self._audio_stream_users_snapshot = dict(self.stream_remote_users)
                 else:
-                    # --- Микрофон стримера ---
                     if uid == self.my_uid:
-                        continue  # нет эха своего голоса
+                        continue
 
-                    # FIX Bug #2: Ранее пакет отбрасывался, если uid уже есть в remote_users
-                    # (тот же пользователь в той же комнате).  Но зритель СЛЫШИТ голос через
-                    # обычный аудио-микс только пока тот активно говорит (VAD).  Поверх стрима
-                    # стример может транслировать иначе сформированный пакет (другой seq/flags).
-                    # Дублирование предотвращаем, добавляя пакет в stream_remote_users ТОЛЬКО
-                    # если uid НЕТ в remote_users (обычный голосовой поток отсутствует) —
-                    # тогда поведение прежнее.  Если uid уже в remote_users, пакет всё равно
-                    # складываем в stream_remote_users под тем же uid: audio_callback смешивает
-                    # оба источника, а небольшое наложение (< 20 мс) на практике не слышно,
-                    # потому что regular-audio и stream-audio транслируются разными путями
-                    # (разные jitter-буферы) и VAD обычно совпадает.
-                    #
-                    # Простейший корректный вариант без двойного микса: пропускаем пакет
-                    # только если у зрителя уже есть свежий regular-аудио от этого uid
-                    # (т.е. last_packet_time < 0.3 с назад).
                     with self.users_lock:
                         reg_user = self.remote_users.get(uid)
                         recently_received = (
                             reg_user is not None
                             and (time.time() - reg_user.last_packet_time) < 1.5
-                            # FIX: увеличено с 0.3с до 1.5с.
-                            # При 0.3с: любая пауза >300мс в речи стримера приводила к тому,
-                            # что stream-mic пакет проскакивал в stream_remote_users и зритель
-                            # в той же комнате слышал голос стримера ДВАЖДЫ (двойной голос).
-                            # 1.5с совпадает с порогом last_packet_time < 1.5 в audio_callback,
-                            # т.е. пока стример «активен» в комнате — stream-mic подавляется.
                         )
                     if recently_received:
-                        continue  # уже слышим через обычный аудио-путь — не дублируем
+                        continue
 
                     with self.stream_users_lock:
                         if uid not in self.stream_remote_users:
@@ -1188,7 +1003,6 @@ class AudioHandler(QObject):
                         if data:
                             user.jitter_buffer.add(seq, data)
                             user.last_packet_time = time.time()
-                        # FIX #1: COW-снимок для audio_callback
                         self._audio_stream_users_snapshot = dict(self.stream_remote_users)
 
             except queue.Empty:
@@ -1196,13 +1010,15 @@ class AudioHandler(QObject):
             except Exception:
                 pass
 
-    def audio_callback(self, indata, outdata, frames, time_info, status):
-        # Логируем только первый вызов — подтверждает что callback запустился
-        if not getattr(self, '_cb_first_logged', False):
-            self._cb_first_logged = True
-            print("[DEBUG] audio_callback: ПЕРВЫЙ ВЫЗОВ — PortAudio callback работает", flush=True)
+    def audio_callback(self, indata: np.ndarray, outdata: np.ndarray,
+                       frames: int, time_info, status):
+        """PortAudio realtime callback: захват микрофона + микширование входящих голосов.
+
+            :param indata: входные PCM-данные (frames, channels) float32
+            :param outdata: выходные PCM-данные (frames, channels) float32
+        """
         if status:
-            print(f"[DEBUG] audio_callback: status={status}", flush=True)
+            print(f"[Audio] callback status: {status}")
 
         if not self._is_running.is_set():
             outdata.fill(0)
@@ -1217,65 +1033,47 @@ class AudioHandler(QObject):
                 pcm_int16 = (raw_input * 32767).astype(np.int16)
                 processed = [f for p, f in self.denoiser.denoise_chunk(pcm_int16)]
                 if processed:
-                    # Оптимизация: RNNoise чаще всего возвращает ровно 1 фрейм.
-                    # Проверяем сначала — избегаем np.concatenate (аллокацию) 50 раз/сек.
                     if len(processed) == 1:
                         denoised_float = processed[0].astype(np.float32) / 32767.0
                     else:
                         denoised_float = np.concatenate(processed).astype(np.float32) / 32767.0
                     if len(denoised_float) != len(raw_input):
                         denoised_float = np.resize(denoised_float, len(raw_input))
-            except:
+            except Exception:
                 pass
 
-        # ── Pre-encode input normalization ──────────────────────────────────
-        # Если denoised_float содержит пики > 1.0 (микрофонный буст Windows,
-        # RNNoise иногда выходит за ±1.0, некоторые ASIO-драйверы) →
-        # умножение на 32767 даёт значения > INT16_MAX → wraparound в
-        # отрицательную зону → жёсткий треск именно при громком голосе
-        # («на пределе микрофона»). Soft-limit здесь — единственная защита.
-        # Используем in-place операцию: аллокаций нет.
+        # Soft-limit: защита от INT16 wraparound при пиках > 1.0
         _in_peak = np.max(np.abs(denoised_float))
         if _in_peak > 0.98:
-            # Нормализуем к 0.98 — оставляем 2% запас до INT16_MAX
             denoised_float = denoised_float * (0.98 / _in_peak)
 
         rms = np.sqrt(np.mean(denoised_float ** 2))
-        self.volume_level_signal.emit(int(min(rms * 1000, 100)))
+
+        # ОПТИМИЗАЦИЯ: Отправляем сигнал громкости не чаще чем раз в 50 мс (20 FPS)
+        if curr_time - getattr(self, '_last_vol_emit_time', 0) > 0.05:
+            self.volume_level_signal.emit(int(min(rms * 1000, 100)))
+            self._last_vol_emit_time = curr_time
 
         is_talking = rms > self.vad_threshold or (curr_time - self.last_voice_time < self.vad_hangover)
-        if rms > self.vad_threshold: self.last_voice_time = curr_time
+
+        is_talking = rms > self.vad_threshold or (curr_time - self.last_voice_time < self.vad_hangover)
+        if rms > self.vad_threshold:
+            self.last_voice_time = curr_time
 
         if self.my_uid != 0:
             mute_flag = 1 if self._is_muted.is_set() else 0
             deaf_flag = 2 if self._is_deafened.is_set() else 0
             flags = mute_flag | deaf_flag
-
-            # Читаем whisper_target_uid ДО проверки мута — шёпот обходит мут.
-            # Это атомарное чтение int (GIL-safe).
             whisper_uid = self.whisper_target_uid
 
             try:
                 if is_talking and whisper_uid != 0:
-                    # ── РЕЖИМ ШЁПОТА ─────────────────────────────────────────
-                    # Шёпот отправляется НЕЗАВИСИМО от состояния мута.
-                    # Мут означает «не говорить в комнату» — шёпот приватный
-                    # и не нарушает намерение пользователя заглушить себя от
-                    # остальных. PTT-кнопка шёпота — явное действие отправить.
-                    #
-                    # Нормальный аудио-пакет в комнату НЕ кладём в очередь →
-                    # остальные участники не слышат отправителя в этот момент.
+                    # Режим шёпота: пакет только whisper_uid, в комнату ничего
                     pcm_to_encode = (denoised_float * 32767).astype(np.int16).tobytes()
                     encoded = self.encoder.encode(pcm_to_encode, CHUNK_SIZE)
-                    # FIX: убираем лишний my_sequence += 1.
-                    # В режиме шёпота пакет в комнату НЕ отправляется — my_sequence
-                    # не должен расти. stop_whisper() синхронизирует его с
-                    # _whisper_sequence, так что разрыва seq при возврате не будет.
                     self._whisper_sequence += 1
-                    w_flags = FLAG_WHISPER
-                    w_header = UDP_HEADER_STRUCT.pack(self.my_uid, curr_time,
-                                           self._whisper_sequence, w_flags)
-                    # Payload: [target_uid: 4 байта] + [opus]
+                    w_header = UDP_HEADER_STRUCT.pack(
+                        self.my_uid, curr_time, self._whisper_sequence, FLAG_WHISPER)
                     w_payload = struct.pack('!I', whisper_uid) + encoded
                     try:
                         self.send_queue.put_nowait(w_header + w_payload)
@@ -1283,82 +1081,54 @@ class AudioHandler(QObject):
                         pass
 
                 elif is_talking and not self._is_muted.is_set():
-                    # ── ОБЫЧНЫЙ РЕЖИМ: пакет в комнату ───────────────────────
+                    # Обычный режим: пакет в комнату
                     pcm_to_encode = (denoised_float * 32767).astype(np.int16).tobytes()
                     encoded = self.encoder.encode(pcm_to_encode, CHUNK_SIZE)
                     self.my_sequence += 1
-                    packet = UDP_HEADER_STRUCT.pack(self.my_uid, curr_time, self.my_sequence, flags) + encoded
+                    packet = UDP_HEADER_STRUCT.pack(
+                        self.my_uid, curr_time, self.my_sequence, flags) + encoded
 
                     if not self.was_talking:
-                        # FIX #3: deque.popleft() — O(1) вместо list.pop(0) — O(n)
                         while self.vad_pre_buffer:
                             try:
                                 self.send_queue.put_nowait(self.vad_pre_buffer.popleft())
-                            except:
+                            except Exception:
                                 pass
                         self.was_talking = True
                     self.send_queue.put_nowait(packet)
 
-                    # Стрим-аудио: дополнительно посылаем тот же encoded с FLAG_STREAM_AUDIO
-                    # Сервер направит его только зрителям, а не в комнату (нет дублирования)
                     if self._stream_audio_sending.is_set():
-                        stream_flags = flags | FLAG_STREAM_AUDIO
-                        stream_packet = UDP_HEADER_STRUCT.pack(self.my_uid, curr_time,
-                                                    self.my_sequence, stream_flags) + encoded
+                        stream_packet = UDP_HEADER_STRUCT.pack(
+                            self.my_uid, curr_time,
+                            self.my_sequence, flags | FLAG_STREAM_AUDIO) + encoded
                         try:
                             self.send_queue.put_nowait(stream_packet)
-                        except:
+                        except Exception:
                             pass
 
                 else:
-                    # Не говорим (или мут без шёпота) — сбрасываем was_talking,
-                    # пополняем pre_buffer для следующего старта речи.
                     self.was_talking = False
                     if not is_talking and whisper_uid == 0:
                         empty_packet = UDP_HEADER_STRUCT.pack(self.my_uid, curr_time, 0, flags)
-                        # FIX #3: deque(maxlen=5) — автоматически вытесняет старые
-                        # элементы при переполнении, ручная проверка len > 5 не нужна.
                         self.vad_pre_buffer.append(empty_packet)
-            except:
+            except Exception:
                 pass
 
         self.mix_buffer.fill(0)
         if not self._is_deafened.is_set():
-            # ── N-speaker headroom ────────────────────────────────────────────
-            # Проблема: 3+ участников говорят одновременно → сумма амплитуд
-            # до 3.0–4.0 → даже soft limiter давит сигнал в 3× → все тихие
-            # и «мутные». Это не дисторшн, но воспринимается как «плохое качество».
-            #
-            # Решение: заранее вычисляем gain для каждого активного спикера
-            # по формуле sqrt(2) / sqrt(N_active). При N=1: gain=1.0 (без изменений).
-            # При N=2: gain=1.0 (пара = норма). При N=3: gain=0.82. При N=4: gain=0.71.
-            # Это стандартный incoherent sources scaling — суммарная RMS остаётся
-            # постоянной независимо от числа говорящих.
-            #
-            # Считаем «активных»: last_packet < 1.5с AND не заглушен AND volume > 0.
-            # Не блокируемся — читаем уже готовый COW-снимок без лока.
+            # N-speaker headroom: sqrt(2)/sqrt(N) — RMS остаётся постоянным при N говорящих
             _n_active = sum(
                 1 for u in self._audio_users_snapshot.values()
                 if (curr_time - u.last_packet_time < 1.5
                     and not u.is_locally_muted
                     and not u.volume_zero)
             )
-            # Включаем стрим-пользователей в подсчёт (они тоже добавляются в mix)
             _n_active += sum(
                 1 for u in self._audio_stream_users_snapshot.values()
                 if curr_time - u.last_packet_time < 1.5
             )
-            # gain: при 1–2 спикерах = 1.0 (без изменений),
-            # при 3+ — плавно снижается, сохраняя суммарную громкость.
-            # Не меняем gain агрессивно: берём max(2, N) чтобы 2 человека
-            # никогда не получали ослабления.
             _speaker_gain = math.sqrt(2.0) / math.sqrt(max(2, _n_active))
 
-            # FIX #1: читаем COW-снимок БЕЗ лока.
-            # _packet_processor_loop обновляет _audio_users_snapshot внутри
-            # users_lock после каждого изменения. Снимок «отстаёт» максимум
-            # на 1 пакет (~20 мс) — для аудиомикширования незаметно.
-            # JitterBuffer.get() имеет собственный внутренний лок — thread-safe.
             for uid, user in self._audio_users_snapshot.items():
                 if curr_time - user.last_packet_time < 1.5:
                     data = user.jitter_buffer.get()
@@ -1367,83 +1137,41 @@ class AudioHandler(QObject):
                             decoded = user.decoder.decode(data, CHUNK_SIZE)
                             s = np.frombuffer(decoded, dtype=np.int16).astype(np.float32) / 32767.0
 
-                            # ── Per-uid whisper effect ───────────────────────────────────
-                            # _active_whispers[uid] обновляется в add_incoming_whisper_packet
-                            # на каждый входящий пакет шёпота (~50 раз/сек).
-                            #
-                            # «Тёплый старт» при первом пакете (uid не в _whisper_states):
-                            # history заполняем текущим фреймом s (повторённым до 2048).
-                            # Обе читающие головки pitch-shifter'а сразу попадают в реальный
-                            # сигнал — переход ноль→сигнал отсутствует → нет треска/click.
-                            #
-                            # LP-фильтр: нулевые начальные условия оптимальны для голосового
-                            # сигнала (mean ≈ 0); sosfilt_zi(sos)*0 == zeros.
-                            #
-                            # Два шептуна одновременно: каждый uid имеет свой state dict →
-                            # независимые history/phase/lp_zi/buf → нет взаимных артефактов →
-                            # оба смешиваются в mix_buffer без потерь.
+                            # Whisper effect: per-uid pitch-shift + LP для входящих шёпотов
                             _w_ts = self._active_whispers.get(uid, 0.0)
                             if _w_ts and (curr_time - _w_ts) < 2.0:
                                 if uid not in self._whisper_states:
-                                    # Ленивое создание: тёплый старт с реальным сигналом
-                                    _warm_history = np.resize(
-                                        s.astype(np.float32), 2048).copy()
                                     self._whisper_states[uid] = {
-                                        'history': _warm_history,
+                                        'history': np.resize(s.astype(np.float32), 2048).copy(),
                                         'phase':   0.0,
                                         'lp_zi':   np.zeros(
-                                            (self._anon_lp_sos.shape[0], 2),
-                                            dtype=np.float64),
-                                        'buf':     np.zeros(
-                                            2048 + CHUNK_SIZE, dtype=np.float32),
+                                            (self._anon_lp_sos.shape[0], 2), dtype=np.float64),
+                                        'buf':     np.zeros(2048 + CHUNK_SIZE, dtype=np.float32),
                                     }
                                 s = self._apply_anonymous_voice_effect(
                                     s, self._whisper_states[uid])
                             else:
-                                # Шептун неактивен: освобождаем state (нет утечки памяти)
                                 self._active_whispers.pop(uid, None)
                                 self._whisper_states.pop(uid, None)
 
                             self.mix_buffer += s * (user.volume * _speaker_gain)
 
-                            # ── Mix Minus для зрителей (FLAG_STREAM_VOICES) ───────────────
-                            # Стример ретранслирует голос каждого собеседника зрителям
-                            # с пометкой speaker_uid. Зритель на своей стороне отбросит
-                            # пакет, если speaker_uid == его собственный uid (Mix Minus
-                            # без DSP). Это устраняет эхо даже если AEC не справился.
-                            #
-                            # Payload: [speaker_uid: 4 байта big-endian] + [opus-данные].
-                            # Флаги: FLAG_STREAM_AUDIO | FLAG_STREAM_VOICES.
-                            # Сервер маршрутизирует такие пакеты только зрителям стримера.
-                            #
-                            # FIX Bug #2: каждый голос получает свой уникальный seq через
-                            # self._sv_sequence — иначе все спикеры одного кадра имели
-                            # одинаковый seq и JitterBuffer на приёмной стороне отбрасывал
-                            # все пакеты кроме первого (seq <= last_seq → return).
+                            # Mix Minus для зрителей: ретрансляция голоса с speaker_uid
                             if self._stream_audio_sending.is_set():
                                 try:
                                     self._sv_sequence += 1
-                                    sv_flags = (FLAG_STREAM_AUDIO | FLAG_STREAM_VOICES)
-                                    # header: uid стримера (отправитель), ts, seq, flags
-                                    sv_header = UDP_HEADER_STRUCT.pack(self.my_uid, curr_time,
-                                                            self._sv_sequence, sv_flags)
-                                    # payload: speaker_uid (чей голос) + opus
+                                    sv_header = UDP_HEADER_STRUCT.pack(
+                                        self.my_uid, curr_time, self._sv_sequence,
+                                        FLAG_STREAM_AUDIO | FLAG_STREAM_VOICES)
                                     sv_payload = struct.pack('!I', uid) + data
                                     self.send_queue.put_nowait(sv_header + sv_payload)
                                 except Exception:
                                     pass
-                        except:
+                        except Exception:
                             pass
 
-            # ── Стрим-аудио: игровой звук от стримера (зрительская сторона) ─────────
-            # Микшируем ВНУТРИ deafen-проверки: если зритель нажал «заглушить всё»,
-            # стрим тоже должен замолчать.
-            #
-            # С VB-CABLE: CABLE Output содержит только игровой звук →
-            #   ducking не нужен, AEC не нужен, полная громкость всегда.
-            # С WASAPI Loopback (fallback): AEC применён внутри StreamAudioCapture._audio_cb.
-            sv = self.stream_volume   # float, чтение атомарно (GIL-safe)
-            # FIX #1: читаем COW-снимок БЕЗ лока — аналогично блоку remote_users выше.
+            # Стрим-аудио: игровой звук от стримера (зрительская сторона)
+            sv = self.stream_volume
             for s_uid, user in self._audio_stream_users_snapshot.items():
                 if curr_time - user.last_packet_time < 1.5:
                     data = user.jitter_buffer.get()
@@ -1460,12 +1188,7 @@ class AudioHandler(QObject):
                         except Exception as e:
                             print(f"[Audio-Output] Ошибка декодирования стрим-аудио: {e}")
 
-        # FIX: Soft limiter вместо жёсткого clip.
-        # Жёсткий clip при пиках > 1.0 (2-3 говорящих + stream audio) создаёт
-        # waveshaping дисторшн — нелинейные гармоники, слышимые как хруст/артефакт.
-        # Решение: если пик > 0.95 — нормализуем весь буфер пропорционально.
-        # Это аналог look-ahead limiter без attack/release (приемлемо для 20 мс фреймов).
-        # np.clip остаётся как safety net для float-погрешностей.
+        # Soft limiter: нормализация пика вместо жёсткого clip (устраняет waveshaping дисторшн)
         _peak = np.max(np.abs(self.mix_buffer))
         if _peak > 0.95:
             self.mix_buffer *= (0.95 / _peak)
@@ -1473,8 +1196,14 @@ class AudioHandler(QObject):
 
         outdata[:] = self.mix_buffer.reshape(-1, 1)
 
-    def register_ip_mapping(self, uid, ip_addr):
-        if not ip_addr: return
+    def register_ip_mapping(self, uid: int, ip_addr: str):
+        """Связывает uid с IP-адресом и восстанавливает сохранённую громкость.
+
+            :param uid: идентификатор пользователя
+            :param ip_addr: IP-адрес пользователя
+        """
+        if not ip_addr:
+            return
         with self.users_lock:
             self.uid_to_ip[uid] = ip_addr
             saved_vol = self.settings.value(f"vol_ip_{ip_addr}", None)
@@ -1486,10 +1215,14 @@ class AudioHandler(QObject):
                 else:
                     self.pending_volumes[uid] = saved_vol
 
-    def set_user_volume(self, uid, vol):
-        # Зажимаем в [0.0 … 2.0]. vol=0.0 → «тихий мут» через ползунок.
+    def set_user_volume(self, uid: int, vol: float):
+        """Устанавливает громкость конкретного пользователя.
+
+            :param uid: идентификатор пользователя
+            :param vol: громкость в диапазоне [0.0, 2.0]
+        """
         vol = max(0.0, min(2.0, float(vol)))
-        emit_zero_state = None  # None = состояние не изменилось
+        emit_zero_state = None
 
         with self.users_lock:
             if uid in self.remote_users:
@@ -1505,105 +1238,92 @@ class AudioHandler(QObject):
                 else:
                     self.settings.setValue(f"volume_{uid}", vol)
 
-        # Эмитируем сигнал ВНЕ лока — не блокируем аудиопоток
         if emit_zero_state is not None:
             self.user_volume_zero.emit(uid, emit_zero_state)
 
-    def toggle_user_mute(self, uid):
+    def toggle_user_mute(self, uid: int) -> bool:
+        """Переключает локальное заглушение пользователя.
+
+            :param uid: идентификатор пользователя
+            :return: новое состояние mute (True — заглушён)
+        """
         with self.users_lock:
             if uid in self.remote_users:
                 self.remote_users[uid].is_locally_muted = not self.remote_users[uid].is_locally_muted
                 return self.remote_users[uid].is_locally_muted
         return False
 
-    # ── Шёпот ────────────────────────────────────────────────────────────────
-
     def start_whisper(self, target_uid: int):
-        """
-        Начинает шёпот к конкретному пользователю.
-        Пока активно — голос кодируется и отправляется только ему (FLAG_WHISPER).
-        Нормальные аудио-пакеты в комнату НЕ отправляются, остальные не слышат.
+        """Начинает шёпот к конкретному пользователю.
 
-        ВАЖНО: _whisper_sequence инициализируется от my_sequence, а НЕ от 0.
-        JitterBuffer получателя уже видел seq из нормального потока (my_sequence).
-        Сброс в 0 → все шёпот-пакеты отбрасывались бы как seq <= last_seq.
+        Голос кодируется с FLAG_WHISPER и отправляется только target_uid.
+        Нормальные пакеты в комнату не отправляются — остальные не слышат.
+        _whisper_sequence инициализируется от my_sequence во избежание разрыва seq.
+
+            :param target_uid: uid получателя шёпота
         """
         self.whisper_target_uid = target_uid
-        self._whisper_sequence = self.my_sequence  # продолжаем seq без разрыва
-        # Сбрасываем состояние sosfilt-фильтра чтобы шёпот каждого нового собеседника
-        # начинался с чистого состояния (без «хвоста» от предыдущего шёпота).
+        self._whisper_sequence = self.my_sequence
         self._wlp_zi = sosfilt_zi(self._wlp_sos).astype(np.float64)
-        # FIX race condition: сброс состояния фильтра через флаг, а не напрямую.
-        # Прямой вызов _anon_history.fill(0) / _anon_phase=0 из UI-потока конкурирует
-        # с audio_callback (PortAudio thread). numpy снимает GIL → torn read/write →
-        # щелчки. Флаг — атомарный bool, audio_callback сбросит состояние сам.
         self._whisper_effect_reset = True
         print(f"[Audio] Whisper START → uid={target_uid}, seq_from={self._whisper_sequence}")
 
     def stop_whisper(self):
-        """Останавливает шёпот, возвращает нормальную передачу в комнату.
-        Синхронизируем my_sequence чтобы не было обратного прыжка seq."""
-        # Переносим счётчик чтобы нормальные пакеты продолжили нумерацию
-        # с того места, где остановился шёпот. Иначе получатели в комнате
-        # увидят резкий откат seq и часть пакетов будет отброшена JitterBuffer.
+        """Останавливает шёпот и синхронизирует my_sequence для непрерывной нумерации."""
         if self._whisper_sequence > self.my_sequence:
             self.my_sequence = self._whisper_sequence
-        print(f"[Audio] Whisper STOP  (was → uid={self.whisper_target_uid}), seq_sync={self.my_sequence}")
+        print(f"[Audio] Whisper STOP (was → uid={self.whisper_target_uid}), "
+              f"seq_sync={self.my_sequence}")
         self.whisper_target_uid = 0
 
-    def add_incoming_packet(self, uid, seq, data, flags=0):
+    def add_incoming_packet(self, uid: int, seq: int, data: bytes, flags: int = 0):
+        """Добавляет входящий аудио-пакет в очередь обработки.
+
+            :param uid: идентификатор отправителя
+            :param seq: порядковый номер пакета
+            :param data: Opus-данные
+            :param flags: битовые флаги пакета
+        """
         try:
             self.incoming_packets.put_nowait((uid, seq, data, flags))
-        except:
+        except Exception:
             pass
 
-    def add_incoming_whisper_packet(self, uid, seq, data):
-        """
-        Входящий шёпот (FLAG_WHISPER) от uid.
+    def add_incoming_whisper_packet(self, uid: int, seq: int, data: bytes):
+        """Обрабатывает входящий шёпот (FLAG_WHISPER).
 
-        Испускает whisper_received(uid) на КАЖДЫЙ пакет — это необходимо
-        для корректной работы UI-таймера завершения шёпота (_whisper_end_timer).
+        Испускает whisper_received(uid) на каждый пакет — UI-таймер завершения
+        шёпота перезапускается и не гаснет пока идут пакеты.
 
-        Почему раньше было неправильно:
-          Сигнал испускался только при первом пакете или после паузы >1.5с.
-          _whisper_end_timer (1500 мс, single-shot) перезапускался только тогда.
-          Результат: через ~1.5с после начала шёпота таймер срабатывал и скрывал
-          оверлей, хотя шептун всё ещё держал PTT-кнопку.
-
-        Почему теперь правильно:
-          Сигнал испускается на каждый пакет (~50/сек). MainWindow._on_whisper_received
-          перезапускает таймер при каждом сигнале, но обновляет текст/показывает
-          оверлей только при смене отправителя (uid != текущий) — без визуального
-          мерцания. Пока идут пакеты — таймер никогда не истекает.
+            :param uid: идентификатор шептуна
+            :param seq: порядковый номер пакета
+            :param data: Opus-данные
         """
         now = time.time()
-
-        # Обновляем реестр активных шептунов — dict lookup O(1), GIL-safe.
-        # audio_callback читает self._active_whispers[uid] без лока:
-        # dict.__setitem__ с существующим ключом (update float значения) GIL-атомарно.
-        # При новом uid — новый ключ; audio_callback увидит его на следующем фрейме
-        # (max 20 мс опоздания), что приемлемо.
         self._active_whispers[uid] = now
-
-        # Backward compat: UI-сигнал и таймер скрытия оверлея ориентируются на
-        # _whisper_in_uid / _whisper_in_ts. Показываем последнего шептуна.
         self._whisper_in_uid = uid
-        self._whisper_in_ts  = now
-
-        # Эмитим на каждый пакет — UI-таймер перезапускается, оверлей не гаснет.
+        self._whisper_in_ts = now
         self.whisper_received.emit(uid)
-
         self.add_incoming_packet(uid, seq, data, 0)
 
-    def add_incoming_stream_packet(self, uid, seq, data, flags=0):
-        """Входящий пакет стрим-аудио (FLAG_STREAM_AUDIO) от сервера."""
+    def add_incoming_stream_packet(self, uid: int, seq: int, data: bytes, flags: int = 0):
+        """Добавляет входящий пакет стрим-аудио (FLAG_STREAM_AUDIO) в очередь.
+
+            :param uid: идентификатор отправителя
+            :param seq: порядковый номер пакета
+            :param data: Opus-данные
+            :param flags: битовые флаги пакета
+        """
         try:
             self.incoming_stream_packets.put_nowait((uid, seq, data, flags))
-        except:
+        except Exception:
             pass
 
     def set_stream_audio_enabled(self, enabled: bool):
-        """Включить/выключить передачу микрофона и системного звука стримером зрителям."""
+        """Включает/выключает отправку микрофона и системного звука зрителям.
+
+            :param enabled: True — включить трансляцию, False — выключить
+        """
         if enabled:
             self._stream_audio_sending.set()
         else:
@@ -1612,31 +1332,30 @@ class AudioHandler(QObject):
         print(f"[Audio] Stream mic & loopback sending: {'ON' if enabled else 'OFF'}")
 
     def set_stream_volume(self, volume: float):
-        """
-        Установить громкость стрима для зрителя (0.0–2.0).
-        Вызывается из оверлея VideoWindow.
+        """Устанавливает громкость стрима для зрителя.
+
+            :param volume: громкость в диапазоне [0.0, 2.0]
         """
         self.stream_volume = max(0.0, min(2.0, volume))
         print(f"[Audio] Stream volume set to {self.stream_volume:.2f}")
 
-    def start_stream_audio(self, device_idx=None):
-        """
-        Запустить захват системного аудио (WASAPI Loopback) для трансляции.
-        device_idx — индекс WASAPI output-устройства из list_wasapi_output_devices().
-        Если None — автоматически выбирается дефолтное WASAPI output.
+    def start_stream_audio(self, device_idx: Optional[int] = None):
+        """Запускает захват системного аудио (WASAPI Loopback) для трансляции.
+
+            :param device_idx: индекс WASAPI output-устройства; None — автовыбор
         """
         self.stream_audio_capture.start(device_idx)
 
     def stop_stream_audio(self):
-        """Остановить захват системного аудио."""
+        """Останавливает захват системного аудио."""
         self.stream_audio_capture.stop()
 
     @property
-    def is_muted(self):
+    def is_muted(self) -> bool:
         return self._is_muted.is_set()
 
     @is_muted.setter
-    def is_muted(self, value):
+    def is_muted(self, value: bool):
         if value:
             self._is_muted.set()
         else:
@@ -1644,11 +1363,11 @@ class AudioHandler(QObject):
         self.status_changed.emit(self.is_muted, self.is_deafened)
 
     @property
-    def is_deafened(self):
+    def is_deafened(self) -> bool:
         return self._is_deafened.is_set()
 
     @is_deafened.setter
-    def is_deafened(self, value):
+    def is_deafened(self, value: bool):
         if value:
             self._is_deafened.set()
         else:

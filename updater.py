@@ -1,23 +1,13 @@
-# updater.py
-# ──────────────────────────────────────────────────────────────────────────────
-# Тихое автообновление через GitHub Releases.
-#
-# Логика работы:
-#   1. check_for_updates_async(callback) — запускает проверку в фоновом потоке.
-#   2. Делает GET https://api.github.com/repos/{owner}/{repo}/releases/latest
-#   3. Сравнивает tag_name с APP_VERSION.
-#   4. Если новее — вызывает callback(new_version: str, download_url: str).
-#   5. download_and_install(url) — скачивает .zip/.7z в %TEMP%,
-#      распаковывает, находит .exe внутри и запускает его.
-#
-# Требования к GitHub релизу:
-#   - Прикрепи файл VoiceChat.zip или VoiceChat.7z (содержащий VoiceChat.exe)
-#   - Тег релиза должен быть в формате "v1.2.3" или "1.2.3"
-#
-# Зависимости:
-#   - py7zr      (для .7z архивов)  pip install py7zr
-#   - packaging  (для SemVer)       pip install packaging
-# ──────────────────────────────────────────────────────────────────────────────
+"""Тихое автообновление через GitHub Releases.
+
+Требования к GitHub релизу:
+  - Прикрепи файл VoiceChat.zip или VoiceChat.7z (содержащий VoiceChat.exe)
+  - Тег релиза в формате 'v1.2.3' или '1.2.3'
+
+Зависимости:
+  - py7zr       (для .7z архивов)  pip install py7zr
+  - packaging   (для SemVer)       pip install packaging
+"""
 
 import threading
 import urllib.request
@@ -33,43 +23,38 @@ from packaging.version import Version
 
 from version import APP_VERSION, GITHUB_REPO
 
-# Таймаут HTTP-запроса к API (секунды)
-_HTTP_TIMEOUT = 8
-
-# Таймаут скачивания (секунды). Файл 116 МБ на плохом канале может идти долго.
-_DOWNLOAD_TIMEOUT = 300
-
-# User-Agent для всех запросов — GitHub CDN блокирует запросы без него.
-_USER_AGENT = "VoiceChat-Updater/1.0"
-
-# Поддерживаемые расширения архивов (в порядке приоритета)
+_HTTP_TIMEOUT      = 8
+_DOWNLOAD_TIMEOUT  = 300
+_USER_AGENT        = "VoiceChat-Updater/1.0"
 _SUPPORTED_EXTENSIONS = (".zip", ".7z")
-
-# Magic bytes для определения типа архива по содержимому (не по расширению)
-_ZIP_MAGIC = b"PK\x03\x04"
-_7Z_MAGIC  = b"7z\xbc\xaf\x27\x1c"
-
-# Имя stamp-файла, который сигнализирует «только что установлено обновление».
-# Создаётся в папке установки ДО запуска bat-лончера.
-# check_for_updates() находит его при старте нового exe, удаляет и пропускает
-# GitHub-запрос — это разрывает петлю бесконечного обновления.
-_STAMP_FILENAME = ".pulse_just_updated"
+_ZIP_MAGIC         = b"PK\x03\x04"
+_7Z_MAGIC          = b"7z\xbc\xaf\x27\x1c"
+_STAMP_FILENAME    = ".pulse_just_updated"
 
 
 def _get_install_dir() -> str:
-    """Папка, где лежит исполняемый файл приложения (работает в frozen и dev)."""
+    """Вернуть папку исполняемого файла (работает в frozen и dev режимах)."""
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(sys.argv[0]))
 
 
 def _parse_version(tag: str) -> str:
-    """Убирает префикс 'v' из тега релиза -> '1.2.3'."""
+    """Убрать префикс 'v' из тега релиза.
+
+    :param tag: тег вида 'v1.2.3' или '1.2.3'
+    :return: строка версии '1.2.3'
+    """
     return tag.lstrip("vV").strip()
 
 
 def _is_newer(remote: str, current: str) -> bool:
-    """True если remote строго новее current (SemVer)."""
+    """Проверить, является ли remote строго новее current (SemVer).
+
+    :param remote: версия с сервера
+    :param current: текущая версия приложения
+    :return: True если remote новее
+    """
     try:
         return Version(remote) > Version(current)
     except Exception:
@@ -77,14 +62,10 @@ def _is_newer(remote: str, current: str) -> bool:
 
 
 def _find_archive_asset(assets: list):
-    """
-    Ищет первый поддерживаемый архив (.zip или .7z) в списке релизных активов.
-    Возвращает (name, browser_download_url, ext) или None.
+    """Найти первый поддерживаемый архив (.zip или .7z) в списке релизных активов.
 
-    Приоритет: сначала .zip (встроенная библиотека), потом .7z (py7zr).
-    Раньше функция называлась _find_zip_asset и искала только .zip —
-    это и была причина бага: файл VoiceChatClient.7z не находился,
-    код падал в fallback на html_url (HTML-страница GitHub) → не архив → ошибка.
+    :param assets: список активов из GitHub API
+    :return: (name, browser_download_url, ext) или None
     """
     for ext in _SUPPORTED_EXTENSIONS:
         for asset in assets:
@@ -95,17 +76,14 @@ def _find_archive_asset(assets: list):
 
 
 def _download_file_with_progress(url: str, dest_path: str, on_progress=None):
-    """
-    Скачивает файл по URL с поддержкой прогресса.
+    """Скачать файл по URL с поддержкой прогресса.
 
-    ВАЖНО: использует urllib.request.Request с User-Agent.
-    urlretrieve() не позволяет передать заголовки — без User-Agent
-    GitHub CDN возвращает HTML вместо бинарного файла.
-
-    Raises:
-        urllib.error.HTTPError  — сервер вернул HTTP-ошибку (4xx/5xx)
-        urllib.error.URLError   — сетевая ошибка
-        OSError                 — ошибка записи на диск
+    :param url: URL файла
+    :param dest_path: путь для сохранения
+    :param on_progress: callback(percent: int) или None
+    :raises urllib.error.HTTPError: HTTP-ошибка сервера
+    :raises urllib.error.URLError: сетевая ошибка
+    :raises OSError: ошибка записи на диск
     """
     req = urllib.request.Request(
         url,
@@ -118,7 +96,7 @@ def _download_file_with_progress(url: str, dest_path: str, on_progress=None):
     with urllib.request.urlopen(req, timeout=_DOWNLOAD_TIMEOUT) as response:
         total_size = int(response.headers.get("Content-Length", 0))
         downloaded = 0
-        chunk_size = 65536  # 64 KB
+        chunk_size = 65536
 
         with open(dest_path, "wb") as f:
             while True:
@@ -136,9 +114,10 @@ def _download_file_with_progress(url: str, dest_path: str, on_progress=None):
 
 
 def _detect_archive_type(path: str):
-    """
-    Определяет тип архива по magic bytes (не по расширению файла).
-    Возвращает 'zip', '7z' или None если файл не является поддерживаемым архивом.
+    """Определить тип архива по magic bytes.
+
+    :param path: путь к файлу
+    :return: 'zip', '7z' или None если формат не поддерживается
     """
     try:
         with open(path, "rb") as f:
@@ -153,13 +132,13 @@ def _detect_archive_type(path: str):
 
 
 def _extract_archive(archive_path: str, extract_dir: str, archive_type: str):
-    """
-    Распаковывает архив в указанную директорию.
+    """Распаковать архив в указанную директорию.
 
-    Raises:
-        zipfile.BadZipFile  — повреждённый ZIP
-        RuntimeError        — py7zr не установлен или неизвестный формат
-        Exception           — прочие ошибки py7zr
+    :param archive_path: путь к архиву
+    :param extract_dir: папка назначения
+    :param archive_type: 'zip' или '7z'
+    :raises zipfile.BadZipFile: повреждённый ZIP
+    :raises RuntimeError: py7zr не установлен или неизвестный формат
     """
     if archive_type == "zip":
         with zipfile.ZipFile(archive_path, "r") as z:
@@ -181,19 +160,12 @@ def _extract_archive(archive_path: str, extract_dir: str, archive_type: str):
 
 
 def check_for_updates(on_update_found=None, on_no_update=None, on_error=None):
-    """
-    Синхронная проверка обновлений. Вызывается из фонового потока.
+    """Синхронная проверка обновлений. Вызывать из фонового потока.
 
-    Параметры:
-        on_update_found(version: str, download_url: str)  - найдена новая версия
-        on_no_update()                                     - версия актуальна
-        on_error(message: str)                             - ошибка сети/API
+    :param on_update_found: callback(version: str, download_url: str) — найдена новая версия
+    :param on_no_update: callback() — версия актуальна
+    :param on_error: callback(message: str) — ошибка сети или API
     """
-    # ── Stamp-файл: защита от петли бесконечного обновления ──────────────────
-    # Если bat-лончер только что установил обновление, он оставил stamp-файл.
-    # Мы находим его при старте нового exe, удаляем и пропускаем GitHub-запрос.
-    # Без этого: новый exe запускается → _update_checked=False → идёт на GitHub →
-    # (если xcopy не успел перезаписать exe) находит «обновление» → петля.
     _stamp = os.path.join(_get_install_dir(), _STAMP_FILENAME)
     if os.path.exists(_stamp):
         try:
@@ -204,6 +176,7 @@ def check_for_updates(on_update_found=None, on_no_update=None, on_error=None):
         if on_no_update:
             on_no_update()
         return
+
     if not GITHUB_REPO or "/" not in GITHUB_REPO:
         if on_error:
             on_error("GITHUB_REPO не настроен в version.py")
@@ -245,7 +218,6 @@ def check_for_updates(on_update_found=None, on_no_update=None, on_error=None):
         asset = _find_archive_asset(assets)
 
         if asset is None:
-            # Нет ни .zip ни .7z — сообщаем внятно вместо тихого падения в html_url
             if on_error:
                 on_error(
                     f"Найдена новая версия {remote_version}, но к релизу\n"
@@ -263,9 +235,11 @@ def check_for_updates(on_update_found=None, on_no_update=None, on_error=None):
 
 
 def check_for_updates_async(on_update_found=None, on_no_update=None, on_error=None):
-    """
-    Запускает проверку обновлений в фоновом потоке-демоне.
-    Не блокирует UI. Безопасен для вызова из любого потока.
+    """Запустить проверку обновлений в фоновом потоке-демоне.
+
+    :param on_update_found: callback(version: str, download_url: str)
+    :param on_no_update: callback()
+    :param on_error: callback(message: str)
     """
     t = threading.Thread(
         target=check_for_updates,
@@ -281,18 +255,18 @@ def check_for_updates_async(on_update_found=None, on_no_update=None, on_error=No
 
 
 def download_and_install(download_url: str, on_progress=None, on_done=None, on_error=None):
-    """
-    Скачивает .zip/.7z по URL в %TEMP%, распаковывает, ищет .exe и запускает.
-    После запуска установщика закрывает текущее приложение через sys.exit(0).
+    """Скачать архив, распаковать, найти .exe и запустить через bat-лончер.
 
-    Параметры:
-        on_progress(percent: int)   - прогресс загрузки 0..100
-        on_done()                   - загрузка завершена, установщик запущен
-        on_error(message: str)      - ошибка
+    После запуска установщика закрывает текущее приложение через sys.exit(0).
+    Пользовательские данные (user_config.json, known_users.json) сохраняются.
+
+    :param download_url: URL архива с GitHub
+    :param on_progress: callback(percent: int) — прогресс загрузки 0..100
+    :param on_done: callback() — установщик запущен
+    :param on_error: callback(message: str) — ошибка
     """
     def _download():
         try:
-            # 1. Сохраняем с оригинальным именем из URL (включая расширение .7z/.zip)
             filename = download_url.split("/")[-1].split("?")[0] or "update.bin"
             dest_path = os.path.join(tempfile.gettempdir(), filename)
 
@@ -313,7 +287,6 @@ def download_and_install(download_url: str, on_progress=None, on_done=None, on_e
             file_size = os.path.getsize(dest_path)
             print(f"[Updater] Скачано байт: {file_size}")
 
-            # 2. Определяем тип архива по magic bytes (не доверяем расширению)
             archive_type = _detect_archive_type(dest_path)
             print(f"[Updater] Тип архива по magic bytes: {archive_type}")
 
@@ -332,7 +305,6 @@ def download_and_install(download_url: str, on_progress=None, on_done=None, on_e
                     )
                 return
 
-            # 3. Распаковываем
             extract_dir = os.path.join(tempfile.gettempdir(), "voicechat_update")
             if os.path.exists(extract_dir):
                 shutil.rmtree(extract_dir, ignore_errors=True)
@@ -354,7 +326,6 @@ def download_and_install(download_url: str, on_progress=None, on_done=None, on_e
                     on_error(f"Ошибка распаковки: {e}")
                 return
 
-            # 4. Ищем .exe внутри
             exe_to_run = None
             for root, _dirs, files in os.walk(extract_dir):
                 for f in files:
@@ -374,43 +345,24 @@ def download_and_install(download_url: str, on_progress=None, on_done=None, on_e
                 subprocess.Popen(["explorer", extract_dir])
                 return
 
-            # 5. Сообщаем UI что сейчас закроемся
             if on_done:
                 on_done()
 
-            # 6. Запускаем через bat-лончер: он дожидается смерти
-            #    текущего процесса (по PID), копирует новые файлы поверх
-            #    папки установки (xcopy), затем запускает exe из оригинального
-            #    расположения.
-            #
-            #    ВАЖНО: запускать exe нужно именно из install_dir, а не из TEMP.
-            #    Иначе первый запуск после обновления работает из %TEMP%,
-            #    а повторный — снова из старой папки → версия откатывается.
             current_pid = os.getpid()
 
-            # Папка установки текущего (старого) приложения
             if getattr(sys, 'frozen', False):
-                # PyInstaller: sys.executable = .../VoiceChatClient/VoiceChatClient.exe
                 install_dir = os.path.dirname(sys.executable)
                 exe_name    = os.path.basename(sys.executable)
             else:
-                # Dev-режим (python client_main.py)
                 install_dir = os.path.dirname(os.path.abspath(sys.argv[0]))
                 exe_name    = os.path.basename(exe_to_run)
 
-            # Папка с новыми файлами внутри TEMP (рядом с найденным exe)
             new_files_dir = os.path.dirname(exe_to_run)
-
-            # Итоговый exe который запустим из оригинального места
-            target_exe = os.path.join(install_dir, exe_name)
+            target_exe    = os.path.join(install_dir, exe_name)
 
             bat_path = os.path.join(tempfile.gettempdir(), "pulse_update_launcher.bat")
 
-            # ── Защита пользовательских данных при обновлении ─────────────────
-            # xcopy /E перезапишет ВСЕ файлы из архива, включая дефолтные
-            # user_config.json / known_users.json если они там присутствуют.
-            # Стратегия: backup → xcopy → restore.
-            # Работает только для файлов которые реально существуют (команды с if exist).
+            # Backup/restore пользовательских данных (не перезаписываем при xcopy)
             _user_data_files = ["user_config.json", "known_users.json"]
             _backup_dir = os.path.join(tempfile.gettempdir(), "pulse_update_backup")
 
@@ -429,20 +381,7 @@ def download_and_install(download_url: str, on_progress=None, on_done=None, on_e
                     f'if exist "{_bak}" copy /Y "{_bak}" "{_dst}" >nul 2>&1'
                 )
 
-            # taskkill /PID — убивает старый процесс принудительно
-            # ping -n 6   — пауза ~5 сек: достаточно для Qt-cleanup + снятия файловых
-            #               блокировок Windows на exe. ping -n 3 (~2 сек) не хватало:
-            #               xcopy падал на заблокированном exe → копировал старый exe →
-            #               новый запуск снова видел «обновление» → бесконечная петля.
-            # backup      — сохраняем user_config.json, known_users.json во временную папку
-            # xcopy       — копирует ВСЕ новые файлы поверх папки установки
-            #               /E = включая подпапки, /Y = перезаписывать без вопросов
-            #               /I = цель — папка, /Q = без вывода имён файлов
-            # restore     — возвращаем пользовательские данные (перезаписываем дефолты из архива)
-            # rmdir /S /Q — удаляем временную папку backup
-            # start ""    — запускает обновлённый exe из оригинального места
-            # ping -n 2   — минимальная пауза перед самоудалением
-            # del         — батник удаляет сам себя
+            # ping -n 6 (~5 сек) даёт Windows время снять файловые блокировки на exe
             bat_lines = [
                 "@echo off",
                 f"taskkill /PID {current_pid} /F >nul 2>&1",
@@ -462,13 +401,8 @@ def download_and_install(download_url: str, on_progress=None, on_done=None, on_e
             print(f"[Updater] install_dir  : {install_dir}")
             print(f"[Updater] new_files_dir: {new_files_dir}")
             print(f"[Updater] target_exe   : {target_exe}")
-
             print(f"[Updater] Лончер: {bat_path}")
 
-            # Записываем stamp ДО запуска батника.
-            # Новый exe при старте найдёт его, удалит и пропустит GitHub-запрос.
-            # Stamp пишем именно сейчас: если bat по какой-то причине не запустится,
-            # stamp не появится — следующий запуск старого exe проверит обновления штатно.
             try:
                 _stamp = os.path.join(install_dir, _STAMP_FILENAME)
                 open(_stamp, "w").close()
@@ -481,8 +415,6 @@ def download_and_install(download_url: str, on_progress=None, on_done=None, on_e
                 creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
                 close_fds=True,
             )
-            # sys.exit вызывает Qt-cleanup и закрывает окно.
-            # Батник убьёт нас через taskkill если Qt завис.
             sys.exit(0)
 
         except Exception as e:

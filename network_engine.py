@@ -27,17 +27,17 @@ from config import (
 MAX_SILENT_RECONNECT_ATTEMPTS = 4
 RECONNECT_DELAY = 3.0
 
-# Устанавливаем точность системного таймера в 1 мс на Windows.
-# Без этого time.sleep(0.001) может спать 10-15мс — аудио глитчи.
+# Точность системного таймера 1 мс на Windows: без этого time.sleep(0.001) спит 10–15 мс
 if platform.system() == "Windows":
     try:
-        winmm = ctypes.WinDLL('winmm')
-        winmm.timeBeginPeriod(1)
+        ctypes.WinDLL('winmm').timeBeginPeriod(1)
     except Exception:
         pass
 
 
 class NetworkClient(QObject):
+    """Сетевой клиент: TCP-команды, UDP-аудио/видео, reconnect, soundboard, nudge."""
+
     connected           = pyqtSignal(dict)
     global_state_update = pyqtSignal(dict)
     error_occurred      = pyqtSignal(str)
@@ -46,15 +46,10 @@ class NetworkClient(QObject):
     connection_restored = pyqtSignal()
     reconnect_failed    = pyqtSignal()
 
-    # Эмитит (from_nick) при получении soundboard-пакета от сервера.
-    # MainWindow показывает тост и обновляет желтую метку в открытой панели.
-    soundboard_played   = pyqtSignal(str)
+    soundboard_played   = pyqtSignal(str)   # (from_nick)
 
-    # Сигналы фичи «Пнуть».
-    # nudge_received  — нас пнули (воспроизведение звука уже запущено в потоке).
-    # nudge_triggered — кого-то пнули в комнате (target_nick, voter_nick) → тост у всех.
     nudge_received  = pyqtSignal()
-    nudge_triggered = pyqtSignal(str, str)
+    nudge_triggered = pyqtSignal(str, str)  # (target_nick, voter_nick)
 
     def __init__(self, audio):
         super().__init__()
@@ -74,29 +69,19 @@ class NetworkClient(QObject):
         self._reconnecting       = False
         self._reconnect_attempts = 0
 
-        # Флаг воспроизведения soundboard.
-        # Используется для блокировки спама: новый звук не запустится,
-        # пока текущий ещё играет.
+        # Блокировка спама soundboard: новый звук не запустится пока играет текущий
         self._sb_playing = threading.Event()
 
-        # -------------------------------------------------------------------
-        # Pacing-очередь для видео-пакетов (leaky bucket).
-        # Пакеты кладёт send_video_packet(), дренирует video_pacing_loop().
+        # Pacing-очередь для видео (leaky bucket).
         # maxsize=2000: ~2.7 сек буфера при 720p60 6Mbps (737 пакетов/сек).
-        # Если очередь заполнена — старые пакеты дропаются (актуальность важнее).
-        # -------------------------------------------------------------------
         self.video_pacing_queue = queue.Queue(maxsize=2000)
 
         self._init_sockets()
 
-    # ------------------------------------------------------------------
-    # Сокеты
-    # ------------------------------------------------------------------
+    # ── Сокеты ───────────────────────────────────────────────────────────────
+
     def _init_sockets(self):
-        # FIX #2: явно закрываем старые сокеты перед созданием новых.
-        # Раньше при каждой неудачной попытке переподключения (_reconnect_loop)
-        # создавались новые socket-объекты, а предыдущие оставались открытыми —
-        # утечка файловых дескрипторов (до 4 при MAX_SILENT_RECONNECT_ATTEMPTS=4).
+        """Создаёт новые TCP/UDP-сокеты, закрывая предыдущие если они есть."""
         for attr in ('tcp_sock', 'udp_sock'):
             old = getattr(self, attr, None)
             if old is not None:
@@ -112,35 +97,29 @@ class NetworkClient(QObject):
         except Exception as e:
             print(f"[Net] Socket init error: {e}")
 
-    # ------------------------------------------------------------------
-    # Soundboard
-    # ------------------------------------------------------------------
-    def play_soundboard_file(self, filename, data_b64=None, from_nick=None):
-        """
-        Воспроизвести soundboard-файл через sounddevice.
+    # ── Soundboard ────────────────────────────────────────────────────────────
 
-        Два режима:
-        1. Стандартный (data_b64 is None): файл ищется в assets/panel/ по имени.
-        2. Кастомный (data_b64 задан): аудио декодируется из base64 и воспроизводится
-           прямо из памяти (BytesIO). Файл на диске не нужен.
+    def play_soundboard_file(self, filename: str, data_b64: str = None,
+                             from_nick: str = None):
+        """Воспроизводит soundboard-файл через sounddevice.
 
-        from_nick: ник отправителя (добавляется сервером). Эмитит soundboard_played
-                   сразу, до фонового воспроизведения — MainWindow покажет тост.
+        Режим 1 (data_b64 is None): файл ищется в assets/panel/ по имени.
+        Режим 2 (data_b64 задан): аудио декодируется из base64 прямо в памяти.
+        Новый звук пропускается если предыдущий ещё играет (anti-spam).
 
-        Защита от спама: новый звук НЕ запускается, пока предыдущий ещё играет.
+            :param filename: имя файла или метка '__custom__:...'
+            :param data_b64: base64-данные кастомного звука; None — стандартный файл
+            :param from_nick: ник отправителя для сигнала soundboard_played
         """
         try:
-            # Anti-spam: блокируем, пока текущий звук ещё играет
             if self._sb_playing.is_set():
                 print(f"[Net] Soundboard: пропущен {filename!r} — звук ещё играет")
                 return
 
             raw = int(QSettings("MyVoiceChat", "GlobalSettings").value("soundboard_volume", 40)) / 100.0
-            vol = raw ** 2  # квадратичная кривая: (raw/100)^2
+            vol = raw ** 2  # квадратичная кривая громкости
 
-            # Определяем источник аудио: байты из data_b64 или файл на диске
             if data_b64:
-                # Кастомный звук: декодируем base64 → BytesIO
                 try:
                     audio_bytes = base64.b64decode(data_b64)
                     audio_source = io.BytesIO(audio_bytes)
@@ -148,10 +127,8 @@ class NetworkClient(QObject):
                     print(f"[Net] Soundboard base64 decode error: {e}")
                     return
             else:
-                # Стандартный звук: путь к файлу в assets/panel/
-                # Пропускаем «кастомные» имена без data_b64 (не наш пакет)
                 if filename and filename.startswith("__custom__:"):
-                    print(f"[Net] Soundboard: кастомный звук без data_b64 — пропущен")
+                    print("[Net] Soundboard: кастомный звук без data_b64 — пропущен")
                     return
                 path = resource_path(os.path.join("assets/panel", filename))
                 if not os.path.exists(path):
@@ -159,8 +136,6 @@ class NetworkClient(QObject):
                     return
                 audio_source = path
 
-            # Эмитим сигнал в GUI-потоке ДО запуска фонового воспроизведения.
-            # MainWindow и VideoWindow подпишутся на него для тоста / метки автора.
             if from_nick:
                 self.soundboard_played.emit(from_nick)
 
@@ -176,14 +151,20 @@ class NetworkClient(QObject):
                     self._sb_playing.clear()
 
             threading.Thread(target=_play, daemon=True, name="soundboard-play").start()
-            print(f"[Net] Playing soundboard: {filename} (vol={vol:.3f}, custom={bool(data_b64)}, by={from_nick!r})")
+            print(f"[Net] Playing soundboard: {filename} "
+                  f"(vol={vol:.3f}, custom={bool(data_b64)}, by={from_nick!r})")
         except Exception as e:
             print(f"[Net] Soundboard error: {e}")
 
-    # ------------------------------------------------------------------
-    # Подключение к серверу
-    # ------------------------------------------------------------------
-    def connect_to_server(self, ip, nick, avatar):
+    # ── Подключение к серверу ────────────────────────────────────────────────
+
+    def connect_to_server(self, ip: str, nick: str, avatar: str):
+        """Запускает первичное подключение в фоновом потоке.
+
+            :param ip: IP-адрес сервера
+            :param nick: никнейм пользователя
+            :param avatar: имя файла аватарки
+        """
         self._ip     = ip
         self._nick   = nick
         self._avatar = avatar
@@ -202,6 +183,7 @@ class NetworkClient(QObject):
             self._reconnect_loop()
 
     def _do_connect(self):
+        """Выполняет TCP/UDP подключение и запускает рабочие потоки."""
         self.server_addr = (self._ip, DEFAULT_PORT_UDP)
 
         self.tcp_sock.settimeout(5.0)
@@ -218,7 +200,6 @@ class NetworkClient(QObject):
                 print(f"[Net] CRITICAL: UDP bind failed: {e}")
                 raise
 
-        # 8 MB буфер приёма: при 6Mbps видео ≈ 750KB/s → запас ~10 сек.
         try:
             self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
             print("[Net] UDP receive buffer set to 8MB")
@@ -229,19 +210,19 @@ class NetworkClient(QObject):
         self.running       = True
         self._is_connected = True
 
-        threading.Thread(target=self.tcp_listen,          daemon=True).start()
-        threading.Thread(target=self.udp_sender_loop,     daemon=True).start()
-        threading.Thread(target=self.udp_keepalive_loop,  daemon=True).start()
-        threading.Thread(target=self.udp_receive_loop,    daemon=True).start()
-        threading.Thread(target=self.ping_loop,           daemon=True).start()
-        threading.Thread(target=self.video_pacing_loop,   daemon=True).start()
+        threading.Thread(target=self.tcp_listen,         daemon=True).start()
+        threading.Thread(target=self.udp_sender_loop,    daemon=True).start()
+        threading.Thread(target=self.udp_keepalive_loop, daemon=True).start()
+        threading.Thread(target=self.udp_receive_loop,   daemon=True).start()
+        threading.Thread(target=self.ping_loop,          daemon=True).start()
+        threading.Thread(target=self.video_pacing_loop,  daemon=True).start()
 
         print("[Net] Connected to server")
 
-    # ------------------------------------------------------------------
-    # Переподключение
-    # ------------------------------------------------------------------
+    # ── Переподключение ───────────────────────────────────────────────────────
+
     def _on_connection_lost(self):
+        """Запускает цикл переподключения при разрыве соединения."""
         if self._reconnecting:
             return
         self._reconnecting       = True
@@ -254,6 +235,7 @@ class NetworkClient(QObject):
         threading.Thread(target=self._reconnect_loop, daemon=True).start()
 
     def _reconnect_loop(self):
+        """Делает MAX_SILENT_RECONNECT_ATTEMPTS попыток переподключения с паузой."""
         while self._reconnect_attempts < MAX_SILENT_RECONNECT_ATTEMPTS:
             self._reconnect_attempts += 1
             print(f"[Net] Reconnect attempt {self._reconnect_attempts}/{MAX_SILENT_RECONNECT_ATTEMPTS}...")
@@ -274,6 +256,7 @@ class NetworkClient(QObject):
         self.reconnect_failed.emit()
 
     def manual_reconnect(self):
+        """Запускает ручное переподключение по запросу пользователя."""
         if self._reconnecting:
             print("[Net] Already reconnecting...")
             return
@@ -286,19 +269,17 @@ class NetworkClient(QObject):
         self.running = False
         threading.Thread(target=self._reconnect_loop, daemon=True).start()
 
-    # ------------------------------------------------------------------
-    # Видео — пакеты кладём в pacing-очередь.
-    # Реальная отправка происходит в video_pacing_loop() с ограничением
-    # скорости, чтобы избежать burst'ов, которые перегружают Radmin VPN
-    # и роняют пинг на каналах с RTT 40-50 мс.
-    # ------------------------------------------------------------------
-    def send_video_packet(self, payload):
+    # ── Видео — pacing-очередь ────────────────────────────────────────────────
+
+    def send_video_packet(self, payload: bytes):
+        """Кладёт видео-пакет в pacing-очередь; переполнение → дроп старого.
+
+            :param payload: сырые байты видео-чанка
+        """
         if not self.server_addr or self.audio.my_uid == 0:
             return
         header = UDP_HEADER_STRUCT.pack(self.audio.my_uid, time.time(), 0, FLAG_VIDEO)
         packet = header + payload
-        # Если очередь переполнена — дропаем самый старый пакет, берём новый.
-        # Актуальный кадр важнее давно стоящего в очереди.
         if self.video_pacing_queue.full():
             try:
                 self.video_pacing_queue.get_nowait()
@@ -309,31 +290,16 @@ class NetworkClient(QObject):
         except queue.Full:
             pass
 
-    # ------------------------------------------------------------------
-    # Leaky bucket pacing для видео-пакетов.
-    #
-    # Проблема (до pacing):
-    #   _fragment_and_send() отправлял 100-300 UDP-пакетов за <1 мс в одном
-    #   burst'е (особенно IDR-кадры). На 10ms-канале (RadminVPN) это проходит,
-    #   на 40-50ms-канале очередь отправки ядра переполняется → ВСЕ UDP пакеты
-    #   (включая ping) встают в очередь → ping улетает до 5000 мс.
-    #
-    # Решение (leaky bucket):
-    #   Пакеты отправляются с постоянным интервалом ~1.4 мс, не превышая
-    #   VIDEO_PACING_RATE_BYTES_SEC. Burst'ы невозможны.
-    #
-    # Точность на Windows:
-    #   timeBeginPeriod(1) уже вызван в этом файле → time.sleep() имеет
-    #   разрешение ~1 мс. Для sub-millisecond интервалов используем
-    #   perf_counter busy-wait с порогом 0.5 мс.
-    # ------------------------------------------------------------------
     def video_pacing_loop(self):
-        # Средний размер видео-пакета: MAX_VIDEO_PAYLOAD + UDP_HEADER(13) + VIDEO_HEADER(8)
-        avg_packet_bytes = MAX_VIDEO_PAYLOAD + 21
-        # Интервал между пакетами в секундах
-        pacing_interval  = avg_packet_bytes / VIDEO_PACING_RATE_BYTES_SEC  # ~1.39 мс
+        """Leaky bucket: отправляет видео-пакеты с постоянным интервалом.
 
-        SLEEP_THRESHOLD = 0.0003  # 0.3 мс — busy-wait точнее sleep(), но дешевле чем 0.5 мс
+        Устраняет burst'ы, из-за которых на каналах с RTT 40–50 мс (RadminVPN)
+        очередь ядра переполняется и ping улетает до 5000 мс.
+        Sub-ms точность: sleep до порога, затем busy-wait остаток.
+        """
+        avg_packet_bytes = MAX_VIDEO_PAYLOAD + 21   # payload + UDP(13) + VIDEO(8)
+        pacing_interval  = avg_packet_bytes / VIDEO_PACING_RATE_BYTES_SEC  # ~1.39 мс
+        SLEEP_THRESHOLD  = 0.0003  # 0.3 мс: граница перехода sleep → busy-wait
 
         last_send_t = time.perf_counter()
 
@@ -346,33 +312,26 @@ class NetworkClient(QObject):
             if not self.server_addr:
                 continue
 
-            # Ждём нужный момент отправки
             target_t = last_send_t + pacing_interval
-            now      = time.perf_counter()
-            delta    = target_t - now
+            now = time.perf_counter()
+            delta = target_t - now
 
-            if delta > SLEEP_THRESHOLD:
-                time.sleep(delta - SLEEP_THRESHOLD)
-                # Busy-wait оставшиеся <0.5 мс для точности
-                while time.perf_counter() < target_t:
-                    pass
-            elif delta > 0:
-                # Короткий busy-wait (< 0.5 мс)
-                while time.perf_counter() < target_t:
-                    pass
+            if delta > 0:
+                # В Windows с timeBeginPeriod(1) sleep работает с точностью ~1-2 мс
+                time.sleep(delta)
 
             try:
                 self.udp_sock.sendto(packet, self.server_addr)
                 self.packets_sent += 1
             except Exception as e:
-                print(f"[Net] Pacing send error: {e}")
+                pass  # Убрал печать, чтобы не спамить в консоль при разрывах
 
             last_send_t = time.perf_counter()
 
-    # ------------------------------------------------------------------
-    # Приём UDP-пакетов
-    # ------------------------------------------------------------------
+    # ── Приём UDP-пакетов ─────────────────────────────────────────────────────
+
     def udp_receive_loop(self):
+        """Принимает и маршрутизирует входящие UDP-пакеты."""
         while self.running:
             try:
                 data, addr = self.udp_sock.recvfrom(BUFFER_SIZE)
@@ -382,7 +341,7 @@ class NetworkClient(QObject):
                 uid, ts, seq, flags = UDP_HEADER_STRUCT.unpack(data[:UDP_HEADER_SIZE])
 
                 if flags == 254:
-                    # Pong — измеряем RTT
+                    # Pong: обновляем RTT (EWMA 0.7/0.3)
                     self.packets_received += 1
                     delay = (time.time() - ts) * 1000
                     if self.current_ping == 0:
@@ -397,9 +356,8 @@ class NetworkClient(QObject):
                         print(f"[Net] Video packet from {uid}, but VideoEngine not initialized")
 
                 elif flags & FLAG_STREAM_AUDIO and flags & FLAG_STREAM_VOICES:
-                    # Голосовой поток стрима — Mix Minus без DSP.
-                    # Payload: [speaker_uid: 4 байта] + [opus].
-                    # Свой голос отбрасываем — не слышим себя в стриме.
+                    # Mix Minus: payload [speaker_uid: 4 байта] + [opus]
+                    # Свой голос отбрасываем — не слышим себя в стриме
                     if len(data) < UDP_HEADER_SIZE + STREAM_VOICE_HEADER_SIZE:
                         continue
                     speaker_uid, = STREAM_VOICE_HEADER_STRUCT.unpack(
@@ -411,26 +369,20 @@ class NetworkClient(QObject):
                     self.audio.add_incoming_stream_packet(speaker_uid, seq, opus_payload, flags)
 
                 elif flags & FLAG_STREAM_AUDIO:
-                    # Стрим-аудио (системный звук / виртуальный кабель)
                     is_loopback = bool(flags & FLAG_LOOPBACK_AUDIO)
                     if seq % 50 == 0:
                         print(f"[Net-Recv] FLAG_STREAM_AUDIO (loopback={is_loopback}) от uid={uid}")
                     self.audio.add_incoming_stream_packet(uid, seq, data[UDP_HEADER_SIZE:], flags)
 
                 elif flags & FLAG_WHISPER:
-                    # Шёпот — приватный голос от sender к нам.
-                    # Payload: [target_uid: 4 байта] + [opus].
-                    # Отбрасываем 4-байтовый заголовок target_uid перед декодированием,
-                    # иначе opuslib получит мусор в начале и вернёт ошибку.
+                    # Payload: [target_uid: 4 байта] + [opus]
+                    # Отбрасываем 4-байтовый заголовок перед передачей в декодер
                     if len(data) < UDP_HEADER_SIZE + STREAM_VOICE_HEADER_SIZE:
                         continue
                     opus_payload = data[UDP_HEADER_SIZE + STREAM_VOICE_HEADER_SIZE:]
-                    # add_incoming_whisper_packet: испускает сигнал whisper_received(uid)
-                    # при первом пакете от нового шептуна → UI показывает баннер.
                     self.audio.add_incoming_whisper_packet(uid, seq, opus_payload)
 
                 else:
-                    # Обычный голос чата
                     self.audio.add_incoming_packet(uid, seq, data[UDP_HEADER_SIZE:], flags)
 
             except Exception as e:
@@ -438,10 +390,10 @@ class NetworkClient(QObject):
                     print(f"[Net] UDP receive error: {e}")
                 continue
 
-    # ------------------------------------------------------------------
-    # Отправка аудио-пакетов из очереди AudioHandler
-    # ------------------------------------------------------------------
+    # ── Отправка аудио-пакетов ────────────────────────────────────────────────
+
     def udp_sender_loop(self):
+        """Дренирует очередь send_queue AudioHandler и отправляет UDP-пакеты."""
         while self.running:
             try:
                 packet = self.audio.send_queue.get(timeout=0.1)
@@ -450,10 +402,10 @@ class NetworkClient(QObject):
             except Exception:
                 continue
 
-    # ------------------------------------------------------------------
-    # Keepalive (статус mute/deaf) и Ping
-    # ------------------------------------------------------------------
+    # ── Keepalive и Ping ──────────────────────────────────────────────────────
+
     def udp_keepalive_loop(self):
+        """Раз в секунду отправляет UDP-пакет с текущими флагами mute/deaf."""
         while self.running:
             if self.audio.my_uid != 0:
                 flags = (1 if self.audio.is_muted else 0) | (2 if self.audio.is_deafened else 0)
@@ -465,6 +417,7 @@ class NetworkClient(QObject):
             time.sleep(1)
 
     def ping_loop(self):
+        """Раз в 7 секунд отправляет ping-пакет (flags=254) для измерения RTT."""
         while self.running:
             if self.audio.my_uid != 0:
                 try:
@@ -475,14 +428,12 @@ class NetworkClient(QObject):
                     print(f"[Net] Ping error: {e}")
             time.sleep(7)
 
-    # ------------------------------------------------------------------
-    # TCP — команды сервера
-    # ------------------------------------------------------------------
+    # ── TCP — команды сервера ─────────────────────────────────────────────────
+
     def tcp_listen(self):
+        """Принимает TCP-сообщения от сервера и передаёт в process_message."""
         raw_data = ""
-        # JSONDecoder создаём ОДИН РАЗ — он stateless и thread-safe.
-        # Создание внутри цикла (старый код) аллоцировало новый объект на КАЖДОЕ
-        # входящее сообщение: при 10 sync/сек это +10 аллокаций/сек без причины.
+        # JSONDecoder создаётся один раз — stateless, избегаем аллокаций в цикле
         _decoder = json.JSONDecoder()
         while self.running:
             try:
@@ -511,7 +462,11 @@ class NetworkClient(QObject):
         if self.running:
             self._on_connection_lost()
 
-    def process_message(self, msg):
+    def process_message(self, msg: dict):
+        """Диспетчер входящих TCP-команд от сервера.
+
+            :param msg: десериализованный JSON-словарь
+        """
         act = msg.get('action')
         if act == 'login_success':
             self.connected.emit(msg)
@@ -524,47 +479,50 @@ class NetworkClient(QObject):
             if self.video:
                 self.video.force_keyframe()
                 print("[Net] IDR keyframe запрошен сервером → передано VideoEngine")
-
         elif act == CMD_PLAY_NUDGE:
-            # Нас пнули — воспроизводим звук в отдельном потоке.
-            # Звук намеренно обходит deaf/mute — цель фичи «достучаться» до АФК.
+            # Нас пнули: звук обходит deaf/mute — цель фичи «достучаться» до АФК
             threading.Thread(
                 target=self._play_nudge_sound,
                 daemon=True,
                 name="nudge-sound",
             ).start()
             self.nudge_received.emit()
-
         elif act == CMD_NUDGE_TRIGGERED:
-            # Broadcast: кого-то пнули в нашей комнате → показываем тост у всех
             target_nick = msg.get('target_nick', '?')
             voter_nick  = msg.get('voter_nick',  '?')
             self.nudge_triggered.emit(target_nick, voter_nick)
 
-    def send_json(self, data):
+    def send_json(self, data: dict):
+        """Отправляет JSON-команду серверу по TCP.
+
+            :param data: словарь для сериализации
+        """
         try:
             self.tcp_sock.sendall(json.dumps(data).encode('utf-8'))
         except Exception as e:
             print(f"[Net] Send JSON error: {e}")
 
-    def update_user_info(self, nick, avatar):
+    def update_user_info(self, nick: str, avatar: str):
+        """Отправляет обновление никнейма и аватарки на сервер.
+
+            :param nick: новый никнейм
+            :param avatar: имя файла аватарки
+        """
         self.send_json({"action": "update_user", "nick": nick, "avatar": avatar})
 
-    def send_status_update(self, mute, deaf):
+    def send_status_update(self, mute: bool, deaf: bool):
+        """Отправляет текущие флаги mute/deaf на сервер.
+
+            :param mute: состояние заглушения микрофона
+            :param deaf: состояние заглушения воспроизведения
+        """
         self.send_json({"action": "update_status", "mute": mute, "deaf": deaf})
 
     def send_presence_update(self, status_icon: str, status_text: str):
-        """
-        Отправляет серверу новый «статус дела» пользователя.
+        """Отправляет новый «статус дела» пользователя на сервер.
 
-        status_icon: имя SVG-файла из assets/status/ (например 'afk.svg')
-                     или '' чтобы убрать статус.
-        status_text: произвольная подпись ≤ 30 символов, показывается как
-                     всплывающая подсказка (tooltip) рядом с иконкой статуса.
-                     Передавайте '' если подпись не нужна.
-
-        Сервер ретранслирует обновление всем участникам через sync_users,
-        и остальные увидят иконку рядом с ником этого пользователя.
+            :param status_icon: имя SVG-файла из assets/status/ или '' — убрать статус
+            :param status_text: подпись ≤ 30 символов или ''
         """
         self.send_json({
             "action":      "update_presence",
@@ -573,50 +531,37 @@ class NetworkClient(QObject):
         })
 
     def set_video_engine(self, video):
+        """Регистрирует VideoEngine для маршрутизации видео-пакетов.
+
+            :param video: экземпляр VideoEngine
+        """
         self.video = video
         print("[Net] VideoEngine registered")
 
-    # ------------------------------------------------------------------
-    # Фича «Пнуть» — воспроизведение звука и отправка голоса
-    # ------------------------------------------------------------------
-    # ------------------------------------------------------------------
-    # Управление системной громкостью Windows (WASAPI IAudioEndpointVolume)
-    # ------------------------------------------------------------------
+    # ── Фича «Пнуть» (Nudge) ─────────────────────────────────────────────────
 
     def _nudge_get_endpoint_vol(self):
+        """Возвращает IAudioEndpointVolume дефолтного устройства воспроизведения.
+
+        Поддерживает pycaw < 0.6 (GetSpeakers → IMMDevice напрямую)
+        и pycaw >= 0.6 (GetSpeakers → AudioDevice-обёртка, IMMDevice в ._dev).
+        Fallback — comtypes напрямую без pycaw.
+
+            :return: IAudioEndpointVolume* или None при ошибке
         """
-        Возвращает указатель на IAudioEndpointVolume дефолтного устройства
-        воспроизведения (мастер-ползунок Windows, тот что в трее).
-
-        Поддерживает ОБЕ версии pycaw:
-          • pycaw < 0.6  — GetSpeakers() возвращает сырой IMMDevice с .Activate()
-          • pycaw >= 0.6 — GetSpeakers() возвращает AudioDevice-обёртку;
-                           сырой IMMDevice лежит в атрибуте ._dev
-
-        Fallback без pycaw — comtypes напрямую (comtypes всегда есть,
-        т.к. является зависимостью pycaw и pywin32).
-
-        Возвращает IAudioEndpointVolume* или None при любой ошибке.
-        """
-        # ── Попытка 1: pycaw (оба поколения API) ─────────────────────────────
+        # Попытка 1: pycaw
         try:
             from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
             from comtypes import CLSCTX_ALL
             from ctypes import cast, POINTER
 
             device = AudioUtilities.GetSpeakers()
-
-            # Определяем откуда брать сырой IMMDevice:
-            #   pycaw >= 0.6 → AudioDevice-обёртка, IMMDevice внутри ._dev
-            #   pycaw <  0.6 → уже IMMDevice, имеет метод Activate()
             if hasattr(device, 'Activate'):
-                raw_dev = device          # старый pycaw — сразу IMMDevice
+                raw_dev = device          # pycaw < 0.6: уже IMMDevice
             elif hasattr(device, '_dev'):
-                raw_dev = device._dev     # новый pycaw — достаём IMMDevice
+                raw_dev = device._dev     # pycaw >= 0.6: IMMDevice внутри обёртки
             else:
-                raise RuntimeError(
-                    f"[Nudge] Неизвестный тип GetSpeakers(): {type(device).__name__}"
-                )
+                raise RuntimeError(f"Неизвестный тип GetSpeakers(): {type(device).__name__}")
 
             iface = raw_dev.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
             return cast(iface, POINTER(IAudioEndpointVolume))
@@ -626,37 +571,25 @@ class NetworkClient(QObject):
         except Exception as e:
             print(f"[Nudge] pycaw get_endpoint_vol error: {e}")
 
-        # ── Попытка 2: comtypes напрямую (без pycaw) ─────────────────────────
-        # Вручную определяем COM-интерфейсы WASAPI через comtypes.
-        # comtypes входит в зависимости pycaw → всегда доступен если pycaw установлен.
+        # Попытка 2: comtypes напрямую
         try:
             import comtypes
             import comtypes.client
             from ctypes import cast, POINTER, c_float, c_int, c_uint, HRESULT
 
-            # GUIDs
-            CLSID_MMDeviceEnumerator = comtypes.GUID(
-                '{BCDE0395-E52F-467C-8E3D-C4579291692E}'
-            )
-            IID_IMMDeviceEnumerator = comtypes.GUID(
-                '{A95664D2-9614-4F35-A746-DE8DB63617E6}'
-            )
-            IID_IMMDevice = comtypes.GUID(
-                '{D666063F-1587-4E43-81F1-B948E807363F}'
-            )
-            IID_IAudioEndpointVolume = comtypes.GUID(
-                '{5CDF2C82-841E-4546-9722-0CF74078229A}'
-            )
+            CLSID_MMDeviceEnumerator = comtypes.GUID('{BCDE0395-E52F-467C-8E3D-C4579291692E}')
+            IID_IMMDeviceEnumerator  = comtypes.GUID('{A95664D2-9614-4F35-A746-DE8DB63617E6}')
+            IID_IMMDevice            = comtypes.GUID('{D666063F-1587-4E43-81F1-B948E807363F}')
+            IID_IAudioEndpointVolume = comtypes.GUID('{5CDF2C82-841E-4546-9722-0CF74078229A}')
 
-            # Определяем минимальные COM-интерфейсы
             class IMMDevice(comtypes.IUnknown):
                 _iid_    = IID_IMMDevice
                 _methods_ = [
                     comtypes.COMMETHOD(
                         [], HRESULT, 'Activate',
-                        (['in'],  comtypes.GUID,           'iid'),
-                        (['in'],  c_uint,                  'dwClsCtx'),
-                        (['in'],  comtypes.c_void_p,       'pActivationParams'),
+                        (['in'],  comtypes.GUID,              'iid'),
+                        (['in'],  c_uint,                     'dwClsCtx'),
+                        (['in'],  comtypes.c_void_p,          'pActivationParams'),
                         (['out'], POINTER(comtypes.c_void_p), 'ppInterface'),
                     ),
                     comtypes.COMMETHOD([], HRESULT, 'OpenPropertyStore',
@@ -682,9 +615,9 @@ class NetworkClient(QObject):
                     ),
                     comtypes.COMMETHOD(
                         [], HRESULT, 'GetDefaultAudioEndpoint',
-                        (['in'],  c_uint,              'dataFlow'),
-                        (['in'],  c_uint,              'role'),
-                        (['out'], POINTER(IMMDevice),  'ppEndpoint'),
+                        (['in'],  c_uint,             'dataFlow'),
+                        (['in'],  c_uint,             'role'),
+                        (['out'], POINTER(IMMDevice), 'ppEndpoint'),
                     ),
                 ]
 
@@ -708,11 +641,11 @@ class NetworkClient(QObject):
                     comtypes.COMMETHOD([], HRESULT, 'GetMasterVolumeLevelScalar',
                         (['out'], POINTER(c_float), 'pfLevel')),
                     comtypes.COMMETHOD([], HRESULT, 'SetChannelVolumeLevel',
-                        (['in'], c_uint, 'nChannel'),
+                        (['in'], c_uint,  'nChannel'),
                         (['in'], c_float, 'fLevelDB'),
                         (['in'], comtypes.c_void_p, 'pguidEventContext')),
                     comtypes.COMMETHOD([], HRESULT, 'SetChannelVolumeLevelScalar',
-                        (['in'], c_uint, 'nChannel'),
+                        (['in'], c_uint,  'nChannel'),
                         (['in'], c_float, 'fLevel'),
                         (['in'], comtypes.c_void_p, 'pguidEventContext')),
                     comtypes.COMMETHOD([], HRESULT, 'GetChannelVolumeLevel',
@@ -744,12 +677,9 @@ class NetworkClient(QObject):
         return None
 
     def _nudge_boost_volume(self) -> tuple:
-        """
-        Снимает системный мьют и поднимает мастер-громкость Windows если нужно.
-        Возвращает (prev_scalar, was_muted) для последующего восстановления.
+        """Снимает системный мьют и поднимает громкость если она ниже 30%.
 
-        NUDGE_MIN_VOL  = 0.30 — ниже считаем «не слышно», поднимаем.
-        NUDGE_BOOST_VOL = 0.80 — до 80% (не 100% — не пугаем соседей).
+            :return: (prev_scalar, was_muted) для последующего восстановления
         """
         NUDGE_MIN_VOL   = 0.30
         NUDGE_BOOST_VOL = 0.80
@@ -780,12 +710,13 @@ class NetworkClient(QObject):
         return prev_scalar, was_muted
 
     def _nudge_restore_volume(self, prev_scalar: float, was_muted: bool):
-        """
-        Восстанавливает мастер-громкость Windows и состояние мьюта.
-        Вызывается из finally-блока _play_nudge_sound — гарантированно.
+        """Восстанавливает мастер-громкость и мьют после воспроизведения.
+
+            :param prev_scalar: предыдущее значение громкости (−1 = не читалось)
+            :param was_muted: было ли устройство замьючено
         """
         if prev_scalar < 0:
-            return   # не удалось прочитать ранее — нечего восстанавливать
+            return
 
         vol = self._nudge_get_endpoint_vol()
         if vol is None:
@@ -801,47 +732,29 @@ class NetworkClient(QObject):
             print(f"[Nudge] restore error: {e}")
 
     def _play_nudge_sound(self):
-        """
-        Воспроизвести Danger.mp3 + системный писк — НЕЗАВИСИМО от deaf/mute.
+        """Воспроизводит Danger.mp3 + системный писк независимо от deaf/mute.
 
-        Перед воспроизведением:
-          • Форсированно снимает системный мьют Windows (если включён).
-          • Поднимает системную громкость до 80% если она ниже 30%.
-        После воспроизведения (в блоке finally):
-          • Восстанавливает исходную громкость и состояние мьюта.
-
-        Порядок звуков:
-          1. winsound.MessageBeep(MB_ICONEXCLAMATION) — системная звуковая схема.
-          2. winsound.Beep(1200, 400) — тональный сигнал 1.2 кГц / 400 мс
-             (PC Speaker / аудиодрайвер в зависимости от железа).
-          3. sounddevice.play(Danger.mp3, vol=1.0) — в обход AudioHandler.
+        Порядок: системный warning-звук → тональный Beep(1200, 400) → Danger.mp3.
+        Перед воспроизведением форсирует громкость ≥ 30%, после — восстанавливает.
         """
         import winsound as _ws
 
-        # ── Форсируем системную громкость ────────────────────────────────────
         prev_scalar, was_muted = self._nudge_boost_volume()
 
         try:
-            # 1. Системный «warning» звук Windows
             try:
-                _ws.MessageBeep(0x30)   # MB_ICONEXCLAMATION = 0x30
+                _ws.MessageBeep(0x30)   # MB_ICONEXCLAMATION
             except Exception as e:
                 print(f"[Nudge] MessageBeep error: {e}")
 
-            # 2. Тональный писк: 1200 Гц, 400 мс
-            # Блокирует daemon-поток на 400 мс — это ОК.
             try:
                 _ws.Beep(1200, 400)
             except Exception as e:
                 print(f"[Nudge] Beep error: {e}")
 
-            # 3. Danger.mp3 через sounddevice (vol=1.0 — без масштабирования)
             sound_path = NUDGE_SOUND_PATH if os.path.exists(NUDGE_SOUND_PATH) else None
-
             if sound_path is None:
-                print(
-                    f"[Nudge] Danger.mp3 не найден: {NUDGE_SOUND_PATH}"
-                )
+                print(f"[Nudge] Danger.mp3 не найден: {NUDGE_SOUND_PATH}")
                 return
 
             try:
@@ -853,24 +766,20 @@ class NetworkClient(QObject):
                 print(f"[Nudge] playback error: {e}")
 
         finally:
-            # ── Восстанавливаем громкость в любом случае ─────────────────────
             self._nudge_restore_volume(prev_scalar, was_muted)
 
     def send_nudge_vote(self, target_uid: int):
-        """Отправить серверу голос «Пнуть» для указанного пользователя."""
-        self.send_json({
-            'action':     CMD_NUDGE_VOTE,
-            'target_uid': target_uid,
-        })
+        """Отправляет серверу голос «Пнуть» для указанного пользователя.
+
+            :param target_uid: uid пользователя-цели
+        """
+        self.send_json({'action': CMD_NUDGE_VOTE, 'target_uid': target_uid})
         print(f"[Net] Nudge vote sent → target_uid={target_uid}")
 
-    # ------------------------------------------------------------------
-    # Заглушки для совместимости с ui_main.py (качество не реализовано).
-    # Кнопка качества в оверлее работает визуально, но на маршрутизацию
-    # сервера не влияет — все зрители получают полный поток.
-    # ------------------------------------------------------------------
+    # ── Stubs (качество не реализовано) ──────────────────────────────────────
+
     def send_quality_request(self, skip_factor: int):
-        """Stub: в текущей архитектуре качество не маршрутизируется."""
+        """Stub: маршрутизация по качеству не реализована."""
         pass
 
     def request_viewer_keyframe(self, streamer_uid: int):

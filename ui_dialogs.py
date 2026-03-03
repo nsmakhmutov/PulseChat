@@ -2,6 +2,7 @@ import os
 import io
 import json
 import math
+import time
 import base64
 import wave
 import sounddevice as sd
@@ -9,35 +10,24 @@ import dxcam
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QScrollArea,
                              QWidget, QGridLayout, QLabel, QSlider, QTabWidget,
                              QComboBox, QProgressBar, QLineEdit, QCheckBox, QFrame,
-                             QGroupBox, QSizePolicy, QFileDialog, QMessageBox)
-from PyQt6.QtCore import Qt, QSize, QSettings, QEvent, QPropertyAnimation, QEasingCurve, QRect, QPoint, QTimer, pyqtSignal
+                             QGroupBox, QSizePolicy, QFileDialog, QMessageBox,
+                             QApplication)
+from PyQt6.QtCore import (Qt, QSize, QSettings, QEvent, QPropertyAnimation, QEasingCurve,
+                          QRect, QPoint, QTimer, pyqtSignal, QObject)
 from PyQt6.QtGui import QIcon, QGuiApplication, QPainter, QColor, QPen, QFont, QPainterPath, QBrush
 from config import resource_path, CMD_SOUNDBOARD
 from audio_engine import PYRNNOISE_AVAILABLE
+from version import APP_VERSION, APP_NAME, APP_AUTHOR, QA_TESTERS, APP_YEAR, ABOUT_TEXT, GITHUB_REPO
 
-# ── Максимальный размер кастомного звука (1 MB) ──────────────────────────────
-# 7 секунд MP3 @ 128kbps ≈ 112 KB, @ 320kbps ≈ 280 KB.
-# 1 MB с большим запасом перекрывает любой типичный 7-секундный звук.
-CUSTOM_SOUND_MAX_BYTES = 1 * 1024 * 1024   # 1 MB
-CUSTOM_SOUND_SLOTS     = 4                  # количество кастомных слотов
+CUSTOM_SOUND_MAX_BYTES = 1 * 1024 * 1024  # 1 MB — ~7 сек MP3/WAV
+CUSTOM_SOUND_SLOTS = 4
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Вспомогательные функции для нелинейной кривой громкости пользователя
-# ──────────────────────────────────────────────────────────────────────────────
-# Почему экспонента, а не линейный множитель:
-#   Речь через Opus кодируется при очень низком уровне (~-20 дБ относительно FS).
-#   Линейный диапазон 0–2.0x (слайдер 0–200) даёт буст максимум +6 дБ — почти
-#   не слышно. Экспоненциальная кривая 10^((slider-100)/100):
-#     slider 0   →  0.01x  (-40 дБ)   — тихо
-#     slider 100 →  1.00x  (  0 дБ)   — нейтрально (дефолт, поведение НЕ меняется)
-#     slider 150 →  3.16x  (+10 дБ)   — заметный буст
-#     slider 200 → 10.00x  (+20 дБ)   — максимальный буст для тихих микрофонов
-# При слайдере 100 пользователь слышит ровно то же что раньше — совместимость.
 def _slider_to_vol(slider_int: int) -> float:
-    """Слайдер 0-200 → коэффициент громкости по экспоненциальной кривой.
-    Особый случай: slider=0 → 0.0 (полная тишина).
-    Без этой проверки 10^((0-100)/100) = 10^-1 = 0.1, то есть 10% — не ноль!
+    """Слайдер 0–200 → коэффициент громкости (экспоненциальная кривая 10^((x-100)/100)).
+
+    :param slider_int: позиция слайдера 0–200
+    :return: коэффициент громкости; 0 → 0.0, 100 → 1.0, 200 → 10.0
     """
     if slider_int == 0:
         return 0.0
@@ -45,109 +35,117 @@ def _slider_to_vol(slider_int: int) -> float:
 
 
 def _vol_to_slider(vol: float) -> int:
-    """Коэффициент громкости → позиция слайдера (обратная функция)."""
+    """Коэффициент громкости → позиция слайдера (обратная функция).
+
+    :param vol: коэффициент громкости ≥ 0
+    :return: целое значение 0–200
+    """
     if vol <= 0.0:
         return 0
     return max(0, min(200, int(math.log10(vol) * 100 + 100)))
-from version import APP_VERSION, APP_NAME, APP_AUTHOR,QA_TESTERS, APP_YEAR, ABOUT_TEXT, GITHUB_REPO
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Виджет: полоса уровня микрофона + маркер порога VAD в одной плоскости
-# ──────────────────────────────────────────────────────────────────────────────
-class MicVadWidget(QWidget):
+_COMBO_POPUP_SS = (
+    "QAbstractItemView {"
+    "  background-color: #1e2130;"
+    "  color: #c8d0e0;"
+    "  selection-background-color: #2c3252;"
+    "  selection-color: #ffffff;"
+    "  border: 1px solid #333648;"
+    "  outline: none;"
+    "}"
+)
+
+
+def _fix_combo_popup(combo: QComboBox) -> None:
+    """Устраняет прозрачность popup-меню QComboBox на Windows.
+
+    :param combo: комбобокс для исправления
     """
-    Комбинированный виджет: отображает уровень микрофона (зелёная полоса)
-    и порог VAD (красная вертикальная линия) в одном пространстве.
-    Так пользователь сразу видит, насколько нужно поднять/опустить громкость
-    относительно порога активации.
+    try:
+        v = combo.view()
+        v.setStyleSheet(_COMBO_POPUP_SS)
+        win = v.window()
+        win.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        win.setStyleSheet("background-color: #1e2130;")
+    except Exception:
+        pass
+
+
+class MicVadWidget(QWidget):
+    """Комбинированный виджет уровня микрофона и порога VAD.
+
+    Зелёная полоса — текущий уровень сигнала.
+    Красная вертикальная черта — порог активации голоса.
     """
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._level = 0          # 0–100 (из volume_level_signal)
-        self._threshold_pos = 10 # 0–100 (позиция на полосе)
+        self._level = 0
+        self._threshold_pos = 10
         self.setMinimumHeight(30)
         self.setMinimumWidth(200)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
-    def set_level(self, val: int):
+    def set_level(self, val: int) -> None:
+        """Обновить уровень сигнала микрофона.
+
+        :param val: уровень 0–100
+        """
         self._level = max(0, min(100, val))
         self.update()
 
-    def set_threshold(self, slider_val: int):
-        # slider_val: 1–50 → позиция 2–100 на полосе (slider_val * 2)
+    def set_threshold(self, slider_val: int) -> None:
+        """Обновить позицию маркера VAD.
+
+        :param slider_val: значение слайдера 1–50
+        """
         self._threshold_pos = max(0, min(100, slider_val * 2))
         self.update()
 
     def paintEvent(self, event):
         p = QPainter(self)
         w, h = self.width(), self.height()
-
-        # Фон
         p.fillRect(0, 0, w, h, QColor("#2a2a2a"))
 
-        # Полоса уровня микрофона
         bar_w = int(self._level / 100.0 * w)
-        if self._level < self._threshold_pos:
-            bar_color = QColor("#27ae60")   # ниже порога — зелёный
-        else:
-            bar_color = QColor("#2ecc71")   # выше порога — яркий зелёный (голос принят)
+        bar_color = QColor("#2ecc71" if self._level >= self._threshold_pos else "#27ae60")
         p.fillRect(0, 0, bar_w, h, bar_color)
 
-        # Маркер порога VAD (красная вертикальная черта)
         tx = int(self._threshold_pos / 100.0 * w)
-        pen = QPen(QColor("#e74c3c"), 3)
-        p.setPen(pen)
+        p.setPen(QPen(QColor("#e74c3c"), 3))
         p.drawLine(tx, 0, tx, h)
 
-        # Подпись маркера
         p.setPen(QPen(QColor("#ffffff"), 1))
         p.setFont(QFont("Segoe UI", 8))
-        label_x = min(tx + 5, w - 40)
-        p.drawText(label_x, h - 5, "VAD")
-
+        p.drawText(min(tx + 5, w - 40), h - 5, "VAD")
         p.end()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Кнопка с удержанием: заполняется за 3 секунды, эмитит hold_complete
-# ──────────────────────────────────────────────────────────────────────────────
 class NudgeHoldButton(QPushButton):
-    """
-    QPushButton с механикой удержания 3 секунды.
+    """QPushButton с механикой удержания 3 секунды.
 
-    Логика:
-      • mousePress  → запускает QTimer с шагом _TICK_MS мс.
-      • каждый тик  → _progress растёт 0 → 1, вызывает update() для перерисовки.
-      • mouseRelease / leaveEvent до завершения → сброс (_progress=0).
-      • progress == 1 → emit hold_complete, кнопка блокируется (_fired=True).
-
-    paintEvent:
-      • super().paintEvent() рисует стандартную кнопку (фон, текст, рамка).
-      • Поверх рисуем скруглённый оранжевый fill с alpha=90 (≈35%),
-        шириной progress * rect.width() — текст остаётся читаемым.
+    При удержании рисует оранжевый прогресс-оверлей.
+    Сигнал ``hold_complete`` эмитится однократно при достижении 100%.
     """
 
     hold_complete = pyqtSignal()
 
-    _HOLD_MS = 3000   # общее время удержания, мс
-    _TICK_MS = 20     # интервал таймера, мс  → 150 тиков за 3 с, ~50 FPS
+    _HOLD_MS = 3000
+    _TICK_MS = 20
 
     def __init__(self, text: str, parent=None):
         super().__init__(text, parent)
-        self._progress: float = 0.0   # 0.0–1.0
+        self._progress: float = 0.0
         self._holding:  bool  = False
-        self._fired:    bool  = False  # сработал → больше не принимаем нажатия
+        self._fired:    bool  = False
 
         self._tick_timer = QTimer(self)
         self._tick_timer.setInterval(self._TICK_MS)
         self._tick_timer.timeout.connect(self._on_tick)
-
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
-    # ── Таймер ────────────────────────────────────────────────────────────────
-    def _on_tick(self):
+    def _on_tick(self) -> None:
         self._progress += self._TICK_MS / self._HOLD_MS
         if self._progress >= 1.0:
             self._progress = 1.0
@@ -159,11 +157,8 @@ class NudgeHoldButton(QPushButton):
         else:
             self.update()
 
-    # ── Мышь ──────────────────────────────────────────────────────────────────
     def mousePressEvent(self, e):
-        if (e.button() == Qt.MouseButton.LeftButton
-                and self.isEnabled()
-                and not self._fired):
+        if e.button() == Qt.MouseButton.LeftButton and self.isEnabled() and not self._fired:
             self._holding = True
             self._progress = 0.0
             self._tick_timer.start()
@@ -178,7 +173,7 @@ class NudgeHoldButton(QPushButton):
         super().mouseReleaseEvent(e)
 
     def leaveEvent(self, e):
-        """Отпускаем удержание, если курсор ушёл за пределы кнопки."""
+        """Сброс удержания при уходе курсора за пределы кнопки."""
         if self._holding:
             self._holding = False
             self._progress = 0.0
@@ -186,12 +181,8 @@ class NudgeHoldButton(QPushButton):
             self.update()
         super().leaveEvent(e)
 
-    # ── Отрисовка ─────────────────────────────────────────────────────────────
     def paintEvent(self, e):
-        # 1. Стандартная отрисовка кнопки (фон из stylesheet, текст, рамка)
         super().paintEvent(e)
-
-        # 2. Оранжевый fill-оверлей поверх — только во время удержания
         if self._progress <= 0.0 or self._fired:
             return
 
@@ -201,40 +192,23 @@ class NudgeHoldButton(QPushButton):
         r = self.rect()
         fill_w = int(r.width() * self._progress)
 
-        # Скруглённый клип совпадает с border-radius кнопки (7 px)
         clip = QPainterPath()
         clip.addRoundedRect(0.0, 0.0, float(r.width()), float(r.height()), 7.0, 7.0)
         p.setClipPath(clip)
 
-        # alpha растёт от 70 до 130 по ходу заливки — плавно проявляется
         alpha = int(70 + 60 * self._progress)
         p.fillRect(0, 0, fill_w, r.height(), QColor(230, 126, 34, alpha))
 
-        # Тонкая светлая граница на краю заливки — визуальный «фронт»
-        pen = QPen(QColor(255, 180, 80, 160), 1.5)
-        p.setPen(pen)
+        p.setPen(QPen(QColor(255, 180, 80, 160), 1.5))
         p.drawLine(fill_w, 2, fill_w, r.height() - 2)
-
         p.end()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Всплывающий оверлей управления пользователем (вместо отдельного окна)
-# ──────────────────────────────────────────────────────────────────────────────
-# ──────────────────────────────────────────────────────────────────────────────
-# Всплывающий оверлей управления пользователем (вместо отдельного окна)
-# ──────────────────────────────────────────────────────────────────────────────
 class UserOverlayPanel(QFrame):
-    """
-    Выпадающий полупрозрачный оверлей прямо под ником пользователя.
-    Qt.WindowType.Popup — автоматически закрывается при клике вне панели,
-    корректно работает при двух мониторах.
+    """Выпадающий полупрозрачный оверлей управления удалённым пользователем.
 
-    Особенности дизайна:
-    • Полупрозрачный тёмный фон, скруглённые углы без артефактов
-    • Никнейм убран из шапки (уже виден в дереве)
-    • Кнопка «Шепнуть» — удерживай, чтобы говорить только этому пользователю
-    • Кнопка «Смотреть стрим» — отображается только если пользователь стримит
+    Открывается прямо под ником в дереве (Qt.Popup — автозакрытие при клике вне).
+    Содержит: регулятор громкости, кнопки «Заглушить», «Шепнуть», «Смотреть стрим», «Пнуть».
     """
 
     def __init__(self, nick: str, current_vol: float, uid: int, audio_handler, global_pos,
@@ -250,9 +224,11 @@ class UserOverlayPanel(QFrame):
         self._whisper_active = False
         self._on_watch_stream = on_watch_stream
         self._net = net
+        self._lbl_nudge_hint = None
 
         # ── Прозрачность окна + рисуем фон сами в paintEvent ─────────────────
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)  # <--- ДОБАВЛЕНО: Авто-очистка при закрытии
         self.setObjectName("userOverlay")
 
         # Внешний padding — чтобы тень/скругление не обрезалось
@@ -426,11 +402,9 @@ class UserOverlayPanel(QFrame):
                 }
             """)
 
-            # Проверяем кулдаун из QSettings — показываем «через Xм» если ещё активен
-            import time as _nudge_time
             _s = QSettings("MyVoiceChat", "GlobalSettings")
             _last = float(_s.value(f"nudge_ts_{uid}", 0))
-            _remaining = int(600 - (_nudge_time.time() - _last))
+            _remaining = int(600 - (time.time() - _last))
             if _remaining > 0:
                 _mins = (_remaining + 59) // 60
                 self.btn_nudge.setEnabled(False)
@@ -439,7 +413,6 @@ class UserOverlayPanel(QFrame):
             self.btn_nudge.hold_complete.connect(self._on_nudge_clicked)
             card_lay.addWidget(self.btn_nudge)
 
-            # Подсказка под кнопкой — занимает место всегда, видна только при удержании
             self._lbl_nudge_hint = QLabel("Держи, чтобы отправить голос «Пнуть»")
             self._lbl_nudge_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self._lbl_nudge_hint.setWordWrap(False)
@@ -454,7 +427,6 @@ class UserOverlayPanel(QFrame):
             self._lbl_nudge_hint.setStyleSheet(self._lbl_nudge_hint_idle_style)
             card_lay.addWidget(self._lbl_nudge_hint)
 
-            # Показываем / скрываем hint через сигналы таймера кнопки
             self.btn_nudge._tick_timer.timeout.connect(self._on_nudge_tick_hint)
 
         # Фиксируем размер ПОСЛЕ добавления всех виджетов (включая hint).
@@ -482,9 +454,14 @@ class UserOverlayPanel(QFrame):
 
         self.move(x, y)
 
-    # ── Фабрика кнопок ────────────────────────────────────────────────────────
+    def _make_btn(self, text: str, checkable: bool = False, checked: bool = False) -> QPushButton:
+        """Фабричный метод — создаёт стилизованную кнопку оверлея.
 
-    def _make_btn(self, text: str, checkable=False, checked=False) -> QPushButton:
+        :param text: текст кнопки
+        :param checkable: кнопка-переключатель
+        :param checked: начальное состояние (только при checkable=True)
+        :return: готовая QPushButton
+        """
         btn = QPushButton(text)
         btn.setCheckable(checkable)
         btn.setChecked(checked)
@@ -513,92 +490,73 @@ class UserOverlayPanel(QFrame):
 
     # ── Слоты ─────────────────────────────────────────────────────────────────
 
-    def _on_vol_changed(self, v: int):
-        # При v=0 показываем "Mute" вместо "0%" — понятнее пользователю
-        if v == 0:
-            self.lbl_vol.setText("🔇")
-        else:
-            self.lbl_vol.setText(f"{v}%")
-        # Экспоненциальная кривая: slider 100 = 1.0x (нейтрально),
-        # slider 200 = 10.0x (+20 дБ) — позволяет поднять тихие микрофоны.
-        # slider 0 → 0.0 (полная тишина, _slider_to_vol гарантирует это).
+    def _on_vol_changed(self, v: int) -> None:
+        """Обновляет метку и применяет громкость пользователя.
+
+        :param v: значение слайдера 0–200
+        """
+        self.lbl_vol.setText("🔇" if v == 0 else f"{v}%")
         self.audio.set_user_volume(self.uid, _slider_to_vol(v))
 
     def _on_toggle_mute(self):
         state = self.audio.toggle_user_mute(self.uid)
         self.btn_mute.setText("🔊  Разглушить" if state else "🔇  Заглушить")
 
-    def _on_whisper_press(self):
-        """Начинаем шёпот при нажатии."""
+    def _on_whisper_press(self) -> None:
+        """Начинает шёпот при нажатии кнопки."""
         if not self._whisper_active:
             self._whisper_active = True
             self.audio.start_whisper(self.uid)
             self.btn_whisper.setText("🤫  Шепчу...")
-            # Показываем подсказку только цветом — размер панели не меняется
             self._lbl_whisper_hint.setStyleSheet(self._lbl_whisper_hint_active_style)
 
-    def _on_whisper_release(self):
-        """Останавливаем шёпот при отпускании."""
+    def _on_whisper_release(self) -> None:
+        """Останавливает шёпот при отпускании кнопки."""
         if self._whisper_active:
             self._whisper_active = False
             self.audio.stop_whisper()
             self.btn_whisper.setText("🤫  Шепнуть  (удерживай)")
             self._lbl_whisper_hint.setStyleSheet(self._lbl_whisper_hint_idle_style)
 
-    def _on_watch_clicked(self):
-        """Открываем окно стрима и закрываем оверлей."""
+    def _on_watch_clicked(self) -> None:
+        """Закрывает оверлей и открывает окно стрима."""
         self.close()
         if self._on_watch_stream is not None:
             self._on_watch_stream()
 
-    def _on_nudge_tick_hint(self):
-        """
-        Вызывается каждые 20 мс пока кнопка удерживается.
-        Показывает подсказку при старте удержания (первый тик),
-        скрывает при сбросе (holding=False).
-        """
-        if not hasattr(self, '_lbl_nudge_hint'):
+    def _on_nudge_tick_hint(self) -> None:
+        """Обновляет подсказку прогресса при удержании кнопки Nudge."""
+        if self._lbl_nudge_hint is None:
             return
         if self.btn_nudge._holding:
             self._lbl_nudge_hint.setStyleSheet(self._lbl_nudge_hint_active_style)
-            # Динамический текст с прогрессом
-            pct = int(self.btn_nudge._progress * 100)
-            self._lbl_nudge_hint.setText(f"Держи… {pct}%")
+            self._lbl_nudge_hint.setText(f"Держи… {int(self.btn_nudge._progress * 100)}%")
         else:
             self._lbl_nudge_hint.setStyleSheet(self._lbl_nudge_hint_idle_style)
             self._lbl_nudge_hint.setText("Держи, чтобы отправить голос «Пнуть»")
 
-    def _on_nudge_clicked(self):
-        """
-        Вызывается после успешного 3-секундного удержания (hold_complete).
+    def _on_nudge_clicked(self) -> None:
+        """Отправляет Nudge после успешного 3-секундного удержания.
 
-        Двойная защита от спама:
-          1. QSettings 'nudge_ts_<uid>' — кулдаун хранится между сессиями.
-          2. NudgeHoldButton._fired = True — повторный hold невозможен.
-
-        Кулдаун совпадает с серверным (NUDGE_COOLDOWN_SEC = 600 с).
+        Кулдаун 600 сек хранится в QSettings и проверяется повторно.
         """
         if self._net is None:
             return
-        import time as _t
         _s   = QSettings("MyVoiceChat", "GlobalSettings")
         _key = f"nudge_ts_{self.uid}"
-        _now = _t.time()
-        # guard: проверяем кулдаун ещё раз
+        _now = time.time()
         if _now - float(_s.value(_key, 0)) < 600:
             return
-        # Сохраняем оптимистично — до ответа сервера
         _s.setValue(_key, _now)
         self._net.send_nudge_vote(self.uid)
         self.btn_nudge.setEnabled(False)
         self.btn_nudge.setText("👟  Проголосовал ✓")
-        # Скрываем hint
-        if hasattr(self, '_lbl_nudge_hint'):
+        if self._lbl_nudge_hint is not None:
             self._lbl_nudge_hint.setStyleSheet(self._lbl_nudge_hint_idle_style)
         print(f"[UI] Nudge vote → uid={self.uid} nick={self._nick!r}")
 
-    def hideEvent(self, event):
-        """Если панель закрылась пока шептали — останавливаем шёпот."""
+    def hideEvent(self, event) -> None:
+        """Останавливает шёпот если панель закрылась во время удержания."""
         if self._whisper_active:
             self._whisper_active = False
             self.audio.stop_whisper()
@@ -799,19 +757,11 @@ class VolumePanel(QDialog):
         self.btn_mute.setText("Разглушить" if s else "Заглушить")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Системный оверлей шёпота — поверх всех окон Windows
-# ──────────────────────────────────────────────────────────────────────────────
 class WhisperSystemOverlay(QWidget):
-    """
-    Полупрозрачный оверлей в правом верхнем углу экрана.
-    Появляется поверх любых окон (игры, браузер, IDE) когда тебе шепчут.
+    """Полупрозрачный системный оверлей шёпота — полоса в верхней части экрана.
 
-    Флаги окна:
-      WindowStaysOnTopHint  — поверх всего
-      FramelessWindowHint   — без заголовка/рамки
-      Tool                  — не мигает в панели задач, не крадёт Alt+Tab
-    WA_ShowWithoutActivating — не уводит фокус из игры при появлении.
+    Отображается поверх любых окон (Tool + WindowStaysOnTopHint).
+    WA_ShowWithoutActivating — не уводит фокус из игры.
     """
 
     def __init__(self):
@@ -856,10 +806,9 @@ class WhisperSystemOverlay(QWidget):
         # Анимация намеренно убрана: оверлей горит ровно, без мигания,
         # пока идут пакеты шёпота, и гасится сразу по их окончании.
 
-    def _reposition(self):
-        """Растягиваем на всю ширину экрана, прибиваем к верхнему краю."""
+    def _reposition(self) -> None:
+        """Растягивает оверлей на всю ширину доступного экрана."""
         try:
-            from PyQt6.QtWidgets import QApplication
             screen = QApplication.primaryScreen()
             if screen:
                 g = screen.availableGeometry()
@@ -868,41 +817,38 @@ class WhisperSystemOverlay(QWidget):
         except Exception:
             pass
 
-    def show_for(self, nick: str):
-        """Показать оверлей с именем шептуна."""
+    def show_for(self, nick: str) -> None:
+        """Показывает оверлей с именем шептуна.
+
+        :param nick: ник пользователя, который шепчет
+        """
         self._text_lbl.setText(f"Тебе шепчет  {nick}")
         self._reposition()
         self.show()
 
-    def hide_overlay(self):
-        """Скрыть оверлей."""
+    def hide_overlay(self) -> None:
+        """Скрывает оверлей."""
         self.hide()
 
-    def paintEvent(self, event):
-        """Полноширинная полупрозрачная плашка — рисуем вручную (WA_TranslucentBackground)."""
+    def paintEvent(self, event) -> None:
+        """Рисует полноширинную полупрозрачную плашку с акцентной линией снизу."""
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        # Фон — тёмная полоса на всю ширину
         p.setBrush(QBrush(QColor(15, 17, 32, 220)))
         p.setPen(Qt.PenStyle.NoPen)
         p.drawRect(self.rect())
-        # Тонкая акцентная линия снизу
         p.setPen(QPen(QColor(93, 173, 226, 180), 2))
         p.drawLine(0, self.height() - 1, self.width(), self.height() - 1)
         p.end()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Кастомный title bar для безрамочных диалогов
-# ──────────────────────────────────────────────────────────────────────────────
 class _DialogTitleBar(QWidget):
-    """
-    Компактный кастомный title bar для безрамочных QDialog.
+    """Компактный кастомный title bar для безрамочных QDialog.
+
     Поддерживает: перетаскивание, сворачивание (опционально), закрытие.
-    Дизайн в едином стиле со SoundboardPanel и UserOverlayPanel.
     """
 
-    def __init__(self, parent_dialog, title: str = "", show_minimize: bool = False):
+    def __init__(self, parent_dialog: QDialog, title: str = "", show_minimize: bool = False):
         super().__init__(parent_dialog)
         self._dlg = parent_dialog
         self._drag_pos = None
@@ -946,7 +892,6 @@ class _DialogTitleBar(QWidget):
         ico_lbl = QLabel()
         ico_lbl.setFixedSize(18, 18)
         try:
-            from config import resource_path
             ico_lbl.setPixmap(QIcon(resource_path("assets/icon/logo.ico")).pixmap(18, 18))
         except Exception:
             pass
@@ -967,39 +912,35 @@ class _DialogTitleBar(QWidget):
         btn_close.clicked.connect(parent_dialog.reject)
         lay.addWidget(btn_close)
 
-    def set_title(self, title: str):
+    def set_title(self, title: str) -> None:
+        """Обновляет заголовок title bar.
+
+        :param title: новый текст заголовка
+        """
         self._title_lbl.setText(title)
 
-    def mousePressEvent(self, e):
+    def mousePressEvent(self, e) -> None:
         if e.button() == Qt.MouseButton.LeftButton:
             self._drag_pos = e.globalPosition().toPoint() - self._dlg.frameGeometry().topLeft()
         super().mousePressEvent(e)
 
-    def mouseMoveEvent(self, e):
+    def mouseMoveEvent(self, e) -> None:
         if e.buttons() == Qt.MouseButton.LeftButton and self._drag_pos is not None:
             self._dlg.move(e.globalPosition().toPoint() - self._drag_pos)
         super().mouseMoveEvent(e)
 
-    def mouseReleaseEvent(self, e):
+    def mouseReleaseEvent(self, e) -> None:
         self._drag_pos = None
         super().mouseReleaseEvent(e)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Виджет перехвата нажатия горячих клавиш
-# ──────────────────────────────────────────────────────────────────────────────
 class HotkeyCaptureEdit(QLineEdit):
-    """
-    Поле для записи горячей клавиши кликом.
+    """Поле захвата горячей клавиши.
 
-    Поведение:
-      • Кликни → поле подсвечивается фиолетовым, появляется «Нажми клавишу…»
-      • Нажми любую клавишу (одиночную или с модификаторами) → записывается
-        строка вида «ctrl+shift+a», «alt+f4», «f8» и т.д.
-      • Escape во время захвата → отменяет, восстанавливает прежнее значение
-      • Повторный клик по занятому полю → очищает и снова ждёт ввода
-
-    Формат совпадает с форматом keyboard-библиотеки (строчные, '+' как разделитель).
+    Клик → режим ожидания (фиолетовая подсветка).
+    Нажатие клавиши → записывается строка вида «ctrl+shift+a» / «f8».
+    Escape → отмена, восстановление предыдущего значения.
+    Потеря фокуса → отмена захвата.
     """
 
     _WAIT_SS = (
@@ -1041,15 +982,17 @@ class HotkeyCaptureEdit(QLineEdit):
         self.setMinimumWidth(180)
         self.setFixedHeight(30)
 
-    # ── публичный API ─────────────────────────────────────────────────────────
+    def set_hotkey(self, text: str) -> None:
+        """Программно задаёт значение без входа в режим захвата.
 
-    def set_hotkey(self, text: str):
-        """Программно задать значение (без перехода в режим захвата)."""
+        :param text: строка горячей клавиши, например «ctrl+f8»
+        """
         self._prev_value = text
         self.setText(text)
         self.setStyleSheet(self._FILLED_SS if text else self._EMPTY_SS)
 
     def get_hotkey(self) -> str:
+        """Возвращает текущую строку горячей клавиши."""
         return self.text()
 
     # ── события ───────────────────────────────────────────────────────────────
@@ -1121,18 +1064,17 @@ class HotkeyCaptureEdit(QLineEdit):
 
     @staticmethod
     def _key_to_str(key: int) -> str:
-        """Qt.Key → строка совместимая с keyboard-библиотекой."""
-        # Буквы
+        """Преобразует Qt.Key в строку, совместимую с keyboard-библиотекой.
+
+        :param key: код клавиши Qt.Key
+        :return: строка клавиши или пустая строка для неизвестных кодов
+        """
         if Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
             return chr(key).lower()
-        # Цифры
         if Qt.Key.Key_0 <= key <= Qt.Key.Key_9:
             return chr(key)
-        # F-клавиши
         if Qt.Key.Key_F1 <= key <= Qt.Key.Key_F24:
-            n = key - Qt.Key.Key_F1 + 1
-            return f"f{n}"
-        # Специальные
+            return f"f{key - Qt.Key.Key_F1 + 1}"
         _MAP = {
             Qt.Key.Key_Space:       "space",
             Qt.Key.Key_Return:      "enter",
@@ -1169,29 +1111,24 @@ class HotkeyCaptureEdit(QLineEdit):
         return _MAP.get(key, "")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Диалог настроек
-# ──────────────────────────────────────────────────────────────────────────────
 class SettingsDialog(QDialog):
+    """Диалог настроек приложения с вкладками: О себе, Аудио, Персонализация, SoundBoard, Версия."""
+
     def __init__(self, audio_engine, parent):
         super().__init__(parent)
         self.audio = audio_engine
-        self.mw = parent  # MainWindow
+        self.mw = parent
         self.app_settings = QSettings("MyVoiceChat", "GlobalSettings")
-
-        # ── Безрамочный стеклянный дизайн (единый стиль с SoundboardPanel) ──
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setWindowTitle("Настройки")
         self.resize(780, 660)
         self.setMinimumSize(480, 520)
 
-        # ── Корневой layout: прозрачный фон, карточка с border-radius ─────────
         root_lay = QVBoxLayout(self)
         root_lay.setContentsMargins(0, 0, 0, 0)
         root_lay.setSpacing(0)
 
-        # Карточка — полупрозрачный тёмный фон, скруглённые углы
         self._card = QFrame(self)
         self._card.setObjectName("settingsCard")
         self._card.setStyleSheet("""
@@ -1429,8 +1366,8 @@ class SettingsDialog(QDialog):
         # каждого комбобокса и снимаем флаг TranslucentBackground с его окна.
         QTimer.singleShot(0, self._fix_combo_popups)
 
-    # ── Вкладка «О себе» ──────────────────────────────────────────────────────
-    def setup_profile_tab(self):
+    def setup_profile_tab(self) -> None:
+        """Инициализирует вкладку «О себе»: аватар и никнейм."""
         tab = QWidget()
         lay = QVBoxLayout(tab)
         self.av_lbl = QLabel()
@@ -1451,8 +1388,8 @@ class SettingsDialog(QDialog):
         lay.addStretch()
         self.tabs.addTab(tab, "О себе")
 
-    # ── Вкладка «Аудио» ───────────────────────────────────────────────────────
-    def setup_audio_tab(self):
+    def setup_audio_tab(self) -> None:
+        """Инициализирует вкладку «Аудио»: устройства, шумодав, VAD, системные звуки."""
         aud_tab = QWidget()
         aud_lay = QVBoxLayout(aud_tab)
 
@@ -1557,18 +1494,8 @@ class SettingsDialog(QDialog):
         aud_lay.addStretch()
         self.tabs.addTab(aud_tab, "Аудио")
 
-    # ── Вкладка «Персонализация» (Горячие клавиши) ────────────────────────────
-    def setup_personalization_tab(self):
-        """
-        Вкладка объединяет:
-        • Горячие клавиши для mute/deafen (раньше были статическими QLineEdit)
-        • PTT-шёпот по нику (раньше вкладка «Шёпот»)
-        • Горячие клавиши для звуков Soundboard
-
-        Дизайн: динамическая таблица строк.
-        Каждая строка = [Функция (ComboBox)] + [Горячая клавиша (HotkeyCaptureEdit)] + [✕]
-        По умолчанию — 1 пустая строка. Кнопка «+» добавляет ещё (макс 8).
-        """
+    def setup_personalization_tab(self) -> None:
+        """Инициализирует вкладку «Персонализация»: горячие клавиши, шёпот, звуки soundboard."""
         tab = QWidget()
         outer = QVBoxLayout(tab)
         outer.setSpacing(10)
@@ -1646,15 +1573,10 @@ class SettingsDialog(QDialog):
     # ── Вспомогательные методы новой таблицы горячих клавиш ──────────────────
 
     def _build_function_options(self) -> list[tuple[str, str, str]]:
-        """
-        Возвращает список (display_text, func_type, func_data) для ComboBox.
+        """Формирует список вариантов действий для ComboBox строки горячей клавиши.
 
-        func_type:
-          "none"      — не задано
-          "mute_mic"  — замутить микрофон
-          "deafen"    — замутить динамики
-          "whisper"   — шёпот; func_data = IP пользователя
-          "sound"     — soundboard; func_data = имя звука (строка из QSettings)
+        :return: список кортежей (display_text, func_type, func_data),
+                 где func_type ∈ {'none', 'mute_mic', 'deafen', 'whisper', 'sound'}
         """
         opts: list[tuple[str, str, str]] = [
             ("— не задано —",                  "none",     ""),
@@ -1688,7 +1610,12 @@ class SettingsDialog(QDialog):
 
     def _add_hk_row(self, func_type: str = "none", func_data: str = "",
                     hotkey: str = "") -> None:
-        """Добавляет одну строку в таблицу горячих клавиш."""
+        """Добавляет одну строку в таблицу горячих клавиш (макс. 7).
+
+        :param func_type: тип действия ('none', 'mute_mic', 'deafen', 'whisper', 'sound')
+        :param func_data: данные действия (IP для whisper, имя для sound)
+        :param hotkey: строка горячей клавиши, например «ctrl+f8»
+        """
         MAX_ROWS = 7
         if len(self._hk_rows) >= MAX_ROWS:
             self._btn_hk_add.setEnabled(False)
@@ -1724,29 +1651,7 @@ class SettingsDialog(QDialog):
                 break
         cb.setCurrentIndex(selected_idx)
 
-        # ── Фикс прозрачности выпадающего списка на Windows ──────────────────
-        # QComboBox popup — отдельное top-level окно, которое при
-        # WA_TranslucentBackground родителя рендерится прозрачным.
-        # Решение: явно задаём solid-фон на view-виджете и убираем флаг у его окна.
-        def _fix_this_cb_popup(combo=cb):
-            try:
-                v = combo.view()
-                v.setStyleSheet(
-                    "QAbstractItemView {"
-                    "  background-color: #1e2130;"
-                    "  color: #c8d0e0;"
-                    "  selection-background-color: #2c3252;"
-                    "  selection-color: #ffffff;"
-                    "  border: 1px solid #333648;"
-                    "  outline: none;"
-                    "}"
-                )
-                win = v.window()
-                win.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
-                win.setStyleSheet("background-color: #1e2130;")
-            except Exception:
-                pass
-        QTimer.singleShot(0, _fix_this_cb_popup)
+        QTimer.singleShot(0, lambda combo=cb: _fix_combo_popup(combo))
 
         # Колонка 2: захват клавиши
         hk_edit = HotkeyCaptureEdit()
@@ -1785,16 +1690,12 @@ class SettingsDialog(QDialog):
         # Кнопка «+» — недоступна при максимуме
         self._btn_hk_add.setEnabled(len(self._hk_rows) < MAX_ROWS)
 
-        # ── Удаление строки ───────────────────────────────────────────────────
-        # ВАЖНО: btn_del.clicked передаёт checked:bool первым аргументом.
-        # Принимаем его явно, чтобы он не попал в _slot и list.remove() не падал.
         def _remove(checked: bool = False, _slot=slot):
             if _slot not in self._hk_rows:
-                return   # защита от двойного срабатывания
+                return
             self._hk_rows.remove(_slot)
             _slot["frame"].setParent(None)
             _slot["frame"].deleteLater()
-            # Если строк не осталось — добавляем одну пустую
             if not self._hk_rows:
                 self._add_hk_row()
             self._btn_hk_add.setEnabled(len(self._hk_rows) < MAX_ROWS)
@@ -1802,16 +1703,14 @@ class SettingsDialog(QDialog):
         btn_del.clicked.connect(_remove)
 
     def _load_hk_rows(self) -> None:
-        """
-        Загружает строки горячих клавиш из QSettings.
-        Если сохранённых строк нет (первый запуск или всё удалено) —
-        добавляет одну пустую строку-шаблон.
+        """Загружает строки горячих клавиш из QSettings.
+
+        При отсутствии сохранённых данных создаёт одну пустую строку.
         """
         s = self.app_settings
         count = s.value("hk_table_count", None)
 
         if count is None or int(count) == 0:
-            # Первый запуск или пустая таблица — одна пустая строка
             self._add_hk_row()
             return
 
@@ -1821,24 +1720,9 @@ class SettingsDialog(QDialog):
             fhk   = s.value(f"hk_table_{i}_key",  "")
             self._add_hk_row(ftype, fdata, fhk)
 
-    # ── Старая вкладка «Шёпот» — удалена (логика перенесена в Персонализацию) ─
-    # setup_whisper_tab — метод намеренно отсутствует.
-    # _clear_whisper_slots — метод намеренно отсутствует.
 
-
-    # ── Вкладка «SoundBoard» ──────────────────────────────────────────────────
-    def setup_soundboard_tab(self):
-        """
-        Вкладка управления Soundboard:
-        - Ползунок громкости (перенесён с вкладки Аудио)
-        - 3 слота кастомных звуков: выбор файла mp3/wav с ПК (макс. 1 МБ),
-          отображение имени, кнопка удаления.
-
-        Хранение: QSettings, ключи custom_sound_{i}_path и custom_sound_{i}_name.
-        Воспроизведение: файл читается в байты → base64 → поле data_b64 в
-        JSON-пакете CMD_SOUNDBOARD. Сервер ретранслирует его без изменений.
-        Клиенты декодируют base64 и воспроизводят из памяти (BytesIO).
-        """
+    def setup_soundboard_tab(self) -> None:
+        """Инициализирует вкладку «SoundBoard»: громкость и слоты кастомных звуков (макс. 1 МБ)."""
         tab = QWidget()
         lay = QVBoxLayout(tab)
         lay.setSpacing(14)
@@ -1883,8 +1767,14 @@ class SettingsDialog(QDialog):
         self.tabs.addTab(tab, "SoundBoard")
 
     def _add_custom_sound_row(self, parent_lay: QVBoxLayout, idx: int,
-                               saved_path: str = "", saved_name: str = ""):
-        """Создаёт строку кастомного звука с кнопками Browse и Delete."""
+                               saved_path: str = "", saved_name: str = "") -> None:
+        """Создаёт строку кастомного звука с кнопками Browse и Delete.
+
+        :param parent_lay: родительский layout для добавления строки
+        :param idx: номер слота (0-based)
+        :param saved_path: сохранённый путь к файлу
+        :param saved_name: сохранённое имя файла (без расширения)
+        """
         row_frame = QFrame()
         row_frame.setStyleSheet("""
             QFrame {
@@ -2035,8 +1925,8 @@ class SettingsDialog(QDialog):
 
         parent_lay.addWidget(row_frame)
 
-    def _rebuild_sb_panel_if_open(self):
-        """Перестраивает SoundboardPanel если он сейчас открыт."""
+    def _rebuild_sb_panel_if_open(self) -> None:
+        """Пересобирает SoundboardPanel если он виден на экране."""
         try:
             mw = self.mw
             if hasattr(mw, '_sb_panel') and mw._sb_panel is not None:
@@ -2048,10 +1938,8 @@ class SettingsDialog(QDialog):
         except Exception:
             pass
 
-    # ── Вкладка «Версия» ──────────────────────────────────────────────────────
-    def setup_version_tab(self):
-        from PyQt6.QtCore import QObject, pyqtSignal
-
+    def setup_version_tab(self) -> None:
+        """Инициализирует вкладку «Версия»: информация о приложении и проверка обновлений."""
         class _Bridge(QObject):
             sig_found    = pyqtSignal(str, str)
             sig_no_upd   = pyqtSignal()
@@ -2123,7 +2011,12 @@ class SettingsDialog(QDialog):
 
     # ── Слоты обновления ──────────────────────────────────────────────────────
 
-    def _slot_update_found(self, version: str, url: str):
+    def _slot_update_found(self, version: str, url: str) -> None:
+        """Отображает информацию о найденном обновлении.
+
+        :param version: строка версии нового релиза
+        :param url: URL для скачивания
+        """
         self._pending_download_url = url
         self._ver_status_lbl.setTextFormat(Qt.TextFormat.RichText)
         self._ver_status_lbl.setText(
@@ -2179,23 +2072,29 @@ class SettingsDialog(QDialog):
             on_error=lambda msg: bridge.sig_error.emit(msg),
         )
 
-    # ── Вспомогательные методы профиля ───────────────────────────────────────
-
-    def open_av_sel(self):
+    def open_av_sel(self) -> None:
+        """Открывает диалог выбора аватара и применяет результат."""
         d = AvatarSelector(self)
         if d.exec():
             self.cur_av = d.selected_avatar
             self.upd_av_preview()
+        d.deleteLater()
+        d = None  # <--- Убираем локальную ссылку
 
-    def upd_av_preview(self):
+        import gc
+        QTimer.singleShot(200, gc.collect)  # <--- Принудительная очистка мусора
+
+    def upd_av_preview(self) -> None:
+        """Обновляет превью аватара в диалоге настроек."""
         p = resource_path(f"assets/avatars/{self.cur_av}")
         self.av_lbl.setPixmap(QIcon(p).pixmap(80, 80) if os.path.exists(p) else QIcon().pixmap(0, 0))
 
-    def refresh_devices_list(self):
+    def refresh_devices_list(self) -> None:
+        """Обновляет списки аудиоустройств ввода и вывода."""
         devs = sd.query_devices()
         try:
             def_api = sd.query_hostapis(sd.default.hostapi)['name']
-        except:
+        except Exception:
             def_api = ""
         self.cb_in.clear()
         self.cb_out.clear()
@@ -2217,7 +2116,11 @@ class SettingsDialog(QDialog):
         self.cb_in.setCurrentText(s_in)
         self.cb_out.setCurrentText(s_out)
 
-    def _update_vad_label(self, val: int):
+    def _update_vad_label(self, val: int) -> None:
+        """Обновляет текстовую метку порога VAD.
+
+        :param val: значение слайдера 1–50
+        """
         threshold = val / 1000.0
         if val <= 5:
             desc = "Очень высокая"
@@ -2233,50 +2136,37 @@ class SettingsDialog(QDialog):
             f"Порог VAD: {threshold:.3f}  —  чувствительность: {desc}"
         )
 
-    def _on_vad_slider_changed(self, val: int):
+    def _on_vad_slider_changed(self, val: int) -> None:
+        """Обрабатывает изменение ползунка VAD: обновляет метку, виджет и движок.
+
+        :param val: новое значение слайдера 1–50
+        """
         self._update_vad_label(val)
         self.audio.set_vad_threshold(val)
         self.mic_vad.set_threshold(val)
 
-    def toggle_nr(self):
+    def toggle_nr(self) -> None:
+        """Переключает шумоподавление и синхронизирует состояние с QSettings."""
         self.audio.use_noise_reduction = self.btn_nr.isChecked()
         self.btn_nr.setText(f"Шумодав: {'ВКЛ' if self.audio.use_noise_reduction else 'ВЫКЛ'}")
         if self.parent():
             self.parent().app_settings.setValue("noise_reduction", self.audio.use_noise_reduction)
 
-    def _fix_combo_popups(self):
-        """
-        Устраняет прозрачность выпадающих меню QComboBox на Windows.
-
-        Причина: диалог имеет WA_TranslucentBackground, и Windows-compositor
-        рендерит popup-окно комбобокса тоже прозрачным, несмотря на CSS.
-        Решение: для каждого QComboBox явно ставим solid-stylesheet на view-виджет
-        и снимаем WA_TranslucentBackground с его top-level окна.
-        """
+    def _fix_combo_popups(self) -> None:
+        """Устраняет прозрачность popup-меню у всех QComboBox диалога."""
         from PyQt6.QtWidgets import QComboBox as _QCB
-        _VIEW_SS = (
-            "QAbstractItemView {"
-            "  background-color: #1e2130;"
-            "  color: #c8d0e0;"
-            "  selection-background-color: #2c3252;"
-            "  selection-color: #ffffff;"
-            "  border: 1px solid #333648;"
-            "}"
-        )
         for cb in self.findChildren(_QCB):
-            try:
-                v = cb.view()
-                v.setStyleSheet(_VIEW_SS)
-                win = v.window()
-                win.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
-                win.setStyleSheet("background-color: #1e2130;")
-            except Exception:
-                pass
+            _fix_combo_popup(cb)
 
-    def get_devices(self):
+    def get_devices(self) -> tuple[str, str]:
+        """Возвращает имена выбранных устройств ввода и вывода.
+
+        :return: (имя_ввода, имя_вывода)
+        """
         return self.cb_in.currentText(), self.cb_out.currentText()
 
-    def save_all(self):
+    def save_all(self) -> None:
+        """Сохраняет все настройки в QSettings и применяет их к приложению."""
         s = self.app_settings
         s.setValue("device_in_name", self.cb_in.currentText())
         s.setValue("device_out_name", self.cb_out.currentText())
@@ -2351,15 +2241,28 @@ class SettingsDialog(QDialog):
                 d['avatar'] = self.mw.avatar
                 with open("user_config.json", 'w') as f:
                     json.dump(d, f)
-            except:
+            except Exception:
                 pass
         self.accept()
 
+    def done(self, r):
+        """Очищаем коннекты сигналов и разрываем циклические ссылки."""
+        try:
+            self.audio.volume_level_signal.disconnect(self.mic_vad.set_level)
+        except TypeError:
+            pass
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Диалог настроек трансляции (без изменений)
-# ──────────────────────────────────────────────────────────────────────────────
+        # --- ДОБАВЛЕНО: Разрываем циклические ссылки Python ---
+        if hasattr(self, '_hk_rows'):
+            self._hk_rows.clear()
+        if hasattr(self, '_custom_sound_rows'):
+            self._custom_sound_rows.clear()
+        # ------------------------------------------------------
+
+        super().done(r)
+
 class StreamSettingsDialog(QDialog):
+    """Диалог настроек экранной трансляции: монитор, разрешение, FPS, аудио."""
     def __init__(self, parent=None):
         super().__init__(parent)
         # ── Безрамочный стеклянный дизайн ────────────────────────────────────
@@ -2476,30 +2379,9 @@ class StreamSettingsDialog(QDialog):
         self.fps_combo.setCurrentText("30")
         layout.addWidget(self.fps_combo)
 
-        # ── Фикс прозрачного popup у всех трёх комбобоксов ───────────────────
-        # QComboBox popup — отдельный top-level виджет: при WA_TranslucentBackground
-        # родителя он рендерится прозрачным. Задаём solid-фон напрямую на view().
-        def _fix_stream_combo(combo):
-            try:
-                v = combo.view()
-                v.setStyleSheet(
-                    "QAbstractItemView {"
-                    "  background-color: #1e2130;"
-                    "  color: #c8d0e0;"
-                    "  selection-background-color: #3d5c9e;"
-                    "  selection-color: #ffffff;"
-                    "  border: 1px solid #333648;"
-                    "  outline: none;"
-                    "}"
-                )
-                win = v.window()
-                win.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
-                win.setStyleSheet("background-color: #1e2130;")
-            except Exception:
-                pass
-        QTimer.singleShot(0, lambda: _fix_stream_combo(self.monitor_combo))
-        QTimer.singleShot(0, lambda: _fix_stream_combo(self.res_combo))
-        QTimer.singleShot(0, lambda: _fix_stream_combo(self.fps_combo))
+        QTimer.singleShot(0, lambda: _fix_combo_popup(self.monitor_combo))
+        QTimer.singleShot(0, lambda: _fix_combo_popup(self.res_combo))
+        QTimer.singleShot(0, lambda: _fix_combo_popup(self.fps_combo))
 
         layout.addSpacing(10)
 
@@ -2578,7 +2460,8 @@ class StreamSettingsDialog(QDialog):
 
         self.adjustSize()
 
-    def _refresh_vbc_ui(self):
+    def _refresh_vbc_ui(self) -> None:
+        """Обновляет состояние блока VB-CABLE в зависимости от установки и чекбокса аудио."""
         try:
             from vbcable_installer import is_vbcable_installed, find_zip
             installed = is_vbcable_installed()
@@ -2633,10 +2516,15 @@ class StreamSettingsDialog(QDialog):
         self._hint_lbl.setVisible(audio_on and installed)
         self.adjustSize()
 
-    def _on_audio_toggled(self, checked):
+    def _on_audio_toggled(self, checked: bool) -> None:
+        """Обрабатывает переключение чекбокса «Транслировать звук».
+
+        :param checked: новое состояние чекбокса
+        """
         self._refresh_vbc_ui()
 
-    def _on_install_vbcable(self):
+    def _on_install_vbcable(self) -> None:
+        """Запускает установку VB-CABLE и обновляет UI по результату."""
         try:
             from vbcable_installer import install_vbcable, find_zip
         except ImportError:
@@ -2657,7 +2545,11 @@ class StreamSettingsDialog(QDialog):
         self._btn_vbc_install.setText("⬇  Установить VB-CABLE")
         self._refresh_vbc_ui()
 
-    def get_settings(self):
+    def get_settings(self) -> dict:
+        """Возвращает словарь параметров трансляции из выбранных значений UI.
+
+        :return: dict с ключами monitor_idx, width, height, fps, stream_audio, system_audio
+        """
         res_text = self.res_combo.currentText()
         width, height = self.res_options[res_text]
         audio_enabled = self.cb_stream_audio.isChecked()
@@ -2702,18 +2594,11 @@ def _pick_emoji(name: str) -> str:
 
 
 class SoundboardPanel(QWidget):
-    """
-    Discord-style прозрачная панель Soundboard.
-    Выезжает снизу вверх над кнопкой вызова с анимацией.
-    Закрывается при клике вне панели (Popup).
+    """Discord-style панель Soundboard.
 
-    ИСПРАВЛЕНО:
-    - WA_DeleteOnClose УБРАН — он уничтожал C++ объект при close(), но Python-ссылка
-      _sb_panel в MainWindow оставалась живой → RuntimeError при следующем обращении.
-      Теперь close() просто скрывает виджет; MainWindow сам управляет временем жизни.
-    - _flash_timer хранится как атрибут экземпляра — больше не используем __import__
-      и не создаём новый QTimer на каждый клик.
-    - Кнопки: setFixedHeight(34) вместо setMinimumHeight(46).
+    Выезжает снизу вверх над кнопкой вызова с анимацией (Qt.Popup).
+    WA_DeleteOnClose намеренно не установлен — управление временем жизни
+    остаётся за MainWindow.
     """
 
     _PANEL_BG   = QColor(32, 34, 42, 235)
@@ -2730,7 +2615,7 @@ class SoundboardPanel(QWidget):
             Qt.WindowType.FramelessWindowHint | Qt.WindowType.Popup
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        # WA_DeleteOnClose намеренно НЕ установлен — см. docstring выше
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)  # <--- УБРАЛИ КОСТЫЛЬ, ДОБАВИЛИ ОЧИСТКУ
         self.setMinimumWidth(420)
 
         self.net = net_client
@@ -2741,12 +2626,8 @@ class SoundboardPanel(QWidget):
 
     # ── Public: пересборка при изменении кастомных звуков ─────────────────────
 
-    def rebuild(self):
-        """
-        Пересобирает UI панели при добавлении / удалении кастомных звуков.
-        Вызывается через _rebuild_sb_panel_if_open().
-        Сохраняет состояние жёлтой метки автора между пересборками.
-        """
+    def rebuild(self) -> None:
+        """Пересобирает UI при изменении кастомных звуков, сохраняя состояние метки автора."""
         # Сохраняем состояние метки автора — _build_ui создаст новые виджеты
         saved_text    = ""
         saved_visible = False
@@ -2773,10 +2654,8 @@ class SoundboardPanel(QWidget):
             except (RuntimeError, AttributeError):
                 pass
 
-    # ── UI ────────────────────────────────────────────────────────────────────
-
-    def _build_ui(self):
-        # Если уже есть layout — очищаем его
+    def _build_ui(self) -> None:
+        """Строит (или перестраивает) весь UI панели."""
         existing = self.layout()
         if existing is not None:
             QWidget().setLayout(existing)   # «уводим» старый layout
@@ -2951,13 +2830,14 @@ class SoundboardPanel(QWidget):
                              title: str,
                              buttons_data: list[tuple[str, str | None, str | None]],
                              accent_color: str,
-                             is_custom: bool):
-        """
-        Добавляет секцию кнопок звуков в parent_lay.
+                             is_custom: bool) -> None:
+        """Добавляет именованную секцию кнопок звуков в layout.
 
-        buttons_data: list of (display_name, fname_or_None, path_or_None)
-          - fname: имя файла в assets/panel/ (стандартные звуки)
-          - path:  абсолютный путь (кастомные звуки)
+        :param parent_lay: родительский layout
+        :param title: заголовок секции
+        :param buttons_data: список (display_name, fname_or_None, path_or_None)
+        :param accent_color: цвет подзаголовка и hover-эффектов
+        :param is_custom: True для кастомных звуков (иной стиль hover)
         """
         # Подзаголовок секции
         sec_hdr = QLabel(f"  {title}")
@@ -3020,16 +2900,11 @@ class SoundboardPanel(QWidget):
 
         parent_lay.addWidget(grid_w)
 
-    def _on_custom_sound_clicked(self, fpath: str, name: str):
-        """
-        Кастомный звук: читает файл → base64 → отправляет JSON с data_b64.
+    def _on_custom_sound_clicked(self, fpath: str, name: str) -> None:
+        """Читает кастомный файл, кодирует в base64 и отправляет JSON на сервер.
 
-        Сервер ретранслирует этот JSON всем клиентам без изменений.
-        Клиенты в play_soundboard_file() декодируют data_b64 и воспроизводят
-        из BytesIO (soundfile.read поддерживает файловоподобные объекты).
-
-        Имя файла в поле 'file' помечается префиксом '__custom__:',
-        чтобы получатель не искал этот «файл» в assets/panel/.
+        :param fpath: абсолютный путь к аудиофайлу
+        :param name: отображаемое имя звука
         """
         try:
             fsize = os.path.getsize(fpath)
@@ -3052,11 +2927,10 @@ class SoundboardPanel(QWidget):
 
     # ── Публичный API: желтая метка автора ───────────────────────────────────
 
-    def flash_from_nick(self, nick: str):
-        """
-        Показывает «▶ [nick]» жёлтым в заголовке панели на 4 секунды.
-        Вызывается из MainWindow/_on_soundboard_played каждый раз при звуке.
-        Безопасен к вызову даже если панель скрыта (обновит метку к следующему открытию).
+    def flash_from_nick(self, nick: str) -> None:
+        """Показывает «▶ [nick]» в заголовке панели на 4 секунды.
+
+        :param nick: ник пользователя, запустившего звук
         """
         try:
             self._from_nick_lbl.setText(f"▶  {nick}")
@@ -3073,13 +2947,11 @@ class SoundboardPanel(QWidget):
 
     # ── Анимация ──────────────────────────────────────────────────────────────
 
-    def show_above(self, ref_widget: QWidget):
+    def show_above(self, ref_widget: QWidget) -> None:
+        """Центрирует панель по ширине окна и показывает с анимацией выезда снизу.
+
+        :param ref_widget: виджет-якорь (кнопка вызова soundboard)
         """
-        Центрирует панель горизонтально по родительскому окну.
-        Ширина = ширина окна − 32 px (16 px отступ с каждого края).
-        Панель выезжает снизу вверх над ref_widget с анимацией.
-        """
-        # Верхнеуровневое окно — по его ширине растягиваем панель
         top_win = ref_widget.window()
         target_w = max(self.minimumWidth(), top_win.width() - 32)
         self.setMinimumWidth(target_w)
@@ -3089,11 +2961,9 @@ class SoundboardPanel(QWidget):
         panel_w = self.width()
         panel_h = self.height()
 
-        # X: центр окна
         g_win = top_win.mapToGlobal(QPoint(0, 0))
         x = g_win.x() + (top_win.width() - panel_w) // 2
 
-        # Y: над кнопкой ref_widget
         g_btn = ref_widget.mapToGlobal(QPoint(0, 0))
         y_final = g_btn.y() - panel_h - 6
         y_start = y_final + 18
@@ -3108,10 +2978,8 @@ class SoundboardPanel(QWidget):
         self._anim.setEndValue(QRect(x, y_final, panel_w, panel_h))
         self._anim.start()
 
-    # ── Отрисовка ─────────────────────────────────────────────────────────────
-
-    def paintEvent(self, event):
-        """Рисуем лёгкую тень вокруг карточки."""
+    def paintEvent(self, event) -> None:
+        """Рисует лёгкую тень вокруг карточки."""
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
 
@@ -3132,24 +3000,12 @@ class SoundboardPanel(QWidget):
 SoundboardDialog = SoundboardPanel
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# StatusDialog — диалог выбора пользовательского статуса
-# ══════════════════════════════════════════════════════════════════════════════
 class SelfStatusOverlayPanel(QFrame):
-    """
-    Всплывающий полупрозрачный оверлей выбора собственного статуса.
-    Открывается правым кликом по своему никнейму в дереве.
+    """Всплывающий оверлей выбора собственного статуса (Qt.Popup).
 
-    Дизайн повторяет UserOverlayPanel: тёмный полупрозрачный card,
-    скруглённые углы, Qt.Popup (автозакрытие при клике вне).
-
-    Содержимое:
-    • Сетка иконок статусов (5 колонок, авто-сканирование assets/status/)
-    • Поле описания (макс. 20 символов) + счётчик
-    • Кнопки «Убрать статус» и «Применить»
-
-    on_save(icon: str, text: str) — вызывается при нажатии «Применить»
-    или «Убрать статус» (с пустыми строками).
+    Открывается правым кликом по своему никнейму.
+    Содержит: сетку иконок, поле описания, кнопки «Убрать» и «Применить».
+    Вызывает on_save(icon: str, text: str) при подтверждении.
     """
 
     _COLS   = 5    # иконок в строке
@@ -3166,6 +3022,7 @@ class SelfStatusOverlayPanel(QFrame):
         self._icon_buttons: dict = {}  # filename → QPushButton
 
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)  # <--- ДОБАВЛЕНО: Авто-очистка при закрытии
         self.setObjectName("selfStatusOverlay")
 
         # ── Внешний layout (отступы = «воздух» под тень) ─────────────────────
@@ -3461,25 +3318,10 @@ class SelfStatusOverlayPanel(QFrame):
 
 
 class StatusDialog(QDialog):
-    """
-    Диалог выбора «статуса дела» пользователя.
+    """Диалог выбора статуса пользователя (иконка + текстовое описание).
 
-    Структура:
-      ┌──────────────────────────────────────────┐
-      │  Выбери статус                           │
-      │  ┌───┐ ┌───┐ ┌───┐ ┌───┐ ┌───┐          │
-      │  │SVG│ │SVG│ │SVG│ │SVG│ │SVG│  ...     │
-      │  └───┘ └───┘ └───┘ └───┘ └───┘          │
-      │  Описание (необязательно):               │
-      │  [ Ушёл пить чай__________________ ]    │
-      │                          0 / 30         │
-      │  [ ✕ Убрать статус ] [Отмена] [Применить]│
-      └──────────────────────────────────────────┘
-
-    Иконки: assets/status/*.svg  (авто-сканирование).
-    Выбранная иконка подсвечивается зелёной рамкой.
-    «Убрать статус» → возвращает ('', '').
-    Tooltip каждой иконки = имя файла без расширения.
+    Иконки: assets/status/*.svg (авто-сканирование).
+    «Убрать статус» возвращает ('', '').
     """
 
     _COLS   = 5    # иконок в строке
@@ -3718,15 +3560,19 @@ class StatusDialog(QDialog):
             self._grid.addWidget(btn, row, col)
             self._icon_buttons[fname] = btn
 
-    def _on_text_changed(self, text: str):
+    def _on_text_changed(self, text: str) -> None:
+        """Обновляет счётчик символов с подсветкой при приближении к лимиту.
+
+        :param text: текущее содержимое поля описания
+        """
         n = len(text)
         self._char_counter.setText(f"{n} / 30")
         self._char_counter.setStyleSheet(
             f"font-size: 11px; color: {'#e74c3c' if n >= 28 else '#888888'};"
         )
 
-    def _on_clear(self):
-        """Сбросить статус и сразу закрыть диалог с пустым результатом."""
+    def _on_clear(self) -> None:
+        """Сбрасывает иконку и текст, принимает диалог с пустым результатом."""
         self._selected_icon = ""
         for btn in self._icon_buttons.values():
             try:
@@ -3737,6 +3583,9 @@ class StatusDialog(QDialog):
         self._text_edit.clear()
         self.accept()
 
-    def get_result(self) -> tuple:
-        """Возвращает (icon_filename, status_text) после exec()."""
+    def get_result(self) -> tuple[str, str]:
+        """Возвращает выбранные данные статуса после exec().
+
+        :return: (имя_файла_иконки, текст_статуса)
+        """
         return self._selected_icon, self._text_edit.text().strip()[:30]
