@@ -1774,7 +1774,7 @@ class MainWindow(QMainWindow):
         только один раз при первом вызове. На диск записывается только при реальных
         изменениях данных. Это устраняет постоянную аллокацию/GC-давление.
         """
-        REGISTRY_FILE = "known_users.json"
+        REGISTRY_FILE = KNOWN_USERS_PATH
 
         # Ленивая загрузка кэша (один раз за время жизни приложения)
         if not hasattr(self, '_known_users_cache'):

@@ -180,3 +180,24 @@ NUDGE_COOLDOWN_SEC  = 600  # 10 минут
 
 # Путь к звуковому файлу «Пнуть» — всегда через resource_path (работает и в dev, и в exe).
 NUDGE_SOUND_PATH = resource_path(os.path.join("assets", "music", "Danger.mp3"))
+
+
+# ── Пути к файлам конфигурации пользователя (AppData) ────────────────────────
+# Файлы хранятся в %APPDATA%\InPulse\ — вне папки установки.
+# Это гарантирует сохранность данных при xcopy-обновлении и переустановке.
+def get_appdata_dir() -> str:
+    """Возвращает путь к папке InPulse в AppData пользователя, создаёт при необходимости."""
+    appdata = os.environ.get('APPDATA')
+    if appdata:
+        path = os.path.join(appdata, "InPulse")
+    else:
+        # Fallback, если переменная окружения недоступна (редкий edge-case)
+        path = os.path.join(os.path.expanduser("~"), ".InPulse")
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+# Глобальные абсолютные пути к файлам конфигурации.
+# Вычисляются один раз при импорте модуля — без повторных вызовов makedirs.
+USER_CONFIG_PATH  = os.path.join(get_appdata_dir(), "user_config.json")
+KNOWN_USERS_PATH  = os.path.join(get_appdata_dir(), "known_users.json")

@@ -55,7 +55,8 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QObject
 from PyQt6.QtGui import QIcon, QSurfaceFormat, QPixmap
 
-from config import resource_path, DEFAULT_PORT_TCP
+import shutil
+from config import resource_path, DEFAULT_PORT_TCP, USER_CONFIG_PATH, KNOWN_USERS_PATH
 from ui_main import MainWindow
 from ui_dialogs import AvatarSelector
 from updater import check_for_updates_async, download_and_install
@@ -64,17 +65,46 @@ from updater import check_for_updates_async, download_and_install
 # ══════════════════════════════════════════════════════════════════════════════
 # Константы
 # ══════════════════════════════════════════════════════════════════════════════
-CONFIG_FILE       = "user_config.json"
 PROBE_TIMEOUT_SEC = 3.0
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Вспомогательные функции
 # ══════════════════════════════════════════════════════════════════════════════
+def migrate_old_configs() -> None:
+    """
+    Единожды переносит старые JSON-файлы из корня приложения в AppData.
+
+    Миграция срабатывает только если:
+      - старый файл существует в папке запуска (install_dir / CWD)
+      - новый файл в AppData ещё НЕ существует (не перезаписываем!)
+    После переноса пользователь ничего не замечает.
+    """
+    # Определяем папку, откуда запущено приложение (frozen или dev)
+    if getattr(__import__('sys'), 'frozen', False):
+        import sys as _sys
+        old_dir = os.path.dirname(_sys.executable)
+    else:
+        old_dir = os.path.abspath(".")
+
+    for old_name, new_path in (
+        ("user_config.json", USER_CONFIG_PATH),
+        ("known_users.json", KNOWN_USERS_PATH),
+    ):
+        old_path = os.path.join(old_dir, old_name)
+        if os.path.exists(old_path) and not os.path.exists(new_path):
+            try:
+                shutil.copy2(old_path, new_path)
+                print(f"[Migration] Перенесён {old_name} → AppData")
+            except Exception as e:
+                print(f"[Migration] Ошибка переноса {old_name}: {e}")
+
+
 def load_config() -> dict | None:
-    if os.path.exists(CONFIG_FILE):
+    migrate_old_configs()           # однократная миграция при первом запуске
+    if os.path.exists(USER_CONFIG_PATH):
         try:
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            with open(USER_CONFIG_PATH, 'r', encoding='utf-8') as f:
                 return json.load(f)
         except Exception:
             pass
@@ -83,7 +113,7 @@ def load_config() -> dict | None:
 
 def save_config(ip: str, nick: str, avatar: str) -> None:
     try:
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+        with open(USER_CONFIG_PATH, 'w', encoding='utf-8') as f:
             json.dump({"ip": ip, "nick": nick, "avatar": avatar}, f)
     except Exception as e:
         print(f"[Config] Не удалось сохранить конфиг: {e}")

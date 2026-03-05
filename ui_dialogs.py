@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QSc
                              QGroupBox, QSizePolicy, QFileDialog, QMessageBox)
 from PyQt6.QtCore import Qt, QSize, QSettings, QEvent, QPropertyAnimation, QEasingCurve, QRect, QPoint, QTimer, pyqtSignal
 from PyQt6.QtGui import QIcon, QGuiApplication, QPainter, QColor, QPen, QFont, QPainterPath, QBrush
-from config import resource_path, CMD_SOUNDBOARD
+from config import resource_path, CMD_SOUNDBOARD, USER_CONFIG_PATH, KNOWN_USERS_PATH
 from audio_engine import PYRNNOISE_AVAILABLE
 
 # ── Максимальный размер кастомного звука (1 MB) ──────────────────────────────
@@ -1671,8 +1671,8 @@ class SettingsDialog(QDialog):
 
         # ── Пользователи из known_users.json (для шёпота) ─────────────────────
         try:
-            if os.path.exists("known_users.json"):
-                with open("known_users.json", "r", encoding="utf-8") as f:
+            if os.path.exists(KNOWN_USERS_PATH):
+                with open(KNOWN_USERS_PATH, "r", encoding="utf-8") as f:
                     registry: dict = json.load(f)
                 users = sorted(
                     ((v.get("nick", ""), ip)
@@ -2337,8 +2337,8 @@ class SettingsDialog(QDialog):
                 # Восстанавливаем nick из known_users.json по IP
                 nick = ""
                 try:
-                    if os.path.exists("known_users.json"):
-                        with open("known_users.json", "r", encoding="utf-8") as f:
+                    if os.path.exists(KNOWN_USERS_PATH):
+                        with open(KNOWN_USERS_PATH, "r", encoding="utf-8") as f:
                             reg = json.load(f)
                         nick = reg.get(fdata, {}).get("nick", "")
                 except Exception:
@@ -2364,13 +2364,13 @@ class SettingsDialog(QDialog):
         if hasattr(self.mw, 'net'):
             self.mw.net.send_presence_update(new_icon, new_text)
 
-        if os.path.exists("user_config.json"):
+        if os.path.exists(USER_CONFIG_PATH):
             try:
-                with open("user_config.json", 'r') as f:
+                with open(USER_CONFIG_PATH, 'r') as f:
                     d = json.load(f)
                 d['nick'] = self.mw.nick
                 d['avatar'] = self.mw.avatar
-                with open("user_config.json", 'w') as f:
+                with open(USER_CONFIG_PATH, 'w') as f:
                     json.dump(d, f)
             except:
                 pass
