@@ -189,6 +189,8 @@ class MainWindow(QMainWindow):
         # Обновляем ban-иконку немедленно, не дожидаясь следующего refresh_ui() (100 мс).
         self.audio.user_volume_zero.connect(self._on_user_volume_zero)
         self.video.frame_received.connect(self.on_video_frame)
+        # Статистика качества (FPS + Loss%) → обновляет HUD VideoWindow каждые 2 сек.
+        self.video.stream_stats_updated.connect(self.on_stream_stats_updated)
 
         # Тост «кто включил soundboard» — желтый лейбл поверх окна
         self.net.soundboard_played.connect(self._on_soundboard_played)
@@ -1208,6 +1210,14 @@ class MainWindow(QMainWindow):
     def on_video_frame(self, uid, q_image):
         if uid in self.stream_windows and self.stream_windows[uid].isVisible():
             self.stream_windows[uid].update_frame(q_image)
+
+    def on_stream_stats_updated(self, uid: int, fps: int, loss_pct: int):
+        """
+        Принимает статистику качества потока от VideoEngine (каждые 2 сек).
+        Пробрасывает в соответствующий VideoWindow для обновления HUD.
+        """
+        if uid in self.stream_windows and self.stream_windows[uid].isVisible():
+            self.stream_windows[uid].update_stream_stats(fps, loss_pct)
 
     def update_user_tree(self, users_map):
         user_rooms: dict = {}

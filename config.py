@@ -55,6 +55,24 @@ VIDEO_PACING_RATE_BYTES_SEC = int(VIDEO_BITRATE * 1.25 / 8)  # ~937 500 байт
 # Флаг для UDP заголовка (битмаска):
 # 1=Mute, 2=Deaf, 4=Video, 8=StreamAudio, 16=LoopbackAudio, 32=StreamVoices, 64=Whisper, 254=Ping
 FLAG_VIDEO          = 4
+# FLAG_VIDEO_LQ: признак низкокачественного видеопотока (Simulcast).
+# Пересылается в заголовке UDP вместе с FLAG_VIDEO (итого flags=132).
+# Сервер маршрутизирует LQ-пакеты только слабым зрителям,
+# HQ-пакеты (flags=4) — только сильным зрителям.
+# 128 не пересекается ни с одним существующим флагом.
+FLAG_VIDEO_LQ       = 128
+
+# --- Simulcast LQ-поток настройки ---
+# Активируется автоматически при наличии h264_nvenc (нулевая нагрузка на CPU).
+# При libx264 fallback — simulcast отключён (двойной CPU-кодек недопустим).
+LQ_VIDEO_BITRATE = 800_000   # 800 kbps — хватает для 480p
+LQ_VIDEO_WIDTH   = 854       # 16:9 480p
+LQ_VIDEO_HEIGHT  = 480
+
+# ABR_LQ_THRESHOLD: зрители, запрашивающие ≤ этого битрейта, получают LQ-поток.
+# 1 500 000 = 1.5 Mbps → зрители на 800k и 1.5M идут в LQ; 2.5M и выше — HQ.
+ABR_LQ_THRESHOLD = 1_500_000
+
 FLAG_STREAM_AUDIO   = 8   # Аудио стрима — маршрутизируется только зрителям
 FLAG_LOOPBACK_AUDIO = 16  # Подтип: системный звук (WASAPI Loopback), бит поверх FLAG_STREAM_AUDIO
 # FLAG_WHISPER: приватная передача голоса одному пользователю.

@@ -13,6 +13,7 @@ from config import (
     CMD_UPDATE_PRESENCE,
     CMD_NUDGE_VOTE, CMD_PLAY_NUDGE, CMD_NUDGE_TRIGGERED, NUDGE_COOLDOWN_SEC,
     CMD_BITRATE_FEEDBACK, CMD_ADJUST_BITRATE, ABR_TIERS,
+    FLAG_VIDEO_LQ, ABR_LQ_THRESHOLD,
 )
 
 
@@ -107,6 +108,19 @@ class SFUServer:
         self._streamer_rx_bytes: dict[int, int]   = {}  # uid → байты за текущее окно
         self._streamer_rx_start: dict[int, float] = {}  # uid → начало текущего окна
 
+        # -------------------------------------------------------------------
+        # Simulcast: раздельная маршрутизация HQ/LQ потоков.
+        #
+        # Когда стример поддерживает simulcast (nvenc), он шлёт два потока:
+        #   HQ (flags=FLAG_VIDEO)           → сильным зрителям (>= ABR_LQ_THRESHOLD)
+        #   LQ (flags=FLAG_VIDEO|FLAG_VIDEO_LQ) → слабым зрителям (< ABR_LQ_THRESHOLD)
+        #
+        # _streamer_simulcast[uid] = True — как только пришёл первый LQ-пакет.
+        # При simulcast _abr_update НЕ отправляет adjust_bitrate стримеру:
+        # энкодеры фиксированы (HQ=6Mbps, LQ=800kbps), спираль ABR невозможна.
+        # -------------------------------------------------------------------
+        self._streamer_simulcast: dict[int, bool]  = {}  # uid → simulcast активен
+
     # ------------------------------------------------------------------
     # Мониторинг
     # ------------------------------------------------------------------
@@ -191,14 +205,29 @@ class SFUServer:
                             pass
 
                 elif is_video:
-                    # ВИДЕО → только зрители стримера.
+                    # ВИДЕО → зрители стримера.
                     # Upload-ABR: счётчик байт от стримера (без лока — udp_handler однопоточен).
                     self._streamer_rx_bytes[sender_uid] = (
                         self._streamer_rx_bytes.get(sender_uid, 0) + len(data)
                     )
                     if sender_uid not in self._streamer_rx_start:
                         self._streamer_rx_start[sender_uid] = time.time()
-                    self._send_to_watchers(sender_uid, data)
+
+                    # Simulcast: определяем тип пакета (HQ или LQ).
+                    is_lq = bool(flags & FLAG_VIDEO_LQ)
+
+                    if is_lq and not self._streamer_simulcast.get(sender_uid, False):
+                        # Первый LQ-пакет: переключаем стримера в simulcast-режим.
+                        self._streamer_simulcast[sender_uid] = True
+                        print(f"[Simulcast] streamer={sender_uid}: LQ-поток обнаружен, "
+                              f"режим раздельной маршрутизации активирован")
+
+                    if self._streamer_simulcast.get(sender_uid, False):
+                        # Simulcast: HQ → сильным зрителям, LQ → слабым.
+                        self._send_to_watchers_routed(sender_uid, data, is_lq)
+                    else:
+                        # Legacy: единый поток всем зрителям.
+                        self._send_to_watchers(sender_uid, data)
 
                 elif is_stream_audio and is_stream_voices:
                     # ГОЛОСОВОЙ ПОТОК СТРИМА → только зрители стримера.
@@ -354,11 +383,12 @@ class SFUServer:
                             if stopped_uid is not None:
                                 with self.watchers_lock:
                                     self.watchers.pop(stopped_uid, None)
-                                # Очищаем ABR-состояние стримера
+                                # Очищаем ABR-состояние и simulcast-флаг стримера
                                 with self.abr_lock:
                                     self.abr_viewer_bitrates.pop(stopped_uid, None)
                                     self.abr_current.pop(stopped_uid, None)
                                     self.abr_last_upgrade.pop(stopped_uid, None)
+                                self._streamer_simulcast.pop(stopped_uid, None)
                             self.send_global_state()
 
                         elif action == 'stream_watch_start':
@@ -602,10 +632,11 @@ class SFUServer:
                     for s_uid in list(self.watchers.keys()):
                         self.watchers[s_uid].pop(u_id, None)
                     self.watchers.pop(u_id, None)
-                # Убираем ABR-запросы отключившегося зрителя
+                # Убираем ABR-запросы и simulcast-флаг отключившегося пользователя
                 with self.abr_lock:
                     for s_uid in list(self.abr_viewer_bitrates.keys()):
                         self.abr_viewer_bitrates[s_uid].pop(u_id, None)
+                self._streamer_simulcast.pop(u_id, None)
                 print(f"[Server] ✖ {nick} (комната: {room}) отключился | Онлайн: {remaining}")
             else:
                 print(f"[Server] ✖ Незарегистрированный клиент {addr[0]} отключился")
@@ -619,18 +650,19 @@ class SFUServer:
     def _abr_update(self, streamer_uid: int, viewer_uid: int, bitrate: int):
         """
         Обновляет запрос битрейта от viewer_uid для стримера streamer_uid.
-        Вычисляет минимум по всем зрителям.
 
-        FIX OPT-4: Гистерезис.
-        - Понижение битрейта (пинг вырос) → немедленно. Зритель уже лагает.
-        - Повышение битрейта (пинг упал)  → не чаще ABR_UPGRADE_COOLDOWN_SEC (10 с).
-          Защита от флапа: RTT 50→55→50→55 мс без кулдауна = перезапуск энкодера
-          каждые 4 с + IDR-кадр 300 КБ каждый раз → сам по себе вызывает спайк пинга.
+        Simulcast-режим (nvenc):
+            Сохраняем предпочтение зрителя для маршрутизации в udp_handler.
+            Команду adjust_bitrate стримеру НЕ отправляем — энкодеры фиксированы
+            (HQ=6Mbps, LQ=800kbps). Спираль ABR физически невозможна.
+
+        Legacy-режим (libx264 / без simulcast):
+            Вычисляем min по всем зрителям и шлём стримеру adjust_bitrate.
+            Гистерезис: понижение немедленно, повышение с кулдауном 10 с.
 
         Вызывается из tcp_handler, вне каких-либо других локов.
         """
         ABR_UPGRADE_COOLDOWN_SEC = 10.0
-        streamer_conn = None
         new_min = bitrate
 
         with self.abr_lock:
@@ -638,6 +670,12 @@ class SFUServer:
                 self.abr_viewer_bitrates[streamer_uid] = {}
             self.abr_viewer_bitrates[streamer_uid][viewer_uid] = bitrate
 
+            # В simulcast-режиме abr_viewer_bitrates используется только
+            # для маршрутизации в _send_to_watchers_routed — выходим сразу.
+            if self._streamer_simulcast.get(streamer_uid, False):
+                return
+
+            # --- Legacy ABR: вычисляем min и решаем — менять ли битрейт ---
             new_min = min(self.abr_viewer_bitrates[streamer_uid].values())
             current = self.abr_current.get(streamer_uid)
 
@@ -654,9 +692,14 @@ class SFUServer:
                     return  # слишком рано повышать
                 self.abr_last_upgrade[streamer_uid] = now
 
+            # FIX: сохраняем старый битрейт ДО перезаписи — нужен для стрелки в логе.
+            # Старый код читал abr_current[streamer_uid] ПОСЛЕ new_min, поэтому
+            # new_min < new_min всегда False и стрелка всегда показывала "↑".
+            old_bitrate = current
             self.abr_current[streamer_uid] = new_min
 
         # Находим conn стримера вне abr_lock
+        streamer_conn = None
         with self.clients_lock:
             for c_conn, c_data in self.clients.items():
                 if c_data['uid'] == streamer_uid and c_data.get('is_streaming'):
@@ -674,7 +717,7 @@ class SFUServer:
                 }).encode('utf-8')
             )
             kbps = new_min // 1000
-            direction = "↓" if (new_min < (self.abr_current.get(streamer_uid) or new_min + 1)) else "↑"
+            direction = "↓" if (old_bitrate is not None and new_min < old_bitrate) else "↑"
             print(f"[ABR] streamer={streamer_uid}: {direction} новый битрейт {kbps} kbps "
                   f"(viewer={viewer_uid} запросил {bitrate//1000} kbps)")
         except Exception as e:
@@ -697,6 +740,57 @@ class SFUServer:
             target_addrs = [
                 self.udp_map[uid]
                 for uid in watcher_uids
+                if uid in self.udp_map
+            ]
+
+        for addr in target_addrs:
+            try:
+                self.udp_sock.sendto(data, addr)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Вспомогательный метод: маршрутизация HQ/LQ при Simulcast
+    # ------------------------------------------------------------------
+    def _send_to_watchers_routed(self, sender_uid: int, data: bytes, is_lq: bool):
+        """
+        Simulcast-маршрутизация: отправляет пакет только тем зрителям,
+        чьё качественное предпочтение совпадает с типом пакета.
+
+        is_lq=True  (FLAG_VIDEO_LQ): отправить зрителям с bitrate ≤ ABR_LQ_THRESHOLD
+        is_lq=False (HQ):            отправить зрителям с bitrate >  ABR_LQ_THRESHOLD
+
+        Зритель без записанного предпочтения (ещё не прислал feedback) → HQ по умолчанию.
+        Это гарантирует, что новый зритель сразу видит максимальное качество, а при
+        первом же bitrate_feedback попадает в правильный поток.
+
+        Порядок локов фиксирован: watchers_lock → abr_lock → udp_lock.
+        sendto() выполняется вне любых локов.
+        """
+        with self.watchers_lock:
+            watcher_uids = list(self.watchers.get(sender_uid, {}).keys())
+
+        if not watcher_uids:
+            return
+
+        with self.abr_lock:
+            prefs = dict(self.abr_viewer_bitrates.get(sender_uid, {}))
+
+        # Фильтруем: сопоставляем is_lq с предпочтением каждого зрителя
+        target_uids = []
+        for w_uid in watcher_uids:
+            req_bps = prefs.get(w_uid, ABR_LQ_THRESHOLD + 1)  # default → HQ
+            viewer_wants_lq = req_bps <= ABR_LQ_THRESHOLD
+            if is_lq == viewer_wants_lq:
+                target_uids.append(w_uid)
+
+        if not target_uids:
+            return
+
+        with self.udp_lock:
+            target_addrs = [
+                self.udp_map[uid]
+                for uid in target_uids
                 if uid in self.udp_map
             ]
 

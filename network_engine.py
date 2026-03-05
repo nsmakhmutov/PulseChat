@@ -18,10 +18,10 @@ from PyQt6.QtCore import QObject, pyqtSignal, QSettings
 
 from config import (
     resource_path, DEFAULT_PORT_TCP, DEFAULT_PORT_UDP, BUFFER_SIZE,
-    UDP_HEADER_STRUCT, UDP_HEADER_SIZE, FLAG_VIDEO, FLAG_STREAM_AUDIO, MAX_VIDEO_PAYLOAD,
+    UDP_HEADER_STRUCT, UDP_HEADER_SIZE, FLAG_VIDEO, FLAG_VIDEO_LQ, FLAG_STREAM_AUDIO, MAX_VIDEO_PAYLOAD,
     CMD_SOUNDBOARD, FLAG_LOOPBACK_AUDIO, FLAG_STREAM_VOICES,
     STREAM_VOICE_HEADER_STRUCT, STREAM_VOICE_HEADER_SIZE,
-    FLAG_WHISPER, VIDEO_BITRATE,
+    FLAG_WHISPER, VIDEO_BITRATE, LQ_VIDEO_BITRATE,
     CMD_NUDGE_VOTE, CMD_PLAY_NUDGE, CMD_NUDGE_TRIGGERED, NUDGE_SOUND_PATH,
     CMD_BITRATE_FEEDBACK, CMD_ADJUST_BITRATE, ABR_TIERS,
 )
@@ -321,7 +321,7 @@ class NetworkClient(QObject):
     # скорости, чтобы избежать burst'ов, которые перегружают Radmin VPN
     # и роняют пинг на каналах с RTT 40-50 мс.
     # ------------------------------------------------------------------
-    def send_video_frame_chunks(self, chunks: list):
+    def send_video_frame_chunks(self, chunks: list, flags: int = FLAG_VIDEO):
         """
         FIX OPT-3: Принимаем ВСЕ чанки одного кадра одним вызовом.
 
@@ -332,14 +332,16 @@ class NetworkClient(QObject):
         Дроп одного чанка делает весь кадр H.264 недекодируемым
         (P-фреймы теряют референс) → артефакты до следующего IDR.
         Дроп целого кадра — декодер просто пропускает момент, без артефактов.
+
+        flags: UDP-флаги пакета. FLAG_VIDEO для HQ, FLAG_VIDEO|FLAG_VIDEO_LQ для LQ.
         """
         if not self.server_addr or self.audio.my_uid == 0:
             return
 
         ts = time.time()
         uid = self.audio.my_uid
-        # Добавляем UDP-заголовок к каждому чанку
-        header = UDP_HEADER_STRUCT.pack(uid, ts, 0, FLAG_VIDEO)
+        # Добавляем UDP-заголовок с нужными флагами к каждому чанку
+        header = UDP_HEADER_STRUCT.pack(uid, ts, 0, flags)
         packets = [header + chunk for chunk in chunks]
 
         # Дропаем ЦЕЛЫЙ старый кадр если очередь переполнена
@@ -420,9 +422,12 @@ class NetworkClient(QObject):
                 cb = self.video._current_bitrate
                 if isinstance(cb, int) and cb > 0:
                     current_bitrate = cb
+                # [FIX-GEMINI] Simulcast: учитываем суммарный битрейт HQ+LQ.
+                # Без этого pacing рассчитан на 6 Mbps, а шлём 6.8 Mbps →
+                # очередь переполняется и кадры дропаются ещё на стримере.
+                if getattr(self.video, '_simulcast_active', False):
+                    current_bitrate += LQ_VIDEO_BITRATE
 
-            # pacing_rate = bitrate * 1.25 / 8: +25% overhead на UDP/IP заголовки.
-            # max(..., 100_000) защита от деления на 0 при гипотетическом нулевом битрейте.
             pacing_rate    = max(int(current_bitrate * 1.25 / 8), 100_000)
             pacing_interval = avg_packet_bytes / pacing_rate
             batch_interval  = pacing_interval * BATCH_SIZE
@@ -456,6 +461,15 @@ class NetworkClient(QObject):
             elif delta > 0:
                 while time.perf_counter() < target_t:
                     pass
+            else:
+                # [FIX] Анти-burst soft-limit 10мс (Gemini).
+                # Если поток "проспал" < 10мс — не сбрасываем полностью:
+                # позволяем микро-задержкам планировщика компенсироваться,
+                # сохраняя средний битрейт.
+                # Долг > 10мс → сбрасываем до now-10мс, исключая мега-бёрсты
+                # которые захлёбывают RadminVPN (молчаливый дроп пакетов).
+                if now - target_t > 0.010:
+                    target_t = now - 0.010
 
             # 4. Отправляем строго BATCH_SIZE пакетов
             for packet in batch:
@@ -465,7 +479,11 @@ class NetworkClient(QObject):
                 except Exception as e:
                     print(f"[Net] Pacing send error: {e}")
 
-            last_send_t = time.perf_counter()
+            # Используем target_t (не perf_counter()) чтобы не накапливать drift:
+            # perf_counter() фиксирует РЕАЛЬНОЕ время после sendto, которое само
+            # по себе занимает несколько мкс → ошибка накапливается и через
+            # несколько тысяч итераций превращается в микро-burst.
+            last_send_t = target_t
 
     # ------------------------------------------------------------------
     # Приём UDP-пакетов
@@ -490,7 +508,10 @@ class NetworkClient(QObject):
 
                 elif flags & FLAG_VIDEO:
                     if self.video:
-                        self.video.process_incoming_packet(uid, data[UDP_HEADER_SIZE:])
+                        # Передаём is_lq: decode_worker использует его для точной диагностики.
+                        # Без этого он гадал по разрешению пикселей — неверно когда HQ < LQ по размеру.
+                        is_lq = bool(flags & FLAG_VIDEO_LQ)
+                        self.video.process_incoming_packet(uid, data[UDP_HEADER_SIZE:], is_lq=is_lq)
                     else:
                         print(f"[Net] Video packet from {uid}, but VideoEngine not initialized")
 
@@ -533,7 +554,8 @@ class NetworkClient(QObject):
 
             except Exception as e:
                 if self.running:
-                    print(f"[Net] UDP receive error: {e}")
+                    import traceback
+                    print(f"[Net] UDP receive error: {e}\n{traceback.format_exc()}")
                 continue
 
     # ------------------------------------------------------------------
@@ -1023,12 +1045,24 @@ class NetworkClient(QObject):
         Зритель → сервер: запрос IDR-кадра у стримера при детекте потери пакетов.
         Сервер ретранслирует команду стримеру (action='request_keyframe').
         Стример вызывает force_keyframe() → следующий кадр будет IDR.
-        Вызывается из VideoEngine._frame_cleanup_loop (rate-limit 1 раз в 2 сек).
+        Вызывается из VideoEngine._frame_cleanup_loop (адаптивный rate-limit).
+
+        Дополнительная защита: при пинге > 1500 мс полностью подавляем запрос.
+        IDR-кадр при таком пинге только усугубит буферблоат (bufferbloat):
+        огромный I-frame (~300 KB LQ, ~1 MB HQ) будет лететь 2-5 секунд,
+        гарантированно добивая канал. Лучше дождаться стабилизации сети.
         """
         if not self.running:
             return
+
+        current_ping = getattr(self, 'current_ping', 0)
+        if current_ping > 1500:
+            # Сеть полностью перегружена — IDR только навредит
+            print(f"[Net] IDR подавлен (ping={current_ping}ms > 1500ms, канал перегружен)")
+            return
+
         self.send_json({
             'action':       'request_keyframe',
             'streamer_uid': streamer_uid,
         })
-        print(f"[Net] IDR запрошен у стримера uid={streamer_uid}")
+        print(f"[Net] IDR запрошен у стримера uid={streamer_uid} (ping={current_ping}ms)")

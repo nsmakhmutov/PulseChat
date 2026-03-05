@@ -486,9 +486,7 @@ class VideoWindow(QWidget):
         self.uid: int | None = None
         self._nick = nick
         self._frame_count = 0
-        self._fps_count = 0
-        self._fps_last_time = time.monotonic()
-        self._current_fps = 0.0
+        self._fps_last_time = time.monotonic()   # для обновления Res/Frames раз в сек
         self._is_fullscreen = False
         self._closing = False        # флаг: окно в процессе закрытия
         self._net = None             # NetworkClient — устанавливается через set_net()
@@ -514,8 +512,15 @@ class VideoWindow(QWidget):
         """
         Вызывается из MainWindow.open_video_window() после создания окна.
         Сохраняет ссылку на NetworkClient и запускает ABR feedback timer.
+
+        FIX cold-start: отправляем первый ABR feedback немедленно (через 200 мс),
+        не ждём первого тика таймера (4000 мс).
+        Проблема без этого: зритель с высоким пингом (например 412 мс) получает
+        HQ-поток (6 Mbps) в течение 4 секунд до первого feedback → канал захлёбывается.
+        200 мс достаточно чтобы current_ping успел обновиться после первого pong.
         """
         self._net = net
+        QTimer.singleShot(200, self._send_abr_feedback)   # ранний фидбек
         self._abr_timer.start()
 
     # ------------------------------------------------------------------
@@ -590,7 +595,7 @@ class VideoWindow(QWidget):
 
         lbl_style = "color: #8888aa; padding: 0 10px; font-size: 11px;"
 
-        self._lbl_fps      = QLabel("FPS: —")
+        self._lbl_fps      = QLabel("Net: —")     # FPS декодера + % потерь пакетов
         self._lbl_res      = QLabel("Res: —")
         self._lbl_frames   = QLabel("Frames: 0")
         self._lbl_renderer = QLabel("🟢 OpenGL GPU")
@@ -766,6 +771,40 @@ class VideoWindow(QWidget):
         except RuntimeError:
             pass
 
+    def update_stream_stats(self, fps: int, loss_pct: int):
+        """
+        Обновляет HUD-метку с FPS декодера и процентом потерь пакетов.
+        Вызывается из MainWindow каждые 2 сек (VideoEngine.stream_stats_updated).
+
+        Цветовая схема по loss%:
+          0-4%   → зелёный  (отличная сеть)
+          5-14%  → жёлтый   (небольшие потери, видео может рябить)
+          ≥15%   → красный  (серьёзные потери, артефакты неизбежны)
+
+        Показываем FPS и Loss вместо исходного «FPS: N»:
+          «28 fps  Loss: 0%»   → хорошая сеть
+          «15 fps  Loss: 22%» → плохая сеть (красный)
+        """
+        if self._closing:
+            return
+        try:
+            if loss_pct < 5:
+                color = "#2ecc71"   # зелёный
+                icon  = "🟢"
+            elif loss_pct < 15:
+                color = "#f1c40f"   # жёлтый
+                icon  = "🟡"
+            else:
+                color = "#e74c3c"   # красный
+                icon  = "🔴"
+
+            self._lbl_fps.setText(f"{icon} {fps} fps  Loss: {loss_pct}%")
+            self._lbl_fps.setStyleSheet(
+                f"color: {color}; padding: 0 10px; font-size: 11px;"
+            )
+        except RuntimeError:
+            pass
+
     # ------------------------------------------------------------------
     # Публичный метод синхронизации состояния аудио с иконками оверлея
     # ------------------------------------------------------------------
@@ -802,16 +841,13 @@ class VideoWindow(QWidget):
             self.surface.set_frame(q_img)
 
             self._frame_count += 1
-            self._fps_count += 1
 
+            # Разрешение обновляем на каждом кадре (дёшево — просто два int).
+            # FPS и Loss% приходят из VideoEngine.stream_stats_updated каждые 2 сек.
             now = time.monotonic()
             elapsed = now - self._fps_last_time
             if elapsed >= 1.0:
-                self._current_fps = self._fps_count / elapsed
-                self._fps_count = 0
                 self._fps_last_time = now
-
-                self._lbl_fps.setText(f"FPS: {self._current_fps:.1f}")
                 self._lbl_res.setText(f"Res: {q_img.width()}×{q_img.height()}")
                 self._lbl_frames.setText(f"Frames: {self._frame_count}")
 
