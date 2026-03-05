@@ -58,6 +58,12 @@ class NetworkClient(QObject):
     nudge_received  = pyqtSignal()
     nudge_triggered = pyqtSignal(str, str)
 
+    # Сигнал адаптивного битрейта: сервер изменил битрейт стримера.
+    # Эмитируется при получении CMD_ADJUST_BITRATE (только стримером).
+    # MainWindow подключает его к _on_bitrate_adjusted() для отображения
+    # индикатора качества соединения в тулбаре рядом с кнопкой трансляции.
+    bitrate_adjusted = pyqtSignal(int)   # новый битрейт в bps
+
     def __init__(self, audio):
         super().__init__()
         self.audio  = audio
@@ -648,9 +654,11 @@ class NetworkClient(QObject):
         elif act == CMD_ADJUST_BITRATE:
             # Сервер прислал новый целевой битрейт (вычисленный как min по всем зрителям).
             # Передаём VideoEngine — он перезапустит энкодер на следующей итерации.
+            # Эмитируем bitrate_adjusted для UI-индикатора качества соединения.
             new_bitrate = msg.get('bitrate')
             if isinstance(new_bitrate, int) and self.video and self.running:
                 self.video.set_bitrate(new_bitrate)
+                self.bitrate_adjusted.emit(new_bitrate)
 
         elif act == CMD_PLAY_NUDGE:
             # Нас пнули — воспроизводим звук в отдельном потоке.

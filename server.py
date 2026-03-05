@@ -671,8 +671,18 @@ class SFUServer:
             self.abr_viewer_bitrates[streamer_uid][viewer_uid] = bitrate
 
             # В simulcast-режиме abr_viewer_bitrates используется только
-            # для маршрутизации в _send_to_watchers_routed — выходим сразу.
-            if self._streamer_simulcast.get(streamer_uid, False):
+            # для маршрутизации в _send_to_watchers_routed.
+            #
+            # Исключение: server upload voter (viewer_uid == 0).
+            # Это специальный псевдо-зритель из _upload_abr_loop — он голосует
+            # только когда фактический upload стримера ниже настроенного битрейта.
+            # В этом случае simulcast не спасает: стример гонит 6+0.8 Mbps,
+            # а его канал держит, например, 800 kbps. Сервер обязан сообщить
+            # стримеру о перегрузке чтобы запустить Spatial Layer Fallback.
+            #
+            # viewer_uid != 0 → обычный зритель с плохим RTT → его защищает
+            # маршрутизация LQ-потока; стримера трогать не нужно.
+            if self._streamer_simulcast.get(streamer_uid, False) and viewer_uid != 0:
                 return
 
             # --- Legacy ABR: вычисляем min и решаем — менять ли битрейт ---

@@ -199,6 +199,9 @@ class MainWindow(QMainWindow):
         self.net.nudge_received.connect(self._on_nudge_received)
         self.net.nudge_triggered.connect(self._on_nudge_triggered)
 
+        # Индикатор качества соединения стримера (ABR-понижение от сервера)
+        self.net.bitrate_adjusted.connect(self._on_bitrate_adjusted)
+
         self.ui_timer = QTimer()
         self.ui_timer.timeout.connect(self.refresh_ui)
         self.ui_timer.start(100)
@@ -421,6 +424,22 @@ class MainWindow(QMainWindow):
         self.btn_stream.setCheckable(True)
         self.btn_stream.clicked.connect(self.toggle_stream)
 
+        # --- Индикатор качества соединения стримера ---
+        # Маленький QLabel с иконкой connection_bad.svg, появляется рядом
+        # с кнопкой трансляции когда сервер понизил битрейт из-за плохого
+        # upload-канала. Аналог индикатора «слабое соединение» в Discord.
+        # Состояния:
+        #   скрыт           — нет трансляции или битрейт ≥ 4 Mbps (норма)
+        #   🟡 tooltip      — битрейт 1.5–4 Mbps (умеренная деградация)
+        #   🔴 tooltip      — битрейт < 1.5 Mbps (сильная деградация)
+        self._stream_conn_lbl = QLabel()
+        self._stream_conn_lbl.setFixedSize(22, 22)
+        self._stream_conn_lbl.setScaledContents(True)
+        self._stream_conn_lbl.setVisible(False)
+        self._stream_conn_lbl.setPixmap(
+            QIcon(resource_path("assets/icon/connection_bad.svg")).pixmap(QSize(22, 22))
+        )
+
         self.ping_lbl = QLabel("0 ms")
         self.ping_lbl.setObjectName("pingLabel")
         self.ping_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -436,6 +455,7 @@ class MainWindow(QMainWindow):
         btns.addWidget(self.btn_deafen)
         btns.addWidget(self.btn_sb)
         btns.addWidget(self.btn_stream)
+        btns.addWidget(self._stream_conn_lbl)
         btns.addStretch()
         btns.addWidget(self.ping_lbl)
         btns.addWidget(btn_set)
@@ -1848,6 +1868,57 @@ class MainWindow(QMainWindow):
             path = resource_path("assets/icon/stream_off.svg")
             self.btn_stream.setIcon(QIcon(path))
             self.btn_stream.setStyleSheet("")  # вернуть к CSS из apply_theme
+            # Скрываем индикатор плохого соединения при остановке трансляции
+            self._stream_conn_lbl.setVisible(False)
+
+    def _on_bitrate_adjusted(self, bitrate: int):
+        """
+        Обработчик CMD_ADJUST_BITRATE от сервера.
+        Показывает/скрывает индикатор качества соединения рядом с кнопкой
+        трансляции в зависимости от текущего битрейта.
+
+        Логика (аналог Discord «слабое соединение» у стримера):
+          bitrate ≥ 4 Mbps  → индикатор скрыт (норма, нет деградации)
+          bitrate < 4 Mbps  → жёлтый: умеренная деградация канала
+          bitrate < 1.5 Mbps → красный: сильная деградация, видимые артефакты
+
+        Индикатор показывается только во время активной трансляции —
+        при остановке он сбрасывается в update_stream_button_icon().
+        """
+        if not self.is_streaming:
+            return
+
+        kbps = bitrate // 1000
+
+        if bitrate >= 4_000_000:
+            # Канал восстановился — скрываем предупреждение
+            self._stream_conn_lbl.setVisible(False)
+            return
+
+        # Устанавливаем иконку и цветовой оверлей через styleSheet
+        if bitrate < 1_500_000:
+            # Критическая деградация: красная тонировка + подсказка
+            self._stream_conn_lbl.setStyleSheet(
+                "background-color: rgba(231, 76, 60, 0.18); "
+                "border-radius: 4px;"
+            )
+            self._stream_conn_lbl.setToolTip(
+                f"⚠ Слабый upload!\n"
+                f"Битрейт снижен до {kbps} kbps.\n"
+                f"Зрители видят ухудшенное качество."
+            )
+        else:
+            # Умеренная деградация: жёлтая тонировка
+            self._stream_conn_lbl.setStyleSheet(
+                "background-color: rgba(241, 196, 15, 0.18); "
+                "border-radius: 4px;"
+            )
+            self._stream_conn_lbl.setToolTip(
+                f"⚡ Upload снижен\n"
+                f"Битрейт адаптирован до {kbps} kbps."
+            )
+
+        self._stream_conn_lbl.setVisible(True)
 
     def toggle_stream(self):
         from ui_dialogs import StreamSettingsDialog

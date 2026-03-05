@@ -96,7 +96,19 @@ STREAM_VOICE_HEADER_SIZE   = STREAM_VOICE_HEADER_STRUCT.size
 # чтобы не смешиваться с его же микрофонным потоком (ключ X).
 LOOPBACK_UID_OFFSET = 1_000_000
 
-MAX_VIDEO_PAYLOAD = 1300
+# MAX_VIDEO_PAYLOAD: максимальный payload одного чанка в UDP-пакете.
+# Расчёт безопасного MTU для RadminVPN:
+#   IP header    : 20 байт
+#   UDP header   :  8 байт
+#   UDP_HEADER   : 17 байт  ("!IdIB" = 4+8+4+1)
+#   VIDEO_HEADER :  8 байт  ("!IHH" = 4+2+2)
+#   Payload      : 1150 байт
+#   ИТОГО        : 1203 байт — гарантированно пролетит без фрагментации
+#   (RadminVPN MTU ≈ 1350–1400; запас ~150–200 байт на инкапсуляцию)
+#
+# Было 1300 → итого 1353 байт — опасно близко к порогу VPN; фрагментация
+# UDP-пакета = потеря всего чанка при любой «дырке» в маршруте.
+MAX_VIDEO_PAYLOAD = 1150
 VIDEO_CHUNK_HEADER = struct.Struct("!IHH")
 VIDEO_HEADER_SIZE = VIDEO_CHUNK_HEADER.size
 

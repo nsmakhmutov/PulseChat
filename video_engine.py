@@ -227,9 +227,19 @@ class VideoEngine(QObject):
         self._force_keyframe = True
 
     def set_bitrate(self, new_bitrate: int):
-        if self._simulcast_active:
-            return
+        """
+        Устанавливает целевой битрейт.
 
+        Ранее при simulcast_active сразу возвращался (return) —
+        это делало Upload-ABR неэффективным: сервер сигнализировал
+        «твой upload перегружен», но стример продолжал гнать 6.8 Mbps.
+
+        Теперь устанавливаем _target_bitrate всегда.
+        В _encode_loop при обнаружении расхождения:
+          — simulcast активен → оба энкодера сбрасываются, simulcast
+            отключается, запускается единый энкодер на новом битрейте.
+          — simulcast неактивен → энкодер просто перезапускается (старый путь).
+        """
         if new_bitrate != self._target_bitrate:
             kbps_old = self._target_bitrate // 1000
             kbps_new = new_bitrate // 1000
@@ -475,13 +485,34 @@ class VideoEngine(QObject):
                     except queue.Empty:
                         continue
 
-                    if not self._simulcast_active and self._target_bitrate != self._current_bitrate:
+                    if self._target_bitrate != self._current_bitrate:
+                        # --- Сброс HQ-энкодера ---
                         try:
                             for _ in codec.encode(None):
                                 pass
                         except Exception:
                             pass
                         del codec
+
+                        # --- Simulcast → Единый поток (Spatial Layer Fallback) ---
+                        # Если сервер сигнализировал о перегрузке upload-канала стримера,
+                        # коллапсируем два потока в один: сбрасываем LQ-энкодер,
+                        # отключаем simulcast, запускаем единый HQ на пониженном битрейте.
+                        # Аналог Discord Spatial Layer Fallback при плохом аплоаде.
+                        if codec_lq is not None:
+                            try:
+                                for _ in codec_lq.encode(None):
+                                    pass
+                            except Exception:
+                                pass
+                            del codec_lq
+                            codec_lq = None
+                            self._simulcast_active = False
+                            print(
+                                f"[Video] ABR Simulcast→Fallback: upload-канал перегружен, "
+                                f"переход на единый поток "
+                                f"{self._target_bitrate // 1000} kbps"
+                            )
 
                         self._current_bitrate = self._target_bitrate
                         try:
@@ -589,6 +620,15 @@ class VideoEngine(QObject):
     # Приём и сборка входящих пакетов
     # ------------------------------------------------------------------
     def _idr_cooldown(self) -> float:
+        """
+        Кулдаун между IDR-запросами, адаптированный к текущему пингу.
+
+        Чем выше пинг — тем дольше ждём перед повторным запросом IDR.
+        Это ломает «смертельную спираль»: при пинге 221 мс стример
+        генерирует ~3 МБ IDR-кадр за ~100 мс → он должен успеть дойти
+        до зрителя ещё до следующего запроса. Без этого 2-секундный
+        кулдаун при пинге 221 мс выдавал IDR-шторм.
+        """
         ping = getattr(self.net, 'current_ping', 50) if self.net else 50
         if ping < 15:
             return 0.3
@@ -596,7 +636,9 @@ class VideoEngine(QObject):
             return 0.5
         elif ping < 150:
             return 1.0
-        return 2.0
+        elif ping < 300:
+            return 3.0   # RTT 150-300 мс: IDR-кадр идёт ~150 мс в одну сторону
+        return 5.0       # RTT ≥ 300 мс: очень плохая сеть, редкие запросы
 
     def process_incoming_packet(self, uid, data, is_lq: bool = False):
         if len(data) < VIDEO_HEADER_SIZE:
