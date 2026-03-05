@@ -12,6 +12,7 @@ import struct
 import os
 import platform
 import ctypes
+from collections import deque
 
 from PyQt6.QtCore import QObject, pyqtSignal, QSettings
 
@@ -20,8 +21,9 @@ from config import (
     UDP_HEADER_STRUCT, UDP_HEADER_SIZE, FLAG_VIDEO, FLAG_STREAM_AUDIO, MAX_VIDEO_PAYLOAD,
     CMD_SOUNDBOARD, FLAG_LOOPBACK_AUDIO, FLAG_STREAM_VOICES,
     STREAM_VOICE_HEADER_STRUCT, STREAM_VOICE_HEADER_SIZE,
-    VIDEO_PACING_RATE_BYTES_SEC, FLAG_WHISPER,
+    FLAG_WHISPER, VIDEO_BITRATE,
     CMD_NUDGE_VOTE, CMD_PLAY_NUDGE, CMD_NUDGE_TRIGGERED, NUDGE_SOUND_PATH,
+    CMD_BITRATE_FEEDBACK, CMD_ADJUST_BITRATE, ABR_TIERS,
 )
 
 MAX_SILENT_RECONNECT_ATTEMPTS = 4
@@ -74,6 +76,11 @@ class NetworkClient(QObject):
         self._reconnecting       = False
         self._reconnect_attempts = 0
 
+        # UID стримера, которого сейчас смотрит этот клиент (0 = не смотрит).
+        # Устанавливается из MainWindow через start_watching() / stop_watching().
+        # Используется ABR-таймером в VideoWindow для отправки bitrate_feedback.
+        self._watching_streamer_uid: int = 0
+
         # Флаг воспроизведения soundboard.
         # Используется для блокировки спама: новый звук не запустится,
         # пока текущий ещё играет.
@@ -81,11 +88,12 @@ class NetworkClient(QObject):
 
         # -------------------------------------------------------------------
         # Pacing-очередь для видео-пакетов (leaky bucket).
-        # Пакеты кладёт send_video_packet(), дренирует video_pacing_loop().
-        # maxsize=2000: ~2.7 сек буфера при 720p60 6Mbps (737 пакетов/сек).
-        # Если очередь заполнена — старые пакеты дропаются (актуальность важнее).
+        # Пакеты кладёт send_video_frame_chunks(), дренирует video_pacing_loop().
+        # maxsize=30: ~500 мс буфера при 60fps.
+        # При перегрузке сети старые КАДРЫ дропаются (лучше дроп, чем накопление
+        # задержки). Было 2000 (~33 сек) — теперь мгновенный дроп при congestion.
         # -------------------------------------------------------------------
-        self.video_pacing_queue = queue.Queue(maxsize=2000)
+        self.video_pacing_queue = queue.Queue(maxsize=30)
 
         self._init_sockets()
 
@@ -107,6 +115,10 @@ class NetworkClient(QObject):
         try:
             self.tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            # Отключаем алгоритм Нейгла: мелкие команды (IDR-запрос, adjust_bitrate,
+            # nudge) отправляются немедленно без буферизации до 200 мс.
+            # Критично для ABR: задержка в 200 мс = зритель лишние 200 мс смотрит артефакты.
+            self.tcp_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.udp_socket_bound = False
         except Exception as e:
@@ -218,10 +230,27 @@ class NetworkClient(QObject):
                 print(f"[Net] CRITICAL: UDP bind failed: {e}")
                 raise
 
-        # 8 MB буфер приёма: при 6Mbps видео ≈ 750KB/s → запас ~10 сек.
+        # Буферы клиентского UDP-сокета — оптимизированы под low-latency режим.
+        #
+        # Проблема 8MB буферов (старый код):
+        #   При 6 Mbps стриме pacing отправляет ~750 KB/s. Если RadminVPN временно
+        #   не успевает дренировать (VPN-шифрование, CPU spike), 8 MB SO_SNDBUF
+        #   заполняется, ping-пакеты (отдельный sendto() из ping_loop) встают в
+        #   хвост очереди позади видео → измеренный RTT = 1000-3000 мс.
+        #   Ложный 3000 мс пинг → ABR роняет битрейт до 800 kbps → "спираль смерти".
+        #
+        # Решение 512 KB SO_SNDBUF (клиент):
+        #   С pacing по 2642 байта каждые ~2.78 мс (~950 KB/s) и drain-скоростью
+        #   RadminVPN >> 950 KB/s, SO_SNDBUF в steady-state практически пустой.
+        #   512 KB — запас на случай временного торможения RadminVPN (~540 мс),
+        #   не позволяя очереди вырасти до "часов".
+        #
+        # SO_RCVBUF 512 KB (клиент): получаем лишь pong + управляющие пакеты,
+        #   8 MB там было избыточным в 16000 раз.
         try:
-            self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
-            print("[Net] UDP receive buffer set to 8MB")
+            self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 512 * 1024)
+            self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 512 * 1024)
+            print("[Net] UDP buffers set to low-latency mode (512 KB recv / 512 KB send)")
         except Exception:
             pass
 
@@ -292,22 +321,41 @@ class NetworkClient(QObject):
     # скорости, чтобы избежать burst'ов, которые перегружают Radmin VPN
     # и роняют пинг на каналах с RTT 40-50 мс.
     # ------------------------------------------------------------------
-    def send_video_packet(self, payload):
+    def send_video_frame_chunks(self, chunks: list):
+        """
+        FIX OPT-3: Принимаем ВСЕ чанки одного кадра одним вызовом.
+
+        Добавляем UDP-заголовок к каждому чанку и кладём весь кадр
+        как единицу в pacing-очередь. При переполнении очереди дропается
+        ЦЕЛЫЙ старый кадр (список чанков), а не один случайный чанк.
+
+        Дроп одного чанка делает весь кадр H.264 недекодируемым
+        (P-фреймы теряют референс) → артефакты до следующего IDR.
+        Дроп целого кадра — декодер просто пропускает момент, без артефактов.
+        """
         if not self.server_addr or self.audio.my_uid == 0:
             return
-        header = UDP_HEADER_STRUCT.pack(self.audio.my_uid, time.time(), 0, FLAG_VIDEO)
-        packet = header + payload
-        # Если очередь переполнена — дропаем самый старый пакет, берём новый.
-        # Актуальный кадр важнее давно стоящего в очереди.
+
+        ts = time.time()
+        uid = self.audio.my_uid
+        # Добавляем UDP-заголовок к каждому чанку
+        header = UDP_HEADER_STRUCT.pack(uid, ts, 0, FLAG_VIDEO)
+        packets = [header + chunk for chunk in chunks]
+
+        # Дропаем ЦЕЛЫЙ старый кадр если очередь переполнена
         if self.video_pacing_queue.full():
             try:
-                self.video_pacing_queue.get_nowait()
+                self.video_pacing_queue.get_nowait()   # убираем один старый кадр
             except queue.Empty:
                 pass
         try:
-            self.video_pacing_queue.put_nowait(packet)
+            self.video_pacing_queue.put_nowait(packets)
         except queue.Full:
             pass
+
+    # Оставляем для обратной совместимости (вдруг вызывается из другого места)
+    def send_video_packet(self, payload):
+        self.send_video_frame_chunks([payload])
 
     # ------------------------------------------------------------------
     # Leaky bucket pacing для видео-пакетов.
@@ -328,44 +376,94 @@ class NetworkClient(QObject):
     #   perf_counter busy-wait с порогом 0.5 мс.
     # ------------------------------------------------------------------
     def video_pacing_loop(self):
-        # Средний размер видео-пакета: MAX_VIDEO_PAYLOAD + UDP_HEADER(13) + VIDEO_HEADER(8)
-        avg_packet_bytes = MAX_VIDEO_PAYLOAD + 21
-        # Интервал между пакетами в секундах
-        pacing_interval  = avg_packet_bytes / VIDEO_PACING_RATE_BYTES_SEC  # ~1.39 мс
+        # Поднимаем приоритет этого потока выше нормального на Windows.
+        #
+        # Проблема без приоритета:
+        #   Планировщик Windows может вытеснить поток на 5–15 мс во время
+        #   фоновой активности ОС (антивирус, Windows Update, дефраг и т.д.).
+        #   Leaky bucket должен срабатывать каждые ~2.78 мс — вытеснение на 15 мс
+        #   порождает burst из накопившихся пакетов, что разрушает весь смысл pacing.
+        #
+        # THREAD_PRIORITY_ABOVE_NORMAL = 1 (не HIGHEST=2 и не TIME_CRITICAL=15):
+        #   Даёт планировщику понять, что поток важный, но не монополизирует ядро.
+        #   Discord, Zoom, TeamSpeak используют аналогичный приоритет для аудио/видео
+        #   send-потоков — проверенная практика.
+        if platform.system() == "Windows":
+            try:
+                handle = ctypes.windll.kernel32.GetCurrentThread()
+                ctypes.windll.kernel32.SetThreadPriority(handle, 1)  # ABOVE_NORMAL
+                print("[Net] video_pacing_loop: приоритет потока → ABOVE_NORMAL")
+            except Exception as e:
+                print(f"[Net] video_pacing_loop: не удалось поднять приоритет: {e}")
 
-        SLEEP_THRESHOLD = 0.0003  # 0.3 мс — busy-wait точнее sleep(), но дешевле чем 0.5 мс
+        avg_packet_bytes = MAX_VIDEO_PAYLOAD + 21
+
+        # BATCH_SIZE=2: отправляем строго по 2 пакета за итерацию.
+        # Снижает частоту busy-wait вдвое при минимальной добавленной задержке.
+        BATCH_SIZE      = 2
+        SLEEP_THRESHOLD = 0.0003   # 0.3 мс — граница sleep/busy-wait
 
         last_send_t = time.perf_counter()
 
+        # Двухуровневый буфер на базе deque (O(1) popleft).
+        pending_packets: deque = deque()
+
         while self.running:
-            try:
-                packet = self.video_pacing_queue.get(timeout=0.05)
-            except queue.Empty:
+            # --- Динамический pacing rate ---
+            # Читаем ТЕКУЩИЙ битрейт энкодера (после ABR-перестройки).
+            # При ABR=800kbps пакуем 800kbps данных; если пейсинг остаётся
+            # зафиксированным на 6Mbps — 800kbps данных улетают мгновенно
+            # мини-бёрстами вместо равномерного потока, что нагружает RadminVPN.
+            # Fallback VIDEO_BITRATE: если VideoEngine ещё не создан (первые мс соединения).
+            current_bitrate = VIDEO_BITRATE
+            if self.video is not None and hasattr(self.video, '_current_bitrate'):
+                cb = self.video._current_bitrate
+                if isinstance(cb, int) and cb > 0:
+                    current_bitrate = cb
+
+            # pacing_rate = bitrate * 1.25 / 8: +25% overhead на UDP/IP заголовки.
+            # max(..., 100_000) защита от деления на 0 при гипотетическом нулевом битрейте.
+            pacing_rate    = max(int(current_bitrate * 1.25 / 8), 100_000)
+            pacing_interval = avg_packet_bytes / pacing_rate
+            batch_interval  = pacing_interval * BATCH_SIZE
+
+            # 1. Пополняем pending_packets до нужного уровня
+            while len(pending_packets) < BATCH_SIZE:
+                try:
+                    # Блокируемся только если буфер совсем пуст — не жжём CPU
+                    timeout = 0.05 if not pending_packets else 0.0
+                    frame_chunks = self.video_pacing_queue.get(timeout=timeout)
+                    pending_packets.extend(frame_chunks)
+                except queue.Empty:
+                    break
+
+            if not pending_packets or not self.server_addr:
                 continue
 
-            if not self.server_addr:
-                continue
+            # 2. Откусываем СТРОГО BATCH_SIZE пакетов (O(1) popleft вместо O(n) slice)
+            n_send          = min(BATCH_SIZE, len(pending_packets))
+            batch           = [pending_packets.popleft() for _ in range(n_send)]
 
-            # Ждём нужный момент отправки
-            target_t = last_send_t + pacing_interval
+            # 3. Ждём нужный момент отправки
+            target_t = last_send_t + batch_interval
             now      = time.perf_counter()
             delta    = target_t - now
 
             if delta > SLEEP_THRESHOLD:
                 time.sleep(delta - SLEEP_THRESHOLD)
-                # Busy-wait оставшиеся <0.5 мс для точности
                 while time.perf_counter() < target_t:
                     pass
             elif delta > 0:
-                # Короткий busy-wait (< 0.5 мс)
                 while time.perf_counter() < target_t:
                     pass
 
-            try:
-                self.udp_sock.sendto(packet, self.server_addr)
-                self.packets_sent += 1
-            except Exception as e:
-                print(f"[Net] Pacing send error: {e}")
+            # 4. Отправляем строго BATCH_SIZE пакетов
+            for packet in batch:
+                try:
+                    self.udp_sock.sendto(packet, self.server_addr)
+                    self.packets_sent += 1
+                except Exception as e:
+                    print(f"[Net] Pacing send error: {e}")
 
             last_send_t = time.perf_counter()
 
@@ -524,6 +622,13 @@ class NetworkClient(QObject):
             if self.video:
                 self.video.force_keyframe()
                 print("[Net] IDR keyframe запрошен сервером → передано VideoEngine")
+
+        elif act == CMD_ADJUST_BITRATE:
+            # Сервер прислал новый целевой битрейт (вычисленный как min по всем зрителям).
+            # Передаём VideoEngine — он перезапустит энкодер на следующей итерации.
+            new_bitrate = msg.get('bitrate')
+            if isinstance(new_bitrate, int) and self.video and self.running:
+                self.video.set_bitrate(new_bitrate)
 
         elif act == CMD_PLAY_NUDGE:
             # Нас пнули — воспроизводим звук в отдельном потоке.
@@ -865,14 +970,65 @@ class NetworkClient(QObject):
         print(f"[Net] Nudge vote sent → target_uid={target_uid}")
 
     # ------------------------------------------------------------------
-    # Заглушки для совместимости с ui_main.py (качество не реализовано).
-    # Кнопка качества в оверлее работает визуально, но на маршрутизацию
-    # сервера не влияет — все зрители получают полный поток.
+    # ABR: управление просмотром и отправка фидбека битрейта
     # ------------------------------------------------------------------
+
+    def start_watching(self, streamer_uid: int):
+        """
+        Регистрируем начало просмотра стрима.
+        Вызывается из MainWindow при открытии VideoWindow.
+        Нужен для отправки bitrate_feedback с правильным streamer_uid.
+        """
+        self._watching_streamer_uid = streamer_uid
+
+    def stop_watching(self):
+        """
+        Регистрируем конец просмотра стрима.
+        Вызывается из MainWindow при закрытии VideoWindow.
+        """
+        self._watching_streamer_uid = 0
+
+    def send_bitrate_feedback(self, ping_ms: int):
+        """
+        Зритель → сервер: сообщаем свой запрошенный битрейт на основе RTT.
+
+        Выбираем тир из ABR_TIERS: первый порог, при котором ping_ms < порога.
+        Сервер вычислит min по всем зрителям и пришлёт стримеру adjust_bitrate.
+
+        Не вызываем если не смотрим стрим (streamer_uid == 0).
+        """
+        streamer_uid = self._watching_streamer_uid
+        if streamer_uid == 0 or not self.running:
+            return
+
+        # Выбираем нужный тир
+        requested_bitrate = ABR_TIERS[-1][1]   # fallback: минимальный
+        for threshold_ms, bitrate in ABR_TIERS:
+            if ping_ms < threshold_ms:
+                requested_bitrate = bitrate
+                break
+
+        self.send_json({
+            'action':       CMD_BITRATE_FEEDBACK,
+            'streamer_uid': streamer_uid,
+            'bitrate':      requested_bitrate,
+        })
+
     def send_quality_request(self, skip_factor: int):
-        """Stub: в текущей архитектуре качество не маршрутизируется."""
+        """Устаревший stub — оставлен для обратной совместимости. Не использовать."""
         pass
 
     def request_viewer_keyframe(self, streamer_uid: int):
-        """Stub: IDR-таймер из ui_video.py вызывает этот метод периодически."""
-        pass
+        """
+        Зритель → сервер: запрос IDR-кадра у стримера при детекте потери пакетов.
+        Сервер ретранслирует команду стримеру (action='request_keyframe').
+        Стример вызывает force_keyframe() → следующий кадр будет IDR.
+        Вызывается из VideoEngine._frame_cleanup_loop (rate-limit 1 раз в 2 сек).
+        """
+        if not self.running:
+            return
+        self.send_json({
+            'action':       'request_keyframe',
+            'streamer_uid': streamer_uid,
+        })
+        print(f"[Net] IDR запрошен у стримера uid={streamer_uid}")

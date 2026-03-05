@@ -273,22 +273,13 @@ class VideoOverlay(QFrame):
     stop_watch_clicked = pyqtSignal()
     fullscreen_clicked = pyqtSignal()
     stream_volume_changed = pyqtSignal(float)   # 0.0–2.0
-    quality_changed    = pyqtSignal(int)         # skip_factor: 1, 2, 4
     # Клик по кнопке soundboard в оверлее стрима → VideoWindow.open_soundboard()
     soundboard_clicked = pyqtSignal()
-
-    # Циклические уровни качества: (skip_factor, emoji-метка, tooltip)
-    _QUALITY_LEVELS = [
-        (1, "🎯", "Высокое HD (1280×720, ~30fps)"),
-        (2, "⚡", "Среднее SD (640×360, ~15fps, меньше трафика)"),
-        (4, "📉", "Низкое SD (640×360, ~15fps, минимум трафика)"),
-    ]
 
     def __init__(self, parent: QWidget):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
         self.setMouseTracking(True)
-        self._quality_idx = 0   # текущий индекс в _QUALITY_LEVELS (по умолчанию HIGH)
 
         self.setStyleSheet("""
             VideoOverlay {
@@ -332,9 +323,7 @@ class VideoOverlay(QFrame):
         self.btn_vol_stream.installEventFilter(self)
         self._vol_popup.installEventFilter(self)
 
-        # --- Soundboard (заменяет нерабочую кнопку качества) ---
-        # Иконка та же что в главном окне (bells.svg).
-        # Клик → VideoWindow.open_soundboard() → SoundboardPanel над стримом.
+        # --- Soundboard ---
         self.btn_soundboard = self._make_btn("assets/icon/bells.svg", "Soundboard")
         self.btn_soundboard.clicked.connect(self.soundboard_clicked)
 
@@ -492,15 +481,6 @@ class VideoWindow(QWidget):
     overlay_stop_watch     = pyqtSignal()
     overlay_stream_volume_changed = pyqtSignal(float)   # 0.0–2.0
 
-    # --- Качество видео ---
-    # Эмитит skip_factor при смене пользователем качества (1/2/4).
-    # MainWindow подключает к net.send_quality_request().
-    quality_changed        = pyqtSignal(int)
-
-    # Эмитит при необходимости получить свежий IDR-кадр (в low-quality режиме).
-    # MainWindow подключает к net.request_viewer_keyframe(streamer_uid).
-    viewer_keyframe_needed = pyqtSignal()
-
     def __init__(self, nick: str):
         super().__init__()
         self.uid: int | None = None
@@ -511,28 +491,32 @@ class VideoWindow(QWidget):
         self._current_fps = 0.0
         self._is_fullscreen = False
         self._closing = False        # флаг: окно в процессе закрытия
-        self._quality_skip = 1       # текущий skip_factor (1=HIGH, 2=MED, 4=LOW)
         self._net = None             # NetworkClient — устанавливается через set_net()
         self._sb_panel = None        # SoundboardPanel поверх стрима (toggle)
 
         self._setup_ui(nick)
         self._setup_hide_timer()
 
-        # IDR-таймер: в режимах MEDIUM/LOW периодически запрашиваем I-frame,
-        # чтобы P-frame артефакты от пропущенных кадров очищались регулярно.
-        # При HIGH (skip=1) таймер не запущен — пакеты не пропускаются.
-        from config import VIDEO_LOW_QUALITY_IDR_INTERVAL_MS
-        self._idr_timer = QTimer(self)
-        self._idr_timer.setSingleShot(False)
-        self._idr_timer.setInterval(VIDEO_LOW_QUALITY_IDR_INTERVAL_MS)
-        self._idr_timer.timeout.connect(self.viewer_keyframe_needed)
+        # --- ABR feedback timer ---
+        # Каждые ABR_FEEDBACK_INTERVAL_MS мс отправляем серверу наш текущий RTT.
+        # Сервер вычислит минимум по всем зрителям и при необходимости скорректирует
+        # битрейт стримера. Таймер запускается в set_net() и останавливается в closeEvent.
+        from config import ABR_FEEDBACK_INTERVAL_MS
+        self._abr_timer = QTimer(self)
+        self._abr_timer.setSingleShot(False)
+        self._abr_timer.setInterval(ABR_FEEDBACK_INTERVAL_MS)
+        self._abr_timer.timeout.connect(self._send_abr_feedback)
 
     # ------------------------------------------------------------------
     # Публичный метод: передать NetworkClient для soundboard в оверлее
     # ------------------------------------------------------------------
     def set_net(self, net):
-        """Вызывается из MainWindow.open_video_window() после создания окна."""
+        """
+        Вызывается из MainWindow.open_video_window() после создания окна.
+        Сохраняет ссылку на NetworkClient и запускает ABR feedback timer.
+        """
         self._net = net
+        self._abr_timer.start()
 
     # ------------------------------------------------------------------
     # Soundboard поверх стрима
@@ -593,7 +577,6 @@ class VideoWindow(QWidget):
         self.overlay.stop_watch_clicked.connect(self._on_overlay_stop)
         self.overlay.fullscreen_clicked.connect(self.toggle_fullscreen)
         self.overlay.stream_volume_changed.connect(self.overlay_stream_volume_changed)
-        self.overlay.quality_changed.connect(self._on_quality_changed)
         self.overlay.soundboard_clicked.connect(self.open_soundboard)
         self.overlay.hide()  # скрыт по умолчанию
 
@@ -611,10 +594,10 @@ class VideoWindow(QWidget):
         self._lbl_res      = QLabel("Res: —")
         self._lbl_frames   = QLabel("Frames: 0")
         self._lbl_renderer = QLabel("🟢 OpenGL GPU")
-        self._lbl_quality  = QLabel("Качество: 🎯 HD")
+        self._lbl_bitrate  = QLabel("ABR: —")   # текущий битрейт, обновляется по adjust_bitrate
 
         for lbl in (self._lbl_fps, self._lbl_res, self._lbl_frames,
-                    self._lbl_renderer, self._lbl_quality):
+                    self._lbl_renderer, self._lbl_bitrate):
             lbl.setStyleSheet(lbl_style)
             bar_layout.addWidget(lbl)
 
@@ -733,29 +716,55 @@ class VideoWindow(QWidget):
         self.close()
 
     # ------------------------------------------------------------------
-    # Управление качеством видео
+    # ABR: периодическая отправка фидбека по RTT
     # ------------------------------------------------------------------
-    def _on_quality_changed(self, skip_factor: int):
+    def _send_abr_feedback(self):
         """
-        Вызывается при нажатии кнопки качества в оверлее.
-        Обновляет внутреннее состояние, метку тулбара,
-        затем пробрасывает skip_factor наружу через quality_changed.
+        Вызывается ABR-таймером каждые ABR_FEEDBACK_INTERVAL_MS мс.
 
-        Примечание: периодический IDR-таймер убран (FIX #6).
-        net.request_viewer_keyframe() — stub-метод, качество-маршрутизация
-        не реализована. Таймер каждые 2 сек вызывал no-op, создавая
-        бессмысленный шум в логах. Одиночный IDR-запрос при смене качества
-        (viewer_keyframe_needed.emit ниже) оставлен — он срабатывает через
-        реальный путь: сервер → request_keyframe → VideoEngine.force_keyframe().
+        Читает current_ping из NetworkClient (EWMA-RTT от ping_loop),
+        вычисляет запрашиваемый битрейт по таблице ABR_TIERS и
+        отправляет серверу bitrate_feedback. Сервер сам вычислит min
+        по всем зрителям и при изменении пришлёт стримеру adjust_bitrate.
+
+        current_ping == 0 означает что ping ещё не измерен (первые 7 с) —
+        в этом случае пропускаем: не нужно занижать битрейт без данных.
         """
-        self._quality_skip = skip_factor
-        labels = {1: "🎯 HD", 2: "⚡ SD", 4: "📉 LQ"}
-        self._lbl_quality.setText(f"Качество: {labels.get(skip_factor, str(skip_factor))}")
+        if self._net is None or self._closing:
+            return
+        ping = getattr(self._net, 'current_ping', 0)
+        if ping <= 0:
+            return
+        self._net.send_bitrate_feedback(ping)
 
-        # Немедленный IDR-запрос: зритель сразу получит чистый I-frame
-        self.viewer_keyframe_needed.emit()
-        # Уведомляем MainWindow → net.send_quality_request()
-        self.quality_changed.emit(skip_factor)
+    def update_bitrate_label(self, bitrate: int):
+        """
+        Вызывается из MainWindow когда сервер прислал adjust_bitrate.
+        Обновляет метку в тулбаре (только если окно ещё живо).
+
+        При битрейте ≤ 1500 kbps показывает предупреждение о плохой сети
+        красным цветом — пользователь понимает, что качество ухудшено не
+        из-за стримера, а из-за состояния канала.
+
+        Пример: 2500000 → "ABR: 2500 kbps"
+        Пример: 800000  → "⚠️ ABR: 800 kbps (Плохая сеть)"
+        """
+        if self._closing:
+            return
+        try:
+            kbps = bitrate // 1000
+            if kbps <= 1500:
+                self._lbl_bitrate.setText(f"⚠️ ABR: {kbps} kbps (Плохая сеть)")
+                self._lbl_bitrate.setStyleSheet(
+                    "color: #e74c3c; padding: 0 10px; font-size: 11px; font-weight: bold;"
+                )
+            else:
+                self._lbl_bitrate.setText(f"ABR: {kbps} kbps")
+                self._lbl_bitrate.setStyleSheet(
+                    "color: #8888aa; padding: 0 10px; font-size: 11px;"
+                )
+        except RuntimeError:
+            pass
 
     # ------------------------------------------------------------------
     # Публичный метод синхронизации состояния аудио с иконками оверлея
@@ -815,7 +824,7 @@ class VideoWindow(QWidget):
     def closeEvent(self, event):
         """Перехватываем закрытие окна, испускаем сигнал до уничтожения объекта."""
         self._closing = True         # блокируем sync_audio_state от внешних сигналов
-        self._idr_timer.stop()       # останавливаем IDR-таймер
+        self._abr_timer.stop()       # останавливаем ABR feedback timer
         self._hide_timer.stop()      # останавливаем таймер авто-скрытия
 
         # Закрываем SoundboardPanel если открыта

@@ -1531,18 +1531,11 @@ class MainWindow(QMainWindow):
             # Синхронизировать попап с текущим значением громкости стрима
             w.overlay._vol_popup.set_value(self.audio.stream_volume)
 
-            # --- Качество видео (per-viewer server-side throttling) ---
-            # Когда зритель нажимает кнопку качества → сообщаем серверу skip_factor.
-            # Сервер начнёт пропускать N-1 из N кадров для этого зрителя.
-            w.quality_changed.connect(
-                lambda sf, _uid=uid: self.net.send_quality_request(sf)
-            )
-            # Периодический IDR-запрос в режиме MEDIUM/LOW качества:
-            # каждые 2 с зритель просит I-frame, чтобы P-frame артефакты
-            # от пропущенных кадров очищались быстро.
-            w.viewer_keyframe_needed.connect(
-                lambda _uid=uid: self.net.request_viewer_keyframe(_uid)
-            )
+            # --- ABR: регистрируем начало просмотра ---
+            # NetworkClient начнёт каждые 4 сек отправлять bitrate_feedback
+            # серверу с нашим RTT → сервер вычислит min по всем зрителям →
+            # пришлёт стримеру adjust_bitrate → VideoEngine перезапустит энкодер.
+            self.net.start_watching(uid)
 
             w.show()
             self.stream_windows[uid] = w
@@ -1560,6 +1553,8 @@ class MainWindow(QMainWindow):
                 pass
         self.stream_windows.pop(uid, None)
         self.net.send_json({"action": "stream_watch_stop", "streamer_uid": uid})
+        # ABR: прекращаем отправлять bitrate_feedback для этого стримера
+        self.net.stop_watching()
 
         # FIX MEM: Останавливаем decode_worker для этого uid.
         #

@@ -1186,6 +1186,13 @@ class SettingsDialog(QDialog):
         self.resize(780, 660)
         self.setMinimumSize(480, 520)
 
+        # ── FIX MEM: удаляем C++ объект при закрытии (accept/reject/X). ─────
+        # Без WA_DeleteOnClose Qt скрывает диалог, но не уничтожает его.
+        # audio_engine держит сильную ссылку на mic_vad через сигнальный слот →
+        # весь диалог остаётся в памяти. Каждое открытие настроек добавляло
+        # ~20–30 МБ виджетов, которые никогда не освобождались.
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+
         # ── Корневой layout: прозрачный фон, карточка с border-radius ─────────
         root_lay = QVBoxLayout(self)
         root_lay.setContentsMargins(0, 0, 0, 0)
@@ -2275,6 +2282,20 @@ class SettingsDialog(QDialog):
 
     def get_devices(self):
         return self.cb_in.currentText(), self.cb_out.currentText()
+
+    # ── FIX MEM: отключаем сигнал уровня микрофона перед закрытием ───────────
+    # audio_engine.volume_level_signal.connect(mic_vad.set_level) создаёт
+    # сильную ссылку: audio_engine → bound-method → mic_vad → SettingsDialog.
+    # Без disconnect диалог не освобождается из памяти даже при WA_DeleteOnClose,
+    # пока audio_engine жив (то есть всё время работы приложения).
+    # done() вызывается для accept(), reject() и кнопки закрытия окна —
+    # единственная точка выхода, которая покрывает все сценарии.
+    def done(self, result: int):
+        try:
+            self.audio.volume_level_signal.disconnect(self.mic_vad.set_level)
+        except (RuntimeError, TypeError):
+            pass  # уже отключён или C++ объект уничтожен
+        super().done(result)
 
     def save_all(self):
         s = self.app_settings

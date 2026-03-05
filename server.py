@@ -12,6 +12,7 @@ from config import (
     FLAG_WHISPER, STREAM_VOICE_HEADER_STRUCT, STREAM_VOICE_HEADER_SIZE,
     CMD_UPDATE_PRESENCE,
     CMD_NUDGE_VOTE, CMD_PLAY_NUDGE, CMD_NUDGE_TRIGGERED, NUDGE_COOLDOWN_SEC,
+    CMD_BITRATE_FEEDBACK, CMD_ADJUST_BITRATE, ABR_TIERS,
 )
 
 
@@ -70,6 +71,41 @@ class SFUServer:
         # Записи живут NUDGE_COOLDOWN_SEC; голоса старше кулдауна не засчитываются.
         self.nudge_votes = {}
         self.nudge_lock  = threading.Lock()
+
+        # --- ABR: фидбек битрейта от зрителей ---
+        # streamer_uid → { viewer_uid → requested_bitrate }
+        # При каждом обновлении вычисляем min и шлём стримеру adjust_bitrate
+        # только если значение изменилось.
+        self.abr_viewer_bitrates: dict[int, dict[int, int]] = {}
+        self.abr_current:         dict[int, int]            = {}  # streamer_uid → текущий битрейт
+        self.abr_lock = threading.Lock()
+
+        # ABR гистерезис: метка времени последнего ПОВЫШЕНИЯ битрейта.
+        # Понижение (при лагах) — немедленно.
+        # Повышение (когда пинг улучшился) — не чаще чем раз в ABR_UPGRADE_COOLDOWN_SEC.
+        # Без кулдауна небольшой джиттер RTT (50→55→50→55 мс) вызывал бы
+        # непрерывные перезапуски энкодера каждые 4 секунды.
+        self.abr_last_upgrade: dict[int, float] = {}   # streamer_uid → timestamp
+        ABR_UPGRADE_COOLDOWN_SEC = 10.0                # константа прямо в __init__ (не в config)
+
+        # -------------------------------------------------------------------
+        # Upload-side ABR: сервер измеряет фактический входящий поток стримера.
+        #
+        # Проблема без этого механизма:
+        #   Стример с плохим upload (напр. 1 Mbps) выставляет энкодер на 6 Mbps.
+        #   Сервер получает кадры burst-ами с огромными паузами.
+        #   Зрители видят битые/замороженные кадры даже при хорошем своём download.
+        #   Viewer-driven ABR не поможет: он измеряет RTT зрителя, а не upload
+        #   стримера. Сервер о проблеме ничего не знает.
+        #
+        # Решение:
+        #   В udp_handler считаем байты от каждого стримера.
+        #   _upload_abr_loop каждые 4 сек вычисляет фактический upload bitrate.
+        #   Если actual < 70% от configured → сервер голосует в min() ABR системы
+        #   с uid=0 (SERVER_VOTER), ограничивая стримера до реальной пропускной способности.
+        # -------------------------------------------------------------------
+        self._streamer_rx_bytes: dict[int, int]   = {}  # uid → байты за текущее окно
+        self._streamer_rx_start: dict[int, float] = {}  # uid → начало текущего окна
 
     # ------------------------------------------------------------------
     # Мониторинг
@@ -155,7 +191,13 @@ class SFUServer:
                             pass
 
                 elif is_video:
-                    # ВИДЕО → только зрители стримера
+                    # ВИДЕО → только зрители стримера.
+                    # Upload-ABR: счётчик байт от стримера (без лока — udp_handler однопоточен).
+                    self._streamer_rx_bytes[sender_uid] = (
+                        self._streamer_rx_bytes.get(sender_uid, 0) + len(data)
+                    )
+                    if sender_uid not in self._streamer_rx_start:
+                        self._streamer_rx_start[sender_uid] = time.time()
                     self._send_to_watchers(sender_uid, data)
 
                 elif is_stream_audio and is_stream_voices:
@@ -312,6 +354,11 @@ class SFUServer:
                             if stopped_uid is not None:
                                 with self.watchers_lock:
                                     self.watchers.pop(stopped_uid, None)
+                                # Очищаем ABR-состояние стримера
+                                with self.abr_lock:
+                                    self.abr_viewer_bitrates.pop(stopped_uid, None)
+                                    self.abr_current.pop(stopped_uid, None)
+                                    self.abr_last_upgrade.pop(stopped_uid, None)
                             self.send_global_state()
 
                         elif action == 'stream_watch_start':
@@ -364,6 +411,43 @@ class SFUServer:
                                         nick = self.clients[conn]['nick'] if conn in self.clients else '?'
                                     print(f"[Server] {nick} перестал смотреть стрим {streamer_uid}")
                             self.send_global_state()
+
+                        elif action == CMD_BITRATE_FEEDBACK:
+                            # Зритель сообщает свой запрошенный битрейт.
+                            # Валидируем: streamer_uid — int, bitrate — один из ABR_TIERS.
+                            streamer_uid_abr = msg.get('streamer_uid')
+                            req_bitrate      = msg.get('bitrate')
+                            valid_bitrates   = {t[1] for t in ABR_TIERS}
+                            if (isinstance(streamer_uid_abr, int)
+                                    and isinstance(req_bitrate, int)
+                                    and req_bitrate in valid_bitrates):
+                                # _abr_update вызываем вне любых локов tcp_handler'а
+                                self._abr_update(streamer_uid_abr, uid, req_bitrate)
+
+                        elif action == 'request_keyframe':
+                            # Зритель детектировал потерю UDP-пакетов и запрашивает IDR.
+                            # Сервер ретранслирует команду стримеру — тот форсирует I-кадр.
+                            # Команда мелкая (~50 байт), отправляем вне всех основных локов.
+                            streamer_uid_idr = msg.get('streamer_uid')
+                            if isinstance(streamer_uid_idr, int):
+                                streamer_conn_idr = None
+                                with self.clients_lock:
+                                    for c_conn, c_data in self.clients.items():
+                                        if (c_data['uid'] == streamer_uid_idr
+                                                and c_data.get('is_streaming')):
+                                            streamer_conn_idr = c_conn
+                                            break
+                                if streamer_conn_idr:
+                                    try:
+                                        streamer_conn_idr.sendall(
+                                            json.dumps({'action': 'request_keyframe'}).encode('utf-8')
+                                        )
+                                        print(
+                                            f"[Server] IDR ретранслирован стримеру uid={streamer_uid_idr}"
+                                            f" (запрос от uid={uid})"
+                                        )
+                                    except Exception:
+                                        pass
 
                         elif action == CMD_SOUNDBOARD:
                             # Добавляем ник отправителя — клиент покажет «кто включил»
@@ -518,12 +602,83 @@ class SFUServer:
                     for s_uid in list(self.watchers.keys()):
                         self.watchers[s_uid].pop(u_id, None)
                     self.watchers.pop(u_id, None)
+                # Убираем ABR-запросы отключившегося зрителя
+                with self.abr_lock:
+                    for s_uid in list(self.abr_viewer_bitrates.keys()):
+                        self.abr_viewer_bitrates[s_uid].pop(u_id, None)
                 print(f"[Server] ✖ {nick} (комната: {room}) отключился | Онлайн: {remaining}")
             else:
                 print(f"[Server] ✖ Незарегистрированный клиент {addr[0]} отключился")
 
             conn.close()
             self.send_global_state()
+
+    # ------------------------------------------------------------------
+    # ABR: обновить битрейт для стримера и уведомить его если изменился
+    # ------------------------------------------------------------------
+    def _abr_update(self, streamer_uid: int, viewer_uid: int, bitrate: int):
+        """
+        Обновляет запрос битрейта от viewer_uid для стримера streamer_uid.
+        Вычисляет минимум по всем зрителям.
+
+        FIX OPT-4: Гистерезис.
+        - Понижение битрейта (пинг вырос) → немедленно. Зритель уже лагает.
+        - Повышение битрейта (пинг упал)  → не чаще ABR_UPGRADE_COOLDOWN_SEC (10 с).
+          Защита от флапа: RTT 50→55→50→55 мс без кулдауна = перезапуск энкодера
+          каждые 4 с + IDR-кадр 300 КБ каждый раз → сам по себе вызывает спайк пинга.
+
+        Вызывается из tcp_handler, вне каких-либо других локов.
+        """
+        ABR_UPGRADE_COOLDOWN_SEC = 10.0
+        streamer_conn = None
+        new_min = bitrate
+
+        with self.abr_lock:
+            if streamer_uid not in self.abr_viewer_bitrates:
+                self.abr_viewer_bitrates[streamer_uid] = {}
+            self.abr_viewer_bitrates[streamer_uid][viewer_uid] = bitrate
+
+            new_min = min(self.abr_viewer_bitrates[streamer_uid].values())
+            current = self.abr_current.get(streamer_uid)
+
+            if current == new_min:
+                return  # ничего не изменилось
+
+            is_downgrade = (current is not None and new_min < current)
+
+            if not is_downgrade:
+                # Повышение — проверяем кулдаун
+                now = time.time()
+                last_upgrade = self.abr_last_upgrade.get(streamer_uid, 0.0)
+                if now - last_upgrade < ABR_UPGRADE_COOLDOWN_SEC:
+                    return  # слишком рано повышать
+                self.abr_last_upgrade[streamer_uid] = now
+
+            self.abr_current[streamer_uid] = new_min
+
+        # Находим conn стримера вне abr_lock
+        with self.clients_lock:
+            for c_conn, c_data in self.clients.items():
+                if c_data['uid'] == streamer_uid and c_data.get('is_streaming'):
+                    streamer_conn = c_conn
+                    break
+
+        if streamer_conn is None:
+            return
+
+        try:
+            streamer_conn.sendall(
+                json.dumps({
+                    'action':  CMD_ADJUST_BITRATE,
+                    'bitrate': new_min,
+                }).encode('utf-8')
+            )
+            kbps = new_min // 1000
+            direction = "↓" if (new_min < (self.abr_current.get(streamer_uid) or new_min + 1)) else "↑"
+            print(f"[ABR] streamer={streamer_uid}: {direction} новый битрейт {kbps} kbps "
+                  f"(viewer={viewer_uid} запросил {bitrate//1000} kbps)")
+        except Exception as e:
+            print(f"[ABR] Ошибка отправки adjust_bitrate стримеру {streamer_uid}: {e}")
 
     # ------------------------------------------------------------------
     # Вспомогательный метод: отправка пакета всем зрителям стримера
@@ -603,14 +758,103 @@ class SFUServer:
                 pass
 
     # ------------------------------------------------------------------
+    # Upload-side ABR: сервер измеряет входящий поток стримера
+    # ------------------------------------------------------------------
+    def _upload_abr_loop(self):
+        """
+        Каждые INTERVAL секунд вычисляет фактический upload bitrate каждого активного
+        стримера на основе реально принятых UDP байт.
+
+        Проблема, которую решает этот метод:
+            Viewer-driven ABR слепой к upload стримера. Если у стримера нестабильный
+            WiFi/мобильный интернет (средний upload 800 kbps, но энкодер пишет 6 Mbps),
+            сервер получает пакеты бурстами. Зрители видят 300 мс тишины → лавину пакетов
+            → переполнение receive-буфера → потери → IDR-шторм. ABR реагирует только
+            через 4 сек через RTT зрителя — этого недостаточно.
+
+        Решение:
+            Сервер голосует в min() ABR системы как псевдо-зритель uid=0.
+            Если actual_bitrate < THRESHOLD * configured → отправляем adjust_bitrate
+            со значением actual (округлённым до ближайшего ABR тира).
+            Если upload восстановился → снимаем ограничение (голос 6 Mbps).
+            Используем существующий _abr_update() — никакой новой логики отправки.
+
+        THRESHOLD 80%: небольшой запас на заголовки и jitter,
+            не роняем битрейт из-за случайного кратковременного спада.
+        """
+        INTERVAL  = 4.0    # секунд — совпадает с ABR_FEEDBACK_INTERVAL_MS клиента
+        THRESHOLD = 0.80   # если actual < 80% configured → ограничиваем
+        SERVER_VOTER_UID = 0  # псевдо-viewer uid для голосования в min()
+
+        # Отсортированные тиры по убыванию для поиска ближайшего подходящего
+        sorted_tiers = sorted(ABR_TIERS, key=lambda x: x[1])  # по возрастанию bitrate
+
+        while True:
+            time.sleep(INTERVAL)
+
+            # Снимаем счётчики атомарно: читаем + сбрасываем
+            now = time.time()
+            streamers = list(self._streamer_rx_start.keys())
+
+            for uid in streamers:
+                rx_bytes = self._streamer_rx_bytes.pop(uid, 0)
+                t_start  = self._streamer_rx_start.pop(uid, now)
+                elapsed  = now - t_start
+                if elapsed < 0.5:
+                    # Слишком короткое окно — пропускаем, данные недостоверны
+                    continue
+
+                actual_bps = int((rx_bytes * 8) / elapsed)
+
+                # Узнаём текущий сконфигурированный битрейт стримера
+                with self.abr_lock:
+                    configured_bps = self.abr_current.get(uid)
+
+                if configured_bps is None:
+                    # Стример есть, но ABR ещё не устанавливал битрейт — пропускаем
+                    continue
+
+                if actual_bps >= int(configured_bps * THRESHOLD):
+                    # Upload справляется — снимаем серверное ограничение
+                    # (голосуем максимальным тиром, не мешаем viewer ABR)
+                    max_bitrate = sorted_tiers[-1][1]
+                    self._abr_update(uid, SERVER_VOTER_UID, max_bitrate)
+                    continue
+
+                # Upload недостаточен — находим подходящий тир
+                # Берём тир чуть выше фактического (даём 10% запас для jitter)
+                target_bps = int(actual_bps * 1.10)
+                voted_bps  = sorted_tiers[0][1]  # fallback: минимальный тир
+                for tier_rtt, tier_bps in sorted_tiers:
+                    if tier_bps <= target_bps:
+                        voted_bps = tier_bps
+                    else:
+                        break
+
+                actual_kbps     = actual_bps // 1000
+                configured_kbps = configured_bps // 1000
+                voted_kbps      = voted_bps // 1000
+                print(
+                    f"[UploadABR] streamer={uid}: фактический upload {actual_kbps} kbps "
+                    f"< порог {int(configured_kbps * THRESHOLD)} kbps "
+                    f"(настроен {configured_kbps} kbps) → голосуем {voted_kbps} kbps"
+                )
+                self._abr_update(uid, SERVER_VOTER_UID, voted_bps)
+
+    # ------------------------------------------------------------------
     # Запуск сервера
     # ------------------------------------------------------------------
     def start(self):
-        threading.Thread(target=self.udp_handler,   daemon=True).start()
-        threading.Thread(target=self.stats_monitor, daemon=True).start()
+        threading.Thread(target=self.udp_handler,      daemon=True).start()
+        threading.Thread(target=self.stats_monitor,    daemon=True).start()
+        threading.Thread(target=self._upload_abr_loop, daemon=True).start()
         print(f"Server started. TCP:{DEFAULT_PORT_TCP}, UDP:{DEFAULT_PORT_UDP}")
         while True:
             conn, addr = self.tcp_sock.accept()
+            # Отключаем алгоритм Нейгла на каждом принятом соединении.
+            # Команды adjust_bitrate и request_keyframe — мелкие JSON (~50 байт).
+            # Без TCP_NODELAY Нейгл буферизует их до 200 мс в ожидании полного сегмента.
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             threading.Thread(target=self.tcp_handler, args=(conn, addr), daemon=True).start()
 
 

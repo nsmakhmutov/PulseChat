@@ -29,7 +29,7 @@ except ImportError:
     print("[Video] ОШИБКА: dxcam не найден.")
 
 try:
-    from PIL import Image
+    pass  # PIL не используется — ресайз через libswscale (av.VideoFrame.reformat)
     PIL_AVAILABLE = True
 except ImportError:
     PIL_AVAILABLE = False
@@ -46,9 +46,11 @@ class VideoEngine(QObject):
         self.capture_thread = None
         self.encode_thread  = None
 
-        # maxsize=4: encode-тред получает небольшой запас при кратковременных пиках.
-        # Больше не нужно — лишние кадры только добавляют задержку (latency).
-        self.frame_queue = queue.Queue(maxsize=4)
+        # maxsize=2: минимальный буфер capture→encode.
+        # При 60fps каждый лишний кадр в очереди = +16 мс задержки стрима.
+        # 2 слота достаточно чтобы энкодер не голодал при кратковременных пиках,
+        # но не накапливал задержку. Старый кадр дропается при переполнении.
+        self.frame_queue = queue.Queue(maxsize=2)
 
         # --- Входящие пакеты ---
         self._buffer_lock   = threading.RLock()
@@ -78,6 +80,19 @@ class VideoEngine(QObject):
         self.frame_counter = 0
         self._dx_factory   = None
         self._force_keyframe = False
+
+        # _last_keyframe_req: uid → timestamp последнего запроса IDR у стримера.
+        # Используется в _frame_cleanup_loop и process_incoming_packet для
+        # rate-limiting: не чаще 1 раза в 2 секунды на uid.
+        self._last_keyframe_req: dict = {}
+
+        # --- ABR: динамическая смена битрейта ---
+        # _target_bitrate: атомарно пишется из Qt-потока (set_bitrate),
+        # читается из _encode_loop. GIL гарантирует безопасность int-присвоения.
+        # _current_bitrate: текущий битрейт работающего энкодера.
+        # При _target_bitrate != _current_bitrate энкодер перезапускается.
+        self._target_bitrate:  int = VIDEO_BITRATE
+        self._current_bitrate: int = VIDEO_BITRATE
 
         # -------------------------------------------------------------------
         # FIX #4: Периодическая чистка протухших фреймов вынесена в отдельный поток.
@@ -151,6 +166,9 @@ class VideoEngine(QObject):
             "fps":         VIDEO_FPS,
         }
         self.running = True
+        # Сбрасываем ABR при старте: начинаем с максимального битрейта
+        self._target_bitrate  = VIDEO_BITRATE
+        self._current_bitrate = VIDEO_BITRATE
 
         with self.frame_queue.mutex:
             self.frame_queue.queue.clear()
@@ -208,6 +226,22 @@ class VideoEngine(QObject):
     def force_keyframe(self):
         self._force_keyframe = True
 
+    def set_bitrate(self, new_bitrate: int):
+        """
+        Запрос смены битрейта от ABR-контроллера (вызывается из Qt-потока).
+
+        Не блокирует: просто пишет int-значение. GIL гарантирует атомарность.
+        _encode_loop на следующей итерации прочитает _target_bitrate, заметит
+        расхождение с _current_bitrate и перезапустит энкодер.
+
+        IDR-кадр после перезапуска обеспечивает чистый старт декодера у зрителя.
+        """
+        if new_bitrate != self._target_bitrate:
+            kbps_old = self._target_bitrate // 1000
+            kbps_new = new_bitrate // 1000
+            print(f"[Video] ABR: запрошена смена битрейта {kbps_old} → {kbps_new} kbps")
+            self._target_bitrate = new_bitrate
+
     def cleanup_users(self, active_uids):
         """
         Очистка памяти от отключившихся юзеров.
@@ -247,10 +281,16 @@ class VideoEngine(QObject):
 
         Теперь чистка происходит раз в 500 мс — достаточно редко, чтобы не
         нагружать CPU, и достаточно часто, чтобы буфер не разрастался.
+
+        OPT: при обнаружении протухших кадров (реальная потеря UDP-пакетов)
+        запрашиваем IDR у стримера с rate-limit 1 раз в 2 сек на uid.
+        IDR-кадр восстанавливает декодер после потери P-кадров (без артефактов).
         """
         while True:
             time.sleep(0.5)
             now = time.time()
+            uids_with_loss = []   # uid у которых в этом цикле найдены протухшие кадры
+
             with self._buffer_lock:
                 for uid in list(self.assembly_info.keys()):
                     to_del = [
@@ -260,6 +300,21 @@ class VideoEngine(QObject):
                     for fid in to_del:
                         self.incoming_buffer[uid].pop(fid, None)
                         self.assembly_info[uid].pop(fid, None)
+                    if to_del:
+                        uids_with_loss.append(uid)
+
+            # Запрашиваем IDR вне лока, rate-limit: не чаще раза в 5 секунд на uid.
+            # 2 сек (прежнее значение) создавало "IDR-шторм" при нестабильной сети:
+            # каждый IDR-кадр (300 KB при 6 Mbps) временно занимал канал на ~320 мс,
+            # что вызывало новые потери → новый запрос → цикл.
+            # 5 сек даёт RadminVPN время на восстановление между IDR.
+            if self.net and uids_with_loss:
+                for uid in uids_with_loss:
+                    last_req = self._last_keyframe_req.get(uid, 0.0)
+                    if now - last_req >= 5.0:
+                        self._last_keyframe_req[uid] = now
+                        self.net.request_viewer_keyframe(uid)
+                        print(f"[Video] Потеря пакетов uid={uid}: запрошен IDR-кадр")
 
     def stop_viewer_for_uid(self, uid):
         """
@@ -417,23 +472,50 @@ class VideoEngine(QObject):
                     except queue.Empty:
                         continue
 
+                    # --- ABR: перезапуск энкодера при смене битрейта ---
+                    # Проверяем каждую итерацию — изменение редкое (раз в ~4 сек).
+                    # Стоимость проверки: одно сравнение int, практически бесплатно.
+                    if self._target_bitrate != self._current_bitrate:
+                        # Сбрасываем буферы старого энкодера (flush без отправки)
+                        try:
+                            for _ in codec.encode(None):
+                                pass
+                        except Exception:
+                            pass
+                        del codec
+
+                        self._current_bitrate = self._target_bitrate
+                        try:
+                            codec = self._init_encoder(width, height, fps, self._current_bitrate)
+                            # IDR сразу: зритель получит чистый I-кадр после смены
+                            self._force_keyframe = True
+                            print(f"[Video] ABR: энкодер перезапущен на {self._current_bitrate//1000} kbps")
+                        except Exception as e:
+                            print(f"[Video] ABR: ошибка перезапуска энкодера: {e}")
+                            self.running = False
+                            return
+
                     if frame_np.size == 0:
                         continue
 
                     src_h, src_w, _ = frame_np.shape
 
-                    if src_w != width or src_h != height:
-                        img   = Image.fromarray(frame_np, 'RGB')
-                        img   = img.resize((width, height), Image.Resampling.BILINEAR)
-                        frame = av.VideoFrame.from_image(img)
-                        del img
-                    else:
-                        frame = av.VideoFrame.from_ndarray(frame_np, format='rgb24')
-
-                    # Явно освобождаем numpy-массив кадра сразу после конвертации.
-                    # frame_np — это ссылка на DXCam-буфер размером ~2.8 МБ (1280×720×3).
-                    # Без del он живёт до следующей итерации, удерживая буфер DXCam.
+                    # FIX OPT-1: libswscale вместо Pillow.
+                    #
+                    # Было: Image.fromarray → PIL.resize(BILINEAR) → from_image
+                    #   Каждый кадр: Python-аллокация PIL Image + BILINEAR на CPU
+                    #   + повторная конвертация RGB→YUV420p внутри FFmpeg = 5-15 мс.
+                    #
+                    # Стало: from_ndarray(rgb24) → reformat(yuv420p, нужный размер)
+                    #   libswscale делает ресайз И конвертацию цветов за ОДИН проход
+                    #   на C-уровне без Python-аллокаций — ~0.5-1 мс.
+                    #
+                    # reformat() вызывается всегда — он no-op если размер/формат совпадает,
+                    # поэтому отдельная ветка if src_w != width больше не нужна.
+                    raw_frame = av.VideoFrame.from_ndarray(frame_np, format='rgb24')
                     del frame_np
+                    frame = raw_frame.reformat(width=width, height=height, format='yuv420p')
+                    del raw_frame
 
                     frame.pts = pts_counter
                     pts_counter += 1
@@ -492,15 +574,23 @@ class VideoEngine(QObject):
         total_len    = len(data)
         chunks_count = (total_len + MAX_VIDEO_PAYLOAD - 1) // MAX_VIDEO_PAYLOAD
 
+        # FIX OPT-3: собираем ВСЕ чанки кадра в список и передаём одним вызовом.
+        #
+        # Было: send_video_packet() для каждого чанка отдельно.
+        #   При переполнении очереди дропался ОДИН чанк — весь кадр шёл с битым
+        #   GOP, декодер сыпал артефактами до следующего IDR.
+        #
+        # Стало: send_video_frame_chunks(list) — дропаем ВЕСЬ старый кадр целиком
+        #   или кладём весь новый. Зритель получает либо полный кадр, либо ничего.
+        chunks = []
         for i in range(chunks_count):
             start         = i * MAX_VIDEO_PAYLOAD
             end           = min(start + MAX_VIDEO_PAYLOAD, total_len)
             chunk_payload = data[start:end]
             v_header      = VIDEO_CHUNK_HEADER.pack(self.frame_counter, i, chunks_count)
-            try:
-                self.net.send_video_packet(v_header + chunk_payload)
-            except Exception:
-                pass
+            chunks.append(v_header + chunk_payload)
+
+        self.net.send_video_frame_chunks(chunks)
 
     # ------------------------------------------------------------------
     # Приём и сборка входящих пакетов
@@ -595,6 +685,15 @@ class VideoEngine(QObject):
                         q.put_nowait(bytes(full_data))
                     except queue.Full:
                         pass
+                else:
+                    # Не все чанки кадра присутствуют (edge-case: дублированный chunk_idx).
+                    # Запрашиваем IDR у стримера, rate-limit 1 раз в 5 сек на uid.
+                    if self.net:
+                        now_t = time.time()
+                        if now_t - self._last_keyframe_req.get(uid, 0.0) >= 5.0:
+                            self._last_keyframe_req[uid] = now_t
+                            self.net.request_viewer_keyframe(uid)
+                            print(f"[Video] Неполный кадр uid={uid}: запрошен IDR-кадр")
 
         except Exception:
             pass
@@ -629,12 +728,15 @@ class VideoEngine(QObject):
         """
         decoder = av.CodecContext.create('h264', 'r')
 
-        # FIX MEM: thread_type='AUTO' заставлял FFmpeg создавать N_cores потоков,
-        # каждый со своими копиями reference frame буферов.
-        # Для 1280×720 H264: AUTO × 8 cores = 8 × ~5MB = ~40MB только для декодера.
-        # FRAME-threading + 2 потока: ~10MB и нет артефактов при baseline профиле.
-        decoder.thread_type  = 'FRAME'
-        decoder.thread_count = 2
+        # SLICE-threading: параллелизирует декодирование ВНУТРИ одного кадра.
+        # В отличие от FRAME-threading, НЕ добавляет задержку декодера:
+        #   FRAME: кадр N выдаётся только когда начинается кадр N+1 → +16 мс при 60fps.
+        #   SLICE: все слайсы кадра N декодируются параллельно, кадр выдаётся сразу.
+        # Для 720p H264 baseline одного потока достаточно с запасом (~1-2 мс/кадр).
+        # thread_count=1: без параллелизма (baseline содержит мало слайсов),
+        #   зато минимальные накладные расходы синхронизации потоков FFmpeg.
+        decoder.thread_type  = 'SLICE'
+        decoder.thread_count = 1
 
         try:
             while True:
@@ -653,11 +755,14 @@ class VideoEngine(QObject):
                     packet = av.Packet(raw)
                     frames = decoder.decode(packet)
                     for frame in frames:
-                        img_np = np.ascontiguousarray(frame.to_rgb().to_ndarray())
-                        h, w, _ = img_np.shape
+                        # to_ndarray(format='rgb24') вызывает libswscale напрямую:
+                        #   - возвращает C-contiguous массив (np.ascontiguousarray не нужен)
+                        #   - на 1 аллокацию меньше vs to_rgb().to_ndarray()
+                        img_np = frame.to_ndarray(format='rgb24')
+                        h, w, c = img_np.shape
                         q_img = QImage(
                             img_np.data, w, h,
-                            img_np.strides[0],
+                            w * c,
                             QImage.Format.Format_RGB888,
                         )
                         # q_img.copy() отвязывает QImage от numpy-буфера
@@ -673,7 +778,7 @@ class VideoEngine(QObject):
                     del raw
         finally:
             # Явное освобождение FFmpeg контекста.
-            # С thread_count=2 вместо AUTO освобождает ~10MB вместо ~40MB.
+            # SLICE/1 поток: ~5 MB (минимально). AUTO × 8 cores было ~40 MB.
             # av.CodecContext.close() отсутствует в актуальных версиях PyAV —
             # del достаточно: Cython-деструктор вызывает avcodec_free_context().
             del decoder
