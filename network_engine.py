@@ -24,6 +24,8 @@ from config import (
     FLAG_WHISPER, VIDEO_BITRATE, LQ_VIDEO_BITRATE,
     CMD_NUDGE_VOTE, CMD_PLAY_NUDGE, CMD_NUDGE_TRIGGERED, NUDGE_SOUND_PATH,
     CMD_BITRATE_FEEDBACK, CMD_ADJUST_BITRATE, ABR_TIERS,
+    CMD_LQ_NEEDED,
+    CMD_NACK, CMD_NACK_RELAY,
 )
 
 MAX_SILENT_RECONNECT_ATTEMPTS = 4
@@ -63,6 +65,12 @@ class NetworkClient(QObject):
     # MainWindow подключает его к _on_bitrate_adjusted() для отображения
     # индикатора качества соединения в тулбаре рядом с кнопкой трансляции.
     bitrate_adjusted = pyqtSignal(int)   # новый битрейт в bps
+
+    # Сигнал входящего предложения файловой передачи.
+    # Payload: полный dict из JSON-пакета file_offer / file_offer_room.
+    # Поля: action, filename, filesize, sender_ip, sender_port, token,
+    #        sender_uid (личная) или отсутствует (room-broadcast).
+    file_offer_received = pyqtSignal(dict)
 
     def __init__(self, audio):
         super().__init__()
@@ -660,6 +668,22 @@ class NetworkClient(QObject):
                 self.video.set_bitrate(new_bitrate)
                 self.bitrate_adjusted.emit(new_bitrate)
 
+        elif act == CMD_LQ_NEEDED:
+            # Сервер сообщает: нужен ли LQ simulcast-поток прямо сейчас.
+            # needed=False → нет слабых зрителей → пропускаем LQ-кодирование.
+            # needed=True  → появился слабый зритель → возобновляем LQ.
+            needed = msg.get('needed')
+            if isinstance(needed, bool) and self.video and self.running:
+                self.video.set_lq_needed(needed)
+
+        elif act == CMD_NACK_RELAY:
+            # Сервер ретранслировал нам NACK-запрос от зрителя.
+            # Стример: вытаскиваем чанк из retransmit_buffer и повторно отправляем.
+            frame_id  = msg.get('frame_id')
+            chunk_idx = msg.get('chunk_idx')
+            if isinstance(frame_id, int) and isinstance(chunk_idx, int) and self.video:
+                self.video.handle_retransmit(frame_id, chunk_idx)
+
         elif act == CMD_PLAY_NUDGE:
             # Нас пнули — воспроизводим звук в отдельном потоке.
             # Звук намеренно обходит deaf/mute — цель фичи «достучаться» до АФК.
@@ -675,6 +699,12 @@ class NetworkClient(QObject):
             target_nick = msg.get('target_nick', '?')
             voter_nick  = msg.get('voter_nick',  '?')
             self.nudge_triggered.emit(target_nick, voter_nick)
+
+        elif act in ('file_offer', 'file_offer_room'):
+            # Входящее предложение файловой передачи.
+            # Содержит: filename, filesize, sender_ip, sender_port, token.
+            # MainWindow покажет toast-диалог с кнопками Принять/Отклонить.
+            self.file_offer_received.emit(msg)
 
     def send_json(self, data):
         try:
@@ -710,6 +740,42 @@ class NetworkClient(QObject):
     def set_video_engine(self, video):
         self.video = video
         print("[Net] VideoEngine registered")
+
+    # ------------------------------------------------------------------
+    # Файловая передача P2P — только сигнализация через сервер
+    # ------------------------------------------------------------------
+    def send_file_offer(self, target_uid: int, filename: str,
+                        filesize: int, sender_port: int, token: str) -> None:
+        """
+        Отправляет серверу предложение личной передачи файла.
+        Сервер инжектирует sender_ip и ретранслирует сообщение цели.
+
+        Вызывается из FileSenderWorker после успешного bind() сокета
+        (порт уже известен) — гарантирует что приёмник подключится
+        к уже слушающему сокету.
+        """
+        self.send_json({
+            "action":      "file_offer",
+            "target_uid":  target_uid,
+            "filename":    filename,
+            "filesize":    filesize,
+            "sender_port": sender_port,
+            "token":       token,
+        })
+
+    def send_file_offer_room(self, filename: str,
+                             filesize: int, sender_port: int, token: str) -> None:
+        """
+        Отправляет серверу предложение массовой передачи файла
+        всем участникам текущей комнаты кроме самого отправителя.
+        """
+        self.send_json({
+            "action":      "file_offer_room",
+            "filename":    filename,
+            "filesize":    filesize,
+            "sender_port": sender_port,
+            "token":       token,
+        })
 
     # ------------------------------------------------------------------
     # Фича «Пнуть» — воспроизведение звука и отправка голоса
@@ -1047,6 +1113,27 @@ class NetworkClient(QObject):
     def send_quality_request(self, skip_factor: int):
         """Устаревший stub — оставлен для обратной совместимости. Не использовать."""
         pass
+
+    def send_nack(self, streamer_uid: int, frame_id: int, chunk_idx: int):
+        """
+        Зритель → сервер → стример: запрос повторной доставки пропавшего чанка.
+
+        Отправляется по TCP вместо UDP чтобы гарантировать доставку:
+        потеря самого NACK-пакета сводила бы на нет весь смысл механизма.
+        TCP_NODELAY уже установлен → отправка без буферизации (~1 мс).
+
+        Стример получит CMD_NACK_RELAY, вызовет handle_retransmit(frame_id, chunk_idx)
+        и повторно отправит UDP-пакет. При RTT 60 мс полный цикл занимает ~120 мс
+        против ~800 мс для IDR при 3 Mbps.
+        """
+        if not self.running:
+            return
+        self.send_json({
+            'action':      CMD_NACK,
+            'streamer_uid': streamer_uid,
+            'frame_id':    frame_id,
+            'chunk_idx':   chunk_idx,
+        })
 
     def request_viewer_keyframe(self, streamer_uid: int):
         """

@@ -11,14 +11,17 @@ from ui_video import VideoWindow
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QPushButton, QTreeWidget, QTreeWidgetItem,
                              QHeaderView, QMessageBox, QStackedWidget,
-                             QFrame, QSizeGrip)
+                             QFrame, QSizeGrip, QFileDialog)
 from PyQt6.QtCore import Qt, QTimer, QSize, QSettings, QRect, QPoint
 from PyQt6.QtGui import QIcon, QFont, QFontDatabase, QBrush, QColor
 
 from config import *
 from audio_engine import AudioHandler
 from network_engine import NetworkClient
-from ui_dialogs import UserOverlayPanel, SettingsDialog, SoundboardDialog, WhisperSystemOverlay, SelfStatusOverlayPanel
+from ui_dialogs import (UserOverlayPanel, SettingsDialog, SoundboardDialog,
+                        WhisperSystemOverlay, SelfStatusOverlayPanel,
+                        FileReceiverWorker, FileTransferProgressWidget,
+                        _show_float_widget, _format_size)
 from version import APP_VERSION, APP_NAME, GITHUB_REPO
 
 
@@ -201,6 +204,9 @@ class MainWindow(QMainWindow):
 
         # Индикатор качества соединения стримера (ABR-понижение от сервера)
         self.net.bitrate_adjusted.connect(self._on_bitrate_adjusted)
+
+        # Входящий запрос файловой передачи от другого пользователя
+        self.net.file_offer_received.connect(self._on_file_offer_received)
 
         self.ui_timer = QTimer()
         self.ui_timer.timeout.connect(self.refresh_ui)
@@ -1762,6 +1768,166 @@ class MainWindow(QMainWindow):
         self._nudge_toast_timer.stop()
         self._nudge_toast_timer.start(4000)
 
+    # ------------------------------------------------------------------
+    # Файловая передача P2P — приём входящего предложения
+    # ------------------------------------------------------------------
+    def _on_file_offer_received(self, msg: dict):
+        """
+        Входящий file_offer / file_offer_room от другого клиента.
+
+        Показывает компактный toast-диалог «Принять / Отклонить».
+        Если пользователь принимает — открывает QFileDialog для выбора
+        папки назначения и запускает FileReceiverWorker в отдельном потоке.
+
+        Метод вызывается в GUI-потоке (сигнал из tcp_listen подключён
+        через прямое соединение Qt → автоматически queued при cross-thread).
+        """
+        filename  = msg.get('filename', 'file')
+        filesize  = msg.get('filesize', 0)
+        sender_ip = msg.get('sender_ip', '')
+        port      = msg.get('sender_port', 0)
+        token     = msg.get('token', '')
+
+        if not sender_ip or not port or not token:
+            print(f"[UI] file_offer: неполные данные — игнорируем ({msg})")
+            return
+
+        size_str = _format_size(filesize)
+        self._show_file_offer_toast(filename, size_str, sender_ip, port, token, filesize)
+
+    def _show_file_offer_toast(self, filename: str, size_str: str,
+                               sender_ip: str, port: int,
+                               token: str, filesize: int):
+        """
+        Показывает компактный toast с кнопками «Принять» / «Отклонить».
+        Позиционируется в правом нижнем углу главного окна.
+        Автоматически скрывается через 30 секунд если нет реакции.
+        """
+        # ── Создаём виджет предложения ────────────────────────────────────────
+        toast = QFrame(self)
+        toast.setObjectName("fileOfferToast")
+        toast.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        toast.setStyleSheet("""
+            QFrame#fileOfferToast {
+                background-color: rgba(20, 22, 30, 235);
+                border: 1px solid rgba(91,142,245,0.50);
+                border-radius: 10px;
+            }
+            QLabel { color: #c8ccd8; background: transparent; border: none; }
+        """)
+
+        lay = QVBoxLayout(toast)
+        lay.setContentsMargins(14, 10, 14, 10)
+        lay.setSpacing(6)
+
+        # Заголовок
+        lbl_title = QLabel(f"📁  Входящий файл")
+        lbl_title.setStyleSheet(
+            "font-size: 12px; font-weight: bold; color: #8ab4f8;"
+        )
+        lay.addWidget(lbl_title)
+
+        # Имя и размер файла
+        lbl_file = QLabel(f"{filename}  ({size_str})")
+        lbl_file.setStyleSheet("font-size: 11px; color: rgba(200,205,225,0.85);")
+        lbl_file.setWordWrap(True)
+        lay.addWidget(lbl_file)
+
+        # Кнопки
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+
+        btn_accept = QPushButton("✓  Принять")
+        btn_accept.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_accept.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(39,174,96,0.25);
+                color: #82e0aa; border: 1px solid rgba(46,204,113,0.45);
+                border-radius: 6px; padding: 4px 12px; font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: rgba(39,174,96,0.45);
+                border-color: rgba(46,204,113,0.8);
+            }
+        """)
+
+        btn_decline = QPushButton("✕  Отклонить")
+        btn_decline.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_decline.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(200,60,60,0.18);
+                color: #ff9090; border: 1px solid rgba(200,60,60,0.35);
+                border-radius: 6px; padding: 4px 12px; font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: rgba(200,60,60,0.35);
+                border-color: rgba(200,60,60,0.7);
+            }
+        """)
+
+        btn_row.addWidget(btn_accept)
+        btn_row.addWidget(btn_decline)
+        lay.addLayout(btn_row)
+
+        toast.adjustSize()
+        toast.setFixedSize(toast.sizeHint())
+
+        # Позиционируем в правом нижнем углу главного окна
+        mw, mh = self.width(), self.height()
+        tx = mw - toast.width() - 14
+        ty = mh - toast.height() - 60
+        toast.move(tx, max(4, ty))
+        toast.raise_()
+        toast.show()
+
+        # Авто-скрытие через 30 секунд
+        auto_hide = QTimer(self)
+        auto_hide.setSingleShot(True)
+        auto_hide.setInterval(30_000)
+        auto_hide.timeout.connect(toast.hide)
+        auto_hide.start()
+
+        # ── Обработчики кнопок ────────────────────────────────────────────────
+        def _on_accept():
+            auto_hide.stop()
+            toast.hide()
+
+            # Выбор пути сохранения
+            default_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+            os.makedirs(default_dir, exist_ok=True)
+            save_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Сохранить файл",
+                os.path.join(default_dir, filename),
+                "Все файлы (*)",
+            )
+            if not save_path:
+                return   # пользователь отменил диалог сохранения
+
+            # Запускаем приёмник
+            worker = FileReceiverWorker(sender_ip, port, token,
+                                        save_path, filesize)
+            prog = FileTransferProgressWidget(filename, filesize, is_sender=False)
+            prog.set_worker(worker)
+
+            worker.progress.connect(lambda r, t: prog.update_progress(r, t))
+            worker.finished.connect(lambda p: (
+                prog.set_done(p),
+                print(f"[UI] 📥 Файл сохранён: {p}")
+            ))
+            worker.error.connect(lambda m: prog.set_error(m))
+            worker.cancelled.connect(lambda: prog.hide())
+
+            _show_float_widget(prog)
+            worker.start()
+
+        def _on_decline():
+            auto_hide.stop()
+            toast.hide()
+
+        btn_accept.clicked.connect(_on_accept)
+        btn_decline.clicked.connect(_on_decline)
+
     def _update_known_users_registry(self, users_map):
         """
         Обновляет реестр известных пользователей (known_users.json).
@@ -1878,9 +2044,9 @@ class MainWindow(QMainWindow):
         трансляции в зависимости от текущего битрейта.
 
         Логика (аналог Discord «слабое соединение» у стримера):
-          bitrate ≥ 4 Mbps  → индикатор скрыт (норма, нет деградации)
-          bitrate < 4 Mbps  → жёлтый: умеренная деградация канала
-          bitrate < 1.5 Mbps → красный: сильная деградация, видимые артефакты
+          bitrate ≥ 2.5 Mbps → индикатор скрыт (норма для VBR max=3 Mbps)
+          bitrate < 2.5 Mbps → жёлтый: умеренная деградация канала
+          bitrate < 1 Mbps   → красный: сильная деградация, видимые артефакты
 
         Индикатор показывается только во время активной трансляции —
         при остановке он сбрасывается в update_stream_button_icon().
@@ -1890,13 +2056,13 @@ class MainWindow(QMainWindow):
 
         kbps = bitrate // 1000
 
-        if bitrate >= 4_000_000:
+        if bitrate >= 2_500_000:
             # Канал восстановился — скрываем предупреждение
             self._stream_conn_lbl.setVisible(False)
             return
 
         # Устанавливаем иконку и цветовой оверлей через styleSheet
-        if bitrate < 1_500_000:
+        if bitrate < 1_000_000:
             # Критическая деградация: красная тонировка + подсказка
             self._stream_conn_lbl.setStyleSheet(
                 "background-color: rgba(231, 76, 60, 0.18); "

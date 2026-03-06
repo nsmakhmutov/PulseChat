@@ -4,15 +4,19 @@ import json
 import math
 import base64
 import wave
+import socket
+import secrets
 import sounddevice as sd
 import dxcam
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QScrollArea,
                              QWidget, QGridLayout, QLabel, QSlider, QTabWidget,
                              QComboBox, QProgressBar, QLineEdit, QCheckBox, QFrame,
                              QGroupBox, QSizePolicy, QFileDialog, QMessageBox)
-from PyQt6.QtCore import Qt, QSize, QSettings, QEvent, QPropertyAnimation, QEasingCurve, QRect, QPoint, QTimer, pyqtSignal
+from PyQt6.QtCore import (Qt, QSize, QSettings, QEvent, QPropertyAnimation, QEasingCurve,
+                          QRect, QPoint, QTimer, pyqtSignal, QThread)
 from PyQt6.QtGui import QIcon, QGuiApplication, QPainter, QColor, QPen, QFont, QPainterPath, QBrush
-from config import resource_path, CMD_SOUNDBOARD, USER_CONFIG_PATH, KNOWN_USERS_PATH
+from config import (resource_path, CMD_SOUNDBOARD, USER_CONFIG_PATH, KNOWN_USERS_PATH,
+                    FILE_CHUNK_SIZE, FILE_TRANSFER_TIMEOUT)
 from audio_engine import PYRNNOISE_AVAILABLE
 
 # ── Максимальный размер кастомного звука (1 MB) ──────────────────────────────
@@ -224,6 +228,368 @@ class NudgeHoldButton(QPushButton):
 # ──────────────────────────────────────────────────────────────────────────────
 # Всплывающий оверлей управления пользователем (вместо отдельного окна)
 # ──────────────────────────────────────────────────────────────────────────────
+
+# ══════════════════════════════════════════════════════════════════════════════
+# P2P Файловая передача — Workers (QThread)
+# ══════════════════════════════════════════════════════════════════════════════
+# Архитектура: прямое TCP соединение между клиентами.
+# Сервер используется ТОЛЬКО для передачи сигнала-предложения.
+# Все байты данных идут напрямую, GIL сервера не нагружается.
+#
+# FileSenderWorker:
+#   1. bind(0.0.0.0, 0) → получаем свободный порт от ОС
+#   2. Сигнал ready(port, token) → UI отправляет file_offer через NetworkClient
+#   3. accept() с таймаутом FILE_TRANSFER_TIMEOUT секунд
+#   4. Читаем токен (8 байт hex) от приёмника — проверяем
+#   5. Стримим файл чанками FILE_CHUNK_SIZE, сигнализируем прогресс
+#
+# FileReceiverWorker:
+#   1. connect(sender_ip, sender_port) с таймаутом
+#   2. Отправляем токен (8 байт hex)
+#   3. Читаем данные до закрытия сокета, пишем во временный файл
+#   4. rename temp → target, сигнализируем finished(save_path)
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+def _show_float_widget(widget: QWidget, margin: int = 18) -> None:
+    """
+    Позиционирует и показывает плавающий виджет в правом нижнем углу
+    основного экрана (над панелью задач Windows).
+    Виджет должен быть уже добавлен в layout или быть top-level.
+    """
+    screen = QGuiApplication.primaryScreen()
+    if screen is None:
+        widget.show()
+        return
+    avail = screen.availableGeometry()
+    widget.adjustSize()
+    w, h = widget.width(), widget.height()
+    widget.move(avail.right() - w - margin, avail.bottom() - h - margin)
+    widget.show()
+    widget.raise_()
+
+
+class FileSenderWorker(QThread):
+    """
+    Поток-отправитель файла (P2P TCP).
+
+    Сигналы:
+        ready(port, token)          — сокет слушает, можно отправлять file_offer
+        progress(sent, total)       — обновление прогресс-бара (байты)
+        finished()                  — файл передан успешно
+        error(message)              — ошибка (таймаут / отказ / ввод-вывод)
+        cancelled()                 — пользователь нажал «Отмена»
+    """
+    ready     = pyqtSignal(int, str)    # (port, token)
+    progress  = pyqtSignal(int, int)    # (bytes_sent, total_bytes)
+    finished  = pyqtSignal()
+    error     = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(self, filepath: str, parent=None):
+        super().__init__(parent)
+        self._filepath   = filepath
+        self._cancel_flag = False
+
+    def cancel(self):
+        """Вызывается из UI-потока для отмены передачи."""
+        self._cancel_flag = True
+
+    def run(self):
+        # Используем context manager — гарантированное закрытие при любом исходе
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
+            try:
+                srv.bind(('0.0.0.0', 0))
+                srv.listen(1)
+                port = srv.getsockname()[1]
+
+                # Криптографически стойкий 8-символьный hex-токен.
+                # Исключает подключение посторонних клиентов из той же VPN-сети.
+                token = secrets.token_hex(4)   # 4 байта → 8 символов hex
+                self.ready.emit(port, token)
+                token_bytes = token.encode('ascii')
+
+                srv.settimeout(FILE_TRANSFER_TIMEOUT)
+                try:
+                    conn, _ = srv.accept()
+                except socket.timeout:
+                    self.error.emit("Получатель не подключился — таймаут")
+                    return
+
+            except Exception as e:
+                self.error.emit(f"Ошибка создания сокета: {e}")
+                return
+
+        # Соединение принято — работаем внутри второго context manager
+        with conn:
+            try:
+                conn.settimeout(FILE_TRANSFER_TIMEOUT)
+
+                # Шаг 1: читаем токен от приёмника
+                raw_token = b''
+                while len(raw_token) < len(token_bytes):
+                    chunk = conn.recv(len(token_bytes) - len(raw_token))
+                    if not chunk:
+                        self.error.emit("Соединение разорвано до передачи токена")
+                        return
+                    raw_token += chunk
+
+                if raw_token != token_bytes:
+                    self.error.emit("Неверный токен — подозрительное подключение")
+                    return
+
+                # Шаг 2: стримим файл чанками
+                total = os.path.getsize(self._filepath)
+                sent  = 0
+                with open(self._filepath, 'rb') as f:
+                    while True:
+                        if self._cancel_flag:
+                            self.cancelled.emit()
+                            return
+                        chunk = f.read(FILE_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        # sendall гарантирует отправку всего чанка
+                        conn.sendall(chunk)
+                        sent += len(chunk)
+                        self.progress.emit(sent, total)
+
+                self.finished.emit()
+
+            except socket.timeout:
+                self.error.emit("Таймаут — соединение зависло во время передачи")
+            except ConnectionResetError:
+                if self._cancel_flag:
+                    self.cancelled.emit()
+                else:
+                    self.error.emit("Получатель неожиданно разорвал соединение")
+            except Exception as e:
+                self.error.emit(f"Ошибка передачи: {e}")
+
+
+class FileReceiverWorker(QThread):
+    """
+    Поток-приёмник файла (P2P TCP).
+
+    Сигналы:
+        progress(received, total)   — обновление прогресс-бара (байты)
+        finished(save_path)         — файл принят и сохранён по пути save_path
+        error(message)              — ошибка сети / диска
+        cancelled()                 — пользователь нажал «Отмена»
+    """
+    progress  = pyqtSignal(int, int)   # (bytes_received, total_bytes)
+    finished  = pyqtSignal(str)        # save_path
+    error     = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(self, sender_ip: str, sender_port: int,
+                 token: str, save_path: str, filesize: int, parent=None):
+        super().__init__(parent)
+        self._sender_ip   = sender_ip
+        self._sender_port = sender_port
+        self._token       = token
+        self._save_path   = save_path
+        self._filesize    = filesize
+        self._cancel_flag = False
+
+    def cancel(self):
+        """Вызывается из UI-потока для отмены приёма."""
+        self._cancel_flag = True
+
+    def run(self):
+        # Временный файл: записываем рядом с целевым с суффиксом .inpulse_tmp
+        tmp_path = self._save_path + '.inpulse_tmp'
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.settimeout(FILE_TRANSFER_TIMEOUT)
+                s.connect((self._sender_ip, self._sender_port))
+
+                # Шаг 1: отправляем токен — подтверждаем личность
+                s.sendall(self._token.encode('ascii'))
+
+                # Шаг 2: читаем данные и пишем во временный файл
+                received = 0
+                with open(tmp_path, 'wb') as f:
+                    while True:
+                        if self._cancel_flag:
+                            self.cancelled.emit()
+                            return
+                        try:
+                            chunk = s.recv(FILE_CHUNK_SIZE)
+                        except socket.timeout:
+                            self.error.emit("Таймаут — отправитель завис во время передачи")
+                            return
+                        if not chunk:
+                            break   # отправитель закрыл соединение — передача завершена
+                        f.write(chunk)
+                        received += len(chunk)
+                        self.progress.emit(received, self._filesize)
+
+            except socket.timeout:
+                self.error.emit("Не удалось подключиться к отправителю — таймаут")
+                return
+            except ConnectionRefusedError:
+                self.error.emit("Отправитель недоступен — соединение отклонено")
+                return
+            except Exception as e:
+                self.error.emit(f"Ошибка приёма: {e}")
+                return
+
+        # Успешно получили — атомарно переименовываем temp → target
+        try:
+            # Если файл уже существует — добавляем суффикс (1), (2), ...
+            final_path = self._save_path
+            if os.path.exists(final_path):
+                base, ext = os.path.splitext(final_path)
+                n = 1
+                while os.path.exists(f"{base} ({n}){ext}"):
+                    n += 1
+                final_path = f"{base} ({n}){ext}"
+            os.rename(tmp_path, final_path)
+            self.finished.emit(final_path)
+        except Exception as e:
+            self.error.emit(f"Ошибка сохранения файла: {e}")
+        finally:
+            # Удаляем temp если что-то пошло не так
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+
+
+class FileTransferProgressWidget(QFrame):
+    """
+    Компактный плавающий прогресс-бар передачи файла.
+    Стиль единый с остальными overlay-виджетами приложения.
+
+    Используется и отправителем, и получателем — передаём worker_ref
+    для кнопки «Отмена».
+    """
+    def __init__(self, filename: str, filesize: int,
+                 is_sender: bool, parent=None):
+        super().__init__(parent)
+        self._is_sender  = is_sender
+        self._worker_ref = None   # устанавливается снаружи после создания
+
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
+
+        # ── Карточка ──────────────────────────────────────────────────────────
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        card = QFrame(self)
+        card.setObjectName("ftCard")
+        card.setStyleSheet("""
+            QFrame#ftCard {
+                background-color: rgba(20, 22, 30, 230);
+                border: 1px solid rgba(91, 142, 245, 0.35);
+                border-radius: 10px;
+            }
+            QLabel { color: #c8ccd8; font-size: 12px;
+                     background: transparent; border: none; }
+            QProgressBar {
+                background: rgba(255,255,255,0.10);
+                border: none; border-radius: 4px; height: 7px;
+                text-align: center; color: transparent;
+            }
+            QProgressBar::chunk {
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #4a7fdb, stop:1 #7b52d4);
+                border-radius: 4px;
+            }
+        """)
+        outer.addWidget(card)
+
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(14, 10, 14, 10)
+        lay.setSpacing(6)
+
+        # Заголовок
+        direction = "📤  Отправка" if is_sender else "📥  Получение"
+        lbl_title = QLabel(f"{direction}:  {filename}")
+        lbl_title.setStyleSheet("font-weight: bold; font-size: 12px;")
+        lbl_title.setWordWrap(True)
+        lay.addWidget(lbl_title)
+
+        # Прогресс-бар
+        self._bar = QProgressBar()
+        self._bar.setRange(0, 100)
+        self._bar.setValue(0)
+        self._bar.setFixedHeight(7)
+        lay.addWidget(self._bar)
+
+        # Строка статуса + кнопка отмены
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        self._lbl_status = QLabel("Ожидание подключения…" if is_sender else "Подключение…")
+        self._lbl_status.setStyleSheet("font-size: 11px; color: rgba(180,190,220,0.75);")
+        row.addWidget(self._lbl_status, 1)
+
+        btn_cancel = QPushButton("✕")
+        btn_cancel.setFixedSize(22, 22)
+        btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_cancel.setStyleSheet("""
+            QPushButton {
+                background: rgba(200,60,60,0.25); color: #ff9090;
+                border: 1px solid rgba(200,60,60,0.4); border-radius: 5px;
+                font-size: 10px; font-weight: bold;
+            }
+            QPushButton:hover { background: rgba(200,60,60,0.45); }
+        """)
+        btn_cancel.clicked.connect(self._on_cancel)
+        row.addWidget(btn_cancel)
+        lay.addLayout(row)
+
+        self.adjustSize()
+        self.setFixedSize(self.sizeHint())
+
+    def set_worker(self, worker):
+        """Устанавливаем ссылку на worker для кнопки Отмена."""
+        self._worker_ref = worker
+
+    def update_progress(self, done: int, total: int):
+        """Обновляем бар и текстовый статус."""
+        if total > 0:
+            pct = int(done * 100 / total)
+            self._bar.setValue(pct)
+        self._lbl_status.setText(
+            f"{_format_size(done)} / {_format_size(total)}"
+        )
+
+    def set_done(self, save_path: str = ''):
+        """Помечаем передачу как завершённую."""
+        self._bar.setValue(100)
+        if save_path:
+            self._lbl_status.setText(f"✓  Сохранено")
+        else:
+            self._lbl_status.setText("✓  Отправлено")
+
+    def set_error(self, msg: str):
+        self._lbl_status.setText(f"✗  {msg}")
+        self._bar.setStyleSheet(self._bar.styleSheet().replace(
+            "#4a7fdb", "#c0392b").replace("#7b52d4", "#e74c3c"
+        ))
+
+    def _on_cancel(self):
+        if self._worker_ref is not None:
+            self._worker_ref.cancel()
+        self._lbl_status.setText("Отменено")
+        # Плавно скрываем через 1.5 с
+        QTimer.singleShot(1500, self.hide)
+
+
+def _format_size(n: int) -> str:
+    """Форматирует количество байт в читаемую строку (KB / MB)."""
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / (1024 * 1024):.1f} MB"
+
+
 class UserOverlayPanel(QFrame):
     """
     Выпадающий полупрозрачный оверлей прямо под ником пользователя.
@@ -457,6 +823,32 @@ class UserOverlayPanel(QFrame):
             # Показываем / скрываем hint через сигналы таймера кнопки
             self.btn_nudge._tick_timer.timeout.connect(self._on_nudge_tick_hint)
 
+        # ── Кнопка: Передать файл ─────────────────────────────────────────────
+        # Доступна только если net задан (есть активное соединение)
+        if net is not None:
+            sep_f = QFrame()
+            sep_f.setFrameShape(QFrame.Shape.HLine)
+            sep_f.setStyleSheet(
+                "background: rgba(255,255,255,0.08); border: none; max-height: 1px;"
+            )
+            sep_f.setMaximumHeight(1)
+            card_lay.addWidget(sep_f)
+
+            self.btn_file = self._make_btn("📁  Передать файл")
+            self.btn_file.setStyleSheet(self.btn_file.styleSheet() + """
+                QPushButton { border-color: rgba(91,142,245,0.4); color: #8ab4f8; }
+                QPushButton:hover {
+                    background-color: rgba(74,127,219,0.20);
+                    border-color: rgba(91,142,245,0.80);
+                }
+                QPushButton:pressed {
+                    background-color: rgba(74,127,219,0.40);
+                    color: #ffffff;
+                }
+            """)
+            self.btn_file.clicked.connect(self._on_send_file_clicked)
+            card_lay.addWidget(self.btn_file)
+
         # Фиксируем размер ПОСЛЕ добавления всех виджетов (включая hint).
         # Это гарантирует, что место под hint уже учтено и панель
         # не будет прыгать при появлении текста.
@@ -596,6 +988,61 @@ class UserOverlayPanel(QFrame):
         if hasattr(self, '_lbl_nudge_hint'):
             self._lbl_nudge_hint.setStyleSheet(self._lbl_nudge_hint_idle_style)
         print(f"[UI] Nudge vote → uid={self.uid} nick={self._nick!r}")
+
+    def _on_send_file_clicked(self):
+        """
+        Пользователь нажал «📁 Передать файл».
+
+        Открываем стандартный диалог выбора файла.
+        Закрываем оверлей до старта QFileDialog — иначе popup-тип
+        перехватывает события и диалог может не отобразиться.
+        Запуск FileSenderWorker делегируется родительскому окну
+        через специальный сигнал, чтобы не тащить логику workers
+        внутрь оверлея.
+        """
+        if self._net is None:
+            return
+
+        self.close()    # закрываем popup ДО открытия QFileDialog
+
+        filepath, _ = QFileDialog.getOpenFileName(
+            None,
+            "Выберите файл для передачи",
+            os.path.expanduser("~"),
+            "Все файлы (*)",
+        )
+        if not filepath:
+            return
+
+        filename = os.path.basename(filepath)
+        filesize = os.path.getsize(filepath)
+
+        # Создаём и запускаем worker-отправитель
+        worker = FileSenderWorker(filepath)
+
+        # Создаём прогресс-виджет.
+        # Родитель None — он будет показан MainWindow отдельно.
+        prog = FileTransferProgressWidget(filename, filesize, is_sender=True)
+        prog.set_worker(worker)
+
+        def on_ready(port: int, token: str):
+            # Сигнал из рабочего потока — нужен переход в GUI-поток
+            # используем QTimer.singleShot(0, ...) для безопасного вызова
+            def _send():
+                self._net.send_file_offer(
+                    self.uid, filename, filesize, port, token
+                )
+            QTimer.singleShot(0, _send)
+
+        worker.ready.connect(on_ready)
+        worker.progress.connect(lambda s, t: prog.update_progress(s, t))
+        worker.finished.connect(lambda: prog.set_done())
+        worker.error.connect(lambda msg: prog.set_error(msg))
+        worker.cancelled.connect(lambda: prog.hide())
+
+        # Показываем прогресс-виджет в правом нижнем углу экрана
+        _show_float_widget(prog)
+        worker.start()
 
     def hideEvent(self, event):
         """Если панель закрылась пока шептали — останавливаем шёпот."""

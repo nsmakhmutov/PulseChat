@@ -14,6 +14,9 @@ from config import (
     CMD_NUDGE_VOTE, CMD_PLAY_NUDGE, CMD_NUDGE_TRIGGERED, NUDGE_COOLDOWN_SEC,
     CMD_BITRATE_FEEDBACK, CMD_ADJUST_BITRATE, ABR_TIERS,
     FLAG_VIDEO_LQ, ABR_LQ_THRESHOLD,
+    CMD_FILE_OFFER, CMD_FILE_OFFER_ROOM,
+    CMD_LQ_NEEDED,
+    CMD_NACK, CMD_NACK_RELAY,
 )
 
 
@@ -120,6 +123,11 @@ class SFUServer:
         # энкодеры фиксированы (HQ=6Mbps, LQ=800kbps), спираль ABR невозможна.
         # -------------------------------------------------------------------
         self._streamer_simulcast: dict[int, bool]  = {}  # uid → simulcast активен
+
+        # _lq_needed_state: последнее значение lq_needed, отправленное каждому стримеру.
+        # Нужно чтобы не спамить одинаковыми командами при каждом ABR-обновлении.
+        # streamer_uid → bool (True = LQ нужен, False = LQ не нужен)
+        self._lq_needed_state: dict[int, bool] = {}
 
     # ------------------------------------------------------------------
     # Мониторинг
@@ -437,9 +445,15 @@ class SFUServer:
                                     with self.watchers_lock:
                                         if streamer_uid in self.watchers:
                                             self.watchers[streamer_uid].pop(w_uid, None)
+                                    # Убираем bitrate-предпочтение ушедшего зрителя
+                                    with self.abr_lock:
+                                        if streamer_uid in self.abr_viewer_bitrates:
+                                            self.abr_viewer_bitrates[streamer_uid].pop(w_uid, None)
                                     with self.clients_lock:
                                         nick = self.clients[conn]['nick'] if conn in self.clients else '?'
                                     print(f"[Server] {nick} перестал смотреть стрим {streamer_uid}")
+                                    # Пересчитываем нужен ли LQ (зритель мог быть единственным слабым)
+                                    self._notify_lq_needed(streamer_uid)
                             self.send_global_state()
 
                         elif action == CMD_BITRATE_FEEDBACK:
@@ -475,6 +489,36 @@ class SFUServer:
                                         print(
                                             f"[Server] IDR ретранслирован стримеру uid={streamer_uid_idr}"
                                             f" (запрос от uid={uid})"
+                                        )
+                                    except Exception:
+                                        pass
+
+                        elif action == CMD_NACK:
+                            # Зритель запрашивает повторную доставку конкретного чанка.
+                            # Ретранслируем стримеру — тот вытащит чанк из retransmit_buffer
+                            # и повторно отправит его по UDP.
+                            # Команда мелкая (~70 байт), критична по latency — TCP_NODELAY уже включён.
+                            streamer_uid_nack = msg.get('streamer_uid')
+                            frame_id_nack     = msg.get('frame_id')
+                            chunk_idx_nack    = msg.get('chunk_idx')
+                            if (isinstance(streamer_uid_nack, int)
+                                    and isinstance(frame_id_nack, int)
+                                    and isinstance(chunk_idx_nack, int)):
+                                streamer_conn_nack = None
+                                with self.clients_lock:
+                                    for c_conn, c_data in self.clients.items():
+                                        if (c_data['uid'] == streamer_uid_nack
+                                                and c_data.get('is_streaming')):
+                                            streamer_conn_nack = c_conn
+                                            break
+                                if streamer_conn_nack:
+                                    try:
+                                        streamer_conn_nack.sendall(
+                                            json.dumps({
+                                                'action':    CMD_NACK_RELAY,
+                                                'frame_id':  frame_id_nack,
+                                                'chunk_idx': chunk_idx_nack,
+                                            }).encode('utf-8')
                                         )
                                     except Exception:
                                         pass
@@ -599,6 +643,66 @@ class SFUServer:
                                     except Exception:
                                         pass
 
+                        # ──────────────────────────────────────────────────────
+                        # Файловая передача P2P — сервер только relay-агент.
+                        # Все байты идут напрямую между клиентами, сервер не
+                        # читает и не буферизует данные → GIL не страдает,
+                        # пинг и голос остаются незатронутыми.
+                        # ──────────────────────────────────────────────────────
+
+                        elif action == CMD_FILE_OFFER:
+                            # Личная передача файла: relay одному получателю.
+                            # Сервер инжектирует реальный IP отправителя —
+                            # клиент сам не знает свой внешний Radmin-IP.
+                            target_uid_fo = msg.get('target_uid')
+                            if not isinstance(target_uid_fo, int):
+                                pass
+                            else:
+                                msg['sender_ip'] = client_ip
+                                payload_fo = json.dumps(msg).encode('utf-8')
+                                target_conn_fo = None
+                                with self.clients_lock:
+                                    for c_conn, c_data in self.clients.items():
+                                        if c_data['uid'] == target_uid_fo:
+                                            target_conn_fo = c_conn
+                                            break
+                                if target_conn_fo:
+                                    try:
+                                        target_conn_fo.sendall(payload_fo)
+                                        print(
+                                            f"[Server] 📁 file_offer: "
+                                            f"uid={uid} ({client_ip}) → uid={target_uid_fo}"
+                                        )
+                                    except Exception:
+                                        pass
+
+                        elif action == CMD_FILE_OFFER_ROOM:
+                            # Массовая передача: relay всем в комнате кроме отправителя.
+                            msg['sender_ip'] = client_ip
+                            payload_for = json.dumps(msg).encode('utf-8')
+                            room_conns = []
+                            with self.clients_lock:
+                                sender_room_fo = (
+                                    self.clients[conn]['room'] if conn in self.clients else None
+                                )
+                                if sender_room_fo:
+                                    room_conns = [
+                                        c_conn
+                                        for c_conn, c_data in self.clients.items()
+                                        if c_data['room'] == sender_room_fo
+                                        and c_data['uid'] != uid
+                                    ]
+                            for rc in room_conns:
+                                try:
+                                    rc.sendall(payload_for)
+                                except Exception:
+                                    pass
+                            if room_conns:
+                                print(
+                                    f"[Server] 📁 file_offer_room: "
+                                    f"uid={uid} ({client_ip}) → {len(room_conns)} получателей"
+                                )
+
                     except json.JSONDecodeError:
                         break
 
@@ -628,21 +732,104 @@ class SFUServer:
                 with self.udp_lock:
                     self.udp_map.pop(u_id, None)
                     self.uid_to_room.pop(u_id, None)
+                # Собираем streamer_uid-ы у которых этот пользователь был зрителем
+                affected_streamers = []
                 with self.watchers_lock:
                     for s_uid in list(self.watchers.keys()):
-                        self.watchers[s_uid].pop(u_id, None)
+                        if u_id in self.watchers[s_uid]:
+                            self.watchers[s_uid].pop(u_id, None)
+                            affected_streamers.append(s_uid)
                     self.watchers.pop(u_id, None)
                 # Убираем ABR-запросы и simulcast-флаг отключившегося пользователя
                 with self.abr_lock:
                     for s_uid in list(self.abr_viewer_bitrates.keys()):
                         self.abr_viewer_bitrates[s_uid].pop(u_id, None)
                 self._streamer_simulcast.pop(u_id, None)
+                self._lq_needed_state.pop(u_id, None)
+                # Пересчитываем lq_needed для всех стримеров, у которых был этот зритель
+                for s_uid in affected_streamers:
+                    self._notify_lq_needed(s_uid)
                 print(f"[Server] ✖ {nick} (комната: {room}) отключился | Онлайн: {remaining}")
             else:
                 print(f"[Server] ✖ Незарегистрированный клиент {addr[0]} отключился")
 
             conn.close()
             self.send_global_state()
+
+    # ------------------------------------------------------------------
+    # Simulcast: уведомление стримера о необходимости LQ-потока
+    # ------------------------------------------------------------------
+    def _notify_lq_needed(self, streamer_uid: int):
+        """
+        Вычисляет, нужен ли LQ-поток стримеру прямо сейчас, и отправляет
+        CMD_LQ_NEEDED только если состояние ИЗМЕНИЛОСЬ — без лишнего спама.
+
+        LQ нужен если: simulcast активен И среди зрителей есть хотя бы один
+        «слабый» (запрошенный битрейт < ABR_LQ_THRESHOLD).
+
+        Если зрителей нет совсем — LQ не нужен (NVENC-блок отдыхает).
+
+        Вызывается из:
+          • _abr_update (simulcast-ветка, при изменении bitrate зрителя)
+          • stream_watch_stop (зритель ушёл)
+          • disconnect handler (клиент отключился, убран из всех watchers)
+
+        Вне любых локов — не блокирует UDP-маршрутизацию.
+        """
+        if not self._streamer_simulcast.get(streamer_uid, False):
+            return  # стример не в simulcast-режиме — команда не нужна
+
+        # Вычисляем нужен ли LQ: есть ли слабый зритель
+        with self.abr_lock:
+            prefs = dict(self.abr_viewer_bitrates.get(streamer_uid, {}))
+        # Исключаем server-voter (uid=0) из расчёта — он голосует за upload,
+        # не отражает реальную силу зрителя.
+        viewer_prefs = {uid: bps for uid, bps in prefs.items() if uid != 0}
+
+        # Количество живых зрителей (независимо от наличия ABR-данных)
+        with self.watchers_lock:
+            watcher_count = len(self.watchers.get(streamer_uid, {}))
+
+        if viewer_prefs:
+            # Есть реальные ABR-данные — определяем по ним
+            lq_needed = any(bps < ABR_LQ_THRESHOLD for bps in viewer_prefs.values())
+        elif watcher_count > 0:
+            # Зрители есть, но ещё не прислали feedback (< 1.5 сек после подключения).
+            # Включаем LQ: лучше потратить 600 kbps на LQ-поток,
+            # чем дать слабому зрителю HQ и получить IDR-шторм.
+            lq_needed = True
+        else:
+            # Зрителей нет совсем — LQ не нужен.
+            lq_needed = False
+
+        # Дедупликация: отправляем только если состояние изменилось
+        if self._lq_needed_state.get(streamer_uid) == lq_needed:
+            return
+
+        self._lq_needed_state[streamer_uid] = lq_needed
+
+        # Ищем коннект стримера
+        streamer_conn = None
+        with self.clients_lock:
+            for c_conn, c_data in self.clients.items():
+                if c_data['uid'] == streamer_uid and c_data.get('is_streaming'):
+                    streamer_conn = c_conn
+                    break
+
+        if streamer_conn is None:
+            return
+
+        try:
+            streamer_conn.sendall(
+                json.dumps({
+                    'action': CMD_LQ_NEEDED,
+                    'needed': lq_needed,
+                }).encode('utf-8')
+            )
+            state_str = "включён (слабый зритель)" if lq_needed else "выключен (нет слабых зрителей)"
+            print(f"[Simulcast] streamer={streamer_uid}: LQ-поток {state_str}")
+        except Exception as e:
+            print(f"[Simulcast] Ошибка отправки lq_needed стримеру {streamer_uid}: {e}")
 
     # ------------------------------------------------------------------
     # ABR: обновить битрейт для стримера и уведомить его если изменился
@@ -683,7 +870,14 @@ class SFUServer:
             # viewer_uid != 0 → обычный зритель с плохим RTT → его защищает
             # маршрутизация LQ-потока; стримера трогать не нужно.
             if self._streamer_simulcast.get(streamer_uid, False) and viewer_uid != 0:
-                return
+                # Зритель обновил свой битрейт — пересчитываем нужен ли LQ.
+                # Вызываем ВНЕ abr_lock (хелпер сам берёт нужные локи).
+                pass  # выходим из with abr_lock перед вызовом хелпера
+
+        # _notify_lq_needed вызывается вне abr_lock — без риска дедлока.
+        if self._streamer_simulcast.get(streamer_uid, False) and viewer_uid != 0:
+            self._notify_lq_needed(streamer_uid)
+            return
 
             # --- Legacy ABR: вычисляем min и решаем — менять ли битрейт ---
             new_min = min(self.abr_viewer_bitrates[streamer_uid].values())
@@ -786,11 +980,15 @@ class SFUServer:
         with self.abr_lock:
             prefs = dict(self.abr_viewer_bitrates.get(sender_uid, {}))
 
-        # Фильтруем: сопоставляем is_lq с предпочтением каждого зрителя
+        # Фильтруем: сопоставляем is_lq с предпочтением каждого зрителя.
+        # Зритель без записанного предпочтения (ещё не прислал feedback) → LQ по умолчанию.
+        # Rationale: неизвестный зритель может быть слабым; лучше показать 600 kbps LQ,
+        # чем залить его HQ и получить IDR-шторм до первого feedback (~1.5 сек).
+        # Как только придёт первый bitrate_feedback → попадёт в правильный поток.
         target_uids = []
         for w_uid in watcher_uids:
-            req_bps = prefs.get(w_uid, ABR_LQ_THRESHOLD + 1)  # default → HQ
-            viewer_wants_lq = req_bps <= ABR_LQ_THRESHOLD
+            req_bps = prefs.get(w_uid, 0)              # 0 → "слабый" до первого feedback
+            viewer_wants_lq = req_bps < ABR_LQ_THRESHOLD
             if is_lq == viewer_wants_lq:
                 target_uids.append(w_uid)
 

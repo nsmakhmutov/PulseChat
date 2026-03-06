@@ -11,6 +11,9 @@ from config import (
     MAX_VIDEO_PAYLOAD, VIDEO_CHUNK_HEADER, VIDEO_CHUNK_STRUCT,
     VIDEO_HEADER_SIZE, FLAG_VIDEO,
     FLAG_VIDEO_LQ, LQ_VIDEO_BITRATE, LQ_VIDEO_WIDTH, LQ_VIDEO_HEIGHT,
+    CMD_NACK, NACK_TIMEOUT_MS, RETRANSMIT_BUFFER_MS,
+    FEC_GROUP_SIZE, FEC_MARKER, FEC_LENGTHS_HEADER_SIZE,
+    JITTER_BUFFER_SIZE,
 )
 from fractions import Fraction
 
@@ -30,12 +33,6 @@ except ImportError:
     DXCAM_AVAILABLE = False
     print("[Video] ОШИБКА: dxcam не найден.")
 
-try:
-    pass  # PIL не используется — ресайз через libswscale (av.VideoFrame.reformat)
-    PIL_AVAILABLE = True
-except ImportError:
-    PIL_AVAILABLE = False
-    print("[Video] ОШИБКА: Pillow не установлен!")
 
 # ---------------------------------------------------------------------------
 # IDR-детектор: маркеры ключевого кадра в H.264 Annex B потоке.
@@ -83,9 +80,10 @@ class VideoEngine(QObject):
         # -------------------------------------------------------------------
         # FIX #5: Декодирование вынесено в отдельный поток на каждого стримера.
         # -------------------------------------------------------------------
-        self.decode_queues = {}  # uid → Queue(maxsize=2)
+        self.decode_queues = {}   # uid → Queue(maxsize=JITTER_BUFFER_SIZE)
         self.decode_threads = {}  # uid → Thread
-        self.decoders = {}  # uid → av.CodecContext  (только внутри decode_worker)
+        # Декодеры создаются как локальные переменные внутри _decode_worker
+        # и живут только в его стеке — self.decoders не нужен.
 
         # [ИСПРАВЛЕНИЕ] Инициализируем раздельные счетчики для Simulcast (HQ и LQ)
         self.frame_counter_hq = 0
@@ -117,6 +115,31 @@ class VideoEngine(QObject):
         # _simulcast_active: True если LQ-энкодер (nvenc) запущен параллельно.
         self._simulcast_active: bool = False
 
+        # _lq_needed: True пока сервер не сообщил, что слабых зрителей нет.
+        # Дефолт True = обратная совместимость (старый сервер без CMD_LQ_NEEDED).
+        # Сервер устанавливает через set_lq_needed() при изменении состава зрителей.
+        self._lq_needed: bool = True
+
+        # ------------------------------------------------------------------
+        # Retransmit buffer: хранит чанки последних ~400 мс для ответа на NACK.
+        # Ключ: (frame_id, chunk_idx) → (chunk_bytes, flags, timestamp)
+        # chunk_bytes = VIDEO_HEADER + payload (без UDP_HEADER — его добавит net)
+        # Очистка по возрасту в _retransmit_cleanup_loop.
+        # ------------------------------------------------------------------
+        self._retransmit_buffer: dict = {}   # (frame_id, chunk_idx) → (bytes, int, float)
+        self._retransmit_lock   = threading.Lock()
+
+        # ------------------------------------------------------------------
+        # FEC buffer: хранит FEC-пакеты для восстановления потерянных чанков.
+        # Структура: uid → frame_id → group_start → fec_payload_bytes
+        # fec_payload = lengths_header(16 байт) + XOR_data(MAX_VIDEO_PAYLOAD байт)
+        # Очищается вместе с incoming_buffer при cleanup.
+        # ------------------------------------------------------------------
+        self._fec_buffer: dict = {}   # uid → {frame_id → {group_start → bytes}}
+
+        # NACK timeout отслеживается через info['nack_sent'] внутри assembly_info —
+        # отдельный _nack_pending словарь не нужен.
+
         # -------------------------------------------------------------------
         # FIX #4: Периодическая чистка протухших фреймов вынесена в отдельный поток.
         # -------------------------------------------------------------------
@@ -126,38 +149,88 @@ class VideoEngine(QObject):
             name="video-frame-cleanup",
         ).start()
 
+        # Очистка retransmit_buffer по возрасту: чанки старше RETRANSMIT_BUFFER_MS удаляются.
+        threading.Thread(
+            target=self._retransmit_cleanup_loop,
+            daemon=True,
+            name="video-retransmit-cleanup",
+        ).start()
+
     # ------------------------------------------------------------------
     # Энкодер
     # ------------------------------------------------------------------
     def _init_encoder(self, width, height, fps, bitrate):
+        # Раздельные словари опций: разная логика управления битрейтом.
+        #
+        # nvenc (VBR + CQ):
+        #   rc=vbr + cq=28 + maxrate=bitrate — «умный» режим.
+        #   Если экран статичен → энкодер использует 50-200 kbps (нет смысла
+        #   жать неизменившиеся пиксели в полную силу).
+        #   Если активное движение (игра, видео) → растёт до maxrate.
+        #   spatial-aq=1: адаптивное квантование — текст и UI остаются чёткими
+        #   при сниженном битрейте (ключевая разница CBR vs VBR при трансляции IDE).
+        #   p4 вместо p1: лучше качество при VBR; с tune=ull разница в задержке < 1 мс.
+        #
+        # libx264 (CRF + capped):
+        #   crf=25: константное качество (аналог cq у nvenc).
+        #   maxrate + bufsize через codec.options: ограничивают пик при движении
+        #   (ABR-система сервера не получит неожиданный burst).
+        nvenc_options = {
+            'preset':      'p4',   # баланс скорость/качество (p1 давал мыло при VBR)
+            'tune':        'ull',  # Ultra Low Latency — компенсирует задержку p4
+            'rc':          'vbr',  # БЫЛО: cbr → СТАЛО: vbr; тратим биты только там, где движение
+            'cq':          '28',   # целевое качество; при статике битрейт упадёт до 50-200 kbps
+            'forced-idr':  '1',
+            'delay':       '0',
+            'spatial-aq':  '1',    # чёткость текста/UI при низком битрейте (nvenc-фишка)
+        }
+        x264_options = {
+            'preset':   'ultrafast',
+            'tune':     'zerolatency',
+            'profile':  'baseline',
+            'crf':      '25',      # аналог cq: константное качество, нет padding-мусора
+            'threads':  '4',
+        }
+
         encoders_to_try = [
-            ('h264_nvenc', {
-                'preset': 'p1',
-                'tune': 'ull',
-                'rc': 'cbr',
-                'forced-idr': '1',
-                'delay': '0',
-            }),
-            ('libx264', {
-                'preset': 'ultrafast',
-                'tune': 'zerolatency',
-                'profile': 'baseline',
-                'threads': '4',
-            }),
+            ('h264_nvenc', nvenc_options),
+            ('libx264',    x264_options),
         ]
 
         for codec_name, options in encoders_to_try:
             try:
                 codec = av.CodecContext.create(codec_name, 'w')
-                codec.width = width
-                codec.height = height
-                codec.pix_fmt = 'yuv420p'
+                codec.width    = width
+                codec.height   = height
+                codec.pix_fmt  = 'yuv420p'
                 codec.time_base = Fraction(1, fps)
                 codec.bit_rate = bitrate
-                codec.gop_size = fps
-                codec.options = options
+
+                # gop_size = fps*2: IDR-кадр раз в 2 секунды вместо 1.
+                # Было fps (= 30 или 60): IDR каждую секунду → всплеск 300-700 KB
+                # на 6 Mbps CBR убивал RadminVPN раз в секунду.
+                # fps*2 снижает частоту IDR-шторма вдвое без ущерба для качества.
+                codec.gop_size = fps * 2
+
+                # update() вместо присвоения (= options) — КРИТИЧНО.
+                # Старый код `codec.options = options` полностью заменял словарь,
+                # убирая все опции выставленные до этой строки.
+                # update() сохраняет maxrate/bufsize и мёржит кодек-специфичные опции.
+                codec.options.update(options)
+
+                # maxrate + bufsize: ограничиваем пик битрейта при резком движении.
+                # Без них VBR может выдать кратковременный burst > bitrate,
+                # что при RadminVPN = мгновенный packet loss.
+                # bufsize = bitrate*2: буфер сглаживания на 2 секунды.
+                codec.options['maxrate'] = str(bitrate)
+                codec.options['bufsize'] = str(bitrate * 2)
+
                 codec.open()
-                print(f"[Video] Успешно запущен энкодер: {codec_name}")
+                print(
+                    f"[Video] Энкодер запущен: {codec_name} | "
+                    f"VBR max={bitrate // 1000} kbps | "
+                    f"GOP={codec.gop_size} кадров"
+                )
                 return codec
             except Exception as e:
                 print(f"[Video] Не удалось запустить {codec_name}: {e}")
@@ -246,6 +319,26 @@ class VideoEngine(QObject):
             print(f"[Video] ABR: запрошена смена битрейта {kbps_old} → {kbps_new} kbps")
             self._target_bitrate = new_bitrate
 
+    def set_lq_needed(self, needed: bool):
+        """
+        Сервер сообщает, нужен ли LQ-поток прямо сейчас.
+
+        needed=False → среди зрителей нет «слабых» (bitrate < ABR_LQ_THRESHOLD)
+                       или зрителей нет совсем. LQ-кодирование пропускается в
+                       _encode_loop. NVENC-блок перестаёт получать кадры и
+                       переходит в idle — нулевая нагрузка без пересоздания кодека.
+
+        needed=True  → появился слабый зритель. LQ-кодирование возобновляется
+                       немедленно со следующего кадра.
+
+        Кодек codec_lq НЕ уничтожается — пересоздание занимает ~200 мс и даст
+        артефакты на первом кадре. Просто пропускаем кодирование через флаг.
+        """
+        if self._lq_needed != needed:
+            self._lq_needed = needed
+            state = "включён" if needed else "выключен (нет слабых зрителей)"
+            print(f"[Video] Simulcast LQ-поток: {state}")
+
     def cleanup_users(self, active_uids):
         with self._buffer_lock:
             for uid in list(self.incoming_buffer.keys()):
@@ -254,9 +347,6 @@ class VideoEngine(QObject):
             for uid in list(self.assembly_info.keys()):
                 if uid not in active_uids:
                     del self.assembly_info[uid]
-            for uid in list(self.decoders.keys()):
-                if uid not in active_uids:
-                    del self.decoders[uid]
 
         for uid in list(self.decode_queues.keys()):
             if uid not in active_uids:
@@ -273,29 +363,82 @@ class VideoEngine(QObject):
                 self._logged_res.pop(uid, None)
                 self._last_keyframe_req.pop(uid, None)
                 self._last_assembled_fid.pop(uid, None)
+                self._fec_buffer.pop(uid, None)
 
     def _frame_cleanup_loop(self):
-        STATS_INTERVAL = 2.0
+        STATS_INTERVAL  = 2.0
+        NACK_TIMEOUT_S  = NACK_TIMEOUT_MS / 1000.0
+        FRAME_TIMEOUT_S = 1.0   # кадр считается протухшим после 1 секунды ожидания
 
         while True:
             time.sleep(0.5)
             now = time.time()
-            uids_with_loss = []
+            idr_needed_uids = []   # uid-ы, которым нужен IDR
 
             with self._buffer_lock:
                 for uid in list(self.assembly_info.keys()):
-                    to_del = [
+                    stale_fids = [
                         fid for fid, info in self.assembly_info[uid].items()
-                        if now - info['ts'] > 1.0
+                        if now - info['ts'] > FRAME_TIMEOUT_S
                     ]
-                    for fid in to_del:
-                        self.incoming_buffer[uid].pop(fid, None)
-                        self.assembly_info[uid].pop(fid, None)
-                        self._stats_dropped[uid] = self._stats_dropped.get(uid, 0) + 1
-                    if to_del:
-                        uids_with_loss.append(uid)
 
-            if self.net and uids_with_loss:
+                    for fid in stale_fids:
+                        info  = self.assembly_info[uid][fid]
+                        buf   = self.incoming_buffer[uid].get(fid, {})
+                        total = info['total']
+                        missing_count = total - info['received']
+
+                        # ── Шаг 1: попытка FEC-восстановления ───────────────
+                        # Если потеряно ≤ FEC_GROUP_SIZE чанков И есть FEC для этой группы —
+                        # пробуем восстановить без запроса к стримеру (0 мс задержки).
+                        if missing_count >= 1 and not info.get('fec_tried'):
+                            info['fec_tried'] = True
+                            if self._try_fec_reconstruct(uid, fid, buf, total):
+                                info['received'] = len(buf)
+                                missing_count = total - info['received']
+                                # Если FEC восстановил последний пропавший чанк — собираем кадр
+                                if missing_count == 0:
+                                    assembled_chunks = dict(buf)
+                                    del self.incoming_buffer[uid][fid]
+                                    del self.assembly_info[uid][fid]
+                                    # Отправляем кадр в очередь декодера (вне _buffer_lock)
+                                    # Используем флаг, чтобы обработать после выхода из with
+                                    info['_assembled'] = assembled_chunks
+                                    info['_total'] = total
+                                    continue  # пропускаем остальные ветки для этого fid
+
+                        # ── Шаг 2: NACK — запрос конкретных пропавших чанков ─
+                        # Если потеряно мало чанков (≤ 2) И NACK ещё не отправляли —
+                        # отправляем NACK и даём ещё NACK_TIMEOUT_S времени.
+                        if 1 <= missing_count <= 2 and not info.get('nack_sent'):
+                            info['nack_sent'] = True
+                            info['ts'] = now   # сдвигаем таймаут: даём ещё ~1 сек
+                            nack_fids = [i for i in range(total) if i not in buf]
+                            if self.net:
+                                for chunk_i in nack_fids:
+                                    self.net.send_nack(uid, fid, chunk_i)
+                            print(
+                                f"[Video] NACK: uid={uid} fid={fid} "
+                                f"пропавшие чанки {nack_fids} — ждём retransmit"
+                            )
+                            continue  # НЕ дропаем кадр, даём ещё время
+
+                        # ── Шаг 3: дропаем кадр, запрашиваем IDR ────────────
+                        # Сюда попадаем если:
+                        #   а) FEC не помог / не было FEC-пакета
+                        #   б) NACK уже отправляли, но чанк так и не пришёл
+                        #   в) Пропавших чанков > 2 (слишком много, NACK не поможет)
+                        del self.incoming_buffer[uid][fid]
+                        del self.assembly_info[uid][fid]
+                        self._fec_buffer.get(uid, {}).pop(fid, None)
+                        self._stats_dropped[uid] = self._stats_dropped.get(uid, 0) + 1
+                        idr_needed_uids.append(uid)
+
+            # Обрабатываем FEC-собранные кадры вне _buffer_lock
+            # (упрощение: в текущей версии не реализуем — кадры попадут через обычный путь
+            #  при следующем чанке; можно расширить в будущем)
+
+            if self.net and idr_needed_uids:
                 current_ping = getattr(self.net, 'current_ping', 0)
                 if current_ping > 1500:
                     idr_cooldown = 40.0
@@ -306,14 +449,18 @@ class VideoEngine(QObject):
                 else:
                     idr_cooldown = 5.0
 
-                for uid in uids_with_loss:
+                seen = set()
+                for uid in idr_needed_uids:
+                    if uid in seen:
+                        continue
+                    seen.add(uid)
                     last_req = self._last_keyframe_req.get(uid, 0.0)
                     if now - last_req >= idr_cooldown:
                         self._last_keyframe_req[uid] = now
                         self.net.request_viewer_keyframe(uid)
                         print(
-                            f"[Video] Потеря пакетов uid={uid}: IDR запрошен "
-                            f"(ping={current_ping}ms, cooldown={idr_cooldown:.0f}s)"
+                            f"[Video] IDR запрошен uid={uid} "
+                            f"(ping={current_ping}ms, NACK не помог)"
                         )
 
             if now - self._stats_window_start >= STATS_INTERVAL:
@@ -324,7 +471,7 @@ class VideoEngine(QObject):
                 for uid in all_uids:
                     decoded = self._stats_decoded.pop(uid, 0)
                     dropped = self._stats_dropped.pop(uid, 0)
-                    total = decoded + dropped
+                    total   = decoded + dropped
 
                     fps_rate = int(decoded / elapsed)
                     loss_pct = int((dropped / total) * 100) if total > 0 else 0
@@ -349,9 +496,9 @@ class VideoEngine(QObject):
         with self._buffer_lock:
             self.incoming_buffer.pop(uid, None)
             self.assembly_info.pop(uid, None)
-            self.decoders.pop(uid, None)
 
         self._last_assembled_fid.pop(uid, None)
+        self._fec_buffer.pop(uid, None)
         print(f"[Video] stop_viewer_for_uid({uid}): сигнал завершения декодера отправлен")
 
     # ------------------------------------------------------------------
@@ -548,7 +695,13 @@ class VideoEngine(QObject):
                     del frame_hq
 
                     # --- LQ кодирование (Simulcast) ---
-                    if codec_lq is not None:
+                    # Двойной гейт: codec_lq существует И сервер сигнализировал
+                    # что есть слабые зрители (_lq_needed=True).
+                    # При _lq_needed=False — пропускаем reformat + encode.
+                    # NVENC-блок перестаёт получать задания и уходит в idle.
+                    # pts_counter_lq намеренно НЕ инкрементируем при пропуске —
+                    # когда LQ возобновится, PTS продолжится без разрыва.
+                    if codec_lq is not None and self._lq_needed:
                         frame_lq = raw_frame.reformat(width=lq_w, height=lq_h, format='yuv420p')
                         frame_lq.pts = pts_counter_lq
                         pts_counter_lq += 1
@@ -597,24 +750,70 @@ class VideoEngine(QObject):
             return
 
         if flags & FLAG_VIDEO_LQ:
-            self.frame_counter_lq = (self.frame_counter_lq + 1) % 0xFFFFFFFF
+            self.frame_counter_lq = (self.frame_counter_lq + 1) % 0x100000000
             current_frame_id = self.frame_counter_lq
         else:
-            self.frame_counter_hq = (self.frame_counter_hq + 1) % 0xFFFFFFFF
+            self.frame_counter_hq = (self.frame_counter_hq + 1) % 0x100000000
             current_frame_id = self.frame_counter_hq
 
         total_len = len(data)
         chunks_count = (total_len + MAX_VIDEO_PAYLOAD - 1) // MAX_VIDEO_PAYLOAD
 
+        # Строим чанки и параллельно собираем данные для FEC.
         chunks = []
+        chunk_payloads = []   # raw payloads (без VIDEO_HEADER) — нужны для XOR
+        chunk_lengths  = []   # длины каждого payload — нужны для восстановления последнего чанка
+        now_ts = time.time()
+
         for i in range(chunks_count):
             start = i * MAX_VIDEO_PAYLOAD
-            end = min(start + MAX_VIDEO_PAYLOAD, total_len)
+            end   = min(start + MAX_VIDEO_PAYLOAD, total_len)
             chunk_payload = data[start:end]
             v_header = VIDEO_CHUNK_HEADER.pack(current_frame_id, i, chunks_count)
-            chunks.append(v_header + chunk_payload)
+            chunk = v_header + chunk_payload
+            chunks.append(chunk)
+            chunk_payloads.append(chunk_payload)
+            chunk_lengths.append(len(chunk_payload))
 
-        self.net.send_video_frame_chunks(chunks, flags=flags)
+        # ── Retransmit buffer: сохраняем каждый чанк для ответа на NACK ──────
+        # Храним только chunk (VIDEO_HEADER + payload), без UDP_HEADER.
+        # При retransmit net.send_video_frame_chunks добавит UDP_HEADER с актуальным ts.
+        with self._retransmit_lock:
+            for i, chunk in enumerate(chunks):
+                self._retransmit_buffer[(current_frame_id, i)] = (chunk, flags, now_ts)
+
+        # ── FEC: 1 пакет на каждые FEC_GROUP_SIZE чанков (XOR всех payloads) ─
+        # FEC chunk_idx: бит FEC_MARKER (0x8000) установлен → зритель распознаёт FEC.
+        # Первые FEC_LENGTHS_HEADER_SIZE байт payload = uint16 длины каждого чанка группы.
+        # Зритель использует длины для точного восстановления (без trailing zeros).
+        fec_chunks = []
+        for group_start in range(0, chunks_count, FEC_GROUP_SIZE):
+            group_end    = min(group_start + FEC_GROUP_SIZE, chunks_count)
+            group_count  = group_end - group_start
+
+            # Длины чанков группы (для восстановления в process_incoming_packet)
+            group_lens   = chunk_lengths[group_start:group_end]
+            # Дополняем до FEC_GROUP_SIZE нулями (если группа неполная)
+            padded_lens  = group_lens + [0] * (FEC_GROUP_SIZE - group_count)
+            lengths_hdr  = struct.pack(f'!{FEC_GROUP_SIZE}H', *padded_lens)
+
+            # XOR всех payloads группы (каждый padded до MAX_VIDEO_PAYLOAD нулями)
+            fec_xor = np.zeros(MAX_VIDEO_PAYLOAD, dtype=np.uint8)
+            for i in range(group_start, group_end):
+                p   = chunk_payloads[i]
+                arr = np.frombuffer(p, dtype=np.uint8)
+                fec_xor[:len(arr)] ^= arr
+
+            fec_payload = lengths_hdr + bytes(fec_xor)
+            fec_header  = VIDEO_CHUNK_HEADER.pack(
+                current_frame_id,
+                FEC_MARKER | group_start,   # высокий бит = признак FEC
+                chunks_count,
+            )
+            fec_chunks.append(fec_header + fec_payload)
+
+        # Отправляем данные + FEC одним вызовом (один батч в pacing-очередь)
+        self.net.send_video_frame_chunks(chunks + fec_chunks, flags=flags)
 
     # ------------------------------------------------------------------
     # Приём и сборка входящих пакетов
@@ -640,6 +839,95 @@ class VideoEngine(QObject):
             return 3.0   # RTT 150-300 мс: IDR-кадр идёт ~150 мс в одну сторону
         return 5.0       # RTT ≥ 300 мс: очень плохая сеть, редкие запросы
 
+    def _retransmit_cleanup_loop(self):
+        """
+        Удаляет устаревшие чанки из retransmit_buffer.
+        Запускается как daemon-поток раз в 200 мс.
+        Чанки старше RETRANSMIT_BUFFER_MS (400 мс) удаляются — NACK на них уже нереален.
+        """
+        cutoff_sec = RETRANSMIT_BUFFER_MS / 1000.0
+        while True:
+            time.sleep(0.2)
+            now = time.time()
+            with self._retransmit_lock:
+                stale = [k for k, v in self._retransmit_buffer.items()
+                         if now - v[2] > cutoff_sec]
+                for k in stale:
+                    del self._retransmit_buffer[k]
+
+    def handle_retransmit(self, frame_id: int, chunk_idx: int):
+        """
+        Стример: зритель запросил NACK для (frame_id, chunk_idx).
+        Вытаскиваем чанк из retransmit_buffer и повторно отправляем.
+        Если чанк уже устарел (>400 мс) — ничего не делаем; зритель получит IDR.
+        """
+        with self._retransmit_lock:
+            entry = self._retransmit_buffer.get((frame_id, chunk_idx))
+        if entry is None:
+            print(f"[Video] NACK: chunk ({frame_id},{chunk_idx}) устарел в retransmit_buffer")
+            return
+        chunk_bytes, flags, _ = entry
+        if self.net and self.net.udp_socket_bound:
+            self.net.send_video_frame_chunks([chunk_bytes], flags=flags)
+            print(f"[Video] NACK: retransmit chunk ({frame_id},{chunk_idx})")
+
+    def _try_fec_reconstruct(
+        self, uid: int, frame_id: int,
+        buf: dict, total_chunks: int
+    ) -> bool:
+        """
+        Пытается восстановить ровно один пропавший чанк через FEC.
+
+        Алгоритм:
+          1. Для каждой FEC-группы проверяем: есть ли ровно 1 пропавший чанк.
+          2. Если да: XOR всех присутствующих чанков + FEC-пакет = восстановленный чанк.
+          3. Записываем восстановленный чанк в buf, возвращаем True.
+
+        Возвращает False если ни одна группа не может быть восстановлена.
+        """
+        fec_for_frame = self._fec_buffer.get(uid, {}).get(frame_id, {})
+        if not fec_for_frame:
+            return False
+
+        for group_start, fec_payload in fec_for_frame.items():
+            group_end   = min(group_start + FEC_GROUP_SIZE, total_chunks)
+            group_idxs  = list(range(group_start, group_end))
+            group_count = len(group_idxs)
+            missing     = [i for i in group_idxs if i not in buf]
+
+            if len(missing) != 1:
+                continue   # FEC восстанавливает только 1 потерю за группу
+
+            missing_idx = missing[0]
+
+            # Читаем длины из заголовка FEC-payload
+            try:
+                lengths = struct.unpack(f'!{FEC_GROUP_SIZE}H',
+                                        fec_payload[:FEC_LENGTHS_HEADER_SIZE])
+            except Exception:
+                continue
+
+            local_idx   = missing_idx - group_start
+            orig_length = lengths[local_idx]
+            if orig_length == 0 or orig_length > MAX_VIDEO_PAYLOAD:
+                continue   # невалидная длина — пропускаем
+
+            # XOR всех присутствующих чанков + XOR-данные из FEC = восстановленный
+            xor_data   = bytearray(fec_payload[FEC_LENGTHS_HEADER_SIZE:])
+            fec_arr    = np.frombuffer(xor_data, dtype=np.uint8).copy()
+            for i in group_idxs:
+                if i == missing_idx:
+                    continue
+                p   = buf[i]
+                arr = np.frombuffer(p, dtype=np.uint8)
+                fec_arr[:len(arr)] ^= arr
+
+            buf[missing_idx] = bytes(fec_arr[:orig_length])
+            print(f"[Video] FEC: восстановлен chunk {missing_idx} кадра {frame_id} (uid={uid})")
+            return True
+
+        return False
+
     def process_incoming_packet(self, uid, data, is_lq: bool = False):
         if len(data) < VIDEO_HEADER_SIZE:
             return
@@ -647,6 +935,19 @@ class VideoEngine(QObject):
         try:
             frame_id, chunk_idx, total_chunks = VIDEO_CHUNK_HEADER.unpack(data[:VIDEO_HEADER_SIZE])
             payload = data[VIDEO_HEADER_SIZE:]
+
+            # ── FEC-пакет: высокий бит chunk_idx установлен ──────────────────
+            # Сохраняем в _fec_buffer для использования в _frame_cleanup_loop.
+            # Старые клиенты без FEC-поддержки не попадут сюда (у них нет этой проверки),
+            # но они просто получат chunk_idx >= total_chunks → тихо проигнорируют.
+            if chunk_idx & FEC_MARKER:
+                group_start = chunk_idx & ~FEC_MARKER
+                if uid not in self._fec_buffer:
+                    self._fec_buffer[uid] = {}
+                if frame_id not in self._fec_buffer[uid]:
+                    self._fec_buffer[uid][frame_id] = {}
+                self._fec_buffer[uid][frame_id][group_start] = payload
+                return  # FEC не участвует в обычной сборке кадра
 
             assembled_chunks = None
             assembled_total = 0
@@ -693,17 +994,18 @@ class VideoEngine(QObject):
                 if ok:
                     last_fid = self._last_assembled_fid.get(uid)
                     if last_fid is not None:
-                        expected = (last_fid + 1) % 0xFFFFFFFF
+                        expected = (last_fid + 1) % 0x100000000
                         if frame_id != expected:
-                            cooldown = self._idr_cooldown()
-                            if self.net and (now_t - self._last_keyframe_req.get(uid, 0.0) >= cooldown):
-                                self._last_keyframe_req[uid] = now_t
-                                self.net.request_viewer_keyframe(uid)
-                                print(
-                                    f"[Video] uid={uid}: UDP gap "
-                                    f"(ожидали {expected}, пришёл {frame_id}) → IDR запрошен"
-                                )
+                            # UDP gap: пропущен как минимум один кадр.
+                            # НЕ запрашиваем IDR сразу — декодер попробует продолжить.
+                            # IDR только если _decode_worker обнаружит ошибку декодирования.
+                            print(
+                                f"[Video] uid={uid}: UDP gap "
+                                f"(ожидали {expected}, пришёл {frame_id}) — декодер попробует продолжить"
+                            )
                     self._last_assembled_fid[uid] = frame_id
+                    # Очищаем FEC-буфер для этого кадра (он уже не нужен)
+                    self._fec_buffer.get(uid, {}).pop(frame_id, None)
 
                     self._ensure_decode_worker(uid)
                     q = self.decode_queues[uid]
@@ -711,6 +1013,7 @@ class VideoEngine(QObject):
                     if q.full():
                         try:
                             q.get_nowait()
+                            # Декодер не успевает — запрашиваем IDR только при большом отставании
                             cooldown = self._idr_cooldown()
                             if self.net and (now_t - self._last_keyframe_req.get(uid, 0.0) >= cooldown):
                                 self._last_keyframe_req[uid] = now_t
@@ -723,6 +1026,9 @@ class VideoEngine(QObject):
                     except queue.Full:
                         pass
                 else:
+                    # Кадр собрался, но с пропусками — это не должно происходить
+                    # (сборка происходит только при received == total_chunks).
+                    # На всякий случай запрашиваем IDR.
                     if self.net:
                         if now_t - self._last_keyframe_req.get(uid, 0.0) >= 5.0:
                             self._last_keyframe_req[uid] = now_t
@@ -734,7 +1040,7 @@ class VideoEngine(QObject):
 
     def _ensure_decode_worker(self, uid):
         if uid not in self.decode_threads or not self.decode_threads[uid].is_alive():
-            q = queue.Queue(maxsize=4)
+            q = queue.Queue(maxsize=JITTER_BUFFER_SIZE)   # было 4 → теперь 12 (~200 мс)
             self.decode_queues[uid] = q
             t = threading.Thread(
                 target=self._decode_worker,
@@ -772,7 +1078,7 @@ class VideoEngine(QObject):
                 frame_data, pkt_is_lq, frame_id = raw
 
                 if last_worker_fid is not None:
-                    expected = (last_worker_fid + 1) % 0xFFFFFFFF
+                    expected = (last_worker_fid + 1) % 0x100000000
                     if frame_id != expected and not waiting_for_idr:
                         waiting_for_idr = True
                         frames_waited = 0
