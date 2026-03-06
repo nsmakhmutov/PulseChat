@@ -737,6 +737,19 @@ class ConnectingScreen(QWidget):
             self.btn_change_ip.show()
 
     def _open_main_window(self):
+        # ── NVENC monkey-patch ────────────────────────────────────────────────
+        # Должен вызываться ОДИН РАЗ до создания первого RTCPeerConnection.
+        # Вызов именно здесь гарантирует:
+        #   1. GPU/драйвер уже инициализированы (мы прошли загрузку ОС).
+        #   2. aiortc ещё не создавал ни одного H264Encoder.
+        #   3. DLL (opus.dll, rnnoise.dll, ffmpeg) уже добавлены через add_dll_directory().
+        # При отсутствии h264_nvenc функция тихо падает на libx264 (без исключения).
+        try:
+            from video_engine import patch_aiortc_nvenc
+            patch_aiortc_nvenc()
+        except Exception as e:
+            print(f"[Main] patch_aiortc_nvenc() error (non-fatal): {e}")
+
         self._main_window = MainWindow(self.ip, self.nick, self.avatar)
         self._main_window.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
         self._main_window.show()

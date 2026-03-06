@@ -1,13 +1,18 @@
+import asyncio
 import threading
 import queue
 import math
 from collections import deque
+from typing import Callable
 import numpy as np
 import sounddevice as sd
 import opuslib
 import heapq
 import struct
 import time
+
+import av
+from aiortc import AudioStreamTrack
 # ── Встроенная замена scipy.signal (butter / sosfilt / sosfilt_zi) ─────────────
 # Причина: scipy.signal при импорте транзитивно подтягивает scipy.stats, которая
 # содержит exec()-генерацию в _distn_infrastructure.py. В замороженном exe
@@ -169,15 +174,16 @@ class StreamAudioCapture:
         capture.stop()                # после остановки стрима
     """
 
-    def __init__(self, send_queue, uid_getter):
-        self.send_queue = send_queue
-        self.get_uid = uid_getter
+    def __init__(self, pcm_callback: "Callable[[np.ndarray], None] | None" = None):
+        """
+        pcm_callback(chunk: np.ndarray) — вызывается для каждого 20-мс PCM-фрейма
+        (float32, моно, CHUNK_SIZE сэмплов). Используется SystemAudioTrack для
+        подачи фреймов в WebRTC вместо кодирования Opus + UDP-отправки.
+        Если None — фреймы молча дропаются (захват работает, но данные никуда не идут).
+        """
+        self._pcm_callback = pcm_callback
         self._running = threading.Event()
         self._thread = None
-        self.encoder = opuslib.Encoder(SAMPLE_RATE, CHANNELS, OPUS_APPLICATION)
-        self.encoder.bitrate = DEFAULT_BITRATE
-        self.encoder.complexity = 5
-        self._sequence = 0
         self._native_sr: int = SAMPLE_RATE
 
         # Промежуточный буфер для сборки точных 20ms фреймов (CHUNK_SIZE).
@@ -596,10 +602,6 @@ class StreamAudioCapture:
         if not self._running.is_set():
             return
 
-        uid = self.get_uid()
-        if uid == 0:
-            return
-
         # ── Локальный мониторинг VB-CABLE ──────────────────────────────────────
         # Сырой фрейм (до любой обработки) кладём в очередь мониторинга.
         # Параллельный sd.OutputStream в _try_vbcable читает её и воспроизводит
@@ -640,28 +642,213 @@ class StreamAudioCapture:
                 self._pcm_buf[self._pcm_len:self._pcm_len + incoming] = mono
                 self._pcm_len += incoming
 
-                # Откусываем строго по CHUNK_SIZE (960 семплов = 20мс) и отправляем
+                # Откусываем строго по CHUNK_SIZE (960 семплов = 20мс) и передаём
                 while self._pcm_len >= CHUNK_SIZE:
                     chunk = self._pcm_buf[:CHUNK_SIZE].copy()
                     # Сдвигаем остаток влево (numpy делает это на C-уровне)
                     self._pcm_len -= CHUNK_SIZE
                     self._pcm_buf[:self._pcm_len] = self._pcm_buf[CHUNK_SIZE:CHUNK_SIZE + self._pcm_len]
 
-                    # ── Отправляем чанк зрителям ───────────────────────────
-                    # VB-CABLE физически не содержит голосов зрителей →
-                    # AEC не нужен, эхо невозможно как явление.
-                    pcm = (chunk * 32767).astype(np.int16).tobytes()
-                    encoded = self.encoder.encode(pcm, CHUNK_SIZE)
+                    # ── Передаём чанк через callback (WebRTC путь) ──────────────
+                    # pcm_callback принимает float32 моно фрейм (CHUNK_SIZE сэмплов).
+                    # SystemAudioTrack кладёт фрейм в asyncio.Queue → recv() →
+                    # av.AudioFrame → WebRTC RTP поток к зрителям.
+                    if self._pcm_callback is not None:
+                        try:
+                            self._pcm_callback(chunk)
+                        except Exception:
+                            pass
 
-                    self._sequence += 1
-                    flags = FLAG_STREAM_AUDIO | FLAG_LOOPBACK_AUDIO
-                    # Используем прекомпилированный struct вместо struct.pack('!IdIB', ...)
-                    packet = UDP_HEADER_STRUCT.pack(uid, time.time(), self._sequence, flags) + encoded
-                    self.send_queue.put_nowait(packet)
-
-        except Exception as e:
+        except Exception:
             pass
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  WebRTC Audio Tracks (Шаг 3 миграции)
+#  Используются только для WebRTC-стрима. Голосовой чат комнаты (AudioHandler)
+#  работает независимо через opuslib + UDP — без каких-либо изменений.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class MicrophoneTrack(AudioStreamTrack):
+    """
+    Захват микрофона через sounddevice → WebRTC AudioStreamTrack.
+
+    Используется стримером для передачи голоса зрителям через WebRTC SFU.
+    НЕ заменяет AudioHandler.audio_callback() — голосовой чат комнаты
+    (opuslib + VAD + JitterBuffer) работает параллельно и независимо.
+
+    WebRTC DTX (Discontinuous Transmission) управляет тишиной вместо VAD:
+    при молчании кодек автоматически снижает поток → дополнительный VAD-гейт
+    здесь избыточен и только добавил бы задержку старта речи.
+
+    Ленивая инициализация: asyncio.Queue и захват-поток создаются при первом
+    вызове recv() из WebRTC asyncio-цикла. Это гарантирует, что loop-ссылка
+    получена в правильном контексте без явной передачи в конструктор.
+
+    Формат: s16, 48 000 Гц, моно, CHUNK_SIZE=960 сэмплов (20 мс).
+    """
+
+    kind = "audio"
+
+    def __init__(self, device_name: str = None):
+        super().__init__()
+        self._device    = device_name
+        self._running   = True
+        # Инициализируются лениво при первом recv():
+        self._queue:  "asyncio.Queue | None" = None
+        self._loop:   "asyncio.AbstractEventLoop | None" = None
+        self._thread: "threading.Thread | None" = None
+
+    # ── Поток захвата ─────────────────────────────────────────────────────────
+
+    def _capture_loop(self) -> None:
+        """Синхронный поток sounddevice; данные отправляются в asyncio.Queue."""
+
+        def _cb(indata: np.ndarray, frames: int, time_info, status) -> None:
+            if not self._running or self._loop is None or self._queue is None:
+                return
+            # indata: (CHUNK_SIZE, 1), dtype=int16
+            # run_coroutine_threadsafe — единственный thread-safe способ положить
+            # данные из PortAudio-потока в asyncio.Queue WebRTC-цикла.
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self._queue.put(indata.copy()), self._loop
+                )
+            except Exception:
+                pass
+
+        try:
+            with sd.InputStream(
+                device=self._device,
+                samplerate=SAMPLE_RATE,
+                channels=CHANNELS,   # 1 (моно)
+                dtype='int16',
+                blocksize=CHUNK_SIZE,
+                callback=_cb,
+            ):
+                while self._running:
+                    time.sleep(0.05)
+        except Exception as e:
+            print(f"[MicrophoneTrack] Ошибка захвата микрофона: {e}")
+
+    # ── aiortc интерфейс ──────────────────────────────────────────────────────
+
+    async def recv(self) -> av.AudioFrame:
+        # Ленивая инициализация при первом вызове из WebRTC asyncio-цикла.
+        if self._queue is None:
+            self._loop   = asyncio.get_event_loop()
+            self._queue  = asyncio.Queue(maxsize=10)
+            self._thread = threading.Thread(
+                target=self._capture_loop,
+                daemon=True,
+                name="webrtc-mic-capture",
+            )
+            self._thread.start()
+
+        data = await self._queue.get()  # (CHUNK_SIZE, 1) int16
+
+        # av.AudioFrame.from_ndarray ожидает shape (channels, samples).
+        frame = av.AudioFrame.from_ndarray(
+            data.T,      # (1, CHUNK_SIZE)
+            format='s16',
+            layout='mono',
+        )
+        frame.sample_rate = SAMPLE_RATE
+        pts, time_base = await self.next_timestamp()
+        frame.pts       = pts
+        frame.time_base = time_base
+        return frame
+
+    def stop(self) -> None:
+        """Останавливает захват микрофона. Вызывать при завершении стрима."""
+        self._running = False
+
+
+class SystemAudioTrack(AudioStreamTrack):
+    """
+    Захват системного звука (WASAPI Loopback / VB-CABLE) → WebRTC.
+
+    Используется стримером для передачи игрового звука зрителям через WebRTC SFU.
+
+    Повторно использует всю логику захвата из StreamAudioCapture без дублирования:
+      VB-CABLE (приоритет) → pyaudiowpatch WASAPI Loopback → sounddevice loopback.
+    Разница: вместо Opus-encode + UDP-отправки StreamAudioCapture вызывает
+    pcm_callback(chunk: float32 mono), а SystemAudioTrack кладёт chunk в asyncio.Queue.
+
+    Локальный мониторинг VB-CABLE (стример слышит игру в наушниках) полностью
+    сохранён — он живёт внутри StreamAudioCapture и не затрагивает WebRTC.
+
+    Ленивая инициализация: захват стартует при первом recv() из WebRTC asyncio-цикла.
+    Формат вывода: s16, 48 000 Гц, моно, CHUNK_SIZE=960 сэмплов (20 мс).
+    """
+
+    kind = "audio"
+
+    def __init__(self, device_idx: int = None):
+        super().__init__()
+        self._device_idx = device_idx
+        self._running    = True
+        # Инициализируются лениво при первом recv():
+        self._queue:   "asyncio.Queue | None"             = None
+        self._loop:    "asyncio.AbstractEventLoop | None" = None
+        self._capture: "StreamAudioCapture | None"        = None
+
+    # ── PCM callback из StreamAudioCapture ───────────────────────────────────
+
+    def _on_pcm_chunk(self, chunk: np.ndarray) -> None:
+        """
+        Вызывается StreamAudioCapture на каждый готовый 20-мс float32-фрейм.
+        Отправляет данные в asyncio.Queue WebRTC-цикла через thread-safe вызов.
+        chunk уже является копией (сделан в _audio_cb) — повторное копирование
+        не требуется.
+        """
+        if not self._running or self._loop is None or self._queue is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._queue.put(chunk), self._loop,
+            )
+        except Exception:
+            pass
+
+    # ── aiortc интерфейс ──────────────────────────────────────────────────────
+
+    async def recv(self) -> av.AudioFrame:
+        # Ленивая инициализация при первом вызове из WebRTC asyncio-цикла.
+        if self._queue is None:
+            self._loop    = asyncio.get_event_loop()
+            self._queue   = asyncio.Queue(maxsize=10)
+            self._capture = StreamAudioCapture(pcm_callback=self._on_pcm_chunk)
+            self._capture.start(self._device_idx)
+            print("[SystemAudioTrack] Захват системного звука запущен")
+
+        data = await self._queue.get()  # float32 mono (CHUNK_SIZE,)
+
+        # float32 [-1.0, 1.0] → int16 для av.AudioFrame.
+        # np.clip inline — защита от пиков (WASAPI иногда выдаёт > 1.0).
+        pcm_int16 = (np.clip(data, -1.0, 1.0) * 32767).astype(np.int16)
+
+        frame = av.AudioFrame.from_ndarray(
+            pcm_int16.reshape(1, -1),   # (channels=1, samples=CHUNK_SIZE)
+            format='s16',
+            layout='mono',
+        )
+        frame.sample_rate = SAMPLE_RATE
+        pts, time_base = await self.next_timestamp()
+        frame.pts       = pts
+        frame.time_base = time_base
+        return frame
+
+    def stop(self) -> None:
+        """Останавливает захват системного звука. Вызывать при завершении стрима."""
+        self._running = False
+        if self._capture is not None:
+            self._capture.stop()
+            self._capture = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 class JitterBuffer:
     def __init__(self, target_delay=4):
@@ -826,25 +1013,15 @@ class AudioHandler(QObject):
                 print(f"[Audio] Ошибка RNNoise: {e}")
 
         self.incoming_packets = queue.Queue(maxsize=500)
-        self.incoming_stream_packets = queue.Queue(maxsize=500)
         self.send_queue = queue.Queue(maxsize=100)
 
-        # --- Стрим-аудио ---
-        # uid → RemoteUser  (зрительская сторона: стримеры из других комнат)
-        self.stream_remote_users = {}
-        # КРИТИЧНО: отдельный лок для stream_remote_users, чтобы не блокировать
-        # audio_callback (high-priority поток) ожиданием _stream_packet_processor_loop
-        self.stream_users_lock = threading.Lock()
-        # Громкость стрима (0.0 - 2.0), регулируется зрителем из оверлея
-        self.stream_volume = 1.0
-        # FIX #5: threading.Event вместо простого bool.
-        # bool-присваивание GIL-атомарно, но Event явно выражает намерение и
-        # согласуется со стилем _is_muted / _is_deafened в этом же классе.
-        self._stream_audio_sending = threading.Event()
-        # AEC удалён: при использовании VB-CABLE (CABLE Output) эхо физически
-        # невозможно — голоса зрителей никогда не попадают в CABLE Output.
-        # Захват системного аудио
-        self.stream_audio_capture = StreamAudioCapture(self.send_queue, lambda: self.my_uid)
+        # --- Стрим-аудио (WebRTC) ---
+        # Воспроизведение стрим-аудио на стороне зрителя теперь обрабатывается
+        # через WebRTC (RTCPeerConnection + AudioStreamTrack).
+        # Следующие атрибуты удалены: incoming_stream_packets, stream_remote_users,
+        # stream_users_lock, _audio_stream_users_snapshot, _stream_pkt_thread,
+        # _sv_sequence, _lb_play_counter, _stream_audio_sending.
+        # Громкость стрима для зрителя (0.0–2.0) — управляется через оверлей VideoWindow.
         self._is_running = threading.Event()
         self._is_muted = threading.Event()
         self._is_deafened = threading.Event()
@@ -898,12 +1075,8 @@ class AudioHandler(QObject):
         # Флаг для start_whisper() — sender-side legacy (сбрасывает _wlp_zi отправителя)
         # На стороне получателя не используется (заменён ленивым созданием per-uid state).
         self._whisper_effect_reset: bool = False
-        # Отдельный счётчик для FLAG_STREAM_VOICES пакетов.
-        # Нельзя использовать my_sequence: несколько спикеров в одном audio_callback
-        # получали бы одинаковый seq → JitterBuffer на стороне зрителя отбрасывал
-        # второй и последующие пакеты (seq <= last_seq → return), зрители слышали
-        # только первого спикера. Отдельный монотонный счётчик решает проблему.
-        self._sv_sequence = 0
+        # Отдельный счётчик для FLAG_STREAM_VOICES удалён (WebRTC заменяет UDP стрим-аудио).
+        # _lb_play_counter удалён (нет UDP loopback воспроизведения).
         # FIX #3: deque(maxlen=5) вместо list.
         # vad_pre_buffer.pop(0) на list — O(n): сдвигает все элементы влево.
         # deque.popleft() — O(1), что важно для audio_callback hot path.
@@ -911,16 +1084,10 @@ class AudioHandler(QObject):
         self.vad_pre_buffer = deque(maxlen=5)
         self.was_talking = False
         self.stream = None
-        # Счётчик воспроизведённых loopback-кадров (для периодического лога).
-        # Инициализируем здесь чтобы убрать hasattr() из audio_callback hot path.
-        self._lb_play_counter = 0
         # Ссылки на рабочие потоки — нужны для корректного join() в stop().
         # Без явного join() повторные вызовы start() (переподключение, смена
-        # устройства) накапливают «зомби»-потоки: каждый поток висит в памяти
-        # пока не завершится _is_running.wait(), что может занять до 0.1 сек
-        # после clear(). За 10 переподключений = 20 лишних потоков.
+        # устройства) накапливают «зомби»-потоки.
         self._pkt_thread: threading.Thread | None = None
-        self._stream_pkt_thread: threading.Thread | None = None
 
         # -------------------------------------------------------------------
         # FIX #1: Copy-on-Write снимки для audio_callback.
@@ -939,7 +1106,6 @@ class AudioHandler(QObject):
         #   - RemoteUser.volume / .is_locally_muted — простые примитивы, GIL-safe.
         # -------------------------------------------------------------------
         self._audio_users_snapshot: dict = {}
-        self._audio_stream_users_snapshot: dict = {}
 
     def set_bitrate(self, bitrate_kbps):
         bitrate_bps = int(bitrate_kbps) * 1000
@@ -1009,10 +1175,8 @@ class AudioHandler(QObject):
             self.stream.start()
             print("[DEBUG] AudioHandler.start: stream.start() выполнен", flush=True)
             self._pkt_thread = threading.Thread(target=self._packet_processor_loop, daemon=True)
-            self._stream_pkt_thread = threading.Thread(target=self._stream_packet_processor_loop, daemon=True)
             self._pkt_thread.start()
-            self._stream_pkt_thread.start()
-            print("[DEBUG] AudioHandler.start: рабочие потоки запущены — DONE", flush=True)
+            print("[DEBUG] AudioHandler.start: рабочий поток запущен — DONE", flush=True)
         except Exception as e:
             import traceback
             print(f"[DEBUG] AudioHandler.start: EXCEPTION:\n{traceback.format_exc()}", flush=True)
@@ -1020,13 +1184,12 @@ class AudioHandler(QObject):
 
     def stop(self):
         self._is_running.clear()
-        # Дожидаемся завершения рабочих потоков — иначе повторный start()
+        # Дожидаемся завершения рабочего потока — иначе повторный start()
         # создаст дублирующие потоки (утечка памяти и CPU)
-        for attr in ('_pkt_thread', '_stream_pkt_thread'):
-            t = getattr(self, attr, None)
-            if t is not None and t.is_alive():
-                t.join(timeout=0.5)
-            setattr(self, attr, None)
+        t = getattr(self, '_pkt_thread', None)
+        if t is not None and t.is_alive():
+            t.join(timeout=0.5)
+        self._pkt_thread = None
         if hasattr(self, 'stream') and self.stream:
             try:
                 self.stream.stop()
@@ -1051,15 +1214,7 @@ class AudioHandler(QObject):
 
             # FIX #1: обновляем COW-снимок после удаления пользователей
             self._audio_users_snapshot = dict(self.remote_users)
-
-        # stream_remote_users — под отдельным локом (не блокировать audio_callback)
-        with self.stream_users_lock:
-            for uid in list(self.stream_remote_users.keys()):
-                real_uid = uid - LOOPBACK_UID_OFFSET if uid >= LOOPBACK_UID_OFFSET else uid
-                if real_uid not in active_uids:
-                    del self.stream_remote_users[uid]
-            # FIX #1: обновляем COW-снимок после удаления
-            self._audio_stream_users_snapshot = dict(self.stream_remote_users)
+        # stream_remote_users удалён: стрим-аудио теперь через WebRTC (RTCPeerConnection).
 
     def _packet_processor_loop(self):
         while self._is_running.is_set():
@@ -1093,103 +1248,6 @@ class AudioHandler(QObject):
                     # audio_callback читает снимок без лока, опираясь на GIL-атомарность
                     # присваивания ссылки.
                     self._audio_users_snapshot = dict(self.remote_users)
-
-            except queue.Empty:
-                continue
-            except Exception:
-                pass
-
-    def _stream_packet_processor_loop(self):
-        """
-        Обрабатывает входящие пакеты стрим-аудио (FLAG_STREAM_AUDIO).
-
-        Различает два типа потоков по флагу FLAG_LOOPBACK_AUDIO:
-
-        ① Loopback (системный звук, flags & FLAG_LOOPBACK_AUDIO):
-           • Всегда воспроизводим — это игры, музыка с экрана стримера.
-           • Хранится под ключом uid + LOOPBACK_UID_OFFSET, чтобы не смешиваться
-             с голосовым каналом того же пользователя.
-           • Единственное исключение: свой собственный loopback (uid == my_uid)
-             сервер и так не отсылает обратно стримеру, но фильтруем на всякий случай.
-
-        ② Микрофон стримера (только FLAG_STREAM_AUDIO, без FLAG_LOOPBACK_AUDIO):
-           • uid == my_uid          → отбрасываем (нет эха своего голоса)
-           • uid in remote_users    → отбрасываем (уже слышим в той же комнате — не дублируем)
-           • иначе                  → воспроизводим (стример из другой комнаты)
-        """
-        while self._is_running.is_set():
-            try:
-                packet_data = self.incoming_stream_packets.get(timeout=0.1)
-                uid, seq, data, flags = packet_data
-
-                is_loopback = bool(flags & FLAG_LOOPBACK_AUDIO)
-
-                if is_loopback:
-                    # --- Системный звук (WASAPI Loopback) ---
-                    # Свой loopback сервер не шлёт назад, но фильтруем на всякий случай
-                    if uid == self.my_uid:
-                        continue
-
-                    # ── VAD-ГЕЙТ: запоминаем что loopback этого стримера активен ─────
-                    # Дропать пакеты здесь НЕЛЬЗЯ — это вызывает полную тишину во время речи.
-                    # Вместо этого audio_callback применит duck-множитель (15%) при микшировании.
-                    # Сам факт «зритель говорит» audio_callback читает из self.last_voice_time.
-
-                    storage_uid = uid + LOOPBACK_UID_OFFSET
-                    with self.stream_users_lock:
-                        if storage_uid not in self.stream_remote_users:
-                            self.stream_remote_users[storage_uid] = RemoteUser(storage_uid)
-                            print(f"[AudioHandler] Создан буфер для системного звука (storage_uid={storage_uid})")
-                        user = self.stream_remote_users[storage_uid]
-                        if data:
-                            user.jitter_buffer.add(seq, data)
-                            user.last_packet_time = time.time()
-                        # FIX #1: COW-снимок для audio_callback
-                        self._audio_stream_users_snapshot = dict(self.stream_remote_users)
-                else:
-                    # --- Микрофон стримера ---
-                    if uid == self.my_uid:
-                        continue  # нет эха своего голоса
-
-                    # FIX Bug #2: Ранее пакет отбрасывался, если uid уже есть в remote_users
-                    # (тот же пользователь в той же комнате).  Но зритель СЛЫШИТ голос через
-                    # обычный аудио-микс только пока тот активно говорит (VAD).  Поверх стрима
-                    # стример может транслировать иначе сформированный пакет (другой seq/flags).
-                    # Дублирование предотвращаем, добавляя пакет в stream_remote_users ТОЛЬКО
-                    # если uid НЕТ в remote_users (обычный голосовой поток отсутствует) —
-                    # тогда поведение прежнее.  Если uid уже в remote_users, пакет всё равно
-                    # складываем в stream_remote_users под тем же uid: audio_callback смешивает
-                    # оба источника, а небольшое наложение (< 20 мс) на практике не слышно,
-                    # потому что regular-audio и stream-audio транслируются разными путями
-                    # (разные jitter-буферы) и VAD обычно совпадает.
-                    #
-                    # Простейший корректный вариант без двойного микса: пропускаем пакет
-                    # только если у зрителя уже есть свежий regular-аудио от этого uid
-                    # (т.е. last_packet_time < 0.3 с назад).
-                    with self.users_lock:
-                        reg_user = self.remote_users.get(uid)
-                        recently_received = (
-                            reg_user is not None
-                            and (time.time() - reg_user.last_packet_time) < 1.5
-                            # FIX: увеличено с 0.3с до 1.5с.
-                            # При 0.3с: любая пауза >300мс в речи стримера приводила к тому,
-                            # что stream-mic пакет проскакивал в stream_remote_users и зритель
-                            # в той же комнате слышал голос стримера ДВАЖДЫ (двойной голос).
-                            # 1.5с совпадает с порогом last_packet_time < 1.5 в audio_callback,
-                            # т.е. пока стример «активен» в комнате — stream-mic подавляется.
-                        )
-                    if recently_received:
-                        continue  # уже слышим через обычный аудио-путь — не дублируем
-
-                    with self.stream_users_lock:
-                        if uid not in self.stream_remote_users:
-                            self.stream_remote_users[uid] = RemoteUser(uid)
-                        user = self.stream_remote_users[uid]
-                        if data:
-                            user.jitter_buffer.add(seq, data)
-                            user.last_packet_time = time.time()
-                        # FIX #1: COW-снимок для audio_callback
-                        self._audio_stream_users_snapshot = dict(self.stream_remote_users)
 
             except queue.Empty:
                 continue
@@ -1298,17 +1356,8 @@ class AudioHandler(QObject):
                                 pass
                         self.was_talking = True
                     self.send_queue.put_nowait(packet)
-
-                    # Стрим-аудио: дополнительно посылаем тот же encoded с FLAG_STREAM_AUDIO
-                    # Сервер направит его только зрителям, а не в комнату (нет дублирования)
-                    if self._stream_audio_sending.is_set():
-                        stream_flags = flags | FLAG_STREAM_AUDIO
-                        stream_packet = UDP_HEADER_STRUCT.pack(self.my_uid, curr_time,
-                                                    self.my_sequence, stream_flags) + encoded
-                        try:
-                            self.send_queue.put_nowait(stream_packet)
-                        except:
-                            pass
+                    # Стрим-аудио микрофона теперь передаётся через WebRTC (MicrophoneTrack).
+                    # UDP FLAG_STREAM_AUDIO для микрофона удалён.
 
                 else:
                     # Не говорим (или мут без шёпота) — сбрасываем was_talking,
@@ -1420,60 +1469,11 @@ class AudioHandler(QObject):
                                 self._whisper_states.pop(uid, None)
 
                             self.mix_buffer += s * (user.volume * _speaker_gain)
-
-                            # ── Mix Minus для зрителей (FLAG_STREAM_VOICES) ───────────────
-                            # Стример ретранслирует голос каждого собеседника зрителям
-                            # с пометкой speaker_uid. Зритель на своей стороне отбросит
-                            # пакет, если speaker_uid == его собственный uid (Mix Minus
-                            # без DSP). Это устраняет эхо даже если AEC не справился.
-                            #
-                            # Payload: [speaker_uid: 4 байта big-endian] + [opus-данные].
-                            # Флаги: FLAG_STREAM_AUDIO | FLAG_STREAM_VOICES.
-                            # Сервер маршрутизирует такие пакеты только зрителям стримера.
-                            #
-                            # FIX Bug #2: каждый голос получает свой уникальный seq через
-                            # self._sv_sequence — иначе все спикеры одного кадра имели
-                            # одинаковый seq и JitterBuffer на приёмной стороне отбрасывал
-                            # все пакеты кроме первого (seq <= last_seq → return).
-                            if self._stream_audio_sending.is_set():
-                                try:
-                                    self._sv_sequence += 1
-                                    sv_flags = (FLAG_STREAM_AUDIO | FLAG_STREAM_VOICES)
-                                    # header: uid стримера (отправитель), ts, seq, flags
-                                    sv_header = UDP_HEADER_STRUCT.pack(self.my_uid, curr_time,
-                                                            self._sv_sequence, sv_flags)
-                                    # payload: speaker_uid (чей голос) + opus
-                                    sv_payload = struct.pack('!I', uid) + data
-                                    self.send_queue.put_nowait(sv_header + sv_payload)
-                                except Exception:
-                                    pass
+                            # Mix-Minus (FLAG_STREAM_VOICES) через UDP удалён.
+                            # Голоса участников комнаты для зрителей стрима будут
+                            # реализованы через WebRTC в следующей итерации.
                         except:
                             pass
-
-            # ── Стрим-аудио: игровой звук от стримера (зрительская сторона) ─────────
-            # Микшируем ВНУТРИ deafen-проверки: если зритель нажал «заглушить всё»,
-            # стрим тоже должен замолчать.
-            #
-            # С VB-CABLE: CABLE Output содержит только игровой звук →
-            #   ducking не нужен, AEC не нужен, полная громкость всегда.
-            # С WASAPI Loopback (fallback): AEC применён внутри StreamAudioCapture._audio_cb.
-            sv = self.stream_volume   # float, чтение атомарно (GIL-safe)
-            # FIX #1: читаем COW-снимок БЕЗ лока — аналогично блоку remote_users выше.
-            for s_uid, user in self._audio_stream_users_snapshot.items():
-                if curr_time - user.last_packet_time < 1.5:
-                    data = user.jitter_buffer.get()
-                    if data:
-                        try:
-                            decoded = user.decoder.decode(data, CHUNK_SIZE)
-                            s = np.frombuffer(decoded, dtype=np.int16).astype(np.float32) / 32767.0
-                            self.mix_buffer += s * sv * _speaker_gain
-                            if s_uid >= LOOPBACK_UID_OFFSET:
-                                self._lb_play_counter += 1
-                                if self._lb_play_counter % 100 == 0:
-                                    print(f"[Audio-Output] Стрим-звук воспроизводится "
-                                          f"(громкость: {sv:.2f})")
-                        except Exception as e:
-                            print(f"[Audio-Output] Ошибка декодирования стрим-аудио: {e}")
 
         # FIX: Soft limiter вместо жёсткого clip.
         # Жёсткий clip при пиках > 1.0 (2-3 говорящих + stream audio) создаёт
@@ -1609,42 +1609,6 @@ class AudioHandler(QObject):
         self.whisper_received.emit(uid)
 
         self.add_incoming_packet(uid, seq, data, 0)
-
-    def add_incoming_stream_packet(self, uid, seq, data, flags=0):
-        """Входящий пакет стрим-аудио (FLAG_STREAM_AUDIO) от сервера."""
-        try:
-            self.incoming_stream_packets.put_nowait((uid, seq, data, flags))
-        except:
-            pass
-
-    def set_stream_audio_enabled(self, enabled: bool):
-        """Включить/выключить передачу микрофона и системного звука стримером зрителям."""
-        if enabled:
-            self._stream_audio_sending.set()
-        else:
-            self._stream_audio_sending.clear()
-        self.start_stream_audio() if enabled else self.stop_stream_audio()
-        print(f"[Audio] Stream mic & loopback sending: {'ON' if enabled else 'OFF'}")
-
-    def set_stream_volume(self, volume: float):
-        """
-        Установить громкость стрима для зрителя (0.0–2.0).
-        Вызывается из оверлея VideoWindow.
-        """
-        self.stream_volume = max(0.0, min(2.0, volume))
-        print(f"[Audio] Stream volume set to {self.stream_volume:.2f}")
-
-    def start_stream_audio(self, device_idx=None):
-        """
-        Запустить захват системного аудио (WASAPI Loopback) для трансляции.
-        device_idx — индекс WASAPI output-устройства из list_wasapi_output_devices().
-        Если None — автоматически выбирается дефолтное WASAPI output.
-        """
-        self.stream_audio_capture.start(device_idx)
-
-    def stop_stream_audio(self):
-        """Остановить захват системного аудио."""
-        self.stream_audio_capture.stop()
 
     @property
     def is_muted(self):

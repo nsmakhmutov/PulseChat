@@ -1,44 +1,108 @@
-import socket
-import threading
-import json
-import time
-import queue
-import io
+# network_engine.py — сетевой клиент InPulse (UDP голос + TCP + WebRTC сигнализация)
+#
+# ─── Архитектура после рефакторинга ────────────────────────────────────────────
+#
+#   NetworkClient — монолит: управляет всеми сетевыми соединениями.
+#
+#   НЕИЗМЕННЫЕ КОМПОНЕНТЫ (голос, soundboard, nudge, файлы):
+#     tcp_sock / udp_sock     — существующие сокеты
+#     tcp_listen / process_message  — TCP-приём
+#     udp_sender_loop         — отправка голоса
+#     udp_receive_loop        — приём голоса, whisper, ping (видео УДАЛЕНО)
+#     udp_keepalive_loop      — статус mute/deaf
+#     ping_loop               — EWMA RTT
+#     play_soundboard_file    — soundboard
+#     nudge методы            — nudge система
+#     file_offer методы       — файлы P2P
+#
+#   НОВЫЕ КОМПОНЕНТЫ (WebRTC сигнализация):
+#     _webrtc_loop            — asyncio event loop в daemon-потоке
+#     _streamer_pc            — RTCPeerConnection стримера (если стримит)
+#     _viewer_pc              — RTCPeerConnection зрителя (если смотрит)
+#     _start_webrtc_loop()    — запуск asyncio loop при подключении
+#     start_streaming_webrtc() — создать offer стримера, добавить DXCamTrack
+#     stop_streaming_webrtc()  — закрыть PC стримера
+#     _handle_viewer_offer_coro() — принять offer от SFU, создать answer
+#     send_webrtc_offer/answer/ice — отправить WebRTC signaling через TCP
+#
+# ─── Что УДАЛЕНО по сравнению с предыдущей версией ────────────────────────────
+#
+#   video_pacing_queue          — UDP-pacing для видеочанков
+#   send_video_frame_chunks()   — UDP-отправка видеочанков
+#   send_video_packet()         — compat wrapper
+#   video_pacing_loop()         — leaky bucket (заменён WebRTC)
+#   FLAG_VIDEO ветка в udp_receive_loop — видео теперь через WebRTC
+#   FLAG_STREAM_AUDIO ветка (loopback) — audio loopback через WebRTC
+#   process_message: CMD_ADJUST_BITRATE — WebRTC TWCC управляет битрейтом
+#   process_message: CMD_LQ_NEEDED     — simulcast управляется SFU
+#   process_message: CMD_NACK_RELAY    — NACK через WebRTC RTCP
+#   process_message: request_keyframe  — WebRTC PLI вместо ручного IDR
+#
+# ─── Что СОХРАНЕНО как заглушки (инкрементальная миграция) ────────────────────
+#
+#   send_bitrate_feedback()     — stub (no-op), вызывается из ui_video.py
+#   send_nack()                 — stub (no-op)
+#   request_viewer_keyframe()   — stub (no-op)
+#   send_video_frame_chunks()   — stub (no-op), вызывается из video_engine stubs
+#   bitrate_adjusted сигнал     — сохранён, никогда не эмитируется
+#
+# ───────────────────────────────────────────────────────────────────────────────
+
+import asyncio
 import base64
-import sounddevice as sd
-import soundfile as sf
-import numpy as np
-import struct
+import io
+import json
 import os
 import platform
+import socket
+import struct
+import threading
+import time
 import ctypes
 from collections import deque
 
+import numpy as np
+import sounddevice as sd
+import soundfile as sf
 from PyQt6.QtCore import QObject, pyqtSignal, QSettings
 
 from config import (
     resource_path, DEFAULT_PORT_TCP, DEFAULT_PORT_UDP, BUFFER_SIZE,
-    UDP_HEADER_STRUCT, UDP_HEADER_SIZE, FLAG_VIDEO, FLAG_VIDEO_LQ, FLAG_STREAM_AUDIO, MAX_VIDEO_PAYLOAD,
-    CMD_SOUNDBOARD, FLAG_LOOPBACK_AUDIO, FLAG_STREAM_VOICES,
+    UDP_HEADER_STRUCT, UDP_HEADER_SIZE,
+    CMD_SOUNDBOARD, FLAG_STREAM_VOICES, FLAG_LOOPBACK_AUDIO,
     STREAM_VOICE_HEADER_STRUCT, STREAM_VOICE_HEADER_SIZE,
-    FLAG_WHISPER, VIDEO_BITRATE, LQ_VIDEO_BITRATE,
+    FLAG_WHISPER,
     CMD_NUDGE_VOTE, CMD_PLAY_NUDGE, CMD_NUDGE_TRIGGERED, NUDGE_SOUND_PATH,
-    CMD_BITRATE_FEEDBACK, CMD_ADJUST_BITRATE, ABR_TIERS,
-    CMD_LQ_NEEDED,
-    CMD_NACK, CMD_NACK_RELAY,
+    CMD_FILE_OFFER, CMD_FILE_OFFER_ROOM,
+    CMD_WEBRTC_OFFER, CMD_WEBRTC_ANSWER, CMD_WEBRTC_ICE,
+    WEBRTC_ICE_TIMEOUT,
 )
 
 MAX_SILENT_RECONNECT_ATTEMPTS = 4
-RECONNECT_DELAY = 3.0
+RECONNECT_DELAY               = 3.0
 
 # Устанавливаем точность системного таймера в 1 мс на Windows.
-# Без этого time.sleep(0.001) может спать 10-15мс — аудио глитчи.
+# Без этого time.sleep(0.001) может спать 10-15 мс — аудио глитчи.
 if platform.system() == "Windows":
     try:
         winmm = ctypes.WinDLL('winmm')
         winmm.timeBeginPeriod(1)
     except Exception:
         pass
+
+# ── Опциональный aiortc (для WebRTC PC) ──────────────────────────────────────
+try:
+    from aiortc import (
+        RTCPeerConnection, RTCSessionDescription,
+        RTCConfiguration,
+    )
+    AIORTC_AVAILABLE = True
+except ImportError:
+    AIORTC_AVAILABLE = False
+    RTCPeerConnection = None
+    RTCSessionDescription = None
+    RTCConfiguration = None
+    print("[Net] WARNING: aiortc не установлен — WebRTC функции недоступны")
 
 
 class NetworkClient(QObject):
@@ -50,37 +114,30 @@ class NetworkClient(QObject):
     connection_restored = pyqtSignal()
     reconnect_failed    = pyqtSignal()
 
-    # Эмитит (from_nick) при получении soundboard-пакета от сервера.
-    # MainWindow показывает тост и обновляет желтую метку в открытой панели.
+    # Эмитит (from_nick) при получении soundboard-пакета от сервера
     soundboard_played   = pyqtSignal(str)
 
-    # Сигналы фичи «Пнуть».
-    # nudge_received  — нас пнули (воспроизведение звука уже запущено в потоке).
-    # nudge_triggered — кого-то пнули в комнате (target_nick, voter_nick) → тост у всех.
+    # Сигналы фичи «Пнуть»
     nudge_received  = pyqtSignal()
     nudge_triggered = pyqtSignal(str, str)
 
-    # Сигнал адаптивного битрейта: сервер изменил битрейт стримера.
-    # Эмитируется при получении CMD_ADJUST_BITRATE (только стримером).
-    # MainWindow подключает его к _on_bitrate_adjusted() для отображения
-    # индикатора качества соединения в тулбаре рядом с кнопкой трансляции.
-    bitrate_adjusted = pyqtSignal(int)   # новый битрейт в bps
+    # ABR-сигнал (сохранён для совместимости, не эмитируется после рефакторинга)
+    # ui_main.py подключается к нему — подключение станет no-op до Шага 6.
+    bitrate_adjusted = pyqtSignal(int)
 
-    # Сигнал входящего предложения файловой передачи.
-    # Payload: полный dict из JSON-пакета file_offer / file_offer_room.
-    # Поля: action, filename, filesize, sender_ip, sender_port, token,
-    #        sender_uid (личная) или отсутствует (room-broadcast).
+    # Входящее предложение файловой передачи
     file_offer_received = pyqtSignal(dict)
 
     def __init__(self, audio):
         super().__init__()
         self.audio  = audio
         self.video  = None
+
         self.server_addr  = None
         self.running      = False
         self.current_ping = 0
-        self.packets_sent = 0
-        self.packets_received = 0
+        self.packets_sent      = 0
+        self.packets_received  = 0
 
         self._ip     = None
         self._nick   = None
@@ -90,24 +147,21 @@ class NetworkClient(QObject):
         self._reconnecting       = False
         self._reconnect_attempts = 0
 
-        # UID стримера, которого сейчас смотрит этот клиент (0 = не смотрит).
-        # Устанавливается из MainWindow через start_watching() / stop_watching().
-        # Используется ABR-таймером в VideoWindow для отправки bitrate_feedback.
+        # UID стримера, которого смотрит клиент (0 = не смотрит)
         self._watching_streamer_uid: int = 0
 
-        # Флаг воспроизведения soundboard.
-        # Используется для блокировки спама: новый звук не запустится,
-        # пока текущий ещё играет.
+        # Флаг воспроизведения soundboard (anti-spam)
         self._sb_playing = threading.Event()
 
-        # -------------------------------------------------------------------
-        # Pacing-очередь для видео-пакетов (leaky bucket).
-        # Пакеты кладёт send_video_frame_chunks(), дренирует video_pacing_loop().
-        # maxsize=30: ~500 мс буфера при 60fps.
-        # При перегрузке сети старые КАДРЫ дропаются (лучше дроп, чем накопление
-        # задержки). Было 2000 (~33 сек) — теперь мгновенный дроп при congestion.
-        # -------------------------------------------------------------------
-        self.video_pacing_queue = queue.Queue(maxsize=30)
+        # --- WebRTC ---
+        # asyncio event loop WebRTC (создаётся один раз при первом подключении)
+        self._webrtc_loop: asyncio.AbstractEventLoop | None = None
+
+        # RTCPeerConnection стримера (если текущий клиент стримит)
+        self._streamer_pc = None
+
+        # RTCPeerConnection зрителя (если текущий клиент смотрит)
+        self._viewer_pc   = None
 
         self._init_sockets()
 
@@ -116,9 +170,7 @@ class NetworkClient(QObject):
     # ------------------------------------------------------------------
     def _init_sockets(self):
         # FIX #2: явно закрываем старые сокеты перед созданием новых.
-        # Раньше при каждой неудачной попытке переподключения (_reconnect_loop)
-        # создавались новые socket-объекты, а предыдущие оставались открытыми —
-        # утечка файловых дескрипторов (до 4 при MAX_SILENT_RECONNECT_ATTEMPTS=4).
+        # При каждой неудачной попытке переподключения старые сокеты закрываются.
         for attr in ('tcp_sock', 'udp_sock'):
             old = getattr(self, attr, None)
             if old is not None:
@@ -129,9 +181,7 @@ class NetworkClient(QObject):
         try:
             self.tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            # Отключаем алгоритм Нейгла: мелкие команды (IDR-запрос, adjust_bitrate,
-            # nudge) отправляются немедленно без буферизации до 200 мс.
-            # Критично для ABR: задержка в 200 мс = зритель лишние 200 мс смотрит артефакты.
+            # Отключаем алгоритм Нейгла: мелкие команды отправляются немедленно.
             self.tcp_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.udp_socket_bound = False
@@ -145,39 +195,28 @@ class NetworkClient(QObject):
         """
         Воспроизвести soundboard-файл через sounddevice.
 
-        Два режима:
-        1. Стандартный (data_b64 is None): файл ищется в assets/panel/ по имени.
-        2. Кастомный (data_b64 задан): аудио декодируется из base64 и воспроизводится
-           прямо из памяти (BytesIO). Файл на диске не нужен.
-
-        from_nick: ник отправителя (добавляется сервером). Эмитит soundboard_played
-                   сразу, до фонового воспроизведения — MainWindow покажет тост.
-
-        Защита от спама: новый звук НЕ запускается, пока предыдущий ещё играет.
+        Режим 1 (data_b64=None): файл ищется в assets/panel/ по имени.
+        Режим 2 (data_b64 задан): аудио декодируется из base64 из памяти.
+        Защита от спама: новый звук не запускается пока предыдущий играет.
         """
         try:
-            # Anti-spam: блокируем, пока текущий звук ещё играет
             if self._sb_playing.is_set():
                 print(f"[Net] Soundboard: пропущен {filename!r} — звук ещё играет")
                 return
 
             raw = int(QSettings("MyVoiceChat", "GlobalSettings").value("soundboard_volume", 40)) / 100.0
-            vol = raw ** 2  # квадратичная кривая: (raw/100)^2
+            vol = raw ** 2   # квадратичная кривая громкости
 
-            # Определяем источник аудио: байты из data_b64 или файл на диске
             if data_b64:
-                # Кастомный звук: декодируем base64 → BytesIO
                 try:
-                    audio_bytes = base64.b64decode(data_b64)
+                    audio_bytes  = base64.b64decode(data_b64)
                     audio_source = io.BytesIO(audio_bytes)
                 except Exception as e:
                     print(f"[Net] Soundboard base64 decode error: {e}")
                     return
             else:
-                # Стандартный звук: путь к файлу в assets/panel/
-                # Пропускаем «кастомные» имена без data_b64 (не наш пакет)
                 if filename and filename.startswith("__custom__:"):
-                    print(f"[Net] Soundboard: кастомный звук без data_b64 — пропущен")
+                    print("[Net] Soundboard: кастомный звук без data_b64 — пропущен")
                     return
                 path = resource_path(os.path.join("assets/panel", filename))
                 if not os.path.exists(path):
@@ -185,8 +224,6 @@ class NetworkClient(QObject):
                     return
                 audio_source = path
 
-            # Эмитим сигнал в GUI-потоке ДО запуска фонового воспроизведения.
-            # MainWindow и VideoWindow подпишутся на него для тоста / метки автора.
             if from_nick:
                 self.soundboard_played.emit(from_nick)
 
@@ -201,8 +238,13 @@ class NetworkClient(QObject):
                 finally:
                     self._sb_playing.clear()
 
-            threading.Thread(target=_play, daemon=True, name="soundboard-play").start()
-            print(f"[Net] Playing soundboard: {filename} (vol={vol:.3f}, custom={bool(data_b64)}, by={from_nick!r})")
+            threading.Thread(
+                target=_play, daemon=True, name="soundboard-play"
+            ).start()
+            print(
+                f"[Net] Playing soundboard: {filename} "
+                f"(vol={vol:.3f}, custom={bool(data_b64)}, by={from_nick!r})"
+            )
         except Exception as e:
             print(f"[Net] Soundboard error: {e}")
 
@@ -214,7 +256,7 @@ class NetworkClient(QObject):
         self._nick   = nick
         self._avatar = avatar
         self._reconnect_attempts = 0
-        self._reconnecting = False
+        self._reconnecting       = False
         threading.Thread(target=self._connect_initial, daemon=True).start()
 
     def _connect_initial(self):
@@ -222,7 +264,7 @@ class NetworkClient(QObject):
             self._do_connect()
         except Exception as e:
             print(f"[Net] Initial connection failed: {e}")
-            self._reconnecting = True
+            self._reconnecting       = True
             self._reconnect_attempts = 0
             self.connection_lost.emit()
             self._reconnect_loop()
@@ -244,27 +286,13 @@ class NetworkClient(QObject):
                 print(f"[Net] CRITICAL: UDP bind failed: {e}")
                 raise
 
-        # Буферы клиентского UDP-сокета — оптимизированы под low-latency режим.
-        #
-        # Проблема 8MB буферов (старый код):
-        #   При 6 Mbps стриме pacing отправляет ~750 KB/s. Если RadminVPN временно
-        #   не успевает дренировать (VPN-шифрование, CPU spike), 8 MB SO_SNDBUF
-        #   заполняется, ping-пакеты (отдельный sendto() из ping_loop) встают в
-        #   хвост очереди позади видео → измеренный RTT = 1000-3000 мс.
-        #   Ложный 3000 мс пинг → ABR роняет битрейт до 800 kbps → "спираль смерти".
-        #
-        # Решение 512 KB SO_SNDBUF (клиент):
-        #   С pacing по 2642 байта каждые ~2.78 мс (~950 KB/s) и drain-скоростью
-        #   RadminVPN >> 950 KB/s, SO_SNDBUF в steady-state практически пустой.
-        #   512 KB — запас на случай временного торможения RadminVPN (~540 мс),
-        #   не позволяя очереди вырасти до "часов".
-        #
-        # SO_RCVBUF 512 KB (клиент): получаем лишь pong + управляющие пакеты,
-        #   8 MB там было избыточным в 16000 раз.
+        # UDP буферы: 512 KB (low-latency режим).
+        # 8 MB SO_SNDBUF порождали ложный 3000 мс пинг из-за backpressure:
+        # при полном буфере ping-пакеты вставали в хвост позади голоса.
         try:
             self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 512 * 1024)
             self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 512 * 1024)
-            print("[Net] UDP buffers set to low-latency mode (512 KB recv / 512 KB send)")
+            print("[Net] UDP buffers: 512 KB (low-latency mode)")
         except Exception:
             pass
 
@@ -272,14 +300,57 @@ class NetworkClient(QObject):
         self.running       = True
         self._is_connected = True
 
-        threading.Thread(target=self.tcp_listen,          daemon=True).start()
-        threading.Thread(target=self.udp_sender_loop,     daemon=True).start()
-        threading.Thread(target=self.udp_keepalive_loop,  daemon=True).start()
-        threading.Thread(target=self.udp_receive_loop,    daemon=True).start()
-        threading.Thread(target=self.ping_loop,           daemon=True).start()
-        threading.Thread(target=self.video_pacing_loop,   daemon=True).start()
+        threading.Thread(target=self.tcp_listen,         daemon=True).start()
+        threading.Thread(target=self.udp_sender_loop,    daemon=True).start()
+        threading.Thread(target=self.udp_keepalive_loop, daemon=True).start()
+        threading.Thread(target=self.udp_receive_loop,   daemon=True).start()
+        threading.Thread(target=self.ping_loop,          daemon=True).start()
+
+        # Запускаем WebRTC asyncio loop (один раз при первом подключении)
+        self._start_webrtc_loop()
 
         print("[Net] Connected to server")
+
+    # ------------------------------------------------------------------
+    # WebRTC asyncio loop
+    # ------------------------------------------------------------------
+    def _start_webrtc_loop(self) -> None:
+        """
+        Запускает asyncio event loop для WebRTC в daemon-потоке.
+
+        Вызывается из _do_connect() при каждом (пере)подключении.
+        Если loop уже запущен и не закрыт — ничего не делает.
+        Один loop на всё время жизни процесса: переподключение к серверу
+        не требует пересоздания loop (WebRTC PC создаются/закрываются внутри).
+        """
+        if self._webrtc_loop is not None and not self._webrtc_loop.is_closed():
+            return   # уже работает
+
+        self._webrtc_loop = asyncio.new_event_loop()
+
+        # Сообщаем VideoEngine loop чтобы DXCamTrack и VideoReceiver
+        # могли использовать правильный asyncio loop
+        if self.video is not None:
+            self.video.set_webrtc_loop(self._webrtc_loop)
+
+        t = threading.Thread(
+            target=self._webrtc_loop.run_forever,
+            daemon=True,
+            name="webrtc-asyncio",
+        )
+        t.start()
+        print("[Net] WebRTC asyncio loop запущен")
+
+    def _run_in_webrtc_loop(self, coro):
+        """
+        Отправляет корутину в WebRTC asyncio loop из threading-контекста.
+        Безопасно вызывать из любого потока.
+        Возвращает concurrent.futures.Future или None если loop не готов.
+        """
+        if self._webrtc_loop is None or self._webrtc_loop.is_closed():
+            print("[Net] WebRTC loop не готов — команда проигнорирована")
+            return None
+        return asyncio.run_coroutine_threadsafe(coro, self._webrtc_loop)
 
     # ------------------------------------------------------------------
     # Переподключение
@@ -299,7 +370,10 @@ class NetworkClient(QObject):
     def _reconnect_loop(self):
         while self._reconnect_attempts < MAX_SILENT_RECONNECT_ATTEMPTS:
             self._reconnect_attempts += 1
-            print(f"[Net] Reconnect attempt {self._reconnect_attempts}/{MAX_SILENT_RECONNECT_ATTEMPTS}...")
+            print(
+                f"[Net] Reconnect attempt "
+                f"{self._reconnect_attempts}/{MAX_SILENT_RECONNECT_ATTEMPTS}..."
+            )
             time.sleep(RECONNECT_DELAY)
             try:
                 self._init_sockets()
@@ -312,7 +386,7 @@ class NetworkClient(QObject):
             except Exception as e:
                 print(f"[Net] Reconnect attempt {self._reconnect_attempts} failed: {e}")
 
-        print("[Net] All reconnect attempts failed. Notifying user.")
+        print("[Net] All reconnect attempts failed.")
         self._reconnecting = False
         self.reconnect_failed.emit()
 
@@ -330,179 +404,309 @@ class NetworkClient(QObject):
         threading.Thread(target=self._reconnect_loop, daemon=True).start()
 
     # ------------------------------------------------------------------
-    # Видео — пакеты кладём в pacing-очередь.
-    # Реальная отправка происходит в video_pacing_loop() с ограничением
-    # скорости, чтобы избежать burst'ов, которые перегружают Radmin VPN
-    # и роняют пинг на каналах с RTT 40-50 мс.
+    # Стриминг — WebRTC
     # ------------------------------------------------------------------
-    def send_video_frame_chunks(self, chunks: list, flags: int = FLAG_VIDEO):
+    def start_streaming_webrtc(self, settings: dict | None = None) -> None:
         """
-        FIX OPT-3: Принимаем ВСЕ чанки одного кадра одним вызовом.
+        Запускает WebRTC-стрим.
 
-        Добавляем UDP-заголовок к каждому чанку и кладём весь кадр
-        как единицу в pacing-очередь. При переполнении очереди дропается
-        ЦЕЛЫЙ старый кадр (список чанков), а не один случайный чанк.
+        Порядок операций:
+        1. Создаёт DXCamTrack через VideoEngine.start_streaming(settings).
+        2. Создаёт RTCPeerConnection и добавляет трек.
+        3. Создаёт WebRTC offer.
+        4. Отправляет offer серверу через TCP (CMD_WEBRTC_OFFER, role="streamer").
+        5. Сервер создаёт PC на своей стороне, отвечает CMD_WEBRTC_ANSWER.
+        6. process_message принимает answer → _handle_streamer_answer_coro.
 
-        Дроп одного чанка делает весь кадр H.264 недекодируемым
-        (P-фреймы теряют референс) → артефакты до следующего IDR.
-        Дроп целого кадра — декодер просто пропускает момент, без артефактов.
-
-        flags: UDP-флаги пакета. FLAG_VIDEO для HQ, FLAG_VIDEO|FLAG_VIDEO_LQ для LQ.
+        Должен вызываться после CMD_STREAM_START (чтобы сервер знал о стриме).
         """
-        if not self.server_addr or self.audio.my_uid == 0:
+        if not AIORTC_AVAILABLE:
+            print("[Net] start_streaming_webrtc: aiortc не установлен")
+            return
+        if self.video is None:
+            print("[Net] start_streaming_webrtc: VideoEngine не установлен")
+            return
+        if self._webrtc_loop is None:
+            print("[Net] start_streaming_webrtc: WebRTC loop не запущен")
             return
 
-        ts = time.time()
-        uid = self.audio.my_uid
-        # Добавляем UDP-заголовок с нужными флагами к каждому чанку
-        header = UDP_HEADER_STRUCT.pack(uid, ts, 0, flags)
-        packets = [header + chunk for chunk in chunks]
+        # Запускаем захват экрана через VideoEngine (создаёт DXCamTrack)
+        if not self.video.start_streaming(settings):
+            print("[Net] start_streaming_webrtc: VideoEngine.start_streaming() вернул False")
+            return
 
-        # Дропаем ЦЕЛЫЙ старый кадр если очередь переполнена
-        if self.video_pacing_queue.full():
+        self._run_in_webrtc_loop(self._start_streaming_coro())
+
+    async def _start_streaming_coro(self) -> None:
+        """
+        Корутина создания WebRTC PC стримера.
+
+        Закрывает старый PC если был (переподключение без перезапуска).
+        Добавляет DXCamTrack из VideoEngine.
+        Создаёт offer → ждёт ICE gathering → отправляет серверу.
+        """
+        if self._streamer_pc is not None:
             try:
-                self.video_pacing_queue.get_nowait()   # убираем один старый кадр
-            except queue.Empty:
+                await self._streamer_pc.close()
+            except Exception:
                 pass
+
+        cfg = RTCConfiguration(iceServers=[])
+        pc  = RTCPeerConnection(cfg)
+        self._streamer_pc = pc
+
+        # Добавляем видеотрек (DXCamTrack)
+        dxcam_track = self.video.get_dxcam_track() if self.video else None
+        if dxcam_track is None:
+            print("[Net] _start_streaming_coro: DXCamTrack недоступен")
+            return
+
+        pc.addTrack(dxcam_track)
+
+        @pc.on("icecandidate")
+        def on_ice(candidate):
+            if candidate:
+                self.send_json({
+                    'action': CMD_WEBRTC_ICE,
+                    'role':   'streamer',
+                    'candidate': {
+                        'sdpMid':        candidate.sdpMid,
+                        'sdpMLineIndex': candidate.sdpMLineIndex,
+                        'candidate':     candidate.candidate,
+                    },
+                })
+
+        @pc.on("connectionstatechange")
+        async def on_state():
+            state = pc.connectionState
+            print(f"[Net] Стример PC state → {state}")
+            if state in ("failed", "disconnected"):
+                print("[Net] Стример PC потерян — WebRTC отключился")
+
         try:
-            self.video_pacing_queue.put_nowait(packets)
-        except queue.Full:
+            offer = await pc.createOffer()
+            await pc.setLocalDescription(offer)
+
+            # Ждём ICE gathering (host-only = быстро, ~50 мс)
+            await self._wait_ice_gathering(pc)
+
+            self.send_json({
+                'action': CMD_WEBRTC_OFFER,
+                'role':   'streamer',
+                'sdp':    pc.localDescription.sdp,
+                'type':   pc.localDescription.type,
+            })
+            print("[Net] WebRTC offer отправлен серверу (стример)")
+
+        except Exception as e:
+            print(f"[Net] _start_streaming_coro error: {e}")
+            self._streamer_pc = None
+
+    async def _handle_streamer_answer_coro(self, sdp: str, sdp_type: str) -> None:
+        """
+        Принимает WebRTC answer от сервера (ответ на наш offer стримера).
+        Завершает ICE negotiation на стороне стримера.
+        """
+        if self._streamer_pc is None:
+            print("[Net] _handle_streamer_answer: нет активного streamer PC")
+            return
+        try:
+            await self._streamer_pc.setRemoteDescription(
+                RTCSessionDescription(sdp=sdp, type=sdp_type)
+            )
+            print("[Net] Streamer PC: WebRTC answer принят, ICE завершается")
+        except Exception as e:
+            print(f"[Net] _handle_streamer_answer error: {e}")
+
+    def stop_streaming_webrtc(self) -> None:
+        """
+        Останавливает WebRTC-стрим.
+        Закрывает PC стримера и останавливает DXCamTrack.
+        Должен вызываться вместе с (или после) CMD_STREAM_STOP.
+        """
+        if self._streamer_pc is not None:
+            self._run_in_webrtc_loop(self._close_pc_coro(self._streamer_pc))
+            self._streamer_pc = None
+
+        if self.video:
+            self.video.stop_streaming()
+
+    # ------------------------------------------------------------------
+    # Просмотр стрима — WebRTC
+    # ------------------------------------------------------------------
+    def start_watching(self, streamer_uid: int):
+        """
+        Регистрируем начало просмотра стрима.
+
+        Отправляет TCP stream_watch_start.
+        Сервер создаёт viewer PC через WebRTCSFU и присылает WebRTC offer.
+        Offer обрабатывается в process_message → _handle_viewer_offer_coro.
+        """
+        self._watching_streamer_uid = streamer_uid
+        self.send_json({
+            'action':      'stream_watch_start',
+            'streamer_uid': streamer_uid,
+        })
+        print(f"[Net] start_watching → streamer_uid={streamer_uid}")
+
+    def stop_watching(self):
+        """
+        Регистрируем конец просмотра стрима.
+        Закрывает viewer PC и отправляет stream_watch_stop серверу.
+        """
+        streamer_uid = self._watching_streamer_uid
+        self._watching_streamer_uid = 0
+
+        # Закрываем viewer PC
+        if self._viewer_pc is not None:
+            self._run_in_webrtc_loop(self._close_pc_coro(self._viewer_pc))
+            self._viewer_pc = None
+
+        if streamer_uid:
+            self.send_json({
+                'action':      'stream_watch_stop',
+                'streamer_uid': streamer_uid,
+            })
+
+        # Останавливаем VideoReceiver для этого стримера
+        if self.video and streamer_uid:
+            self.video.stop_viewer_for_uid(streamer_uid)
+
+    async def _handle_viewer_offer_coro(
+        self, streamer_uid: int, sdp: str, sdp_type: str
+    ) -> None:
+        """
+        Принимает WebRTC offer от сервера (SFU создал PC со треками стримера).
+
+        1. Закрывает старый viewer PC (если был).
+        2. Создаёт новый RTCPeerConnection.
+        3. on("track") → VideoEngine.add_receiver(streamer_uid, track).
+        4. setRemoteDescription(offer) → createAnswer → setLocalDescription.
+        5. Ждёт ICE gathering → отправляет answer серверу.
+        """
+        # Закрываем старый PC зрителя
+        if self._viewer_pc is not None:
+            try:
+                await self._viewer_pc.close()
+            except Exception:
+                pass
+
+        cfg = RTCConfiguration(iceServers=[])
+        pc  = RTCPeerConnection(cfg)
+        self._viewer_pc = pc
+
+        @pc.on("track")
+        def on_track(track):
+            print(
+                f"[Net] Viewer PC: получен трек kind={track.kind} "
+                f"от стримера uid={streamer_uid}"
+            )
+            if track.kind == "video" and self.video:
+                self.video.add_receiver(streamer_uid, track)
+
+        @pc.on("icecandidate")
+        def on_ice(candidate):
+            if candidate:
+                self.send_json({
+                    'action': CMD_WEBRTC_ICE,
+                    'role':   'viewer',
+                    'candidate': {
+                        'sdpMid':        candidate.sdpMid,
+                        'sdpMLineIndex': candidate.sdpMLineIndex,
+                        'candidate':     candidate.candidate,
+                    },
+                })
+
+        @pc.on("connectionstatechange")
+        async def on_state():
+            state = pc.connectionState
+            print(f"[Net] Viewer PC state → {state}")
+            if state in ("failed", "disconnected"):
+                print(f"[Net] Viewer PC для uid={streamer_uid} потерян")
+
+        try:
+            await pc.setRemoteDescription(
+                RTCSessionDescription(sdp=sdp, type=sdp_type)
+            )
+            answer = await pc.createAnswer()
+            await pc.setLocalDescription(answer)
+
+            await self._wait_ice_gathering(pc)
+
+            self.send_json({
+                'action': CMD_WEBRTC_ANSWER,
+                'sdp':    pc.localDescription.sdp,
+                'type':   pc.localDescription.type,
+            })
+            print(f"[Net] WebRTC answer отправлен серверу (зритель uid={streamer_uid})")
+
+        except Exception as e:
+            print(f"[Net] _handle_viewer_offer_coro error: {e}")
+            if self._viewer_pc is pc:
+                self._viewer_pc = None
+
+    async def _handle_ice_candidate_coro(
+        self, role: str, candidate_dict: dict
+    ) -> None:
+        """
+        Добавляет входящий ICE-кандидат к нужному PC.
+        role="streamer" → _streamer_pc
+        role="viewer"   → _viewer_pc
+        """
+        pc = self._streamer_pc if role == "streamer" else self._viewer_pc
+        if pc is None:
+            return
+        try:
+            from aiortc import RTCIceCandidate
+            cand = RTCIceCandidate(
+                sdpMid=candidate_dict.get('sdpMid'),
+                sdpMLineIndex=candidate_dict.get('sdpMLineIndex'),
+                candidate=candidate_dict.get('candidate'),
+            )
+            await pc.addIceCandidate(cand)
+        except Exception as e:
+            print(f"[Net] addIceCandidate ({role}): {e}")
+
+    @staticmethod
+    async def _close_pc_coro(pc) -> None:
+        """Закрывает RTCPeerConnection в asyncio-контексте."""
+        try:
+            await pc.close()
+        except Exception:
             pass
 
-    # Оставляем для обратной совместимости (вдруг вызывается из другого места)
-    def send_video_packet(self, payload):
-        self.send_video_frame_chunks([payload])
-
-    # ------------------------------------------------------------------
-    # Leaky bucket pacing для видео-пакетов.
-    #
-    # Проблема (до pacing):
-    #   _fragment_and_send() отправлял 100-300 UDP-пакетов за <1 мс в одном
-    #   burst'е (особенно IDR-кадры). На 10ms-канале (RadminVPN) это проходит,
-    #   на 40-50ms-канале очередь отправки ядра переполняется → ВСЕ UDP пакеты
-    #   (включая ping) встают в очередь → ping улетает до 5000 мс.
-    #
-    # Решение (leaky bucket):
-    #   Пакеты отправляются с постоянным интервалом ~1.4 мс, не превышая
-    #   VIDEO_PACING_RATE_BYTES_SEC. Burst'ы невозможны.
-    #
-    # Точность на Windows:
-    #   timeBeginPeriod(1) уже вызван в этом файле → time.sleep() имеет
-    #   разрешение ~1 мс. Для sub-millisecond интервалов используем
-    #   perf_counter busy-wait с порогом 0.5 мс.
-    # ------------------------------------------------------------------
-    def video_pacing_loop(self):
-        # Поднимаем приоритет этого потока выше нормального на Windows.
-        #
-        # Проблема без приоритета:
-        #   Планировщик Windows может вытеснить поток на 5–15 мс во время
-        #   фоновой активности ОС (антивирус, Windows Update, дефраг и т.д.).
-        #   Leaky bucket должен срабатывать каждые ~2.78 мс — вытеснение на 15 мс
-        #   порождает burst из накопившихся пакетов, что разрушает весь смысл pacing.
-        #
-        # THREAD_PRIORITY_ABOVE_NORMAL = 1 (не HIGHEST=2 и не TIME_CRITICAL=15):
-        #   Даёт планировщику понять, что поток важный, но не монополизирует ядро.
-        #   Discord, Zoom, TeamSpeak используют аналогичный приоритет для аудио/видео
-        #   send-потоков — проверенная практика.
-        if platform.system() == "Windows":
-            try:
-                handle = ctypes.windll.kernel32.GetCurrentThread()
-                ctypes.windll.kernel32.SetThreadPriority(handle, 1)  # ABOVE_NORMAL
-                print("[Net] video_pacing_loop: приоритет потока → ABOVE_NORMAL")
-            except Exception as e:
-                print(f"[Net] video_pacing_loop: не удалось поднять приоритет: {e}")
-
-        avg_packet_bytes = MAX_VIDEO_PAYLOAD + 21
-
-        # BATCH_SIZE=2: отправляем строго по 2 пакета за итерацию.
-        # Снижает частоту busy-wait вдвое при минимальной добавленной задержке.
-        BATCH_SIZE      = 2
-        SLEEP_THRESHOLD = 0.0003   # 0.3 мс — граница sleep/busy-wait
-
-        last_send_t = time.perf_counter()
-
-        # Двухуровневый буфер на базе deque (O(1) popleft).
-        pending_packets: deque = deque()
-
-        while self.running:
-            # --- Динамический pacing rate ---
-            # Читаем ТЕКУЩИЙ битрейт энкодера (после ABR-перестройки).
-            # При ABR=800kbps пакуем 800kbps данных; если пейсинг остаётся
-            # зафиксированным на 6Mbps — 800kbps данных улетают мгновенно
-            # мини-бёрстами вместо равномерного потока, что нагружает RadminVPN.
-            # Fallback VIDEO_BITRATE: если VideoEngine ещё не создан (первые мс соединения).
-            current_bitrate = VIDEO_BITRATE
-            if self.video is not None and hasattr(self.video, '_current_bitrate'):
-                cb = self.video._current_bitrate
-                if isinstance(cb, int) and cb > 0:
-                    current_bitrate = cb
-                # [FIX-GEMINI] Simulcast: учитываем суммарный битрейт HQ+LQ.
-                # Без этого pacing рассчитан на 6 Mbps, а шлём 6.8 Mbps →
-                # очередь переполняется и кадры дропаются ещё на стримере.
-                if getattr(self.video, '_simulcast_active', False):
-                    current_bitrate += LQ_VIDEO_BITRATE
-
-            pacing_rate    = max(int(current_bitrate * 1.25 / 8), 100_000)
-            pacing_interval = avg_packet_bytes / pacing_rate
-            batch_interval  = pacing_interval * BATCH_SIZE
-
-            # 1. Пополняем pending_packets до нужного уровня
-            while len(pending_packets) < BATCH_SIZE:
-                try:
-                    # Блокируемся только если буфер совсем пуст — не жжём CPU
-                    timeout = 0.05 if not pending_packets else 0.0
-                    frame_chunks = self.video_pacing_queue.get(timeout=timeout)
-                    pending_packets.extend(frame_chunks)
-                except queue.Empty:
-                    break
-
-            if not pending_packets or not self.server_addr:
-                continue
-
-            # 2. Откусываем СТРОГО BATCH_SIZE пакетов (O(1) popleft вместо O(n) slice)
-            n_send          = min(BATCH_SIZE, len(pending_packets))
-            batch           = [pending_packets.popleft() for _ in range(n_send)]
-
-            # 3. Ждём нужный момент отправки
-            target_t = last_send_t + batch_interval
-            now      = time.perf_counter()
-            delta    = target_t - now
-
-            if delta > SLEEP_THRESHOLD:
-                time.sleep(delta - SLEEP_THRESHOLD)
-                while time.perf_counter() < target_t:
-                    pass
-            elif delta > 0:
-                while time.perf_counter() < target_t:
-                    pass
-            else:
-                # [FIX] Анти-burst soft-limit 10мс (Gemini).
-                # Если поток "проспал" < 10мс — не сбрасываем полностью:
-                # позволяем микро-задержкам планировщика компенсироваться,
-                # сохраняя средний битрейт.
-                # Долг > 10мс → сбрасываем до now-10мс, исключая мега-бёрсты
-                # которые захлёбывают RadminVPN (молчаливый дроп пакетов).
-                if now - target_t > 0.010:
-                    target_t = now - 0.010
-
-            # 4. Отправляем строго BATCH_SIZE пакетов
-            for packet in batch:
-                try:
-                    self.udp_sock.sendto(packet, self.server_addr)
-                    self.packets_sent += 1
-                except Exception as e:
-                    print(f"[Net] Pacing send error: {e}")
-
-            # Используем target_t (не perf_counter()) чтобы не накапливать drift:
-            # perf_counter() фиксирует РЕАЛЬНОЕ время после sendto, которое само
-            # по себе занимает несколько мкс → ошибка накапливается и через
-            # несколько тысяч итераций превращается в микро-burst.
-            last_send_t = target_t
+    @staticmethod
+    async def _wait_ice_gathering(
+        pc, timeout: float = WEBRTC_ICE_TIMEOUT
+    ) -> None:
+        """
+        Ждёт завершения ICE gathering с таймаутом.
+        На RadminVPN (host-only ICE) завершается за ~50–200 мс.
+        """
+        loop    = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        while pc.iceGatheringState != "complete":
+            if loop.time() >= deadline:
+                print(f"[Net] ICE gathering timeout ({timeout}s) — продолжаем")
+                break
+            await asyncio.sleep(0.05)
 
     # ------------------------------------------------------------------
     # Приём UDP-пакетов
     # ------------------------------------------------------------------
     def udp_receive_loop(self):
+        """
+        Принимает UDP-пакеты.
+
+        После рефакторинга обрабатывает:
+          — Ping/Pong (flags=254): EWMA RTT.
+          — FLAG_STREAM_VOICES: голоса участников для зрителей (Mix Minus UDP).
+          — FLAG_WHISPER: шёпот (приватный голос).
+          — Голос комнаты: обычный аудио.
+
+        Видео (FLAG_VIDEO) и loopback-аудио (FLAG_STREAM_AUDIO) удалены —
+        они передаются через WebRTC треки.
+        """
         while self.running:
             try:
                 data, addr = self.udp_sock.recvfrom(BUFFER_SIZE)
@@ -512,7 +716,7 @@ class NetworkClient(QObject):
                 uid, ts, seq, flags = UDP_HEADER_STRUCT.unpack(data[:UDP_HEADER_SIZE])
 
                 if flags == 254:
-                    # Pong — измеряем RTT
+                    # Pong — измеряем RTT (EWMA)
                     self.packets_received += 1
                     delay = (time.time() - ts) * 1000
                     if self.current_ping == 0:
@@ -520,19 +724,11 @@ class NetworkClient(QObject):
                     else:
                         self.current_ping = int(self.current_ping * 0.7 + delay * 0.3)
 
-                elif flags & FLAG_VIDEO:
-                    if self.video:
-                        # Передаём is_lq: decode_worker использует его для точной диагностики.
-                        # Без этого он гадал по разрешению пикселей — неверно когда HQ < LQ по размеру.
-                        is_lq = bool(flags & FLAG_VIDEO_LQ)
-                        self.video.process_incoming_packet(uid, data[UDP_HEADER_SIZE:], is_lq=is_lq)
-                    else:
-                        print(f"[Net] Video packet from {uid}, but VideoEngine not initialized")
-
-                elif flags & FLAG_STREAM_AUDIO and flags & FLAG_STREAM_VOICES:
-                    # Голосовой поток стрима — Mix Minus без DSP.
+                elif flags & FLAG_STREAM_VOICES:
+                    # Голосовой поток стрима (Mix Minus без DSP).
                     # Payload: [speaker_uid: 4 байта] + [opus].
-                    # Свой голос отбрасываем — не слышим себя в стриме.
+                    # Свой голос отбрасываем.
+                    # UDP-путь для FLAG_STREAM_VOICES сохранён (план рекомендация В).
                     if len(data) < UDP_HEADER_SIZE + STREAM_VOICE_HEADER_SIZE:
                         continue
                     speaker_uid, = STREAM_VOICE_HEADER_STRUCT.unpack(
@@ -541,25 +737,17 @@ class NetworkClient(QObject):
                     if speaker_uid == self.audio.my_uid:
                         continue
                     opus_payload = data[UDP_HEADER_SIZE + STREAM_VOICE_HEADER_SIZE:]
-                    self.audio.add_incoming_stream_packet(speaker_uid, seq, opus_payload, flags)
-
-                elif flags & FLAG_STREAM_AUDIO:
-                    # Стрим-аудио (системный звук / виртуальный кабель)
-                    is_loopback = bool(flags & FLAG_LOOPBACK_AUDIO)
-                    if seq % 50 == 0:
-                        print(f"[Net-Recv] FLAG_STREAM_AUDIO (loopback={is_loopback}) от uid={uid}")
-                    self.audio.add_incoming_stream_packet(uid, seq, data[UDP_HEADER_SIZE:], flags)
+                    self.audio.add_incoming_stream_packet(
+                        speaker_uid, seq, opus_payload, flags
+                    )
 
                 elif flags & FLAG_WHISPER:
                     # Шёпот — приватный голос от sender к нам.
                     # Payload: [target_uid: 4 байта] + [opus].
-                    # Отбрасываем 4-байтовый заголовок target_uid перед декодированием,
-                    # иначе opuslib получит мусор в начале и вернёт ошибку.
+                    # Отбрасываем 4-байтовый заголовок target_uid перед декодированием.
                     if len(data) < UDP_HEADER_SIZE + STREAM_VOICE_HEADER_SIZE:
                         continue
                     opus_payload = data[UDP_HEADER_SIZE + STREAM_VOICE_HEADER_SIZE:]
-                    # add_incoming_whisper_packet: испускает сигнал whisper_received(uid)
-                    # при первом пакете от нового шептуна → UI показывает баннер.
                     self.audio.add_incoming_whisper_packet(uid, seq, opus_payload)
 
                 else:
@@ -592,7 +780,9 @@ class NetworkClient(QObject):
             if self.audio.my_uid != 0:
                 flags = (1 if self.audio.is_muted else 0) | (2 if self.audio.is_deafened else 0)
                 try:
-                    header = UDP_HEADER_STRUCT.pack(self.audio.my_uid, time.time(), 0, flags)
+                    header = UDP_HEADER_STRUCT.pack(
+                        self.audio.my_uid, time.time(), 0, flags
+                    )
                     self.udp_sock.sendto(header, self.server_addr)
                 except Exception as e:
                     print(f"[Net] Keepalive error: {e}")
@@ -602,7 +792,9 @@ class NetworkClient(QObject):
         while self.running:
             if self.audio.my_uid != 0:
                 try:
-                    header = UDP_HEADER_STRUCT.pack(self.audio.my_uid, time.time(), 0, 254)
+                    header = UDP_HEADER_STRUCT.pack(
+                        self.audio.my_uid, time.time(), 0, 254
+                    )
                     self.udp_sock.sendto(header, self.server_addr)
                     self.packets_sent += 1
                 except Exception as e:
@@ -614,9 +806,7 @@ class NetworkClient(QObject):
     # ------------------------------------------------------------------
     def tcp_listen(self):
         raw_data = ""
-        # JSONDecoder создаём ОДИН РАЗ — он stateless и thread-safe.
-        # Создание внутри цикла (старый код) аллоцировало новый объект на КАЖДОЕ
-        # входящее сообщение: при 10 sync/сек это +10 аллокаций/сек без причины.
+        # JSONDecoder создаём ОДИН РАЗ — stateless, экономим аллокации.
         _decoder = json.JSONDecoder()
         while self.running:
             try:
@@ -645,48 +835,55 @@ class NetworkClient(QObject):
         if self.running:
             self._on_connection_lost()
 
-    def process_message(self, msg):
+    def process_message(self, msg: dict):
         act = msg.get('action')
+
         if act == 'login_success':
             self.connected.emit(msg)
             print(f"[Net] Login success, UID: {msg.get('uid')}")
+
         elif act == 'sync_users':
             self.global_state_update.emit(msg.get('all_users', {}))
+
         elif act == 'play_soundboard':
-            self.play_soundboard_file(msg.get('file'), msg.get('data_b64'), msg.get('from_nick'))
-        elif act == 'request_keyframe':
-            if self.video:
-                self.video.force_keyframe()
-                print("[Net] IDR keyframe запрошен сервером → передано VideoEngine")
+            self.play_soundboard_file(
+                msg.get('file'), msg.get('data_b64'), msg.get('from_nick')
+            )
 
-        elif act == CMD_ADJUST_BITRATE:
-            # Сервер прислал новый целевой битрейт (вычисленный как min по всем зрителям).
-            # Передаём VideoEngine — он перезапустит энкодер на следующей итерации.
-            # Эмитируем bitrate_adjusted для UI-индикатора качества соединения.
-            new_bitrate = msg.get('bitrate')
-            if isinstance(new_bitrate, int) and self.video and self.running:
-                self.video.set_bitrate(new_bitrate)
-                self.bitrate_adjusted.emit(new_bitrate)
+        # ── WebRTC: offer от сервера → мы зритель ─────────────────────────
+        elif act == CMD_WEBRTC_OFFER:
+            role         = msg.get('role', '')
+            sdp          = msg.get('sdp')
+            sdp_type     = msg.get('type', 'offer')
+            streamer_uid = msg.get('streamer_uid', self._watching_streamer_uid)
 
-        elif act == CMD_LQ_NEEDED:
-            # Сервер сообщает: нужен ли LQ simulcast-поток прямо сейчас.
-            # needed=False → нет слабых зрителей → пропускаем LQ-кодирование.
-            # needed=True  → появился слабый зритель → возобновляем LQ.
-            needed = msg.get('needed')
-            if isinstance(needed, bool) and self.video and self.running:
-                self.video.set_lq_needed(needed)
+            if role == 'viewer' and sdp and AIORTC_AVAILABLE:
+                # Сервер прислал нам offer — мы зритель, создаём answer
+                self._run_in_webrtc_loop(
+                    self._handle_viewer_offer_coro(streamer_uid, sdp, sdp_type)
+                )
 
-        elif act == CMD_NACK_RELAY:
-            # Сервер ретранслировал нам NACK-запрос от зрителя.
-            # Стример: вытаскиваем чанк из retransmit_buffer и повторно отправляем.
-            frame_id  = msg.get('frame_id')
-            chunk_idx = msg.get('chunk_idx')
-            if isinstance(frame_id, int) and isinstance(chunk_idx, int) and self.video:
-                self.video.handle_retransmit(frame_id, chunk_idx)
+        # ── WebRTC: answer от сервера → мы стример ────────────────────────
+        elif act == CMD_WEBRTC_ANSWER:
+            sdp      = msg.get('sdp')
+            sdp_type = msg.get('type', 'answer')
+            if sdp and AIORTC_AVAILABLE:
+                # Сервер ответил на наш offer стримера
+                self._run_in_webrtc_loop(
+                    self._handle_streamer_answer_coro(sdp, sdp_type)
+                )
 
+        # ── WebRTC: ICE кандидат ───────────────────────────────────────────
+        elif act == CMD_WEBRTC_ICE:
+            candidate = msg.get('candidate')
+            role      = msg.get('role', '')
+            if candidate and AIORTC_AVAILABLE:
+                self._run_in_webrtc_loop(
+                    self._handle_ice_candidate_coro(role, candidate)
+                )
+
+        # ── Nudge ──────────────────────────────────────────────────────────
         elif act == CMD_PLAY_NUDGE:
-            # Нас пнули — воспроизводим звук в отдельном потоке.
-            # Звук намеренно обходит deaf/mute — цель фичи «достучаться» до АФК.
             threading.Thread(
                 target=self._play_nudge_sound,
                 daemon=True,
@@ -695,17 +892,22 @@ class NetworkClient(QObject):
             self.nudge_received.emit()
 
         elif act == CMD_NUDGE_TRIGGERED:
-            # Broadcast: кого-то пнули в нашей комнате → показываем тост у всех
             target_nick = msg.get('target_nick', '?')
             voter_nick  = msg.get('voter_nick',  '?')
             self.nudge_triggered.emit(target_nick, voter_nick)
 
+        # ── Файловая передача ──────────────────────────────────────────────
         elif act in ('file_offer', 'file_offer_room'):
-            # Входящее предложение файловой передачи.
-            # Содержит: filename, filesize, sender_ip, sender_port, token.
-            # MainWindow покажет toast-диалог с кнопками Принять/Отклонить.
             self.file_offer_received.emit(msg)
 
+        # ── Устаревшие UDP-видео команды (заглушки для совместимости) ──────
+        # request_keyframe, CMD_ADJUST_BITRATE, CMD_LQ_NEEDED, CMD_NACK_RELAY:
+        # WebRTC управляет этим автоматически через RTCP PLI / TWCC.
+        # Если сервер старой версии прислал — тихо игнорируем.
+
+    # ------------------------------------------------------------------
+    # Утилиты
+    # ------------------------------------------------------------------
     def send_json(self, data):
         try:
             self.tcp_sock.sendall(json.dumps(data).encode('utf-8'))
@@ -721,15 +923,8 @@ class NetworkClient(QObject):
     def send_presence_update(self, status_icon: str, status_text: str):
         """
         Отправляет серверу новый «статус дела» пользователя.
-
-        status_icon: имя SVG-файла из assets/status/ (например 'afk.svg')
-                     или '' чтобы убрать статус.
-        status_text: произвольная подпись ≤ 30 символов, показывается как
-                     всплывающая подсказка (tooltip) рядом с иконкой статуса.
-                     Передавайте '' если подпись не нужна.
-
-        Сервер ретранслирует обновление всем участникам через sync_users,
-        и остальные увидят иконку рядом с ником этого пользователя.
+        status_icon: имя SVG-файла из assets/status/ или '' (нет статуса).
+        status_text: произвольная подпись ≤ 30 символов или ''.
         """
         self.send_json({
             "action":      "update_presence",
@@ -737,23 +932,26 @@ class NetworkClient(QObject):
             "status_text": status_text,
         })
 
-    def set_video_engine(self, video):
+    def set_video_engine(self, video) -> None:
+        """
+        Регистрирует VideoEngine.
+
+        Если WebRTC loop уже запущен — передаём ему loop сразу.
+        Если нет — loop будет установлен в _start_webrtc_loop() при подключении.
+        """
         self.video = video
+        if self._webrtc_loop is not None and not self._webrtc_loop.is_closed():
+            video.set_webrtc_loop(self._webrtc_loop)
         print("[Net] VideoEngine registered")
 
     # ------------------------------------------------------------------
     # Файловая передача P2P — только сигнализация через сервер
     # ------------------------------------------------------------------
-    def send_file_offer(self, target_uid: int, filename: str,
-                        filesize: int, sender_port: int, token: str) -> None:
-        """
-        Отправляет серверу предложение личной передачи файла.
-        Сервер инжектирует sender_ip и ретранслирует сообщение цели.
-
-        Вызывается из FileSenderWorker после успешного bind() сокета
-        (порт уже известен) — гарантирует что приёмник подключится
-        к уже слушающему сокету.
-        """
+    def send_file_offer(
+        self, target_uid: int, filename: str,
+        filesize: int, sender_port: int, token: str
+    ) -> None:
+        """Личная передача файла: отправляем offer одному получателю."""
         self.send_json({
             "action":      "file_offer",
             "target_uid":  target_uid,
@@ -763,12 +961,11 @@ class NetworkClient(QObject):
             "token":       token,
         })
 
-    def send_file_offer_room(self, filename: str,
-                             filesize: int, sender_port: int, token: str) -> None:
-        """
-        Отправляет серверу предложение массовой передачи файла
-        всем участникам текущей комнаты кроме самого отправителя.
-        """
+    def send_file_offer_room(
+        self, filename: str, filesize: int,
+        sender_port: int, token: str
+    ) -> None:
+        """Массовая передача: offer всем в комнате кроме отправителя."""
         self.send_json({
             "action":      "file_offer_room",
             "filename":    filename,
@@ -778,46 +975,39 @@ class NetworkClient(QObject):
         })
 
     # ------------------------------------------------------------------
-    # Фича «Пнуть» — воспроизведение звука и отправка голоса
+    # Nudge: воспроизведение звука и голосование
     # ------------------------------------------------------------------
-    # ------------------------------------------------------------------
-    # Управление системной громкостью Windows (WASAPI IAudioEndpointVolume)
-    # ------------------------------------------------------------------
+    def send_nudge_vote(self, target_uid: int):
+        """Отправить голос «Пнуть» для указанного пользователя."""
+        self.send_json({
+            'action':     CMD_NUDGE_VOTE,
+            'target_uid': target_uid,
+        })
+        print(f"[Net] Nudge vote sent → target_uid={target_uid}")
 
     def _nudge_get_endpoint_vol(self):
         """
-        Возвращает указатель на IAudioEndpointVolume дефолтного устройства
-        воспроизведения (мастер-ползунок Windows, тот что в трее).
+        Возвращает IAudioEndpointVolume дефолтного устройства воспроизведения.
 
         Поддерживает ОБЕ версии pycaw:
-          • pycaw < 0.6  — GetSpeakers() возвращает сырой IMMDevice с .Activate()
-          • pycaw >= 0.6 — GetSpeakers() возвращает AudioDevice-обёртку;
-                           сырой IMMDevice лежит в атрибуте ._dev
-
-        Fallback без pycaw — comtypes напрямую (comtypes всегда есть,
-        т.к. является зависимостью pycaw и pywin32).
-
+          pycaw < 0.6  — GetSpeakers() возвращает IMMDevice с .Activate()
+          pycaw >= 0.6 — GetSpeakers() возвращает AudioDevice-обёртку, IMMDevice в ._dev
+        Fallback: comtypes напрямую без pycaw.
         Возвращает IAudioEndpointVolume* или None при любой ошибке.
         """
-        # ── Попытка 1: pycaw (оба поколения API) ─────────────────────────────
+        # ── Попытка 1: pycaw ──────────────────────────────────────────────
         try:
             from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
             from comtypes import CLSCTX_ALL
             from ctypes import cast, POINTER
 
             device = AudioUtilities.GetSpeakers()
-
-            # Определяем откуда брать сырой IMMDevice:
-            #   pycaw >= 0.6 → AudioDevice-обёртка, IMMDevice внутри ._dev
-            #   pycaw <  0.6 → уже IMMDevice, имеет метод Activate()
             if hasattr(device, 'Activate'):
-                raw_dev = device          # старый pycaw — сразу IMMDevice
+                raw_dev = device
             elif hasattr(device, '_dev'):
-                raw_dev = device._dev     # новый pycaw — достаём IMMDevice
+                raw_dev = device._dev
             else:
-                raise RuntimeError(
-                    f"[Nudge] Неизвестный тип GetSpeakers(): {type(device).__name__}"
-                )
+                raise RuntimeError(f"Неизвестный тип GetSpeakers(): {type(device).__name__}")
 
             iface = raw_dev.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
             return cast(iface, POINTER(IAudioEndpointVolume))
@@ -827,37 +1017,24 @@ class NetworkClient(QObject):
         except Exception as e:
             print(f"[Nudge] pycaw get_endpoint_vol error: {e}")
 
-        # ── Попытка 2: comtypes напрямую (без pycaw) ─────────────────────────
-        # Вручную определяем COM-интерфейсы WASAPI через comtypes.
-        # comtypes входит в зависимости pycaw → всегда доступен если pycaw установлен.
+        # ── Попытка 2: comtypes напрямую ──────────────────────────────────
         try:
             import comtypes
             import comtypes.client
             from ctypes import cast, POINTER, c_float, c_int, c_uint, HRESULT
 
-            # GUIDs
-            CLSID_MMDeviceEnumerator = comtypes.GUID(
-                '{BCDE0395-E52F-467C-8E3D-C4579291692E}'
-            )
-            IID_IMMDeviceEnumerator = comtypes.GUID(
-                '{A95664D2-9614-4F35-A746-DE8DB63617E6}'
-            )
-            IID_IMMDevice = comtypes.GUID(
-                '{D666063F-1587-4E43-81F1-B948E807363F}'
-            )
-            IID_IAudioEndpointVolume = comtypes.GUID(
-                '{5CDF2C82-841E-4546-9722-0CF74078229A}'
-            )
+            CLSID_MMDeviceEnumerator = comtypes.GUID('{BCDE0395-E52F-467C-8E3D-C4579291692E}')
+            IID_IMMDeviceEnumerator  = comtypes.GUID('{A95664D2-9614-4F35-A746-DE8DB63617E6}')
+            IID_IMMDevice            = comtypes.GUID('{D666063F-1587-4E43-81F1-B948E807363F}')
+            IID_IAudioEndpointVolume = comtypes.GUID('{5CDF2C82-841E-4546-9722-0CF74078229A}')
 
-            # Определяем минимальные COM-интерфейсы
             class IMMDevice(comtypes.IUnknown):
-                _iid_    = IID_IMMDevice
+                _iid_ = IID_IMMDevice
                 _methods_ = [
-                    comtypes.COMMETHOD(
-                        [], HRESULT, 'Activate',
-                        (['in'],  comtypes.GUID,           'iid'),
-                        (['in'],  c_uint,                  'dwClsCtx'),
-                        (['in'],  comtypes.c_void_p,       'pActivationParams'),
+                    comtypes.COMMETHOD([], HRESULT, 'Activate',
+                        (['in'],  comtypes.GUID,              'iid'),
+                        (['in'],  c_uint,                     'dwClsCtx'),
+                        (['in'],  comtypes.c_void_p,          'pActivationParams'),
                         (['out'], POINTER(comtypes.c_void_p), 'ppInterface'),
                     ),
                     comtypes.COMMETHOD([], HRESULT, 'OpenPropertyStore',
@@ -873,24 +1050,22 @@ class NetworkClient(QObject):
                 ]
 
             class IMMDeviceEnumerator(comtypes.IUnknown):
-                _iid_    = IID_IMMDeviceEnumerator
+                _iid_ = IID_IMMDeviceEnumerator
                 _methods_ = [
-                    comtypes.COMMETHOD(
-                        [], HRESULT, 'EnumAudioEndpoints',
+                    comtypes.COMMETHOD([], HRESULT, 'EnumAudioEndpoints',
                         (['in'],  c_uint, 'dataFlow'),
                         (['in'],  c_uint, 'dwStateMask'),
                         (['out'], POINTER(comtypes.IUnknown), 'ppDevices'),
                     ),
-                    comtypes.COMMETHOD(
-                        [], HRESULT, 'GetDefaultAudioEndpoint',
-                        (['in'],  c_uint,              'dataFlow'),
-                        (['in'],  c_uint,              'role'),
-                        (['out'], POINTER(IMMDevice),  'ppEndpoint'),
+                    comtypes.COMMETHOD([], HRESULT, 'GetDefaultAudioEndpoint',
+                        (['in'],  c_uint,             'dataFlow'),
+                        (['in'],  c_uint,             'role'),
+                        (['out'], POINTER(IMMDevice), 'ppEndpoint'),
                     ),
                 ]
 
             class IAudioEndpointVolumeDirect(comtypes.IUnknown):
-                _iid_    = IID_IAudioEndpointVolume
+                _iid_ = IID_IAudioEndpointVolume
                 _methods_ = [
                     comtypes.COMMETHOD([], HRESULT, 'RegisterControlChangeNotify',
                         (['in'], comtypes.IUnknown, 'pNotify')),
@@ -931,10 +1106,8 @@ class NetworkClient(QObject):
 
             comtypes.CoInitialize()
             enumerator = comtypes.client.CreateObject(
-                CLSID_MMDeviceEnumerator,
-                interface=IMMDeviceEnumerator,
+                CLSID_MMDeviceEnumerator, interface=IMMDeviceEnumerator,
             )
-            # eRender=0, eConsole=0 → дефолтное устройство воспроизведения
             device = enumerator.GetDefaultAudioEndpoint(0, 0)
             iface  = device.Activate(IID_IAudioEndpointVolume, 0x17, None)
             return cast(iface, POINTER(IAudioEndpointVolumeDirect))
@@ -946,11 +1119,8 @@ class NetworkClient(QObject):
 
     def _nudge_boost_volume(self) -> tuple:
         """
-        Снимает системный мьют и поднимает мастер-громкость Windows если нужно.
-        Возвращает (prev_scalar, was_muted) для последующего восстановления.
-
-        NUDGE_MIN_VOL  = 0.30 — ниже считаем «не слышно», поднимаем.
-        NUDGE_BOOST_VOL = 0.80 — до 80% (не 100% — не пугаем соседей).
+        Снимает системный мьют и поднимает мастер-громкость Windows.
+        Возвращает (prev_scalar, was_muted) для восстановления.
         """
         NUDGE_MIN_VOL   = 0.30
         NUDGE_BOOST_VOL = 0.80
@@ -981,17 +1151,12 @@ class NetworkClient(QObject):
         return prev_scalar, was_muted
 
     def _nudge_restore_volume(self, prev_scalar: float, was_muted: bool):
-        """
-        Восстанавливает мастер-громкость Windows и состояние мьюта.
-        Вызывается из finally-блока _play_nudge_sound — гарантированно.
-        """
+        """Восстанавливает мастер-громкость Windows в finally-блоке."""
         if prev_scalar < 0:
-            return   # не удалось прочитать ранее — нечего восстанавливать
-
+            return
         vol = self._nudge_get_endpoint_vol()
         if vol is None:
             return
-
         try:
             vol.SetMasterVolumeLevelScalar(prev_scalar, None)
             if was_muted:
@@ -1004,45 +1169,26 @@ class NetworkClient(QObject):
     def _play_nudge_sound(self):
         """
         Воспроизвести Danger.mp3 + системный писк — НЕЗАВИСИМО от deaf/mute.
-
-        Перед воспроизведением:
-          • Форсированно снимает системный мьют Windows (если включён).
-          • Поднимает системную громкость до 80% если она ниже 30%.
-        После воспроизведения (в блоке finally):
-          • Восстанавливает исходную громкость и состояние мьюта.
-
-        Порядок звуков:
-          1. winsound.MessageBeep(MB_ICONEXCLAMATION) — системная звуковая схема.
-          2. winsound.Beep(1200, 400) — тональный сигнал 1.2 кГц / 400 мс
-             (PC Speaker / аудиодрайвер в зависимости от железа).
-          3. sounddevice.play(Danger.mp3, vol=1.0) — в обход AudioHandler.
+        Форсирует системную громкость Windows, восстанавливает в finally.
         """
         import winsound as _ws
 
-        # ── Форсируем системную громкость ────────────────────────────────────
         prev_scalar, was_muted = self._nudge_boost_volume()
 
         try:
-            # 1. Системный «warning» звук Windows
             try:
-                _ws.MessageBeep(0x30)   # MB_ICONEXCLAMATION = 0x30
+                _ws.MessageBeep(0x30)   # MB_ICONEXCLAMATION
             except Exception as e:
                 print(f"[Nudge] MessageBeep error: {e}")
 
-            # 2. Тональный писк: 1200 Гц, 400 мс
-            # Блокирует daemon-поток на 400 мс — это ОК.
             try:
                 _ws.Beep(1200, 400)
             except Exception as e:
                 print(f"[Nudge] Beep error: {e}")
 
-            # 3. Danger.mp3 через sounddevice (vol=1.0 — без масштабирования)
             sound_path = NUDGE_SOUND_PATH if os.path.exists(NUDGE_SOUND_PATH) else None
-
             if sound_path is None:
-                print(
-                    f"[Nudge] Danger.mp3 не найден: {NUDGE_SOUND_PATH}"
-                )
+                print(f"[Nudge] Danger.mp3 не найден: {NUDGE_SOUND_PATH}")
                 return
 
             try:
@@ -1054,110 +1200,35 @@ class NetworkClient(QObject):
                 print(f"[Nudge] playback error: {e}")
 
         finally:
-            # ── Восстанавливаем громкость в любом случае ─────────────────────
             self._nudge_restore_volume(prev_scalar, was_muted)
 
-    def send_nudge_vote(self, target_uid: int):
-        """Отправить серверу голос «Пнуть» для указанного пользователя."""
-        self.send_json({
-            'action':     CMD_NUDGE_VOTE,
-            'target_uid': target_uid,
-        })
-        print(f"[Net] Nudge vote sent → target_uid={target_uid}")
-
     # ------------------------------------------------------------------
-    # ABR: управление просмотром и отправка фидбека битрейта
+    # Устаревшие методы — заглушки для инкрементальной миграции
+    # ------------------------------------------------------------------
+    # Вызываются из: ui_video.py (_send_abr_feedback → send_bitrate_feedback),
+    # видео-движок (заглушки video_engine.py), ui_main.py.
+    # После обновления ui_video.py (Шаг 7) и ui_main.py (Шаг 6) — удалить.
     # ------------------------------------------------------------------
 
-    def start_watching(self, streamer_uid: int):
-        """
-        Регистрируем начало просмотра стрима.
-        Вызывается из MainWindow при открытии VideoWindow.
-        Нужен для отправки bitrate_feedback с правильным streamer_uid.
-        """
-        self._watching_streamer_uid = streamer_uid
-
-    def stop_watching(self):
-        """
-        Регистрируем конец просмотра стрима.
-        Вызывается из MainWindow при закрытии VideoWindow.
-        """
-        self._watching_streamer_uid = 0
-
-    def send_bitrate_feedback(self, ping_ms: int):
-        """
-        Зритель → сервер: сообщаем свой запрошенный битрейт на основе RTT.
-
-        Выбираем тир из ABR_TIERS: первый порог, при котором ping_ms < порога.
-        Сервер вычислит min по всем зрителям и пришлёт стримеру adjust_bitrate.
-
-        Не вызываем если не смотрим стрим (streamer_uid == 0).
-        """
-        streamer_uid = self._watching_streamer_uid
-        if streamer_uid == 0 or not self.running:
-            return
-
-        # Выбираем нужный тир
-        requested_bitrate = ABR_TIERS[-1][1]   # fallback: минимальный
-        for threshold_ms, bitrate in ABR_TIERS:
-            if ping_ms < threshold_ms:
-                requested_bitrate = bitrate
-                break
-
-        self.send_json({
-            'action':       CMD_BITRATE_FEEDBACK,
-            'streamer_uid': streamer_uid,
-            'bitrate':      requested_bitrate,
-        })
-
-    def send_quality_request(self, skip_factor: int):
-        """Устаревший stub — оставлен для обратной совместимости. Не использовать."""
+    def send_video_frame_chunks(self, chunks: list, flags: int = 0) -> None:
+        """УСТАРЕЛО: видео передаётся через WebRTC DXCamTrack. Заглушка."""
         pass
 
-    def send_nack(self, streamer_uid: int, frame_id: int, chunk_idx: int):
+    def send_video_packet(self, payload) -> None:
+        """УСТАРЕЛО: compat wrapper. Заглушка."""
+        pass
+
+    def send_bitrate_feedback(self, ping_ms: int) -> None:
         """
-        Зритель → сервер → стример: запрос повторной доставки пропавшего чанка.
-
-        Отправляется по TCP вместо UDP чтобы гарантировать доставку:
-        потеря самого NACK-пакета сводила бы на нет весь смысл механизма.
-        TCP_NODELAY уже установлен → отправка без буферизации (~1 мс).
-
-        Стример получит CMD_NACK_RELAY, вызовет handle_retransmit(frame_id, chunk_idx)
-        и повторно отправит UDP-пакет. При RTT 60 мс полный цикл занимает ~120 мс
-        против ~800 мс для IDR при 3 Mbps.
+        УСТАРЕЛО: WebRTC управляет битрейтом через TWCC автоматически.
+        Вызывается из VideoWindow._send_abr_feedback() — no-op до Шага 7.
         """
-        if not self.running:
-            return
-        self.send_json({
-            'action':      CMD_NACK,
-            'streamer_uid': streamer_uid,
-            'frame_id':    frame_id,
-            'chunk_idx':   chunk_idx,
-        })
+        pass
 
-    def request_viewer_keyframe(self, streamer_uid: int):
-        """
-        Зритель → сервер: запрос IDR-кадра у стримера при детекте потери пакетов.
-        Сервер ретранслирует команду стримеру (action='request_keyframe').
-        Стример вызывает force_keyframe() → следующий кадр будет IDR.
-        Вызывается из VideoEngine._frame_cleanup_loop (адаптивный rate-limit).
+    def send_nack(self, streamer_uid: int, frame_id: int, chunk_idx: int) -> None:
+        """УСТАРЕЛО: NACK через WebRTC RTCP. Заглушка."""
+        pass
 
-        Дополнительная защита: при пинге > 1500 мс полностью подавляем запрос.
-        IDR-кадр при таком пинге только усугубит буферблоат (bufferbloat):
-        огромный I-frame (~300 KB LQ, ~1 MB HQ) будет лететь 2-5 секунд,
-        гарантированно добивая канал. Лучше дождаться стабилизации сети.
-        """
-        if not self.running:
-            return
-
-        current_ping = getattr(self, 'current_ping', 0)
-        if current_ping > 1500:
-            # Сеть полностью перегружена — IDR только навредит
-            print(f"[Net] IDR подавлен (ping={current_ping}ms > 1500ms, канал перегружен)")
-            return
-
-        self.send_json({
-            'action':       'request_keyframe',
-            'streamer_uid': streamer_uid,
-        })
-        print(f"[Net] IDR запрошен у стримера uid={streamer_uid} (ping={current_ping}ms)")
+    def request_viewer_keyframe(self, streamer_uid: int) -> None:
+        """УСТАРЕЛО: WebRTC PLI (Picture Loss Indication). Заглушка."""
+        pass

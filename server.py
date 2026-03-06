@@ -1,24 +1,497 @@
+# server.py — SFU сервер InPulse (UDP голос + TCP команды + WebRTC видео)
+#
+# ─── Архитектура после рефакторинга ────────────────────────────────────────────
+#
+#   SFUServer   — существующий синхронный сервер.
+#                 TCP: команды, чат, файлы, presence, nudge, soundboard.
+#                 UDP: голос комнаты, whisper, ping/keepalive.  ← БЕЗ ИЗМЕНЕНИЙ
+#
+#   WebRTCSFU   — НОВЫЙ asyncio-класс в отдельном daemon-потоке.
+#                 Принимает WebRTC-offer от стримера, сохраняет треки через MediaRelay.
+#                 Создаёт WebRTC-offer зрителю, форвардит ему треки стримера.
+#                 Сигнализация: 3 новые TCP-команды поверх существующего JSON-протокола.
+#
+# ─── Что УДАЛЕНО по сравнению с предыдущей версией ────────────────────────────
+#
+#   UDP-видео маршрутизация     (is_video/is_stream_audio ветки в udp_handler)
+#   Simulcast HQ/LQ             (_streamer_simulcast, _lq_needed_state, _send_to_watchers_routed)
+#   Viewer-side ABR             (abr_viewer_bitrates, abr_current, abr_last_upgrade, _abr_update)
+#   Upload ABR                  (_streamer_rx_bytes, _streamer_rx_start, _upload_abr_loop)
+#   NACK relay                  (CMD_NACK → CMD_NACK_RELAY → стример)
+#   IDR relay                   (request_keyframe TCP relay — WebRTC PLI берёт на себя)
+#   CMD_BITRATE_FEEDBACK        (зритель больше не измеряет RTT вручную)
+#   CMD_ADJUST_BITRATE          (WebRTC управляет через TWCC)
+#   CMD_LQ_NEEDED               (simulcast на WebRTC SFU-уровне в будущем)
+#
+# ─── Что СОХРАНЕНО без изменений ───────────────────────────────────────────────
+#
+#   UDP: голос комнаты, whisper, ping/keepalive
+#   TCP: login, join_room, update_user, update_status, presence
+#   TCP: stream_start/stop, stream_watch_start/stop, soundboard, nudge, file_offer
+#   Все локи и их дисциплина (clients_lock, udp_lock, watchers_lock, nudge_lock)
+#   send_global_state(), _send_to_watchers(), stats_monitor()
+#
+# ───────────────────────────────────────────────────────────────────────────────
+
+import asyncio
+import json
+import secrets
 import socket
 import threading
-import json
 import time
-import secrets
+
 from config import (
     DEFAULT_PORT_TCP, DEFAULT_PORT_UDP, BUFFER_SIZE,
     UDP_RECV_BUFFER_SIZE, UDP_SEND_BUFFER_SIZE,
-    UDP_HEADER_STRUCT, UDP_HEADER_SIZE, FLAG_VIDEO, FLAG_STREAM_AUDIO,
+    UDP_HEADER_STRUCT, UDP_HEADER_SIZE,
+    FLAG_STREAM_VOICES, FLAG_WHISPER,
+    STREAM_VOICE_HEADER_STRUCT, STREAM_VOICE_HEADER_SIZE,
     CMD_LOGIN, CMD_JOIN_ROOM, CMD_STREAM_START, CMD_STREAM_STOP,
-    CMD_SYNC_USERS, CMD_SOUNDBOARD, FLAG_LOOPBACK_AUDIO, FLAG_STREAM_VOICES,
-    FLAG_WHISPER, STREAM_VOICE_HEADER_STRUCT, STREAM_VOICE_HEADER_SIZE,
+    CMD_SYNC_USERS, CMD_SOUNDBOARD,
     CMD_UPDATE_PRESENCE,
     CMD_NUDGE_VOTE, CMD_PLAY_NUDGE, CMD_NUDGE_TRIGGERED, NUDGE_COOLDOWN_SEC,
-    CMD_BITRATE_FEEDBACK, CMD_ADJUST_BITRATE, ABR_TIERS,
-    FLAG_VIDEO_LQ, ABR_LQ_THRESHOLD,
     CMD_FILE_OFFER, CMD_FILE_OFFER_ROOM,
-    CMD_LQ_NEEDED,
-    CMD_NACK, CMD_NACK_RELAY,
+    CMD_WEBRTC_OFFER, CMD_WEBRTC_ANSWER, CMD_WEBRTC_ICE,
+    WEBRTC_ICE_TIMEOUT,
 )
 
+# ── Опциональный импорт aiortc (только для WebRTCSFU) ────────────────────────
+# При отсутствии aiortc — сервер работает без WebRTC (голос/чат работают).
+try:
+    from aiortc import (
+        RTCPeerConnection, RTCSessionDescription,
+        RTCConfiguration,
+    )
+    from aiortc.contrib.media import MediaRelay
+    AIORTC_AVAILABLE = True
+except ImportError:
+    AIORTC_AVAILABLE = False
+    print("[Server] WARNING: aiortc не установлен — WebRTC видео недоступно")
+
+
+# =============================================================================
+# WebRTCSFU — asyncio SFU для видео/аудио стримов
+# =============================================================================
+
+class WebRTCSFU:
+    """
+    asyncio-based SFU (Selective Forwarding Unit) для WebRTC видео/аудио.
+
+    Запускается в отдельном daemon-потоке с собственным asyncio event loop.
+    tcp_handler вызывает методы через asyncio.run_coroutine_threadsafe().
+
+    ─── Жизненный цикл стримера ────────────────────────────────────────────
+    1. tcp_handler получает CMD_WEBRTC_OFFER (role="streamer") → вызывает
+       handle_streamer_offer(uid, sdp, conn)
+    2. SFU создаёт RTCPeerConnection, принимает video/audio треки,
+       оборачивает их в MediaRelay
+    3. Ждёт завершения ICE-gathering (host-only на RadminVPN = ~50 мс)
+    4. Отправляет CMD_WEBRTC_ANSWER стримеру через conn.sendall()
+
+    ─── Жизненный цикл зрителя ─────────────────────────────────────────────
+    1. tcp_handler получает stream_watch_start → регистрирует в watchers,
+       вызывает handle_viewer_connect(viewer_uid, streamer_uid, viewer_conn)
+    2. SFU создаёт RTCPeerConnection для зрителя, добавляет реле-треки стримера
+    3. Создаёт offer, ждёт ICE-gathering, отправляет CMD_WEBRTC_OFFER зрителю
+    4. Зритель отвечает CMD_WEBRTC_ANSWER → handle_viewer_answer(uid, sdp)
+
+    ─── ICE стратегия ──────────────────────────────────────────────────────
+    В RadminVPN все клиенты в одной виртуальной сети (26.x.x.x).
+    Host ICE кандидаты достаточны — STUN не нужен.
+    Используем "gather-and-send" вместо trickle ICE для простоты:
+    ждём завершения gathering, затем отправляем SDP со всеми кандидатами.
+    CMD_WEBRTC_ICE поддерживается для будущей совместимости с STUN.
+
+    ─── MediaRelay ──────────────────────────────────────────────────────────
+    Треки от одного RTCPeerConnection нельзя напрямую добавить в другой.
+    MediaRelay создаёт прокси-треки с общим буфером — один входящий трек
+    может быть подписан несколькими зрителями без копирования данных.
+    """
+
+    def __init__(self):
+        self._loop   = asyncio.new_event_loop()
+        self._thread = threading.Thread(
+            target=self._run_loop, daemon=True, name="webrtc-sfu"
+        )
+        self._thread.start()
+
+        # streamer_uid → {'pc': RTCPeerConnection, 'relay': MediaRelay,
+        #                  'tracks': {kind: relayed_track}, 'conn': conn}
+        self._streamer_entries: dict = {}
+
+        # viewer_uid → {'pc': RTCPeerConnection, 'conn': conn,
+        #                'streamer_uid': int}
+        self._viewer_entries: dict = {}
+
+        # Буфер ожидающих зрителей: streamer_uid → [(viewer_uid, conn)]
+        # Используется если зритель подключился до завершения offer стримера.
+        self._pending_viewers: dict[int, list] = {}
+
+        # Входящие ICE-кандидаты до момента создания PC:
+        # uid → [candidate_dict]
+        self._pending_ice: dict[int, list] = {}
+
+    # ------------------------------------------------------------------
+    # Запуск asyncio loop
+    # ------------------------------------------------------------------
+
+    def _run_loop(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_forever()
+
+    def call_async(self, coro):
+        """
+        Отправляет корутину в asyncio loop из threading-контекста (tcp_handler).
+        Возвращает concurrent.futures.Future — можно игнорировать для fire-and-forget.
+        """
+        return asyncio.run_coroutine_threadsafe(coro, self._loop)
+
+    # ------------------------------------------------------------------
+    # Вспомогательные методы
+    # ------------------------------------------------------------------
+
+    async def _send_async(self, conn, msg: dict) -> None:
+        """
+        Отправляет JSON-пакет клиенту из asyncio-контекста.
+        run_in_executor: conn.sendall() блокирующий → не блокируем asyncio loop.
+        """
+        payload = json.dumps(msg).encode('utf-8')
+        loop = asyncio.get_event_loop()
+        try:
+            await loop.run_in_executor(None, conn.sendall, payload)
+        except Exception as e:
+            print(f"[SFU] send_async error: {e}")
+
+    @staticmethod
+    async def _wait_ice_gathering(pc, timeout: float = WEBRTC_ICE_TIMEOUT) -> None:
+        """
+        Ждёт завершения ICE gathering с таймаутом.
+        На RadminVPN (host-only ICE) gathering завершается за ~50–200 мс.
+        """
+        deadline = asyncio.get_event_loop().time() + timeout
+        while pc.iceGatheringState != "complete":
+            if asyncio.get_event_loop().time() >= deadline:
+                print(f"[SFU] ICE gathering timeout ({timeout}s) — отправляем что есть")
+                break
+            await asyncio.sleep(0.05)
+
+    # ------------------------------------------------------------------
+    # Стример: обработка offer
+    # ------------------------------------------------------------------
+
+    async def handle_streamer_offer(
+        self, streamer_uid: int, sdp: str, sdp_type: str, conn
+    ) -> None:
+        """
+        Принимает WebRTC offer от стримера.
+
+        1. Закрывает старый PC стримера (переподключение).
+        2. Создаёт новый RTCPeerConnection.
+        3. on("track") → оборачивает трек в MediaRelay, сохраняет.
+        4. setRemoteDescription(offer) → createAnswer → setLocalDescription.
+        5. Ждёт завершения ICE gathering.
+        6. Отправляет answer стримеру.
+        7. Обрабатывает ожидающих зрителей.
+        """
+        # Закрываем предыдущую сессию если была
+        old = self._streamer_entries.pop(streamer_uid, None)
+        if old:
+            try:
+                await old['pc'].close()
+            except Exception:
+                pass
+
+        cfg = RTCConfiguration(iceServers=[])
+        pc  = RTCPeerConnection(cfg)
+
+        relay = MediaRelay()
+        entry = {
+            'pc':     pc,
+            'relay':  relay,
+            'tracks': {},
+            'conn':   conn,
+        }
+        self._streamer_entries[streamer_uid] = entry
+
+        @pc.on("track")
+        def on_track(track):
+            # MediaRelay.subscribe(buffered=False): нет буферизации → минимальная задержка.
+            # Несколько зрителей подпишутся на один и тот же физический трек.
+            relayed = relay.subscribe(track, buffered=False)
+            entry['tracks'][track.kind] = relayed
+            print(
+                f"[SFU] Стример uid={streamer_uid}: трек получен kind={track.kind}"
+            )
+            # Обрабатываем ожидавших зрителей (подключились до стримера)
+            # Запускаем через ensure_future — не блокируем on_track callback
+            pending = self._pending_viewers.pop(streamer_uid, [])
+            for v_uid, v_conn in pending:
+                asyncio.ensure_future(
+                    self.handle_viewer_connect(v_uid, streamer_uid, v_conn)
+                )
+
+        @pc.on("icecandidate")
+        def on_ice(candidate):
+            # Trickle ICE (для будущей поддержки STUN).
+            # При host-only ICE кандидаты уже в SDP после gathering → эта ветка редка.
+            if candidate:
+                asyncio.ensure_future(self._send_async(conn, {
+                    'action':     CMD_WEBRTC_ICE,
+                    'target_uid': streamer_uid,
+                    'candidate': {
+                        'sdpMid':        candidate.sdpMid,
+                        'sdpMLineIndex': candidate.sdpMLineIndex,
+                        'candidate':     candidate.candidate,
+                    },
+                }))
+
+        @pc.on("connectionstatechange")
+        async def on_state():
+            state = pc.connectionState
+            print(f"[SFU] Стример uid={streamer_uid}: PC state → {state}")
+            if state in ("failed", "closed", "disconnected"):
+                await self.close_streamer(streamer_uid)
+
+        # Принимаем offer, создаём answer
+        try:
+            await pc.setRemoteDescription(
+                RTCSessionDescription(sdp=sdp, type=sdp_type)
+            )
+            # Добавляем буферизованные ICE-кандидаты (если клиент использует trickle)
+            for ice in self._pending_ice.pop(streamer_uid, []):
+                try:
+                    from aiortc import RTCIceCandidate
+                    cand = RTCIceCandidate(
+                        sdpMid=ice['sdpMid'],
+                        sdpMLineIndex=ice['sdpMLineIndex'],
+                        candidate=ice['candidate'],
+                    )
+                    await pc.addIceCandidate(cand)
+                except Exception as e:
+                    print(f"[SFU] addIceCandidate error: {e}")
+
+            answer = await pc.createAnswer()
+            await pc.setLocalDescription(answer)
+
+            # Ждём завершения ICE gathering (host-only = быстро)
+            await self._wait_ice_gathering(pc)
+
+            await self._send_async(conn, {
+                'action': CMD_WEBRTC_ANSWER,
+                'sdp':    pc.localDescription.sdp,
+                'type':   pc.localDescription.type,
+            })
+            print(f"[SFU] Answer отправлен стримеру uid={streamer_uid}")
+
+        except Exception as e:
+            print(f"[SFU] handle_streamer_offer error uid={streamer_uid}: {e}")
+            self._streamer_entries.pop(streamer_uid, None)
+
+    # ------------------------------------------------------------------
+    # Зритель: создание offer и подключение
+    # ------------------------------------------------------------------
+
+    async def handle_viewer_connect(
+        self, viewer_uid: int, streamer_uid: int, viewer_conn
+    ) -> None:
+        """
+        Создаёт WebRTC соединение для нового зрителя.
+
+        Если треки стримера ещё не готовы — кладём зрителя в pending_viewers.
+        Как только on("track") от стримера сработает — pending обработается автоматически.
+
+        Порядок:
+        1. Проверяем наличие relay-треков стримера.
+        2. Создаём RTCPeerConnection для зрителя.
+        3. Добавляем relay-треки: viewer_pc.addTrack(relayed_track).
+        4. on("track") → video_engine.add_receiver() (на клиентской стороне).
+        5. createOffer → setLocalDescription → wait ICE → send offer зрителю.
+        """
+        entry = self._streamer_entries.get(streamer_uid)
+        if entry is None or not entry['tracks']:
+            # Стример ещё не прислал offer или треки не готовы
+            self._pending_viewers.setdefault(streamer_uid, []).append(
+                (viewer_uid, viewer_conn)
+            )
+            print(
+                f"[SFU] Зритель uid={viewer_uid}: стример uid={streamer_uid} "
+                f"ещё не готов — помещён в pending"
+            )
+            return
+
+        # Закрываем предыдущий PC зрителя (переподключение)
+        old = self._viewer_entries.pop(viewer_uid, None)
+        if old:
+            try:
+                await old['pc'].close()
+            except Exception:
+                pass
+
+        cfg = RTCConfiguration(iceServers=[])
+        pc  = RTCPeerConnection(cfg)
+
+        # Добавляем relay-треки стримера
+        for kind, relayed_track in entry['tracks'].items():
+            pc.addTrack(relayed_track)
+
+        self._viewer_entries[viewer_uid] = {
+            'pc':           pc,
+            'conn':         viewer_conn,
+            'streamer_uid': streamer_uid,
+        }
+
+        @pc.on("icecandidate")
+        def on_ice(candidate):
+            if candidate:
+                asyncio.ensure_future(self._send_async(viewer_conn, {
+                    'action':     CMD_WEBRTC_ICE,
+                    'target_uid': viewer_uid,
+                    'candidate': {
+                        'sdpMid':        candidate.sdpMid,
+                        'sdpMLineIndex': candidate.sdpMLineIndex,
+                        'candidate':     candidate.candidate,
+                    },
+                }))
+
+        @pc.on("connectionstatechange")
+        async def on_state():
+            state = pc.connectionState
+            print(f"[SFU] Зритель uid={viewer_uid}: PC state → {state}")
+            if state in ("failed", "closed", "disconnected"):
+                await self.close_viewer(viewer_uid)
+
+        try:
+            offer = await pc.createOffer()
+            await pc.setLocalDescription(offer)
+            await self._wait_ice_gathering(pc)
+
+            await self._send_async(viewer_conn, {
+                'action':      CMD_WEBRTC_OFFER,
+                'role':        'viewer',
+                'streamer_uid': streamer_uid,
+                'sdp':         pc.localDescription.sdp,
+                'type':        pc.localDescription.type,
+            })
+            print(
+                f"[SFU] Offer отправлен зрителю uid={viewer_uid} "
+                f"(стример uid={streamer_uid})"
+            )
+        except Exception as e:
+            print(f"[SFU] handle_viewer_connect error uid={viewer_uid}: {e}")
+            self._viewer_entries.pop(viewer_uid, None)
+
+    # ------------------------------------------------------------------
+    # Зритель: обработка answer
+    # ------------------------------------------------------------------
+
+    async def handle_viewer_answer(
+        self, viewer_uid: int, sdp: str, sdp_type: str
+    ) -> None:
+        """
+        Принимает WebRTC answer от зрителя.
+        Завершает ICE negotiation на стороне сервера.
+        """
+        entry = self._viewer_entries.get(viewer_uid)
+        if entry is None:
+            print(f"[SFU] handle_viewer_answer: нет PC для uid={viewer_uid}")
+            return
+        try:
+            await entry['pc'].setRemoteDescription(
+                RTCSessionDescription(sdp=sdp, type=sdp_type)
+            )
+            # Добавляем буферизованные ICE-кандидаты
+            for ice in self._pending_ice.pop(viewer_uid, []):
+                try:
+                    from aiortc import RTCIceCandidate
+                    cand = RTCIceCandidate(
+                        sdpMid=ice['sdpMid'],
+                        sdpMLineIndex=ice['sdpMLineIndex'],
+                        candidate=ice['candidate'],
+                    )
+                    await entry['pc'].addIceCandidate(cand)
+                except Exception:
+                    pass
+            print(f"[SFU] Answer принят от зрителя uid={viewer_uid}")
+        except Exception as e:
+            print(f"[SFU] handle_viewer_answer error uid={viewer_uid}: {e}")
+
+    # ------------------------------------------------------------------
+    # ICE кандидаты (trickle ICE)
+    # ------------------------------------------------------------------
+
+    async def handle_ice_candidate(
+        self, uid: int, candidate_dict: dict
+    ) -> None:
+        """
+        Добавляет ICE-кандидат к нужному PC.
+        Буферизует если PC ещё не создан (гонка: ICE пришёл до offer/answer).
+        """
+        pc = None
+        if uid in self._streamer_entries:
+            pc = self._streamer_entries[uid]['pc']
+        elif uid in self._viewer_entries:
+            pc = self._viewer_entries[uid]['pc']
+
+        if pc is None:
+            # PC ещё не создан — буферизуем
+            self._pending_ice.setdefault(uid, []).append(candidate_dict)
+            return
+
+        try:
+            from aiortc import RTCIceCandidate
+            cand = RTCIceCandidate(
+                sdpMid=candidate_dict.get('sdpMid'),
+                sdpMLineIndex=candidate_dict.get('sdpMLineIndex'),
+                candidate=candidate_dict.get('candidate'),
+            )
+            await pc.addIceCandidate(cand)
+        except Exception as e:
+            print(f"[SFU] handle_ice_candidate uid={uid}: {e}")
+
+    # ------------------------------------------------------------------
+    # Закрытие соединений
+    # ------------------------------------------------------------------
+
+    async def close_streamer(self, streamer_uid: int) -> None:
+        """
+        Закрывает PC стримера и все PC его зрителей.
+        Вызывается при CMD_STREAM_STOP или потере соединения.
+        """
+        entry = self._streamer_entries.pop(streamer_uid, None)
+        if entry:
+            try:
+                await entry['pc'].close()
+            except Exception:
+                pass
+            print(f"[SFU] Стример uid={streamer_uid}: PC закрыт")
+
+        # Закрываем всех зрителей этого стримера
+        victims = [
+            v_uid for v_uid, ve in list(self._viewer_entries.items())
+            if ve['streamer_uid'] == streamer_uid
+        ]
+        for v_uid in victims:
+            await self.close_viewer(v_uid)
+
+        self._pending_viewers.pop(streamer_uid, None)
+
+    async def close_viewer(self, viewer_uid: int) -> None:
+        """
+        Закрывает PC зрителя.
+        Вызывается при stream_watch_stop или потере соединения.
+        """
+        entry = self._viewer_entries.pop(viewer_uid, None)
+        if entry:
+            try:
+                await entry['pc'].close()
+            except Exception:
+                pass
+            print(f"[SFU] Зритель uid={viewer_uid}: PC закрыт")
+
+
+# =============================================================================
+# SFUServer — основной сервер
+# =============================================================================
 
 class SFUServer:
     def __init__(self, host='0.0.0.0'):
@@ -28,34 +501,27 @@ class SFUServer:
         self.tcp_sock.bind((host, DEFAULT_PORT_TCP))
         self.tcp_sock.listen()
 
-        # --- UDP ---
+        # --- UDP (только голос комнаты + ping) ---
         self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # FIX #4: Увеличены буферы ядра.
-        # SO_RCVBUF: 8 MB — пакеты не дропаются пока handler занят маршрутизацией.
-        # SO_SNDBUF: 8 MB — исходящая очередь не блокирует recv-путь.
+        # SO_RCVBUF 8MB: голосовые пакеты не дропаются пока handler занят.
+        # SO_SNDBUF 8MB: исходящая очередь не блокирует recv-путь.
         self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, UDP_RECV_BUFFER_SIZE)
         self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, UDP_SEND_BUFFER_SIZE)
         self.udp_sock.bind((host, DEFAULT_PORT_UDP))
 
         # -------------------------------------------------------------------
-        # FIX #1: Разделение локов.
-        #
-        # Было: один self.lock на всё — UDP-поток ждал, пока TCP-поток
-        #       делает sendall() внутри send_global_state(), что блокировало
-        #       приём пакетов на сотни миллисекунд → пинг 1000 мс.
-        #
-        # Стало:
-        #   self.clients_lock  — только для self.clients (TCP-потоки)
-        #   self.udp_lock      — только для self.udp_map (UDP-поток)
-        #   self.watchers_lock — только для self.watchers (stream-события)
-        #
-        # UDP-поток теперь никогда не ждёт TCP sendall().
+        # Разделение локов (FIX #1):
+        #   clients_lock  — self.clients (TCP-потоки)
+        #   udp_lock      — self.udp_map (UDP-поток)
+        #   watchers_lock — self.watchers (stream-события)
+        # UDP-поток никогда не ждёт TCP sendall().
         # -------------------------------------------------------------------
         self.clients_lock  = threading.Lock()
         self.udp_lock      = threading.Lock()
         self.watchers_lock = threading.Lock()
 
-        # conn → {nick, room, uid, avatar, ip, mute, deaf, is_streaming, status_icon, status_text}
+        # conn → {nick, room, uid, avatar, ip, mute, deaf, is_streaming,
+        #          status_icon, status_text}
         self.clients = {}
 
         # uid → addr  (UDP-адрес клиента)
@@ -67,67 +533,30 @@ class SFUServer:
         # streamer_uid → {watcher_uid: {nick, avatar, uid}}
         self.watchers = {}
 
-        self.stats = {"packets": 0, "bytes": 0}
+        self.stats      = {"packets": 0, "bytes": 0}
         self.start_time = time.time()
 
         # --- Голосование «Пнуть» (Nudge) ---
-        # Структура: { room_name → { target_uid → { voter_uid → vote_timestamp } } }
-        # Записи живут NUDGE_COOLDOWN_SEC; голоса старше кулдауна не засчитываются.
+        # { room_name → { target_uid → { voter_uid → vote_timestamp } } }
         self.nudge_votes = {}
         self.nudge_lock  = threading.Lock()
 
-        # --- ABR: фидбек битрейта от зрителей ---
-        # streamer_uid → { viewer_uid → requested_bitrate }
-        # При каждом обновлении вычисляем min и шлём стримеру adjust_bitrate
-        # только если значение изменилось.
-        self.abr_viewer_bitrates: dict[int, dict[int, int]] = {}
-        self.abr_current:         dict[int, int]            = {}  # streamer_uid → текущий битрейт
-        self.abr_lock = threading.Lock()
+        # --- WebRTC SFU (создаётся в start()) ---
+        self.sfu: WebRTCSFU | None = None
 
-        # ABR гистерезис: метка времени последнего ПОВЫШЕНИЯ битрейта.
-        # Понижение (при лагах) — немедленно.
-        # Повышение (когда пинг улучшился) — не чаще чем раз в ABR_UPGRADE_COOLDOWN_SEC.
-        # Без кулдауна небольшой джиттер RTT (50→55→50→55 мс) вызывал бы
-        # непрерывные перезапуски энкодера каждые 4 секунды.
-        self.abr_last_upgrade: dict[int, float] = {}   # streamer_uid → timestamp
-        ABR_UPGRADE_COOLDOWN_SEC = 10.0                # константа прямо в __init__ (не в config)
-
-        # -------------------------------------------------------------------
-        # Upload-side ABR: сервер измеряет фактический входящий поток стримера.
-        #
-        # Проблема без этого механизма:
-        #   Стример с плохим upload (напр. 1 Mbps) выставляет энкодер на 6 Mbps.
-        #   Сервер получает кадры burst-ами с огромными паузами.
-        #   Зрители видят битые/замороженные кадры даже при хорошем своём download.
-        #   Viewer-driven ABR не поможет: он измеряет RTT зрителя, а не upload
-        #   стримера. Сервер о проблеме ничего не знает.
-        #
-        # Решение:
-        #   В udp_handler считаем байты от каждого стримера.
-        #   _upload_abr_loop каждые 4 сек вычисляет фактический upload bitrate.
-        #   Если actual < 70% от configured → сервер голосует в min() ABR системы
-        #   с uid=0 (SERVER_VOTER), ограничивая стримера до реальной пропускной способности.
-        # -------------------------------------------------------------------
-        self._streamer_rx_bytes: dict[int, int]   = {}  # uid → байты за текущее окно
-        self._streamer_rx_start: dict[int, float] = {}  # uid → начало текущего окна
-
-        # -------------------------------------------------------------------
-        # Simulcast: раздельная маршрутизация HQ/LQ потоков.
-        #
-        # Когда стример поддерживает simulcast (nvenc), он шлёт два потока:
-        #   HQ (flags=FLAG_VIDEO)           → сильным зрителям (>= ABR_LQ_THRESHOLD)
-        #   LQ (flags=FLAG_VIDEO|FLAG_VIDEO_LQ) → слабым зрителям (< ABR_LQ_THRESHOLD)
-        #
-        # _streamer_simulcast[uid] = True — как только пришёл первый LQ-пакет.
-        # При simulcast _abr_update НЕ отправляет adjust_bitrate стримеру:
-        # энкодеры фиксированы (HQ=6Mbps, LQ=800kbps), спираль ABR невозможна.
-        # -------------------------------------------------------------------
-        self._streamer_simulcast: dict[int, bool]  = {}  # uid → simulcast активен
-
-        # _lq_needed_state: последнее значение lq_needed, отправленное каждому стримеру.
-        # Нужно чтобы не спамить одинаковыми командами при каждом ABR-обновлении.
-        # streamer_uid → bool (True = LQ нужен, False = LQ не нужен)
-        self._lq_needed_state: dict[int, bool] = {}
+    # ------------------------------------------------------------------
+    # Вспомогательный метод: отправка JSON клиенту из любого потока
+    # ------------------------------------------------------------------
+    def send_to_conn(self, conn, msg: dict) -> None:
+        """
+        Синхронная отправка JSON клиенту.
+        Используется из tcp_handler (threading-контекст).
+        Для вызова из asyncio-контекста — используй SFU._send_async().
+        """
+        try:
+            conn.sendall(json.dumps(msg).encode('utf-8'))
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Мониторинг
@@ -138,30 +567,28 @@ class SFUServer:
             time.sleep(5)
             with self.clients_lock:
                 active = len(self.clients)
-            curr_bytes = self.stats["bytes"]          # int — атомарное чтение
+            curr_bytes = self.stats["bytes"]   # int — атомарное чтение
             diff = (curr_bytes - last_bytes) / 1024 / 5
             print(f"[Stats] Active: {active} | Traffic: {diff:.1f} KB/s")
             last_bytes = curr_bytes
 
     # ------------------------------------------------------------------
-    # UDP-маршрутизация
+    # UDP-маршрутизация (только голос + ping)
     # ------------------------------------------------------------------
     def udp_handler(self):
         """
-        FIX #1 + FIX #2: UDP-поток держит лок только на минимальное время —
-        ровно столько, сколько нужно для чтения адресов из словаря.
-        Все sendto() выполняются УЖЕ после освобождения лока.
+        FIX #1 + FIX #2: UDP-поток держит лок только на минимальное время.
+        Все sendto() выполняются после освобождения лока.
 
-        Было (псевдокод):
-            with self.lock:          # захват
-                for addr in targets:
-                    sendto(addr)     # I/O внутри лока → всё остальное стоит
+        После рефакторинга обрабатывает только:
+          — Ping (flags=254): echo без локов.
+          — Голос комнаты: broadcast всем в комнате кроме отправителя.
+          — Whisper (FLAG_WHISPER): доставка конкретному получателю.
+          — FLAG_STREAM_VOICES: голоса участников для зрителей стрима.
+              (Mix Minus UDP — сохранён для первой итерации, WebRTC аудио позже)
 
-        Стало:
-            with self.udp_lock:
-                targets = [...]      # только копирование адресов — микросекунды
-            for addr in targets:
-                sendto(addr)         # I/O вне лока
+        Видеопакеты (FLAG_VIDEO, FLAG_STREAM_AUDIO) больше не приходят через UDP —
+        стрим передаётся через WebRTC.
         """
         while True:
             try:
@@ -169,7 +596,9 @@ class SFUServer:
                 if len(data) < UDP_HEADER_SIZE:
                     continue
 
-                sender_uid, msg_ts, seq, flags = UDP_HEADER_STRUCT.unpack(data[:UDP_HEADER_SIZE])
+                sender_uid, msg_ts, seq, flags = UDP_HEADER_STRUCT.unpack(
+                    data[:UDP_HEADER_SIZE]
+                )
 
                 # Ping: отвечаем немедленно, без локов
                 if flags == 254:
@@ -177,28 +606,22 @@ class SFUServer:
                     continue
 
                 # Обновляем UDP-адрес отправителя.
-                # stats обновляем ВНЕ лока — простые инты, GIL достаточен.
-                # Раньше они были внутри udp_lock без необходимости: чтение из
-                # stats_monitor() никогда не держало udp_lock, а запись int — атомарна.
+                # stats обновляем ВНЕ лока — int-запись атомарна через GIL.
                 with self.udp_lock:
                     self.udp_map[sender_uid] = addr
                     sender_room = self.uid_to_room.get(sender_uid)
                 self.stats["packets"] += 1
-                self.stats["bytes"] += len(data)
+                self.stats["bytes"]   += len(data)
 
                 if not sender_room:
                     continue
 
-                is_video = bool(flags & FLAG_VIDEO)
-                is_stream_audio = bool(flags & FLAG_STREAM_AUDIO)
                 is_stream_voices = bool(flags & FLAG_STREAM_VOICES)
-                is_whisper = bool(flags & FLAG_WHISPER)
+                is_whisper       = bool(flags & FLAG_WHISPER)
 
                 if is_whisper:
                     # ШЁПОТ → только target_uid.
-                    # Payload: [target_uid: 4 байта big-endian unsigned int] + [opus].
-                    # Сервер извлекает target_uid и доставляет пакет только ему.
-                    # Остальные участники комнаты пакет не получают.
+                    # Payload: [target_uid: 4 байта big-endian] + [opus].
                     if len(data) < UDP_HEADER_SIZE + STREAM_VOICE_HEADER_SIZE:
                         continue
                     (target_uid,) = STREAM_VOICE_HEADER_STRUCT.unpack(
@@ -212,58 +635,19 @@ class SFUServer:
                         except Exception:
                             pass
 
-                elif is_video:
-                    # ВИДЕО → зрители стримера.
-                    # Upload-ABR: счётчик байт от стримера (без лока — udp_handler однопоточен).
-                    self._streamer_rx_bytes[sender_uid] = (
-                        self._streamer_rx_bytes.get(sender_uid, 0) + len(data)
-                    )
-                    if sender_uid not in self._streamer_rx_start:
-                        self._streamer_rx_start[sender_uid] = time.time()
-
-                    # Simulcast: определяем тип пакета (HQ или LQ).
-                    is_lq = bool(flags & FLAG_VIDEO_LQ)
-
-                    if is_lq and not self._streamer_simulcast.get(sender_uid, False):
-                        # Первый LQ-пакет: переключаем стримера в simulcast-режим.
-                        self._streamer_simulcast[sender_uid] = True
-                        print(f"[Simulcast] streamer={sender_uid}: LQ-поток обнаружен, "
-                              f"режим раздельной маршрутизации активирован")
-
-                    if self._streamer_simulcast.get(sender_uid, False):
-                        # Simulcast: HQ → сильным зрителям, LQ → слабым.
-                        self._send_to_watchers_routed(sender_uid, data, is_lq)
-                    else:
-                        # Legacy: единый поток всем зрителям.
-                        self._send_to_watchers(sender_uid, data)
-
-                elif is_stream_audio and is_stream_voices:
-                    # ГОЛОСОВОЙ ПОТОК СТРИМА → только зрители стримера.
-                    #
-                    # Mix Minus без DSP: payload содержит [speaker_uid (4 байта)] + [opus].
-                    # Каждый зритель получает полный пакет, но на клиенте отбрасывает
-                    # пакет если speaker_uid == my_uid — он не слышит свой собственный голос.
-                    #
-                    # Сервер не фильтрует по speaker_uid, т.к.:
-                    # 1) Не знает my_uid каждого зрителя в момент маршрутизации без доп. лока.
-                    # 2) Это O(1) на клиенте vs O(N зрителей) на сервере.
-                    self._send_to_watchers(sender_uid, data)
-
-                elif is_stream_audio:
-                    # СТРИМ-АУДИО → только зрители стримера (аналогично видео).
-                    # Зрители сами отфильтруют голоса своих собеседников на клиенте.
+                elif is_stream_voices:
+                    # ГОЛОСОВОЙ ПОТОК СТРИМА (Mix Minus) → зрители стримера.
+                    # Payload: [speaker_uid: 4 байта] + [opus].
+                    # Зритель получает полный пакет, отбрасывает свой speaker_uid.
+                    # UDP-путь сохранён для первой итерации (план рекомендация В).
                     self._send_to_watchers(sender_uid, data)
 
                 else:
-                    # АУДИО → все в той же комнате, кроме отправителя.
-                    # FIX: Убираем вложенный лок (clients_lock → udp_lock).
-                    # Старый код захватывал udp_lock ВНУТРИ clients_lock →
-                    # риск дедлока если другой поток держит udp_lock и ждёт clients_lock.
-                    # Новый код:
-                    #   1. Под clients_lock собираем список uid получателей (int-ы, не адреса).
-                    #   2. Отпускаем clients_lock.
-                    #   3. Под udp_lock однократно разрешаем uid → addr.
-                    #   4. sendto() — вообще без локов.
+                    # АУДИО КОМНАТЫ → все в той же комнате, кроме отправителя.
+                    # FIX: без вложенных локов (clients_lock → udp_lock).
+                    # 1. Под clients_lock собираем uid получателей.
+                    # 2. Под udp_lock разрешаем uid → addr.
+                    # 3. sendto() — без любых локов.
                     with self.clients_lock:
                         target_uids = [
                             c_data['uid']
@@ -279,7 +663,6 @@ class SFUServer:
                             if uid in self.udp_map
                         ]
 
-                    # sendto — вне любых локов
                     for target_addr in target_addrs:
                         try:
                             self.udp_sock.sendto(data, target_addr)
@@ -293,15 +676,15 @@ class SFUServer:
     # TCP-обработчик одного клиента
     # ------------------------------------------------------------------
     def tcp_handler(self, conn, addr):
-        uid = secrets.randbelow(10**9) + 1  # криптографически уникальный, без коллизий
+        uid       = secrets.randbelow(10**9) + 1  # криптографически уникальный
         client_ip = addr[0]
-        buffer = ""
+        buffer    = ""
         # JSONDecoder создаём ОДИН РАЗ на соединение — он stateless.
-        # Каждое сообщение json.JSONDecoder() в старом коде = лишняя аллокация.
-        _decoder = json.JSONDecoder()
+        _decoder  = json.JSONDecoder()
+
         try:
             while True:
-                chunk_bytes = conn.recv(4096)  # TCP: JSON-команды редко превышают 1 КБ
+                chunk_bytes = conn.recv(4096)
                 if not chunk_bytes:
                     break
                 buffer += chunk_bytes.decode('utf-8', errors='ignore')
@@ -309,9 +692,10 @@ class SFUServer:
                 while True:
                     try:
                         msg, idx = _decoder.raw_decode(buffer)
-                        buffer = buffer[idx:].lstrip()
-                        action = msg.get('action')
+                        buffer   = buffer[idx:].lstrip()
+                        action   = msg.get('action')
 
+                        # ── Login ─────────────────────────────────────────────
                         if action == CMD_LOGIN:
                             client_nick   = msg.get('nick', 'User')
                             client_avatar = msg.get('avatar', '1.svg')
@@ -322,8 +706,8 @@ class SFUServer:
                                     'uid':          uid,
                                     'avatar':       client_avatar,
                                     'ip':           client_ip,
-                                    'status_icon':  '',   # имя SVG-файла из assets/status/ или ''
-                                    'status_text':  '',   # подсказка ≤ 30 символов или ''
+                                    'status_icon':  '',
+                                    'status_text':  '',
                                 }
                             with self.udp_lock:
                                 self.uid_to_room[uid] = 'General'
@@ -334,10 +718,11 @@ class SFUServer:
                                 remaining = len(self.clients)
                             print(
                                 f"[Server] ✔ {client_nick} подключился "
-                                f"(комната: General, IP: {client_ip}) | Онлайн: {remaining}"
+                                f"(General, IP: {client_ip}) | Онлайн: {remaining}"
                             )
                             self.send_global_state()
 
+                        # ── Join Room ─────────────────────────────────────────
                         elif action == CMD_JOIN_ROOM:
                             new_room = msg.get('room', 'General')
                             with self.clients_lock:
@@ -347,6 +732,7 @@ class SFUServer:
                                 self.uid_to_room[uid] = new_room
                             self.send_global_state()
 
+                        # ── Update User ───────────────────────────────────────
                         elif action == 'update_user':
                             with self.clients_lock:
                                 if conn in self.clients:
@@ -354,6 +740,7 @@ class SFUServer:
                                     self.clients[conn]['avatar'] = msg.get('avatar', self.clients[conn]['avatar'])
                             self.send_global_state()
 
+                        # ── Update Status ─────────────────────────────────────
                         elif action == 'update_status':
                             with self.clients_lock:
                                 if conn in self.clients:
@@ -361,19 +748,17 @@ class SFUServer:
                                     self.clients[conn]['deaf'] = msg.get('deaf', False)
                             self.send_global_state()
 
+                        # ── Presence ──────────────────────────────────────────
                         elif action == CMD_UPDATE_PRESENCE:
-                            # Пользователь изменил свой «статус дела» (иконка + текст).
-                            # status_icon: имя SVG-файла из assets/status/ или '' (нет статуса).
-                            # status_text: произвольная подпись ≤ 30 символов или ''.
-                            # Сервер только хранит и ретранслирует — не валидирует содержимое.
-                            icon = msg.get('status_icon', '')[:64]   # ограничение длины имени файла
-                            text = msg.get('status_text', '')[:30]   # ≤ 30 символов согласно ТЗ
+                            icon = msg.get('status_icon', '')[:64]
+                            text = msg.get('status_text', '')[:30]
                             with self.clients_lock:
                                 if conn in self.clients:
                                     self.clients[conn]['status_icon'] = icon
                                     self.clients[conn]['status_text'] = text
                             self.send_global_state()
 
+                        # ── Stream Start ──────────────────────────────────────
                         elif action == CMD_STREAM_START:
                             with self.clients_lock:
                                 if conn in self.clients:
@@ -381,6 +766,7 @@ class SFUServer:
                                     print(f"[Server] {self.clients[conn]['nick']} запустил стрим")
                             self.send_global_state()
 
+                        # ── Stream Stop ───────────────────────────────────────
                         elif action == CMD_STREAM_STOP:
                             stopped_uid = None
                             with self.clients_lock:
@@ -391,51 +777,45 @@ class SFUServer:
                             if stopped_uid is not None:
                                 with self.watchers_lock:
                                     self.watchers.pop(stopped_uid, None)
-                                # Очищаем ABR-состояние и simulcast-флаг стримера
-                                with self.abr_lock:
-                                    self.abr_viewer_bitrates.pop(stopped_uid, None)
-                                    self.abr_current.pop(stopped_uid, None)
-                                    self.abr_last_upgrade.pop(stopped_uid, None)
-                                self._streamer_simulcast.pop(stopped_uid, None)
+                                # Закрываем WebRTC сессию стримера и всех его зрителей
+                                if self.sfu:
+                                    self.sfu.call_async(
+                                        self.sfu.close_streamer(stopped_uid)
+                                    )
                             self.send_global_state()
 
+                        # ── Stream Watch Start ────────────────────────────────
                         elif action == 'stream_watch_start':
-                            streamer_uid  = msg.get('streamer_uid')
-                            streamer_conn = None
+                            streamer_uid = msg.get('streamer_uid')
                             if streamer_uid is not None:
                                 with self.clients_lock:
                                     if conn in self.clients:
-                                        watcher = self.clients[conn]
-                                        w_uid   = watcher['uid']
-                                        # Ищем коннект стримера
-                                        for c_conn, c_data in self.clients.items():
-                                            if (c_data['uid'] == streamer_uid
-                                                    and c_data.get('is_streaming')):
-                                                streamer_conn = c_conn
-                                                break
+                                        watcher      = self.clients[conn]
+                                        w_uid        = watcher['uid']
+                                        watcher_nick = watcher['nick']
+                                        watcher_avatar = watcher.get('avatar', '1.svg')
                                 with self.watchers_lock:
                                     if streamer_uid not in self.watchers:
                                         self.watchers[streamer_uid] = {}
                                     self.watchers[streamer_uid][w_uid] = {
                                         'uid':    w_uid,
-                                        'nick':   watcher['nick'],
-                                        'avatar': watcher.get('avatar', '1.svg'),
+                                        'nick':   watcher_nick,
+                                        'avatar': watcher_avatar,
                                     }
                                 print(
-                                    f"[Server] {watcher['nick']} "
-                                    f"начал смотреть стрим {streamer_uid}"
+                                    f"[Server] {watcher_nick} "
+                                    f"начал смотреть стрим uid={streamer_uid}"
                                 )
-                            # IDR-запрос вне всех локов
-                            if streamer_conn:
-                                try:
-                                    streamer_conn.sendall(
-                                        json.dumps({'action': 'request_keyframe'}).encode('utf-8')
+                                # WebRTC: создаём offer для зрителя через SFU
+                                if self.sfu:
+                                    self.sfu.call_async(
+                                        self.sfu.handle_viewer_connect(
+                                            w_uid, streamer_uid, conn
+                                        )
                                     )
-                                    print(f"[Server] IDR запрошен у стримера uid={streamer_uid}")
-                                except Exception:
-                                    pass
                             self.send_global_state()
 
+                        # ── Stream Watch Stop ─────────────────────────────────
                         elif action == 'stream_watch_stop':
                             streamer_uid = msg.get('streamer_uid')
                             if streamer_uid is not None:
@@ -445,116 +825,83 @@ class SFUServer:
                                     with self.watchers_lock:
                                         if streamer_uid in self.watchers:
                                             self.watchers[streamer_uid].pop(w_uid, None)
-                                    # Убираем bitrate-предпочтение ушедшего зрителя
-                                    with self.abr_lock:
-                                        if streamer_uid in self.abr_viewer_bitrates:
-                                            self.abr_viewer_bitrates[streamer_uid].pop(w_uid, None)
                                     with self.clients_lock:
                                         nick = self.clients[conn]['nick'] if conn in self.clients else '?'
-                                    print(f"[Server] {nick} перестал смотреть стрим {streamer_uid}")
-                                    # Пересчитываем нужен ли LQ (зритель мог быть единственным слабым)
-                                    self._notify_lq_needed(streamer_uid)
+                                    print(f"[Server] {nick} перестал смотреть стрим uid={streamer_uid}")
+                                    # Закрываем WebRTC PC зрителя
+                                    if self.sfu:
+                                        self.sfu.call_async(
+                                            self.sfu.close_viewer(w_uid)
+                                        )
                             self.send_global_state()
 
-                        elif action == CMD_BITRATE_FEEDBACK:
-                            # Зритель сообщает свой запрошенный битрейт.
-                            # Валидируем: streamer_uid — int, bitrate — один из ABR_TIERS.
-                            streamer_uid_abr = msg.get('streamer_uid')
-                            req_bitrate      = msg.get('bitrate')
-                            valid_bitrates   = {t[1] for t in ABR_TIERS}
-                            if (isinstance(streamer_uid_abr, int)
-                                    and isinstance(req_bitrate, int)
-                                    and req_bitrate in valid_bitrates):
-                                # _abr_update вызываем вне любых локов tcp_handler'а
-                                self._abr_update(streamer_uid_abr, uid, req_bitrate)
+                        # ── WebRTC Offer (от стримера или зрителя) ────────────
+                        elif action == CMD_WEBRTC_OFFER:
+                            sdp      = msg.get('sdp')
+                            sdp_type = msg.get('type', 'offer')
+                            role     = msg.get('role', '')
 
-                        elif action == 'request_keyframe':
-                            # Зритель детектировал потерю UDP-пакетов и запрашивает IDR.
-                            # Сервер ретранслирует команду стримеру — тот форсирует I-кадр.
-                            # Команда мелкая (~50 байт), отправляем вне всех основных локов.
-                            streamer_uid_idr = msg.get('streamer_uid')
-                            if isinstance(streamer_uid_idr, int):
-                                streamer_conn_idr = None
-                                with self.clients_lock:
-                                    for c_conn, c_data in self.clients.items():
-                                        if (c_data['uid'] == streamer_uid_idr
-                                                and c_data.get('is_streaming')):
-                                            streamer_conn_idr = c_conn
-                                            break
-                                if streamer_conn_idr:
-                                    try:
-                                        streamer_conn_idr.sendall(
-                                            json.dumps({'action': 'request_keyframe'}).encode('utf-8')
-                                        )
-                                        print(
-                                            f"[Server] IDR ретранслирован стримеру uid={streamer_uid_idr}"
-                                            f" (запрос от uid={uid})"
-                                        )
-                                    except Exception:
-                                        pass
+                            if not sdp or not self.sfu:
+                                continue
 
-                        elif action == CMD_NACK:
-                            # Зритель запрашивает повторную доставку конкретного чанка.
-                            # Ретранслируем стримеру — тот вытащит чанк из retransmit_buffer
-                            # и повторно отправит его по UDP.
-                            # Команда мелкая (~70 байт), критична по latency — TCP_NODELAY уже включён.
-                            streamer_uid_nack = msg.get('streamer_uid')
-                            frame_id_nack     = msg.get('frame_id')
-                            chunk_idx_nack    = msg.get('chunk_idx')
-                            if (isinstance(streamer_uid_nack, int)
-                                    and isinstance(frame_id_nack, int)
-                                    and isinstance(chunk_idx_nack, int)):
-                                streamer_conn_nack = None
-                                with self.clients_lock:
-                                    for c_conn, c_data in self.clients.items():
-                                        if (c_data['uid'] == streamer_uid_nack
-                                                and c_data.get('is_streaming')):
-                                            streamer_conn_nack = c_conn
-                                            break
-                                if streamer_conn_nack:
-                                    try:
-                                        streamer_conn_nack.sendall(
-                                            json.dumps({
-                                                'action':    CMD_NACK_RELAY,
-                                                'frame_id':  frame_id_nack,
-                                                'chunk_idx': chunk_idx_nack,
-                                            }).encode('utf-8')
-                                        )
-                                    except Exception:
-                                        pass
+                            if role == 'streamer':
+                                # Стример прислал offer → SFU принимает треки
+                                self.sfu.call_async(
+                                    self.sfu.handle_streamer_offer(
+                                        uid, sdp, sdp_type, conn
+                                    )
+                                )
+                            # role == 'viewer' не обрабатывается здесь:
+                            # offer от SFU к зрителю уже отправлен в handle_viewer_connect.
+                            # Если придёт — это ошибка протокола, игнорируем.
 
+                        # ── WebRTC Answer (от зрителя) ────────────────────────
+                        elif action == CMD_WEBRTC_ANSWER:
+                            sdp      = msg.get('sdp')
+                            sdp_type = msg.get('type', 'answer')
+
+                            if sdp and self.sfu:
+                                # Зритель ответил на наш offer
+                                self.sfu.call_async(
+                                    self.sfu.handle_viewer_answer(uid, sdp, sdp_type)
+                                )
+
+                        # ── WebRTC ICE Candidate ──────────────────────────────
+                        elif action == CMD_WEBRTC_ICE:
+                            candidate = msg.get('candidate')
+                            if candidate and self.sfu:
+                                self.sfu.call_async(
+                                    self.sfu.handle_ice_candidate(uid, candidate)
+                                )
+
+                        # ── Soundboard ────────────────────────────────────────
                         elif action == CMD_SOUNDBOARD:
-                            # Добавляем ник отправителя — клиент покажет «кто включил»
                             with self.clients_lock:
                                 sender_nick = self.clients[conn]['nick'] if conn in self.clients else '?'
                                 conns = list(self.clients.keys())
                             msg['from_nick'] = sender_nick
                             payload = json.dumps(msg).encode('utf-8')
-                            # FIX #2: sendall вне clients_lock — не блокируем чтение других потоков
+                            # FIX #2: sendall вне clients_lock
                             for c in conns:
                                 try:
                                     c.sendall(payload)
                                 except Exception:
                                     pass
 
+                        # ── Nudge Vote ────────────────────────────────────────
                         elif action == CMD_NUDGE_VOTE:
-                            # ── Голосование «Пнуть» ──────────────────────────────────────
-                            # Порог срабатывания: все участники комнаты, кроме цели.
-                            # Пример: 4 человека в комнате, 1 АФК — нужно 3 голоса.
-                            # Кулдаун: один voter может добавить голос не чаще
-                            # NUDGE_COOLDOWN_SEC за одну цель.
                             target_uid = msg.get('target_uid')
                             if not isinstance(target_uid, int):
                                 continue
 
                             now  = time.time()
                             fire = False
-                            t_conn          = None
+                            t_conn            = None
                             broadcaster_conns = []
-                            voter_nick  = '?'
-                            target_nick = '?'
-                            voter_uid_v = None
-                            voter_room  = None
+                            voter_nick   = '?'
+                            target_nick  = '?'
+                            voter_uid_v  = None
+                            voter_room   = None
 
                             with self.clients_lock:
                                 if conn not in self.clients:
@@ -564,15 +911,12 @@ class SFUServer:
                                 voter_room  = voter_info['room']
                                 voter_nick  = voter_info['nick']
 
-                                # uid всех участников комнаты
                                 room_uids = [
                                     c['uid'] for c in self.clients.values()
                                     if c['room'] == voter_room
                                 ]
-                                # порог = все в комнате, кроме цели
                                 threshold = max(1, len(room_uids) - 1)
 
-                                # Находим conn и ник цели
                                 for c_conn, c_data in self.clients.items():
                                     if (c_data['uid'] == target_uid
                                             and c_data['room'] == voter_room):
@@ -580,21 +924,18 @@ class SFUServer:
                                         target_nick = c_data['nick']
                                         break
 
-                                # broadcast-список — все участники комнаты
                                 broadcaster_conns = [
                                     c_conn for c_conn, c_data in self.clients.items()
                                     if c_data['room'] == voter_room
                                 ]
 
                             if t_conn is None:
-                                # цель не в нашей комнате — игнорируем
                                 continue
 
                             with self.nudge_lock:
                                 room_votes   = self.nudge_votes.setdefault(voter_room, {})
                                 target_votes = room_votes.setdefault(target_uid, {})
 
-                                # Проверяем кулдаун для этого voter
                                 last = target_votes.get(voter_uid_v, 0)
                                 if now - last < NUDGE_COOLDOWN_SEC:
                                     remaining = int(NUDGE_COOLDOWN_SEC - (now - last))
@@ -606,9 +947,8 @@ class SFUServer:
 
                                 target_votes[voter_uid_v] = now
 
-                                # Считаем только активные (не протухшие) голоса
                                 active = sum(
-                                    1 for uid_v, ts in target_votes.items()
+                                    1 for _, ts in target_votes.items()
                                     if now - ts < NUDGE_COOLDOWN_SEC
                                 )
                                 print(
@@ -617,12 +957,10 @@ class SFUServer:
                                 )
 
                                 if active >= threshold:
-                                    # Сбрасываем голоса — следующий пнёт снова через кулдаун
                                     room_votes.pop(target_uid, None)
                                     fire = True
 
                             if fire:
-                                # Отправляем play_nudge только цели
                                 try:
                                     t_conn.sendall(
                                         json.dumps({'action': CMD_PLAY_NUDGE}).encode('utf-8')
@@ -631,7 +969,6 @@ class SFUServer:
                                 except Exception:
                                     pass
 
-                                # Рассылаем nudge_triggered всем в комнате (тост у всех)
                                 broadcast_payload = json.dumps({
                                     'action':      CMD_NUDGE_TRIGGERED,
                                     'target_nick': target_nick,
@@ -643,17 +980,8 @@ class SFUServer:
                                     except Exception:
                                         pass
 
-                        # ──────────────────────────────────────────────────────
-                        # Файловая передача P2P — сервер только relay-агент.
-                        # Все байты идут напрямую между клиентами, сервер не
-                        # читает и не буферизует данные → GIL не страдает,
-                        # пинг и голос остаются незатронутыми.
-                        # ──────────────────────────────────────────────────────
-
+                        # ── Файловая передача P2P ─────────────────────────────
                         elif action == CMD_FILE_OFFER:
-                            # Личная передача файла: relay одному получателю.
-                            # Сервер инжектирует реальный IP отправителя —
-                            # клиент сам не знает свой внешний Radmin-IP.
                             target_uid_fo = msg.get('target_uid')
                             if not isinstance(target_uid_fo, int):
                                 pass
@@ -671,13 +999,12 @@ class SFUServer:
                                         target_conn_fo.sendall(payload_fo)
                                         print(
                                             f"[Server] 📁 file_offer: "
-                                            f"uid={uid} ({client_ip}) → uid={target_uid_fo}"
+                                            f"uid={uid} → uid={target_uid_fo}"
                                         )
                                     except Exception:
                                         pass
 
                         elif action == CMD_FILE_OFFER_ROOM:
-                            # Массовая передача: relay всем в комнате кроме отправителя.
                             msg['sender_ip'] = client_ip
                             payload_for = json.dumps(msg).encode('utf-8')
                             room_conns = []
@@ -700,7 +1027,7 @@ class SFUServer:
                             if room_conns:
                                 print(
                                     f"[Server] 📁 file_offer_room: "
-                                    f"uid={uid} ({client_ip}) → {len(room_conns)} получателей"
+                                    f"uid={uid} → {len(room_conns)} получателей"
                                 )
 
                     except json.JSONDecodeError:
@@ -713,7 +1040,7 @@ class SFUServer:
                 print(f"[Server] TCP ошибка: {e}")
 
         finally:
-            # Очистка при отключении
+            # ── Очистка при отключении ────────────────────────────────────
             u_id = None
             nick = 'Unknown'
             room = '?'
@@ -721,9 +1048,9 @@ class SFUServer:
             with self.clients_lock:
                 if conn in self.clients:
                     client_info = self.clients.pop(conn)
-                    nick  = client_info.get('nick', 'Unknown')
-                    room  = client_info.get('room', '?')
-                    u_id  = client_info['uid']
+                    nick      = client_info.get('nick', 'Unknown')
+                    room      = client_info.get('room', '?')
+                    u_id      = client_info['uid']
                     remaining = len(self.clients)
                 else:
                     remaining = len(self.clients)
@@ -732,7 +1059,8 @@ class SFUServer:
                 with self.udp_lock:
                     self.udp_map.pop(u_id, None)
                     self.uid_to_room.pop(u_id, None)
-                # Собираем streamer_uid-ы у которых этот пользователь был зрителем
+
+                # Убираем пользователя из списков зрителей всех стримеров
                 affected_streamers = []
                 with self.watchers_lock:
                     for s_uid in list(self.watchers.keys()):
@@ -740,16 +1068,18 @@ class SFUServer:
                             self.watchers[s_uid].pop(u_id, None)
                             affected_streamers.append(s_uid)
                     self.watchers.pop(u_id, None)
-                # Убираем ABR-запросы и simulcast-флаг отключившегося пользователя
-                with self.abr_lock:
-                    for s_uid in list(self.abr_viewer_bitrates.keys()):
-                        self.abr_viewer_bitrates[s_uid].pop(u_id, None)
-                self._streamer_simulcast.pop(u_id, None)
-                self._lq_needed_state.pop(u_id, None)
-                # Пересчитываем lq_needed для всех стримеров, у которых был этот зритель
-                for s_uid in affected_streamers:
-                    self._notify_lq_needed(s_uid)
-                print(f"[Server] ✖ {nick} (комната: {room}) отключился | Онлайн: {remaining}")
+
+                # Закрываем WebRTC сессии отключившегося пользователя
+                if self.sfu:
+                    # Если был стримером — закрываем стример PC + все зрители
+                    self.sfu.call_async(self.sfu.close_streamer(u_id))
+                    # Если был зрителем — закрываем зритель PC
+                    self.sfu.call_async(self.sfu.close_viewer(u_id))
+
+                print(
+                    f"[Server] ✖ {nick} (комната: {room}) "
+                    f"отключился | Онлайн: {remaining}"
+                )
             else:
                 print(f"[Server] ✖ Незарегистрированный клиент {addr[0]} отключился")
 
@@ -757,185 +1087,13 @@ class SFUServer:
             self.send_global_state()
 
     # ------------------------------------------------------------------
-    # Simulcast: уведомление стримера о необходимости LQ-потока
-    # ------------------------------------------------------------------
-    def _notify_lq_needed(self, streamer_uid: int):
-        """
-        Вычисляет, нужен ли LQ-поток стримеру прямо сейчас, и отправляет
-        CMD_LQ_NEEDED только если состояние ИЗМЕНИЛОСЬ — без лишнего спама.
-
-        LQ нужен если: simulcast активен И среди зрителей есть хотя бы один
-        «слабый» (запрошенный битрейт < ABR_LQ_THRESHOLD).
-
-        Если зрителей нет совсем — LQ не нужен (NVENC-блок отдыхает).
-
-        Вызывается из:
-          • _abr_update (simulcast-ветка, при изменении bitrate зрителя)
-          • stream_watch_stop (зритель ушёл)
-          • disconnect handler (клиент отключился, убран из всех watchers)
-
-        Вне любых локов — не блокирует UDP-маршрутизацию.
-        """
-        if not self._streamer_simulcast.get(streamer_uid, False):
-            return  # стример не в simulcast-режиме — команда не нужна
-
-        # Вычисляем нужен ли LQ: есть ли слабый зритель
-        with self.abr_lock:
-            prefs = dict(self.abr_viewer_bitrates.get(streamer_uid, {}))
-        # Исключаем server-voter (uid=0) из расчёта — он голосует за upload,
-        # не отражает реальную силу зрителя.
-        viewer_prefs = {uid: bps for uid, bps in prefs.items() if uid != 0}
-
-        # Количество живых зрителей (независимо от наличия ABR-данных)
-        with self.watchers_lock:
-            watcher_count = len(self.watchers.get(streamer_uid, {}))
-
-        if viewer_prefs:
-            # Есть реальные ABR-данные — определяем по ним
-            lq_needed = any(bps < ABR_LQ_THRESHOLD for bps in viewer_prefs.values())
-        elif watcher_count > 0:
-            # Зрители есть, но ещё не прислали feedback (< 1.5 сек после подключения).
-            # Включаем LQ: лучше потратить 600 kbps на LQ-поток,
-            # чем дать слабому зрителю HQ и получить IDR-шторм.
-            lq_needed = True
-        else:
-            # Зрителей нет совсем — LQ не нужен.
-            lq_needed = False
-
-        # Дедупликация: отправляем только если состояние изменилось
-        if self._lq_needed_state.get(streamer_uid) == lq_needed:
-            return
-
-        self._lq_needed_state[streamer_uid] = lq_needed
-
-        # Ищем коннект стримера
-        streamer_conn = None
-        with self.clients_lock:
-            for c_conn, c_data in self.clients.items():
-                if c_data['uid'] == streamer_uid and c_data.get('is_streaming'):
-                    streamer_conn = c_conn
-                    break
-
-        if streamer_conn is None:
-            return
-
-        try:
-            streamer_conn.sendall(
-                json.dumps({
-                    'action': CMD_LQ_NEEDED,
-                    'needed': lq_needed,
-                }).encode('utf-8')
-            )
-            state_str = "включён (слабый зритель)" if lq_needed else "выключен (нет слабых зрителей)"
-            print(f"[Simulcast] streamer={streamer_uid}: LQ-поток {state_str}")
-        except Exception as e:
-            print(f"[Simulcast] Ошибка отправки lq_needed стримеру {streamer_uid}: {e}")
-
-    # ------------------------------------------------------------------
-    # ABR: обновить битрейт для стримера и уведомить его если изменился
-    # ------------------------------------------------------------------
-    def _abr_update(self, streamer_uid: int, viewer_uid: int, bitrate: int):
-        """
-        Обновляет запрос битрейта от viewer_uid для стримера streamer_uid.
-
-        Simulcast-режим (nvenc):
-            Сохраняем предпочтение зрителя для маршрутизации в udp_handler.
-            Команду adjust_bitrate стримеру НЕ отправляем — энкодеры фиксированы
-            (HQ=6Mbps, LQ=800kbps). Спираль ABR физически невозможна.
-
-        Legacy-режим (libx264 / без simulcast):
-            Вычисляем min по всем зрителям и шлём стримеру adjust_bitrate.
-            Гистерезис: понижение немедленно, повышение с кулдауном 10 с.
-
-        Вызывается из tcp_handler, вне каких-либо других локов.
-        """
-        ABR_UPGRADE_COOLDOWN_SEC = 10.0
-        new_min = bitrate
-
-        with self.abr_lock:
-            if streamer_uid not in self.abr_viewer_bitrates:
-                self.abr_viewer_bitrates[streamer_uid] = {}
-            self.abr_viewer_bitrates[streamer_uid][viewer_uid] = bitrate
-
-            # В simulcast-режиме abr_viewer_bitrates используется только
-            # для маршрутизации в _send_to_watchers_routed.
-            #
-            # Исключение: server upload voter (viewer_uid == 0).
-            # Это специальный псевдо-зритель из _upload_abr_loop — он голосует
-            # только когда фактический upload стримера ниже настроенного битрейта.
-            # В этом случае simulcast не спасает: стример гонит 6+0.8 Mbps,
-            # а его канал держит, например, 800 kbps. Сервер обязан сообщить
-            # стримеру о перегрузке чтобы запустить Spatial Layer Fallback.
-            #
-            # viewer_uid != 0 → обычный зритель с плохим RTT → его защищает
-            # маршрутизация LQ-потока; стримера трогать не нужно.
-            if self._streamer_simulcast.get(streamer_uid, False) and viewer_uid != 0:
-                # Зритель обновил свой битрейт — пересчитываем нужен ли LQ.
-                # Вызываем ВНЕ abr_lock (хелпер сам берёт нужные локи).
-                pass  # выходим из with abr_lock перед вызовом хелпера
-
-        # _notify_lq_needed вызывается вне abr_lock — без риска дедлока.
-        if self._streamer_simulcast.get(streamer_uid, False) and viewer_uid != 0:
-            self._notify_lq_needed(streamer_uid)
-            return
-
-            # --- Legacy ABR: вычисляем min и решаем — менять ли битрейт ---
-            new_min = min(self.abr_viewer_bitrates[streamer_uid].values())
-            current = self.abr_current.get(streamer_uid)
-
-            if current == new_min:
-                return  # ничего не изменилось
-
-            is_downgrade = (current is not None and new_min < current)
-
-            if not is_downgrade:
-                # Повышение — проверяем кулдаун
-                now = time.time()
-                last_upgrade = self.abr_last_upgrade.get(streamer_uid, 0.0)
-                if now - last_upgrade < ABR_UPGRADE_COOLDOWN_SEC:
-                    return  # слишком рано повышать
-                self.abr_last_upgrade[streamer_uid] = now
-
-            # FIX: сохраняем старый битрейт ДО перезаписи — нужен для стрелки в логе.
-            # Старый код читал abr_current[streamer_uid] ПОСЛЕ new_min, поэтому
-            # new_min < new_min всегда False и стрелка всегда показывала "↑".
-            old_bitrate = current
-            self.abr_current[streamer_uid] = new_min
-
-        # Находим conn стримера вне abr_lock
-        streamer_conn = None
-        with self.clients_lock:
-            for c_conn, c_data in self.clients.items():
-                if c_data['uid'] == streamer_uid and c_data.get('is_streaming'):
-                    streamer_conn = c_conn
-                    break
-
-        if streamer_conn is None:
-            return
-
-        try:
-            streamer_conn.sendall(
-                json.dumps({
-                    'action':  CMD_ADJUST_BITRATE,
-                    'bitrate': new_min,
-                }).encode('utf-8')
-            )
-            kbps = new_min // 1000
-            direction = "↓" if (old_bitrate is not None and new_min < old_bitrate) else "↑"
-            print(f"[ABR] streamer={streamer_uid}: {direction} новый битрейт {kbps} kbps "
-                  f"(viewer={viewer_uid} запросил {bitrate//1000} kbps)")
-        except Exception as e:
-            print(f"[ABR] Ошибка отправки adjust_bitrate стримеру {streamer_uid}: {e}")
-
-    # ------------------------------------------------------------------
-    # Вспомогательный метод: отправка пакета всем зрителям стримера
+    # Вспомогательный метод: отправка пакета всем зрителям стримера (UDP)
     # ------------------------------------------------------------------
     def _send_to_watchers(self, sender_uid: int, data: bytes):
         """
         Отправляет UDP-пакет всем зрителям стримера sender_uid.
-
-        Порядок локов намеренно фиксирован: watchers_lock → udp_lock.
-        sendto() выполняется вне любых локов.
+        Используется для FLAG_STREAM_VOICES (Mix Minus, UDP-путь).
+        Порядок локов: watchers_lock → udp_lock. sendto() вне любых локов.
         """
         with self.watchers_lock:
             watcher_uids = list(self.watchers.get(sender_uid, {}).keys())
@@ -954,82 +1112,20 @@ class SFUServer:
                 pass
 
     # ------------------------------------------------------------------
-    # Вспомогательный метод: маршрутизация HQ/LQ при Simulcast
-    # ------------------------------------------------------------------
-    def _send_to_watchers_routed(self, sender_uid: int, data: bytes, is_lq: bool):
-        """
-        Simulcast-маршрутизация: отправляет пакет только тем зрителям,
-        чьё качественное предпочтение совпадает с типом пакета.
-
-        is_lq=True  (FLAG_VIDEO_LQ): отправить зрителям с bitrate ≤ ABR_LQ_THRESHOLD
-        is_lq=False (HQ):            отправить зрителям с bitrate >  ABR_LQ_THRESHOLD
-
-        Зритель без записанного предпочтения (ещё не прислал feedback) → HQ по умолчанию.
-        Это гарантирует, что новый зритель сразу видит максимальное качество, а при
-        первом же bitrate_feedback попадает в правильный поток.
-
-        Порядок локов фиксирован: watchers_lock → abr_lock → udp_lock.
-        sendto() выполняется вне любых локов.
-        """
-        with self.watchers_lock:
-            watcher_uids = list(self.watchers.get(sender_uid, {}).keys())
-
-        if not watcher_uids:
-            return
-
-        with self.abr_lock:
-            prefs = dict(self.abr_viewer_bitrates.get(sender_uid, {}))
-
-        # Фильтруем: сопоставляем is_lq с предпочтением каждого зрителя.
-        # Зритель без записанного предпочтения (ещё не прислал feedback) → LQ по умолчанию.
-        # Rationale: неизвестный зритель может быть слабым; лучше показать 600 kbps LQ,
-        # чем залить его HQ и получить IDR-шторм до первого feedback (~1.5 сек).
-        # Как только придёт первый bitrate_feedback → попадёт в правильный поток.
-        target_uids = []
-        for w_uid in watcher_uids:
-            req_bps = prefs.get(w_uid, 0)              # 0 → "слабый" до первого feedback
-            viewer_wants_lq = req_bps < ABR_LQ_THRESHOLD
-            if is_lq == viewer_wants_lq:
-                target_uids.append(w_uid)
-
-        if not target_uids:
-            return
-
-        with self.udp_lock:
-            target_addrs = [
-                self.udp_map[uid]
-                for uid in target_uids
-                if uid in self.udp_map
-            ]
-
-        for addr in target_addrs:
-            try:
-                self.udp_sock.sendto(data, addr)
-            except Exception:
-                pass
-
-    # ------------------------------------------------------------------
     # Рассылка глобального состояния по TCP
     # ------------------------------------------------------------------
     def send_global_state(self):
         """
         FIX #2: sendall() выполняется вне clients_lock.
-        FIX nested-lock: watchers_lock больше не захватывается ВНУТРИ clients_lock.
+        FIX nested-lock: watchers_lock не захватывается внутри clients_lock.
 
-        Было:
-            with clients_lock:
-                with watchers_lock: ...   # риск дедлока при инверсии порядка
-
-        Стало:
-            1. Под watchers_lock берём полный снимок watchers.
-            2. Под clients_lock строим payload, используя уже готовый снимок.
-            3. sendall() без каких-либо локов.
+        1. Под watchers_lock берём снимок watchers.
+        2. Под clients_lock строим payload, используя снимок.
+        3. sendall() без каких-либо локов.
         """
-        # Шаг 1: снимок watchers под своим локом (без clients_lock)
         with self.watchers_lock:
             watchers_snapshot = {uid: dict(ws) for uid, ws in self.watchers.items()}
 
-        # Шаг 2: собрать состояние и список получателей — быстро, под clients_lock
         with self.clients_lock:
             state = {}
             conns_snapshot = []
@@ -1050,9 +1146,10 @@ class SFUServer:
                 })
                 conns_snapshot.append(c_conn)
 
-        payload = json.dumps({'action': CMD_SYNC_USERS, 'all_users': state}).encode('utf-8')
+        payload = json.dumps(
+            {'action': CMD_SYNC_USERS, 'all_users': state}
+        ).encode('utf-8')
 
-        # Шаг 3: отправить — без лока, медленный клиент не тормозит UDP
         for c_conn in conns_snapshot:
             try:
                 c_conn.sendall(payload)
@@ -1060,104 +1157,30 @@ class SFUServer:
                 pass
 
     # ------------------------------------------------------------------
-    # Upload-side ABR: сервер измеряет входящий поток стримера
-    # ------------------------------------------------------------------
-    def _upload_abr_loop(self):
-        """
-        Каждые INTERVAL секунд вычисляет фактический upload bitrate каждого активного
-        стримера на основе реально принятых UDP байт.
-
-        Проблема, которую решает этот метод:
-            Viewer-driven ABR слепой к upload стримера. Если у стримера нестабильный
-            WiFi/мобильный интернет (средний upload 800 kbps, но энкодер пишет 6 Mbps),
-            сервер получает пакеты бурстами. Зрители видят 300 мс тишины → лавину пакетов
-            → переполнение receive-буфера → потери → IDR-шторм. ABR реагирует только
-            через 4 сек через RTT зрителя — этого недостаточно.
-
-        Решение:
-            Сервер голосует в min() ABR системы как псевдо-зритель uid=0.
-            Если actual_bitrate < THRESHOLD * configured → отправляем adjust_bitrate
-            со значением actual (округлённым до ближайшего ABR тира).
-            Если upload восстановился → снимаем ограничение (голос 6 Mbps).
-            Используем существующий _abr_update() — никакой новой логики отправки.
-
-        THRESHOLD 80%: небольшой запас на заголовки и jitter,
-            не роняем битрейт из-за случайного кратковременного спада.
-        """
-        INTERVAL  = 4.0    # секунд — совпадает с ABR_FEEDBACK_INTERVAL_MS клиента
-        THRESHOLD = 0.80   # если actual < 80% configured → ограничиваем
-        SERVER_VOTER_UID = 0  # псевдо-viewer uid для голосования в min()
-
-        # Отсортированные тиры по убыванию для поиска ближайшего подходящего
-        sorted_tiers = sorted(ABR_TIERS, key=lambda x: x[1])  # по возрастанию bitrate
-
-        while True:
-            time.sleep(INTERVAL)
-
-            # Снимаем счётчики атомарно: читаем + сбрасываем
-            now = time.time()
-            streamers = list(self._streamer_rx_start.keys())
-
-            for uid in streamers:
-                rx_bytes = self._streamer_rx_bytes.pop(uid, 0)
-                t_start  = self._streamer_rx_start.pop(uid, now)
-                elapsed  = now - t_start
-                if elapsed < 0.5:
-                    # Слишком короткое окно — пропускаем, данные недостоверны
-                    continue
-
-                actual_bps = int((rx_bytes * 8) / elapsed)
-
-                # Узнаём текущий сконфигурированный битрейт стримера
-                with self.abr_lock:
-                    configured_bps = self.abr_current.get(uid)
-
-                if configured_bps is None:
-                    # Стример есть, но ABR ещё не устанавливал битрейт — пропускаем
-                    continue
-
-                if actual_bps >= int(configured_bps * THRESHOLD):
-                    # Upload справляется — снимаем серверное ограничение
-                    # (голосуем максимальным тиром, не мешаем viewer ABR)
-                    max_bitrate = sorted_tiers[-1][1]
-                    self._abr_update(uid, SERVER_VOTER_UID, max_bitrate)
-                    continue
-
-                # Upload недостаточен — находим подходящий тир
-                # Берём тир чуть выше фактического (даём 10% запас для jitter)
-                target_bps = int(actual_bps * 1.10)
-                voted_bps  = sorted_tiers[0][1]  # fallback: минимальный тир
-                for tier_rtt, tier_bps in sorted_tiers:
-                    if tier_bps <= target_bps:
-                        voted_bps = tier_bps
-                    else:
-                        break
-
-                actual_kbps     = actual_bps // 1000
-                configured_kbps = configured_bps // 1000
-                voted_kbps      = voted_bps // 1000
-                print(
-                    f"[UploadABR] streamer={uid}: фактический upload {actual_kbps} kbps "
-                    f"< порог {int(configured_kbps * THRESHOLD)} kbps "
-                    f"(настроен {configured_kbps} kbps) → голосуем {voted_kbps} kbps"
-                )
-                self._abr_update(uid, SERVER_VOTER_UID, voted_bps)
-
-    # ------------------------------------------------------------------
     # Запуск сервера
     # ------------------------------------------------------------------
     def start(self):
-        threading.Thread(target=self.udp_handler,      daemon=True).start()
-        threading.Thread(target=self.stats_monitor,    daemon=True).start()
-        threading.Thread(target=self._upload_abr_loop, daemon=True).start()
-        print(f"Server started. TCP:{DEFAULT_PORT_TCP}, UDP:{DEFAULT_PORT_UDP}")
+        # Запускаем WebRTCSFU если aiortc установлен
+        if AIORTC_AVAILABLE:
+            self.sfu = WebRTCSFU()
+            print("[Server] WebRTCSFU запущен (aiortc доступен)")
+        else:
+            print("[Server] WebRTCSFU ОТКЛЮЧЁН (aiortc не установлен)")
+
+        threading.Thread(target=self.udp_handler,   daemon=True).start()
+        threading.Thread(target=self.stats_monitor, daemon=True).start()
+        print(f"[Server] Запущен. TCP:{DEFAULT_PORT_TCP}, UDP:{DEFAULT_PORT_UDP}")
+
         while True:
             conn, addr = self.tcp_sock.accept()
-            # Отключаем алгоритм Нейгла на каждом принятом соединении.
-            # Команды adjust_bitrate и request_keyframe — мелкие JSON (~50 байт).
-            # Без TCP_NODELAY Нейгл буферизует их до 200 мс в ожидании полного сегмента.
+            # Отключаем алгоритм Нейгла: мелкие команды (nudge, stream events)
+            # отправляются немедленно без буферизации.
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            threading.Thread(target=self.tcp_handler, args=(conn, addr), daemon=True).start()
+            threading.Thread(
+                target=self.tcp_handler,
+                args=(conn, addr),
+                daemon=True,
+            ).start()
 
 
 if __name__ == "__main__":

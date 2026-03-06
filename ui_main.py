@@ -202,8 +202,8 @@ class MainWindow(QMainWindow):
         self.net.nudge_received.connect(self._on_nudge_received)
         self.net.nudge_triggered.connect(self._on_nudge_triggered)
 
-        # Индикатор качества соединения стримера (ABR-понижение от сервера)
-        self.net.bitrate_adjusted.connect(self._on_bitrate_adjusted)
+        # ABR-сигнал (bitrate_adjusted) удалён: WebRTC управляет битрейтом через TWCC.
+        # _stream_conn_lbl оставлен в UI — будет подключён к WebRTC getStats() позже.
 
         # Входящий запрос файловой передачи от другого пользователя
         self.net.file_offer_received.connect(self._on_file_offer_received)
@@ -1562,16 +1562,9 @@ class MainWindow(QMainWindow):
             # Установить актуальное состояние прямо сейчас
             w.sync_audio_state(self.audio.is_muted, self.audio.is_deafened)
 
-            # Громкость стрима — зритель регулирует из оверлея
-            w.overlay_stream_volume_changed.connect(self.audio.set_stream_volume)
-            # Синхронизировать попап с текущим значением громкости стрима
-            w.overlay._vol_popup.set_value(self.audio.stream_volume)
-
-            # --- ABR: регистрируем начало просмотра ---
-            # NetworkClient начнёт каждые 4 сек отправлять bitrate_feedback
-            # серверу с нашим RTT → сервер вычислит min по всем зрителям →
-            # пришлёт стримеру adjust_bitrate → VideoEngine перезапустит энкодер.
-            self.net.start_watching(uid)
+            # Громкость стрима — управляется VideoWindow через WebRTC (не через AudioHandler).
+            # overlay_stream_volume_changed подключается внутри VideoWindow к своему
+            # WebRTC AudioReceiver напрямую (будет реализовано в Шаге 7: ui_video.py).
 
             w.show()
             self.stream_windows[uid] = w
@@ -1589,8 +1582,7 @@ class MainWindow(QMainWindow):
                 pass
         self.stream_windows.pop(uid, None)
         self.net.send_json({"action": "stream_watch_stop", "streamer_uid": uid})
-        # ABR: прекращаем отправлять bitrate_feedback для этого стримера
-        self.net.stop_watching()
+        # ABR stop_watching() удалён: WebRTC управляет битрейтом через TWCC автоматически.
 
         # FIX MEM: Останавливаем decode_worker для этого uid.
         #
@@ -2039,52 +2031,11 @@ class MainWindow(QMainWindow):
 
     def _on_bitrate_adjusted(self, bitrate: int):
         """
-        Обработчик CMD_ADJUST_BITRATE от сервера.
-        Показывает/скрывает индикатор качества соединения рядом с кнопкой
-        трансляции в зависимости от текущего битрейта.
-
-        Логика (аналог Discord «слабое соединение» у стримера):
-          bitrate ≥ 2.5 Mbps → индикатор скрыт (норма для VBR max=3 Mbps)
-          bitrate < 2.5 Mbps → жёлтый: умеренная деградация канала
-          bitrate < 1 Mbps   → красный: сильная деградация, видимые артефакты
-
-        Индикатор показывается только во время активной трансляции —
-        при остановке он сбрасывается в update_stream_button_icon().
+        STUB — ABR через UDP удалён. WebRTC управляет битрейтом автоматически (TWCC).
+        Метод сохранён: _stream_conn_lbl остаётся в UI и будет подключён
+        к WebRTC pc.getStats() в следующей итерации (ui_video.py, Шаг 7).
         """
-        if not self.is_streaming:
-            return
-
-        kbps = bitrate // 1000
-
-        if bitrate >= 2_500_000:
-            # Канал восстановился — скрываем предупреждение
-            self._stream_conn_lbl.setVisible(False)
-            return
-
-        # Устанавливаем иконку и цветовой оверлей через styleSheet
-        if bitrate < 1_000_000:
-            # Критическая деградация: красная тонировка + подсказка
-            self._stream_conn_lbl.setStyleSheet(
-                "background-color: rgba(231, 76, 60, 0.18); "
-                "border-radius: 4px;"
-            )
-            self._stream_conn_lbl.setToolTip(
-                f"⚠ Слабый upload!\n"
-                f"Битрейт снижен до {kbps} kbps.\n"
-                f"Зрители видят ухудшенное качество."
-            )
-        else:
-            # Умеренная деградация: жёлтая тонировка
-            self._stream_conn_lbl.setStyleSheet(
-                "background-color: rgba(241, 196, 15, 0.18); "
-                "border-radius: 4px;"
-            )
-            self._stream_conn_lbl.setToolTip(
-                f"⚡ Upload снижен\n"
-                f"Битрейт адаптирован до {kbps} kbps."
-            )
-
-        self._stream_conn_lbl.setVisible(True)
+        pass
 
     def toggle_stream(self):
         from ui_dialogs import StreamSettingsDialog
@@ -2093,33 +2044,36 @@ class MainWindow(QMainWindow):
             if dialog.exec():
                 settings = dialog.get_settings()
 
-                # Звук трансляции:
-                #   set_stream_audio_enabled(True) запускает StreamAudioCapture:
-                #     1. Если VB-CABLE установлен → захват из «CABLE Output» (чисто, без эха)
-                #     2. Если нет → WASAPI Loopback с AEC (старый путь, запасной)
-                #   device_idx=None: VB-CABLE определяется по имени автоматически,
-                #   WASAPI выбирает дефолтное устройство.
-                self.audio.set_stream_audio_enabled(settings.get("stream_audio", False))
+                # Порядок операций (важен для WebRTC signaling):
+                #   1. CMD_STREAM_START → сервер помечает нас как стримера.
+                #      Сервер должен знать о стриме ДО получения webrtc_offer,
+                #      иначе он не сможет связать offer с конкретным стримером.
+                #   2. net.start_streaming_webrtc(settings):
+                #        — создаёт DXCamTrack через VideoEngine
+                #        — создаёт RTCPeerConnection
+                #        — добавляет видео/аудио треки
+                #        — создаёт SDP offer → ждёт ICE gathering → отправляет серверу
+                self.net.send_json({"action": CMD_STREAM_START})
+                self.net.start_streaming_webrtc(settings)
 
-                success = self.video.start_streaming(settings)
-                if success:
-                    self.is_streaming = True
-                else:
-                    self.audio.set_stream_audio_enabled(False)
+                # Синхронная проверка успеха: DXCamTrack создаётся синхронно
+                # внутри start_streaming_webrtc() → если None, что-то пошло не так
+                # (отсутствие зависимостей, loop не запущен и т.п.)
+                if self.video.get_dxcam_track() is None:
+                    self.net.send_json({"action": CMD_STREAM_STOP})
                     self.btn_stream.setChecked(False)
                     return
+
+                self.is_streaming = True
             else:
                 self.btn_stream.setChecked(False)
                 return
         else:
             self.video.stop_streaming()
-            self.audio.set_stream_audio_enabled(False)
+            # stop_streaming() останавливает DXCamTrack.
+            # WebRTC PC закрывается отдельно в net.stop_streaming_webrtc() если есть.
             self.is_streaming = False
-            # stop_streaming() уже делает gc.collect() + Windows heap trim внутри.
-            # Доп. trim здесь — для Qt-объектов (QImage в on_video_frame буфере).
+            self.net.send_json({"action": CMD_STREAM_STOP})
 
         self.update_stream_button_icon()
-
-        action = CMD_STREAM_START if self.is_streaming else CMD_STREAM_STOP
-        self.net.send_json({"action": action})
         self.refresh_ui()

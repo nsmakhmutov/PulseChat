@@ -494,16 +494,8 @@ class VideoWindow(QWidget):
 
         self._setup_ui(nick)
         self._setup_hide_timer()
-
-        # --- ABR feedback timer ---
-        # Каждые ABR_FEEDBACK_INTERVAL_MS мс отправляем серверу наш текущий RTT.
-        # Сервер вычислит минимум по всем зрителям и при необходимости скорректирует
-        # битрейт стримера. Таймер запускается в set_net() и останавливается в closeEvent.
-        from config import ABR_FEEDBACK_INTERVAL_MS
-        self._abr_timer = QTimer(self)
-        self._abr_timer.setSingleShot(False)
-        self._abr_timer.setInterval(ABR_FEEDBACK_INTERVAL_MS)
-        self._abr_timer.timeout.connect(self._send_abr_feedback)
+        # ABR-таймер удалён: WebRTC управляет битрейтом через TWCC автоматически.
+        # _lbl_rtc в тулбаре будет подключён к pc.getStats() в следующей итерации.
 
     # ------------------------------------------------------------------
     # Публичный метод: передать NetworkClient для soundboard в оверлее
@@ -511,17 +503,9 @@ class VideoWindow(QWidget):
     def set_net(self, net):
         """
         Вызывается из MainWindow.open_video_window() после создания окна.
-        Сохраняет ссылку на NetworkClient и запускает ABR feedback timer.
-
-        FIX cold-start: отправляем первый ABR feedback немедленно (через 200 мс),
-        не ждём первого тика таймера (4000 мс).
-        Проблема без этого: зритель с высоким пингом (например 412 мс) получает
-        HQ-поток (6 Mbps) в течение 4 секунд до первого feedback → канал захлёбывается.
-        200 мс достаточно чтобы current_ping успел обновиться после первого pong.
+        Сохраняет ссылку на NetworkClient для soundboard в оверлее стрима.
         """
         self._net = net
-        QTimer.singleShot(200, self._send_abr_feedback)   # ранний фидбек
-        self._abr_timer.start()
 
     # ------------------------------------------------------------------
     # Soundboard поверх стрима
@@ -599,10 +583,13 @@ class VideoWindow(QWidget):
         self._lbl_res      = QLabel("Res: —")
         self._lbl_frames   = QLabel("Frames: 0")
         self._lbl_renderer = QLabel("🟢 OpenGL GPU")
-        self._lbl_bitrate  = QLabel("ABR: —")   # текущий битрейт, обновляется по adjust_bitrate
+        # WebRTC stats: RTT + jitter из pc.getStats() (будет подключено в следующей итерации).
+        # Заменяет «ABR: X kbps» — WebRTC управляет битрейтом через TWCC автоматически,
+        # ручной ABR-feedback больше не нужен.
+        self._lbl_rtc = QLabel("WebRTC: —")
 
         for lbl in (self._lbl_fps, self._lbl_res, self._lbl_frames,
-                    self._lbl_renderer, self._lbl_bitrate):
+                    self._lbl_renderer, self._lbl_rtc):
             lbl.setStyleSheet(lbl_style)
             bar_layout.addWidget(lbl)
 
@@ -720,54 +707,30 @@ class VideoWindow(QWidget):
         self.overlay_stop_watch.emit()
         self.close()
 
-    # ------------------------------------------------------------------
-    # ABR: периодическая отправка фидбека по RTT
-    # ------------------------------------------------------------------
-    def _send_abr_feedback(self):
+    def update_rtc_stats(self, rtt_ms: int, jitter_ms: int):
         """
-        Вызывается ABR-таймером каждые ABR_FEEDBACK_INTERVAL_MS мс.
+        Обновляет WebRTC-метку в тулбаре (RTT + jitter из pc.getStats()).
+        Будет вызываться из VideoEngine после подключения к WebRTC pc.getStats()
+        в следующей итерации рефакторинга.
 
-        Читает current_ping из NetworkClient (EWMA-RTT от ping_loop),
-        вычисляет запрашиваемый битрейт по таблице ABR_TIERS и
-        отправляет серверу bitrate_feedback. Сервер сам вычислит min
-        по всем зрителям и при изменении пришлёт стримеру adjust_bitrate.
-
-        current_ping == 0 означает что ping ещё не измерен (первые 7 с) —
-        в этом случае пропускаем: не нужно занижать битрейт без данных.
-        """
-        if self._net is None or self._closing:
-            return
-        ping = getattr(self._net, 'current_ping', 0)
-        if ping <= 0:
-            return
-        self._net.send_bitrate_feedback(ping)
-
-    def update_bitrate_label(self, bitrate: int):
-        """
-        Вызывается из MainWindow когда сервер прислал adjust_bitrate.
-        Обновляет метку в тулбаре (только если окно ещё живо).
-
-        При битрейте ≤ 1500 kbps показывает предупреждение о плохой сети
-        красным цветом — пользователь понимает, что качество ухудшено не
-        из-за стримера, а из-за состояния канала.
-
-        Пример: 2500000 → "ABR: 2500 kbps"
-        Пример: 800000  → "⚠️ ABR: 800 kbps (Плохая сеть)"
+        Цветовая схема по RTT:
+          ≤ 80 мс  → зелёный  (отличная сеть)
+          ≤ 200 мс → жёлтый   (допустимо)
+          > 200 мс → красный  (высокая задержка)
         """
         if self._closing:
             return
         try:
-            kbps = bitrate // 1000
-            if kbps <= 1500:
-                self._lbl_bitrate.setText(f"⚠️ ABR: {kbps} kbps (Плохая сеть)")
-                self._lbl_bitrate.setStyleSheet(
-                    "color: #e74c3c; padding: 0 10px; font-size: 11px; font-weight: bold;"
-                )
+            if rtt_ms <= 80:
+                color, icon = "#2ecc71", "🟢"
+            elif rtt_ms <= 200:
+                color, icon = "#f1c40f", "🟡"
             else:
-                self._lbl_bitrate.setText(f"ABR: {kbps} kbps")
-                self._lbl_bitrate.setStyleSheet(
-                    "color: #8888aa; padding: 0 10px; font-size: 11px;"
-                )
+                color, icon = "#e74c3c", "🔴"
+            self._lbl_rtc.setText(f"{icon} RTT: {rtt_ms} ms  Jitter: {jitter_ms} ms")
+            self._lbl_rtc.setStyleSheet(
+                f"color: {color}; padding: 0 10px; font-size: 11px;"
+            )
         except RuntimeError:
             pass
 
@@ -860,7 +823,6 @@ class VideoWindow(QWidget):
     def closeEvent(self, event):
         """Перехватываем закрытие окна, испускаем сигнал до уничтожения объекта."""
         self._closing = True         # блокируем sync_audio_state от внешних сигналов
-        self._abr_timer.stop()       # останавливаем ABR feedback timer
         self._hide_timer.stop()      # останавливаем таймер авто-скрытия
 
         # Закрываем SoundboardPanel если открыта
