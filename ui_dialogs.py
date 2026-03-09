@@ -1914,15 +1914,49 @@ class SettingsDialog(QDialog):
         self.cb_out = QComboBox()
         self.refresh_devices_list()
 
-        stat = "ВКЛ" if self.audio.use_noise_reduction else "ВЫКЛ"
+        # ── Шумоподавление: ComboBox с тремя режимами ──────────────────────────
+        nr_label = QLabel("🎛  Шумоподавление микрофона:")
+        nr_label.setStyleSheet("font-weight: bold; font-size: 12px; margin-top: 6px;")
+
+        self.cb_nr = QComboBox()
+        self.cb_nr.setObjectName("cb_nr")
+        self.cb_nr.setToolTip(
+            "Выкл — без обработки\n"
+            "RNNoise — лёгкое NN-подавление (низкая нагрузка)\n"
+            "DeepFilterNet — глубокая фильтрация (средняя нагрузка)"
+        )
+
+        # Пункт 0: всегда доступен
+        self.cb_nr.addItem("🔇  Выкл", 0)
+
+        # Пункт 1: RNNoise
+        rnn_item_text = "🟢  RNNoise" if PYRNNOISE_AVAILABLE else "🔴  RNNoise (модуль не установлен)"
+        self.cb_nr.addItem(rnn_item_text, 1)
         if not PYRNNOISE_AVAILABLE:
-            stat = "НЕТ МОДУЛЯ"
-        self.btn_nr = QPushButton(f"Шумодав: {stat}")
-        self.btn_nr.setObjectName("btn_nr")
-        self.btn_nr.setCheckable(True)
-        self.btn_nr.setEnabled(PYRNNOISE_AVAILABLE)
-        self.btn_nr.setChecked(self.audio.use_noise_reduction)
-        self.btn_nr.clicked.connect(self.toggle_nr)
+            # Блокируем пункт через setData на роль Qt.ItemDataRole.UserRole+1
+            from PyQt6.QtGui import QStandardItem
+            model = self.cb_nr.model()
+            item = model.item(1)
+            if item:
+                item.setEnabled(False)
+
+        # Пункт 2: DeepFilterNet
+        dfn_ok = getattr(self.audio, 'dfn_available', False)
+        dfn_item_text = "🔵  DeepFilterNet" if dfn_ok else "🔴  DeepFilterNet (dll не найдена)"
+        self.cb_nr.addItem(dfn_item_text, 2)
+        if not dfn_ok:
+            model = self.cb_nr.model()
+            item = model.item(2)
+            if item:
+                item.setEnabled(False)
+
+        # Восстанавливаем сохранённый режим
+        saved_nr = getattr(self.audio, 'nr_mode', 0)
+        idx = self.cb_nr.findData(saved_nr)
+        if idx != -1:
+            self.cb_nr.setCurrentIndex(idx)
+
+        self.cb_nr.currentIndexChanged.connect(self._on_nr_mode_changed)
 
         aud_lay.addWidget(QLabel("Качество звука (Битрейт):"))
         self.cb_bitrate = QComboBox()
@@ -1946,7 +1980,8 @@ class SettingsDialog(QDialog):
         aud_lay.addWidget(self.cb_in)
         aud_lay.addWidget(QLabel("Вывод:"))
         aud_lay.addWidget(self.cb_out)
-        aud_lay.addWidget(self.btn_nr)
+        aud_lay.addWidget(nr_label)
+        aud_lay.addWidget(self.cb_nr)
 
         # ── Блок: Микрофон + Порог VAD (объединённый) ────────────────────────
         aud_lay.addSpacing(10)
@@ -2692,11 +2727,12 @@ class SettingsDialog(QDialog):
         self.audio.set_vad_threshold(val)
         self.mic_vad.set_threshold(val)
 
-    def toggle_nr(self):
-        self.audio.use_noise_reduction = self.btn_nr.isChecked()
-        self.btn_nr.setText(f"Шумодав: {'ВКЛ' if self.audio.use_noise_reduction else 'ВЫКЛ'}")
-        if self.parent():
-            self.parent().app_settings.setValue("noise_reduction", self.audio.use_noise_reduction)
+    def _on_nr_mode_changed(self, index: int):
+        """Вызывается при смене режима шумодава в ComboBox."""
+        mode = self.cb_nr.currentData()
+        if mode is None:
+            return
+        self.audio.set_nr_mode(mode)
 
     def _fix_combo_popups(self):
         """

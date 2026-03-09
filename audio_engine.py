@@ -10,6 +10,8 @@ import opuslib
 import heapq
 import struct
 import time
+import ctypes
+import os
 
 import av
 from aiortc import AudioStreamTrack
@@ -24,6 +26,106 @@ from aiortc import AudioStreamTrack
 #   sosfilt(sos, x, zi=zi)
 #   sosfilt_zi(sos)
 # Алгоритм: аналоговый прототип Баттерворта → bilinear transform → SOS.
+
+
+class DeepFilterEngine:
+    # Файлы модели, которые должны быть запакованы в tar-архив.
+    # Порядок важен: df_create читает архив последовательно.
+    _MODEL_FILES = ("config.ini", "enc.onnx", "erb_dec.onnx", "df_dec.onnx")
+
+    @staticmethod
+    def _ensure_tar(model_dir: str) -> str:
+        """
+        Возвращает путь к tar-архиву моделей.
+
+        DLL deep_filter.dll написана на Rust и ожидает путь к TAR-файлу
+        (не к директории). Передача пути к директории → Rust вызывает
+        File::open(dir) → Windows возвращает ERROR_ACCESS_DENIED (os error 5).
+
+        Алгоритм:
+          1. Если рядом с папкой уже есть DeepFilterNet3.tar.gz — возвращаем его.
+          2. Иначе создаём tar из четырёх файлов модели (без сжатия,
+             без вложенных папок — файлы кладутся в корень архива).
+        """
+        import tarfile
+
+        tar_path = model_dir.rstrip("\\/") + ".tar.gz"
+
+        # Если tar уже создан — проверяем что он не старше файлов модели
+        if os.path.exists(tar_path):
+            tar_mtime = os.path.getmtime(tar_path)
+            need_rebuild = False
+            for fname in DeepFilterEngine._MODEL_FILES:
+                fpath = os.path.join(model_dir, fname)
+                if os.path.exists(fpath) and os.path.getmtime(fpath) > tar_mtime:
+                    need_rebuild = True
+                    break
+            if not need_rebuild:
+                return tar_path
+
+        # Проверяем наличие всех файлов
+        missing = [f for f in DeepFilterEngine._MODEL_FILES
+                   if not os.path.exists(os.path.join(model_dir, f))]
+        if missing:
+            raise FileNotFoundError(
+                f"Файлы модели DFN3 не найдены в {model_dir}: {missing}"
+            )
+
+        # Пакуем в tar.gz — DLL написана на Rust и ожидает именно gzip-сжатый tar
+        print(f"[DFN] Создаём tar-архив моделей: {tar_path}")
+        with tarfile.open(tar_path, "w:gz") as tf:
+            for fname in DeepFilterEngine._MODEL_FILES:
+                fpath = os.path.join(model_dir, fname)
+                # arcname=fname → файлы в корне архива, без подпапок
+                tf.add(fpath, arcname=fname)
+        print(f"[DFN] Архив создан ({os.path.getsize(tar_path) // 1024} KB)")
+        return tar_path
+
+    def __init__(self):
+        root      = os.path.dirname(os.path.abspath(__file__))
+        model_dir = os.path.join(root, "dlls", "DeepFilterNet3")
+        dll_path  = os.path.join(model_dir, "deep_filter.dll")
+
+        if not os.path.exists(dll_path):
+            raise FileNotFoundError(f"deep_filter.dll не найдена: {dll_path}")
+
+        # Создаём / проверяем tar-архив моделей.
+        # df_create принимает путь к TAR-файлу, а не к директории.
+        tar_path = self._ensure_tar(model_dir)
+
+        self.lib = ctypes.CDLL(dll_path)
+
+        # Настройка типов C-API
+        self.lib.df_create.argtypes = [ctypes.c_char_p]
+        self.lib.df_create.restype  = ctypes.c_void_p
+        self.lib.df_process_frame.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_float),
+            ctypes.POINTER(ctypes.c_float),
+        ]
+        self.lib.df_process_frame.restype = ctypes.c_int
+
+        # Передаём путь к TAR-архиву (не к директории!)
+        self.handle = self.lib.df_create(tar_path.encode('utf-8'))
+        if not self.handle:
+            raise RuntimeError("df_create вернул NULL — ошибка инициализации модели DFN")
+
+        # DFN3: фиксированный размер кадра 480 сэмплов (10 мс @ 48 кГц).
+        # df_get_frame_len может отсутствовать в некоторых сборках DLL.
+        try:
+            self.lib.df_get_frame_len.restype = ctypes.c_size_t
+            self.frame_len = int(self.lib.df_get_frame_len(self.handle))
+        except AttributeError:
+            self.frame_len = 480  # стандарт DFN3 @ 48 kHz
+
+    def process(self, audio_np_float32):
+        # audio_np_float32 имеет размер CHUNK=960. Проходим его двумя кадрами по 480.
+        out = np.zeros_like(audio_np_float32)
+        for i in range(0, len(audio_np_float32), self.frame_len):
+            in_ptr = audio_np_float32[i:].ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+            out_ptr = out[i:].ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+            self.lib.df_process_frame(self.handle, in_ptr, out_ptr)
+        return out
 
 def butter(order: int, cutoff_hz, btype: str = 'low',
            fs: float = None, output: str = 'ba') -> np.ndarray:
@@ -1003,12 +1105,28 @@ class AudioHandler(QObject):
         self.encoder.bitrate = saved_bitrate
         self.encoder.complexity = 5
 
-        self.denoiser = None
-        self.use_noise_reduction = False
+        # --- Секция шумоподавления ---
+        self.denoiser = None  # Для RNNoise
+        self.dfn_engine = None  # Для DeepFilterNet
+
+        # nr_mode: 0=выкл, 1=RNNoise, 2=DeepFilterNet
+        # По умолчанию 0 — пользователь сам выбирает в настройках.
+        self.nr_mode = int(self.global_settings.value("audio/nr_mode", 0))
+
+        # 1. Сначала пробуем инициализировать DeepFilterNet
+        try:
+            self.dfn_engine = DeepFilterEngine()
+            self.dfn_available = True
+            print("[Audio] DeepFilterNet3 инициализирован успешно.")
+        except Exception as e:
+            self.dfn_available = False
+            print(f"[Audio] DFN не загружен: {e}")
+
+        # 2. Параллельно держим RNNoise как запасной вариант (fallback)
         if PYRNNOISE_AVAILABLE:
             try:
                 self.denoiser = RNNoise(sample_rate=SAMPLE_RATE)
-                self.use_noise_reduction = True
+                print("[Audio] RNNoise инициализирован.")
             except Exception as e:
                 print(f"[Audio] Ошибка RNNoise: {e}")
 
@@ -1117,6 +1235,18 @@ class AudioHandler(QObject):
                     print(f"[Audio] Bitrate changed to {bitrate_kbps} kbps")
         except Exception as e:
             print(f"[Audio] Error setting bitrate: {e}")
+
+    def set_nr_mode(self, mode: int):
+        """
+        Устанавливает режим шумоподавления (мгновенно, без перезапуска аудио):
+          0 = выкл
+          1 = RNNoise
+          2 = DeepFilterNet
+        """
+        self.nr_mode = int(mode)
+        self.global_settings.setValue("audio/nr_mode", self.nr_mode)
+        labels = {0: "выкл", 1: "RNNoise", 2: "DeepFilterNet"}
+        print(f"[Audio] NR mode → {labels.get(self.nr_mode, "?")} ({self.nr_mode})")
 
     def set_vad_threshold(self, slider_val: int):
         threshold = max(1, min(50, slider_val)) / 1000.0
@@ -1270,20 +1400,24 @@ class AudioHandler(QObject):
         raw_input = indata.flatten()
         denoised_float = raw_input
 
-        if self.use_noise_reduction and self.denoiser:
+        # nr_mode: 0=выкл, 1=RNNoise, 2=DFN — читаем self (не QSettings каждые 20мс)
+        _nr = self.nr_mode
+        if _nr == 2 and self.dfn_engine:
             try:
-                pcm_int16 = (raw_input * 32767).astype(np.int16)
+                denoised_float = self.dfn_engine.process(denoised_float)
+            except Exception:
+                pass
+        elif _nr == 1 and self.denoiser:
+            try:
+                pcm_int16 = (denoised_float * 32767).astype(np.int16)
                 processed = [f for p, f in self.denoiser.denoise_chunk(pcm_int16)]
                 if processed:
-                    # Оптимизация: RNNoise чаще всего возвращает ровно 1 фрейм.
-                    # Проверяем сначала — избегаем np.concatenate (аллокацию) 50 раз/сек.
-                    if len(processed) == 1:
-                        denoised_float = processed[0].astype(np.float32) / 32767.0
-                    else:
-                        denoised_float = np.concatenate(processed).astype(np.float32) / 32767.0
-                    if len(denoised_float) != len(raw_input):
-                        denoised_float = np.resize(denoised_float, len(raw_input))
-            except:
+                    denoised_float = (
+                        processed[0].astype(np.float32) / 32767.0
+                        if len(processed) == 1
+                        else np.concatenate(processed).astype(np.float32) / 32767.0
+                    )
+            except Exception:
                 pass
 
         # ── Pre-encode input normalization ──────────────────────────────────
