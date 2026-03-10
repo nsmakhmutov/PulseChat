@@ -61,6 +61,7 @@ from config import (
     CMD_FILE_OFFER, CMD_FILE_OFFER_ROOM,
     CMD_WEBRTC_OFFER, CMD_WEBRTC_ANSWER, CMD_WEBRTC_ICE,
     WEBRTC_ICE_TIMEOUT,
+    CMD_SERVER_TRANSFER, CMD_SERVER_MIGRATE,
 )
 
 # ── Опциональный импорт aiortc (только для WebRTCSFU) ────────────────────────
@@ -560,6 +561,21 @@ class SFUServer:
         # --- WebRTC SFU (создаётся в start()) ---
         self.sfu: WebRTCSFU | None = None
 
+        # ── Встроенный сервер: host_order ────────────────────────────────────
+        # Упорядоченный список UID в порядке первого входа на сервер.
+        # host_order[0] = потенциальный новый хост при падении текущего.
+        # Рассылается клиентам в каждом sync_users — хранится локально
+        # для авто-переключения при потере соединения.
+        self._host_order: list[int]   = []
+        self._host_order_lock         = threading.Lock()
+
+        # ── Встроенный сервер: управление ────────────────────────────────────
+        # _is_embedded=True: сервер запущен внутри процесса клиента (start_embedded).
+        # _accepting: False → accept-цикл завершится после следующего accept().
+        self._is_embedded: bool       = False
+        self._accepting:   bool       = True
+        self._announcer               = None   # ServerAnnouncer | None
+
     # ------------------------------------------------------------------
     # Вспомогательный метод: отправка JSON клиенту из любого потока
     # ------------------------------------------------------------------
@@ -727,6 +743,10 @@ class SFUServer:
                                 }
                             with self.udp_lock:
                                 self.uid_to_room[uid] = 'General'
+                            # Добавляем в очередь потенциальных хостов
+                            with self._host_order_lock:
+                                if uid not in self._host_order:
+                                    self._host_order.append(uid)
                             conn.sendall(
                                 json.dumps({'action': 'login_success', 'uid': uid}).encode('utf-8')
                             )
@@ -889,6 +909,46 @@ class SFUServer:
                                 self.sfu.call_async(
                                     self.sfu.handle_ice_candidate(uid, candidate)
                                 )
+
+                        # ── Передача сервера другому участнику ────────────────
+                        elif action == CMD_SERVER_TRANSFER:
+                            target_uid_st = msg.get('target_uid')
+                            if not isinstance(target_uid_st, int):
+                                continue
+                            # Только хост (host_order[0]) может передать сервер
+                            with self._host_order_lock:
+                                is_host = bool(
+                                    self._host_order and self._host_order[0] == uid
+                                )
+                            if not is_host:
+                                print(
+                                    f"[Server] server_transfer от uid={uid}: "
+                                    f"не является хостом — отклонено"
+                                )
+                                continue
+                            # Находим IP цели
+                            target_ip_st = None
+                            target_nick_st = '?'
+                            with self.clients_lock:
+                                for c_data in self.clients.values():
+                                    if c_data['uid'] == target_uid_st:
+                                        target_ip_st   = c_data.get('ip')
+                                        target_nick_st = c_data.get('nick', '?')
+                                        break
+                            if not target_ip_st:
+                                print(
+                                    f"[Server] server_transfer: "
+                                    f"uid={target_uid_st} не найден"
+                                )
+                                continue
+                            print(
+                                f"[Server] 🔀 Передача сервера: "
+                                f"uid={uid} → {target_nick_st} (uid={target_uid_st}, "
+                                f"IP={target_ip_st})"
+                            )
+                            self._broadcast_server_migrate(
+                                target_uid_st, target_ip_st
+                            )
 
                         # ── Soundboard ────────────────────────────────────────
                         elif action == CMD_SOUNDBOARD:
@@ -1076,6 +1136,11 @@ class SFUServer:
                     self.udp_map.pop(u_id, None)
                     self.uid_to_room.pop(u_id, None)
 
+                # Удаляем из очереди хостов
+                with self._host_order_lock:
+                    if u_id in self._host_order:
+                        self._host_order.remove(u_id)
+
                 # Убираем пользователя из списков зрителей всех стримеров
                 with self.watchers_lock:
                     for s_uid in list(self.watchers.keys()):
@@ -1140,6 +1205,10 @@ class SFUServer:
         with self.watchers_lock:
             watchers_snapshot = {uid: dict(ws) for uid, ws in self.watchers.items()}
 
+        with self._host_order_lock:
+            host_order_snapshot  = list(self._host_order)
+            server_host_uid = self._host_order[0] if self._host_order else 0
+
         with self.clients_lock:
             state = {}
             conns_snapshot = []
@@ -1161,7 +1230,9 @@ class SFUServer:
                 conns_snapshot.append(c_conn)
 
         payload = json.dumps(
-            {'action': CMD_SYNC_USERS, 'all_users': state}
+            {'action': CMD_SYNC_USERS, 'all_users': state,
+             'host_order': host_order_snapshot,
+             'server_host_uid': server_host_uid}
         ).encode('utf-8')
 
         for c_conn in conns_snapshot:
@@ -1171,7 +1242,155 @@ class SFUServer:
                 pass
 
     # ------------------------------------------------------------------
-    # Запуск сервера
+    # Встроенный сервер: запуск внутри процесса клиента
+    # ------------------------------------------------------------------
+    def start_embedded(self, host_ip: str, host_nick: str) -> None:
+        """
+        Запускает сервер в фоновых потоках (не блокирует вызывающий поток).
+
+        Отличие от start():
+          — Возвращает управление немедленно после запуска потоков.
+          — TCP accept-цикл работает в отдельном daemon-потоке.
+          — Запускает ServerAnnouncer: broadcast в RadminVPN каждые
+            DISCOVERY_INTERVAL секунд, чтобы другие клиенты нашли нас.
+
+        Используется DiscoveryScreen и _on_become_host() в MainWindow.
+
+        host_ip   — RadminVPN IP этого клиента (26.x.x.x), объявляется через broadcast.
+        host_nick — ник пользователя, отображается в DiscoveryScreen других.
+        """
+        self._is_embedded = True
+        self._accepting   = True
+
+        # WebRTCSFU
+        if AIORTC_AVAILABLE:
+            self.sfu = WebRTCSFU()
+            print("[Server] WebRTCSFU запущен (встроенный режим)")
+        else:
+            print("[Server] WebRTCSFU ОТКЛЮЧЁН (aiortc не установлен)")
+
+        # Фоновые потоки сервера
+        threading.Thread(target=self.udp_handler,   daemon=True, name="srv-udp").start()
+        threading.Thread(target=self.stats_monitor, daemon=True, name="srv-stats").start()
+        threading.Thread(
+            target=self._embedded_accept_loop,
+            daemon=True,
+            name="srv-accept",
+        ).start()
+
+        # Запускаем broadcast-анонс
+        try:
+            from server_discovery import ServerAnnouncer
+            self._announcer = ServerAnnouncer(host_ip, DEFAULT_PORT_TCP, host_nick)
+            self._announcer.start()
+        except Exception as e:
+            print(f"[Server] ServerAnnouncer error: {e}")
+
+        print(
+            f"[Server] Встроенный сервер запущен. "
+            f"TCP:{DEFAULT_PORT_TCP}, UDP:{DEFAULT_PORT_UDP}, IP={host_ip}"
+        )
+
+    def _embedded_accept_loop(self) -> None:
+        """
+        TCP accept-цикл для встроенного режима (неблокирующий вариант start()).
+        Проверяет self._accepting после каждого accept() для корректного завершения.
+        """
+        self.tcp_sock.settimeout(1.0)   # таймаут чтобы иногда проверять _accepting
+        while self._accepting:
+            try:
+                conn, addr = self.tcp_sock.accept()
+                conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                threading.Thread(
+                    target=self.tcp_handler,
+                    args=(conn, addr),
+                    daemon=True,
+                ).start()
+            except socket.timeout:
+                continue   # проверяем _accepting снова
+            except OSError:
+                break      # сокет закрыт — завершаем
+
+    def stop_gracefully(self) -> None:
+        """
+        Корректная остановка встроенного сервера с передачей хостинга.
+
+        Алгоритм:
+          1. Определяем следующего в host_order (первый, кто не мы).
+          2. Если нет никого — просто останавливаем сервер.
+          3. Иначе — broadcast CMD_SERVER_MIGRATE со следующим IP.
+          4. Ждём 600 мс (клиенты успеют получить пакет), затем закрываемся.
+
+        Вызывается из MainWindow.closeEvent() если _is_embedded=True.
+        """
+        if not self._is_embedded:
+            return
+
+        self._accepting = False
+
+        # Останавливаем анонсер
+        if self._announcer:
+            self._announcer.stop()
+            self._announcer = None
+
+        # Находим следующего в очереди
+        with self._host_order_lock:
+            order_copy = list(self._host_order)
+
+        if len(order_copy) < 2:
+            # Только мы → просто закрываемся
+            print("[Server] stop_gracefully: нет других участников, закрываемся")
+            self.tcp_sock.close()
+            self.udp_sock.close()
+            return
+
+        # order_copy[0] — это мы (хост). Следующий — order_copy[1].
+        next_uid = order_copy[1]
+        next_ip  = None
+        with self.clients_lock:
+            for c_data in self.clients.values():
+                if c_data['uid'] == next_uid:
+                    next_ip = c_data.get('ip')
+                    break
+
+        if next_ip:
+            print(
+                f"[Server] stop_gracefully: передаём хостинг "
+                f"uid={next_uid} ({next_ip})"
+            )
+            self._broadcast_server_migrate(next_uid, next_ip)
+            # Даём клиентам 600 мс принять пакет
+            import time as _time
+            _time.sleep(0.6)
+
+        self.tcp_sock.close()
+        self.udp_sock.close()
+        print("[Server] Встроенный сервер остановлен")
+
+    def _broadcast_server_migrate(self, new_host_uid: int, new_host_ip: str) -> None:
+        """
+        Рассылает CMD_SERVER_MIGRATE всем подключённым клиентам.
+
+        Клиенты-не-хосты reconnect к new_host_ip.
+        Клиент с new_host_uid стартует встроенный сервер у себя.
+        """
+        payload = json.dumps({
+            'action':       CMD_SERVER_MIGRATE,
+            'new_host_uid': new_host_uid,
+            'new_host_ip':  new_host_ip,
+        }).encode('utf-8')
+
+        with self.clients_lock:
+            conns = list(self.clients.keys())
+
+        for c in conns:
+            try:
+                c.sendall(payload)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Запуск сервера (standalone режим — без изменений)
     # ------------------------------------------------------------------
     def start(self):
         # Запускаем WebRTCSFU если aiortc установлен

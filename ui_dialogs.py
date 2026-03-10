@@ -605,7 +605,7 @@ class UserOverlayPanel(QFrame):
 
     def __init__(self, nick: str, current_vol: float, uid: int, audio_handler, global_pos,
                  parent=None, is_streaming: bool = False, on_watch_stream=None,
-                 net=None):
+                 net=None, on_transfer_server=None):
         super().__init__(
             parent,
             Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint
@@ -616,6 +616,7 @@ class UserOverlayPanel(QFrame):
         self._whisper_active = False
         self._on_watch_stream = on_watch_stream
         self._net = net
+        self._on_transfer_server = on_transfer_server
 
         # ── Прозрачность окна + рисуем фон сами в paintEvent ─────────────────
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -849,7 +850,32 @@ class UserOverlayPanel(QFrame):
             self.btn_file.clicked.connect(self._on_send_file_clicked)
             card_lay.addWidget(self.btn_file)
 
-        # Фиксируем размер ПОСЛЕ добавления всех виджетов (включая hint).
+        # ── Кнопка: Передать сервер (только если on_transfer_server задан) ────
+        # Видна исключительно хосту встроенного сервера в его контекстном меню.
+        if self._on_transfer_server is not None:
+            sep_ts = QFrame()
+            sep_ts.setFrameShape(QFrame.Shape.HLine)
+            sep_ts.setStyleSheet(
+                "background: rgba(255,255,255,0.08); border: none; max-height: 1px;"
+            )
+            sep_ts.setMaximumHeight(1)
+            card_lay.addWidget(sep_ts)
+
+            self.btn_transfer_server = self._make_btn("🔀  Передать сервер")
+            self.btn_transfer_server.setStyleSheet(
+                self.btn_transfer_server.styleSheet() + """
+                QPushButton { border-color: rgba(200,160,50,0.45); color: #f0c060; }
+                QPushButton:hover {
+                    background-color: rgba(200,160,50,0.18);
+                    border-color: rgba(220,180,60,0.85);
+                }
+                QPushButton:pressed {
+                    background-color: rgba(200,160,50,0.35);
+                    color: #ffffff;
+                }
+            """)
+            self.btn_transfer_server.clicked.connect(self._on_transfer_server_clicked)
+            card_lay.addWidget(self.btn_transfer_server)
         # Это гарантирует, что место под hint уже учтено и панель
         # не будет прыгать при появлении текста.
         self.adjustSize()
@@ -1043,6 +1069,16 @@ class UserOverlayPanel(QFrame):
         # Показываем прогресс-виджет в правом нижнем углу экрана
         _show_float_widget(prog)
         worker.start()
+
+    def _on_transfer_server_clicked(self):
+        """
+        Пользователь нажал «🔀 Передать сервер».
+        Закрываем popup и вызываем callback из MainWindow
+        (он покажет QMessageBox с подтверждением).
+        """
+        self.close()
+        if self._on_transfer_server is not None:
+            self._on_transfer_server()
 
     def hideEvent(self, event):
         """Если панель закрылась пока шептали — останавливаем шёпот."""

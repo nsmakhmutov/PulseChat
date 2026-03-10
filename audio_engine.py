@@ -219,15 +219,65 @@ class DeepFilterEngine:
         Rust panic() → abort() завершает ВЕСЬ процесс на уровне ОС.
         Python try/except не способен перехватить abort().
         Единственная защита — тест в дочернем процессе.
+
+        ИСПРАВЛЕНИЯ:
+          1. Frozen mode (PyInstaller EXE): sys.executable = InPulse.exe.
+             InPulse.exe -c "..." PyInstaller bootloader не поддерживает —
+             запустил бы приложение заново или вылетел. Probe пропускается,
+             загрузка идёт напрямую (RUST_LOG уже выставлен на уровне модуля).
+
+          2. Python 3.8+ Windows: ctypes.CDLL НЕ использует PATH для зависимостей
+             загружаемой DLL. Работают только системные директории + директории
+             из os.add_dll_directory(). В subprocess os.add_dll_directory не
+             вызывался → deep_filter.dll не находила свои зависимости → probe
+             падал с returncode 1, хотя DLL физически была на месте.
+             Фикс: добавляем нужные директории явно в probe-код.
         """
         import subprocess
         import sys
         import json
 
-        # Код для subprocess: загружает DLL и вызывает df_create с правильными аргументами.
+        # ── Frozen mode: probe через subprocess невозможен ────────────────────
+        # sys.frozen выставляется PyInstaller bootloader'ом.
+        # В frozen режиме все DLL уже рядом с exe, RUST_LOG выставлен,
+        # поэтому просто сигнализируем что всё ок — загрузка пройдёт напрямую.
+        if getattr(sys, 'frozen', False):
+            print("[DFN] Frozen mode — subprocess probe пропущен, загрузка напрямую.",
+                  flush=True)
+            return True
+
+        # ── Python 3.8+ DLL search: собираем директории для add_dll_directory ──
+        # deep_filter.dll's собственная директория ищется Windows автоматически.
+        # Но её ЗАВИСИМОСТИ (onnxruntime.dll и др.) через PATH уже не находятся.
+        # Нужно явно добавить все нужные пути через os.add_dll_directory.
+
+        dll_dir    = os.path.dirname(dll_path)        # dlls/DeepFilterNet3/
+        dlls_dir   = os.path.dirname(dll_dir)         # dlls/
+
+        # Onnxruntime capi — если deep_filter.dll динамически линкована с ORT
+        ort_capi_dir = ""
+        try:
+            import onnxruntime as _ort
+            _ort_pkg = os.path.dirname(_ort.__file__)
+            _ort_capi = os.path.join(_ort_pkg, "capi")
+            ort_capi_dir = _ort_capi if os.path.isdir(_ort_capi) else _ort_pkg
+        except ImportError:
+            pass
+
+        extra_dirs = [d for d in [dll_dir, dlls_dir, ort_capi_dir]
+                      if d and os.path.isdir(d)]
+
+        # Генерируем код add_dll_directory для каждой директории.
+        # Вставляется в начало probe-кода перед загрузкой DLL.
+        add_dirs_code = "".join(
+            f"os.add_dll_directory({json.dumps(d)});" for d in extra_dirs
+        )
+
+        # Код для subprocess: сначала добавляем директории, потом грузим DLL.
         # log_level=None → NULL pointer → Rust не создаёт логгер → нет паники.
         probe_code = (
-            "import ctypes,sys;"
+            "import ctypes,sys,os;"
+            f"{add_dirs_code}"
             f"lib=ctypes.CDLL({json.dumps(dll_path)});"
             "lib.df_create.argtypes=[ctypes.c_char_p,ctypes.c_float,ctypes.c_char_p];"
             "lib.df_create.restype=ctypes.c_void_p;"
@@ -238,8 +288,8 @@ class DeepFilterEngine:
 
         probe_env = {
             **os.environ,
-            "RUST_LOG": "warn",
-            "DF_LEVEL": "warn",
+            "RUST_LOG":       "warn",
+            "DF_LEVEL":       "warn",
             "RUST_LOG_STYLE": "never",
         }
 
@@ -261,15 +311,20 @@ class DeepFilterEngine:
                     f"DFN недоступен, будет использован RNNoise.",
                     flush=True,
                 )
+                # Полный stderr — чтобы видеть реальную ошибку (WinError, OSError и т.д.)
                 if stderr.strip():
-                    print(f"[DFN] Probe stderr: {stderr[:200]}", flush=True)
+                    print(f"[DFN] Probe stderr:\n{stderr[:800]}", flush=True)
+                if stdout.strip():
+                    print(f"[DFN] Probe stdout: {stdout[:200]}", flush=True)
                 return False
 
             if "DFN_PROBE_OK" in stdout:
-                print("[DFN] Probe OK — DLL работает, загружаем в основной процесс.", flush=True)
+                print("[DFN] Probe OK — DLL работает, загружаем в основной процесс.",
+                      flush=True)
                 return True
             else:
-                print(f"[DFN] Probe: df_create вернул NULL (модель не загружена).", flush=True)
+                print(f"[DFN] Probe: df_create вернул NULL (модель не загружена). "
+                      f"stdout={stdout[:100]!r}", flush=True)
                 return False
 
         except subprocess.TimeoutExpired:
@@ -1267,8 +1322,9 @@ class AudioHandler(QObject):
         self.encoder.complexity = 5
 
         # --- Секция шумоподавления ---
-        self.denoiser = None  # Для RNNoise
-        self.dfn_engine = None  # Для DeepFilterNet
+        self.denoiser = None      # Для RNNoise
+        self.dfn_engine = None    # Для DeepFilterNet
+        self.dfn_available = False  # Инициализируем до try — на случай непредвиденного исключения
 
         # nr_mode: 0=выкл, 1=RNNoise, 2=DeepFilterNet
         # По умолчанию 0 — пользователь сам выбирает в настройках.

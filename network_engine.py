@@ -76,6 +76,7 @@ from config import (
     CMD_FILE_OFFER, CMD_FILE_OFFER_ROOM,
     CMD_WEBRTC_OFFER, CMD_WEBRTC_ANSWER, CMD_WEBRTC_ICE,
     WEBRTC_ICE_TIMEOUT,
+    CMD_SERVER_MIGRATE,
 )
 
 MAX_SILENT_RECONNECT_ATTEMPTS = 4
@@ -128,6 +129,15 @@ class NetworkClient(QObject):
     # Входящее предложение файловой передачи
     file_offer_received = pyqtSignal(dict)
 
+    # ── Встроенный сервер: сигналы миграции хоста ────────────────────────────
+    # become_host      — нам нужно стать новым хостом (запустить embedded server).
+    #                    Эмитируется при получении CMD_SERVER_MIGRATE с нашим uid
+    #                    или при авто-переключении (мы первые в host_order).
+    # server_migrating — получен IP нового хоста; UI показывает индикатор
+    #                    переподключения, network_engine сам reconnect'ится.
+    become_host      = pyqtSignal()
+    server_migrating = pyqtSignal(str)   # new_host_ip
+
     def __init__(self, audio):
         super().__init__()
         self.audio  = audio
@@ -152,6 +162,15 @@ class NetworkClient(QObject):
 
         # Флаг воспроизведения soundboard (anti-spam)
         self._sb_playing = threading.Event()
+
+        # ── Встроенный сервер: состояние хост-очереди и миграции ─────────────
+        # _host_order     — UID в порядке входа на сервер (хранится локально).
+        #                   Используется при авто-переключении хоста.
+        # _server_host_uid — uid текущего хозяина сервера (host_order[0]).
+        # _migration_pending — получен CMD_SERVER_MIGRATE, ждём запуска нового хоста.
+        self._host_order:       list[int] = []
+        self._server_host_uid:  int       = 0
+        self._migration_pending: bool     = False   # уже стартовали авто-переход
 
         # --- WebRTC ---
         # asyncio event loop WebRTC (создаётся один раз при первом подключении)
@@ -390,6 +409,12 @@ class NetworkClient(QObject):
         self._reconnecting = False
         self.reconnect_failed.emit()
 
+        # Авто-переключение хоста: проверяем не нужно ли нам стать хостом
+        if self._host_order:
+            threading.Thread(
+                target=self._auto_host_check, daemon=True, name="auto-host"
+            ).start()
+
     def manual_reconnect(self):
         if self._reconnecting:
             print("[Net] Already reconnecting...")
@@ -402,6 +427,121 @@ class NetworkClient(QObject):
         self._reconnect_attempts = 0
         self.running = False
         threading.Thread(target=self._reconnect_loop, daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # Миграция сервера (встроенный режим)
+    # ------------------------------------------------------------------
+    def _migrate_reconnect(self) -> None:
+        """
+        Выполняет переподключение к новому хосту после CMD_SERVER_MIGRATE.
+
+        Ждёт 1.5 сек (новый хост успевает поднять сервер), затем запускает
+        обычный reconnect_loop к новому _ip.
+
+        Не запускается если мы сами становимся хостом (become_host.emit).
+        """
+        time.sleep(1.5)
+        if not self._migration_pending:
+            return   # уже переподключились другим способом
+        self._migration_pending  = False
+        self._reconnecting       = True
+        self._reconnect_attempts = 0
+        self.running             = False
+        self._reconnect_loop()
+
+    def _auto_host_check(self) -> None:
+        """
+        Запускается после полного провала reconnect_loop (reconnect_failed).
+
+        Логика авто-переключения хоста:
+          1. Определяем нашу позицию в _host_order.
+          2. Ждём position × 4 секунды (нулевая позиция = сразу).
+          3. Проверяем discovery: может кто-то уже поднял сервер?
+          4. Если нашли → reconnect к нему.
+          5. Если не нашли И мы первые в очереди → emit become_host.
+          6. Иначе → ждём ещё, потом снова discovery (max 60 сек).
+
+        Такой механизм гарантирует что сервер поднимется ровно у одного
+        участника даже без какой-либо центральной координации.
+        """
+        try:
+            my_uid = getattr(self.audio, 'my_uid', 0)
+            try:
+                my_pos = self._host_order.index(my_uid)
+            except ValueError:
+                my_pos = -1   # нас нет в очереди (незнакомый пользователь)
+
+            if my_pos < 0:
+                # Не в очереди запасных хостов → периодически ищем новый сервер
+                self._discovery_reconnect_loop()
+                return
+
+            # Ждём своей очереди: позиция × 4 сек
+            wait_sec = my_pos * 4.0
+            if wait_sec > 0:
+                print(
+                    f"[Net] Auto-host: позиция {my_pos}, "
+                    f"ждём {wait_sec:.0f}с..."
+                )
+                time.sleep(wait_sec)
+
+            # Проверяем: не появился ли сервер пока ждали
+            from server_discovery import ServerDiscovery
+            discovered = ServerDiscovery().discover(timeout=2.0)
+            if discovered:
+                print(
+                    f"[Net] Auto-host: обнаружен сервер "
+                    f"{discovered['ip']} (хост {discovered['host_nick']!r})"
+                )
+                self._ip = discovered['ip']
+                self._migration_pending  = False
+                self._reconnecting       = True
+                self._reconnect_attempts = 0
+                self._reconnect_loop()
+                return
+
+            # Сервер не найден — становимся хостом
+            print(f"[Net] Auto-host: становимся хостом (позиция {my_pos})")
+            self.become_host.emit()
+
+        except Exception as e:
+            print(f"[Net] _auto_host_check error: {e}")
+
+    def _discovery_reconnect_loop(self) -> None:
+        """
+        Периодически ищет новый сервер через UDP discovery (для не-первых в очереди).
+        Выполняется в daemon-потоке, не блокирует UI.
+        """
+        from server_discovery import ServerDiscovery
+        max_elapsed = 90.0   # максимум 90 секунд ожидания
+        elapsed     = 0.0
+        probe_interval = 3.5
+
+        print("[Net] Discovery reconnect loop запущен...")
+        while elapsed < max_elapsed:
+            discovered = ServerDiscovery().discover(timeout=probe_interval)
+            if discovered:
+                print(f"[Net] Discovery: найден сервер {discovered['ip']}")
+                self._ip = discovered['ip']
+                self._migration_pending  = False
+                self._reconnecting       = True
+                self._reconnect_attempts = 0
+                self._reconnect_loop()
+                return
+            elapsed += probe_interval
+
+        # Так и не нашли за 90 секунд — испускаем сигнал ещё раз (UI покажет кнопку)
+        print("[Net] Discovery reconnect: сервер не найден за 90 сек")
+        self.reconnect_failed.emit()
+
+    def send_server_transfer(self, target_uid: int) -> None:
+        """
+        Инициирует передачу хостинга другому участнику.
+        Отправляет CMD_SERVER_TRANSFER серверу с uid цели.
+        Должен вызываться только хостом (server_host_uid == audio.my_uid).
+        """
+        self.send_json({'action': 'server_transfer', 'target_uid': target_uid})
+        print(f"[Net] server_transfer → target_uid={target_uid}")
 
     # ------------------------------------------------------------------
     # Стриминг — WebRTC
@@ -843,6 +983,9 @@ class NetworkClient(QObject):
             print(f"[Net] Login success, UID: {msg.get('uid')}")
 
         elif act == 'sync_users':
+            # Обновляем локальный кэш host_order и server_host_uid
+            self._host_order      = msg.get('host_order', [])
+            self._server_host_uid = msg.get('server_host_uid', 0)
             self.global_state_update.emit(msg.get('all_users', {}))
 
         elif act == 'play_soundboard':
@@ -899,6 +1042,30 @@ class NetworkClient(QObject):
         # ── Файловая передача ──────────────────────────────────────────────
         elif act in ('file_offer', 'file_offer_room'):
             self.file_offer_received.emit(msg)
+
+        # ── Миграция сервера (встроенный режим) ────────────────────────────
+        elif act == CMD_SERVER_MIGRATE:
+            new_host_uid = msg.get('new_host_uid', 0)
+            new_host_ip  = msg.get('new_host_ip', '')
+            print(
+                f"[Net] CMD_SERVER_MIGRATE: новый хост uid={new_host_uid}, "
+                f"ip={new_host_ip!r}"
+            )
+            my_uid = getattr(self.audio, 'my_uid', 0)
+            if new_host_uid == my_uid:
+                # Мы — новый хост: сигнализируем UI запустить embedded server
+                self.become_host.emit()
+            elif new_host_ip:
+                # Переподключаемся к новому хосту
+                self._ip = new_host_ip
+                self._migration_pending = True
+                self.server_migrating.emit(new_host_ip)
+                # Небольшая пауза: новый хост успевает запустить сервер
+                threading.Thread(
+                    target=self._migrate_reconnect,
+                    daemon=True,
+                    name="net-migrate",
+                ).start()
 
         # ── Устаревшие UDP-видео команды (заглушки для совместимости) ──────
         # request_keyframe, CMD_ADJUST_BITRATE, CMD_LQ_NEEDED, CMD_NACK_RELAY:

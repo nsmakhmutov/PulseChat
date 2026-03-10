@@ -6,6 +6,39 @@ import socket
 import traceback
 import faulthandler
 
+# ── UTF-8 консоль ─────────────────────────────────────────────────────────────
+# На Windows кодировка консоли по умолчанию cp1251 (Russian) или cp866.
+# Символы за пределами кодировки (→, ✔, ✖, 🎵 и т.д.) вызывают
+# UnicodeEncodeError уже при первом print() с такими символами.
+#
+# Решение — переключить stdout/stderr на UTF-8 БЕЗ смены кодировки терминала.
+# io.TextIOWrapper(buffer, encoding='utf-8', errors='replace') безопасно:
+#   • errors='replace' гарантирует что print() никогда не бросит исключение
+#   • console=False в EXE (PyInstaller) → stdout/stderr = None: проверяем
+#
+# PYTHONIOENCODING=utf-8 (env-переменная) тоже работает, но требует
+# явной установки перед запуском — ненадёжно для конечного пользователя.
+import io as _io
+for _stream_name in ('stdout', 'stderr'):
+    _stream = getattr(sys, _stream_name, None)
+    if _stream is not None:
+        try:
+            # reconfigure() доступен с Python 3.7 и работает корректно
+            _stream.reconfigure(encoding='utf-8', errors='replace')
+        except (AttributeError, io.UnsupportedOperation):
+            try:
+                # Fallback: оборачиваем buffer напрямую
+                setattr(sys, _stream_name,
+                        _io.TextIOWrapper(
+                            _stream.buffer,
+                            encoding='utf-8',
+                            errors='replace',
+                            line_buffering=_stream.line_buffering,
+                        ))
+            except Exception:
+                pass   # frozen без консоли (console=False): None — игнорируем
+del _io, _stream_name, _stream
+
 # ── CRASH DIAGNOSTICS ────────────────────────────────────────────────────────
 # faulthandler пишет нативный C-стектрейс при SIGSEGV / STATUS_STACK_BUFFER_OVERRUN
 # прямо в файл — даже если Python уже не работает.
@@ -412,7 +445,7 @@ class ConnectingScreen(QWidget):
     """
     show_login = pyqtSignal(str, str, str)   # ip, nick, avatar
 
-    def __init__(self, ip: str, nick: str, avatar: str):
+    def __init__(self, ip: str, nick: str, avatar: str, skip_update_check: bool = False):
         super().__init__()
         self.ip     = ip
         self.nick   = nick
@@ -423,7 +456,7 @@ class ConnectingScreen(QWidget):
         # Флаг: проверка обновлений уже выполнялась в этой сессии.
         # При повторном нажатии «Повторить» (retry) мы НЕ проверяем ещё раз —
         # пользователь просто ждёт сервер, не нужно снова тратить ~1-2 сек.
-        self._update_checked: bool = False
+        self._update_checked: bool = skip_update_check
 
         # Сигналы для безопасного взаимодействия updater-потока с UI
         self._upd_sigs = _UpdaterSignals()
@@ -1038,9 +1071,449 @@ class LoginWindow(QWidget):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Встроенный сервер: менеджер жизненного цикла
+# ══════════════════════════════════════════════════════════════════════════════
+
+class EmbeddedServerManager:
+    """
+    Singleton-менеджер встроенного SFUServer внутри процесса клиента.
+
+    Жизненный цикл:
+      start(host_ip, host_nick) — поднимает TCP/UDP/WebRTC сервер в потоках.
+                                  Запускает ServerAnnouncer (UDP broadcast).
+      stop()                    — корректная остановка (server_migrate → все).
+      is_running()              — True пока сервер работает.
+
+    Хранит ссылку на SFUServer чтобы Python GC не убил объект.
+    """
+    _instance: 'EmbeddedServerManager | None' = None
+
+    def __init__(self):
+        self._server = None   # SFUServer | None
+
+    @classmethod
+    def get(cls) -> 'EmbeddedServerManager':
+        """Возвращает единственный экземпляр."""
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def start(self, host_ip: str, host_nick: str) -> None:
+        """
+        Запускает встроенный SFUServer.
+        Если уже запущен — ничего не делает (idempotent).
+
+        ВАЖНО: исключения НЕ глотаются — пробрасываются наружу,
+        чтобы вызывающий код (DiscoveryScreen, _on_become_host) мог
+        показать ошибку пользователю.
+        """
+        if self.is_running():
+            print("[EmbeddedServer] Уже запущен — повторный запуск пропущен")
+            return
+        # Не оборачиваем в try/except — исключение должно дойти до вызывающего
+        from server import SFUServer
+        self._server = SFUServer()
+        try:
+            self._server.start_embedded(host_ip, host_nick)
+        except Exception:
+            self._server = None
+            raise
+        print(f"[EmbeddedServer] Запущен: ip={host_ip}, nick={host_nick!r}")
+
+    def stop(self) -> None:
+        """Останавливает сервер (если запущен) с корректной передачей хостинга."""
+        if self._server is not None:
+            try:
+                self._server.stop_gracefully()
+            except Exception as e:
+                print(f"[EmbeddedServer] Ошибка остановки: {e}")
+            self._server = None
+
+    def is_running(self) -> bool:
+        return self._server is not None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Вспомогательный поток: UDP discovery
+# ══════════════════════════════════════════════════════════════════════════════
+
+class DiscoveryWorker(QThread):
+    """
+    Запускает ServerDiscovery.discover() в отдельном потоке.
+    По результату испускает один из двух сигналов.
+    """
+    found     = pyqtSignal(dict)   # {'ip': ..., 'port': ..., 'host_nick': ...}
+    not_found = pyqtSignal()
+
+    def __init__(self, timeout: float = 2.5):
+        super().__init__()
+        self._timeout = timeout
+
+    def run(self):
+        try:
+            from server_discovery import ServerDiscovery
+            result = ServerDiscovery().discover(self._timeout)
+            if result:
+                self.found.emit(result)
+            else:
+                self.not_found.emit()
+        except Exception as e:
+            print(f"[Discovery] Worker error: {e}")
+            self.not_found.emit()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Экран автоматического обнаружения сервера
+# ══════════════════════════════════════════════════════════════════════════════
+
+class DiscoveryScreen(QWidget):
+    """
+    Первый экран после запуска приложения.
+
+    Логика:
+      1. «Поиск серверов...» — запускает DiscoveryWorker (UDP listen, 2.5 сек).
+      2. Сервер найден  → показывает IP/хост, автоматически переходит к
+                          ConnectingScreen (существующая логика probe → MainWindow).
+      3. Сервер не найден → «Нет серверов. Создать самому?»
+                            Кнопка «Создать» → EmbeddedServerManager.start()
+                                            → ConnectingScreen('127.0.0.1')
+      4. Кнопка «Ввести IP вручную» → переходит к LoginWindow (резерв).
+
+    Сигналы:
+      open_login(ip, nick, avatar)  — показать LoginWindow с данными.
+      _ready(ip)                    — внутренний: сервер готов, переходим к подключению.
+                                      Используется вместо QTimer.singleShot из фонового
+                                      потока — PyQt-сигналы thread-safe по определению.
+
+    ВАЖНО: никогда не вызываем close() — только hide() (см. ConnectingScreen).
+    """
+    open_login = pyqtSignal(str, str, str)
+    _ready     = pyqtSignal(str)   # внутренний: ip готового сервера → _open_connecting
+
+    def __init__(self, nick: str, avatar: str):
+        super().__init__()
+        self.nick   = nick
+        self.avatar = avatar
+
+        self._worker: DiscoveryWorker | None      = None
+        self._connecting_screen: QWidget | None   = None   # держим ссылку для GC
+
+        self._build_ui()
+        # ✅ _ready — сигнал вместо QTimer.singleShot из фонового потока.
+        # PyQt6 гарантирует доставку сигнала в GUI-поток вне зависимости от
+        # того, из какого потока он испущен. QTimer.singleShot из plain-потока
+        # (не QThread) ненадёжен и может просто не сработать.
+        self._ready.connect(self._open_connecting)
+        self._start_discovery()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # UI
+    # ──────────────────────────────────────────────────────────────────────────
+    def _build_ui(self):
+        from version import APP_NAME, APP_VERSION
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
+        self.setFixedSize(420, 480)
+        self.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        card = QWidget()
+        card.setObjectName("glassCard")
+        card.setStyleSheet(_GLASS_CARD_SS)
+        outer.addWidget(card)
+
+        card_lay = QVBoxLayout(card)
+        card_lay.setContentsMargins(0, 0, 0, 0)
+        card_lay.setSpacing(0)
+
+        _tb = _AppTitleBar(self, f"{APP_NAME} v{APP_VERSION}")
+        card_lay.addWidget(_tb)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setFixedHeight(1)
+        sep.setStyleSheet("background: rgba(255,255,255,0.08); border: none;")
+        card_lay.addWidget(sep)
+
+        root = QVBoxLayout()
+        root.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        root.setSpacing(16)
+        root.setContentsMargins(36, 28, 36, 28)
+        card_lay.addLayout(root)
+
+        # Иконка состояния
+        self.lbl_img = QLabel()
+        self.lbl_img.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_img.setFixedHeight(100)
+        self.lbl_img.setStyleSheet("background: transparent; border: none;")
+        logo = resource_path("assets/icon/logo.ico")
+        if os.path.exists(logo):
+            px = QPixmap(logo).scaled(
+                84, 84,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            self.lbl_img.setPixmap(px)
+        else:
+            self.lbl_img.setText("🔍")
+            self.lbl_img.setStyleSheet("font-size: 64px;")
+        root.addWidget(self.lbl_img)
+
+        # Заголовок статуса
+        self.lbl_status = QLabel("Поиск серверов в сети...")
+        self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_status.setWordWrap(True)
+        self.lbl_status.setStyleSheet(
+            "font-size: 17px; font-weight: bold; color: #cdd6f4; "
+            "background: transparent; border: none;"
+        )
+        root.addWidget(self.lbl_status)
+
+        # Подпись (хост / IP)
+        self.lbl_sub = QLabel("")
+        self.lbl_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_sub.setStyleSheet(
+            "color: rgba(200,210,224,0.60); font-size: 13px; "
+            "background: transparent; border: none;"
+        )
+        root.addWidget(self.lbl_sub)
+
+        # Блок ошибки
+        self.frm_error = QFrame()
+        self.frm_error.setStyleSheet(_GLASS_ERROR_SS)
+        err_lay = QVBoxLayout(self.frm_error)
+        err_lay.setContentsMargins(14, 10, 14, 10)
+        self.lbl_error = QLabel()
+        self.lbl_error.setWordWrap(True)
+        self.lbl_error.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_error.setStyleSheet(
+            "color: #ff8080; font-size: 13px; font-weight: 500; "
+            "background: transparent; border: none;"
+        )
+        err_lay.addWidget(self.lbl_error)
+        self.frm_error.hide()
+        root.addWidget(self.frm_error)
+
+        # Кнопки
+        self.btn_create = QPushButton("🖥  Создать сервер")
+        self.btn_create.setStyleSheet(_BTN_PRIMARY_SS)
+        self.btn_create.hide()
+        self.btn_create.clicked.connect(self._on_create_server)
+        root.addWidget(self.btn_create)
+
+        btn_row2 = QHBoxLayout()
+        btn_row2.setSpacing(10)
+
+        self.btn_retry = QPushButton("🔁  Искать снова")
+        self.btn_retry.setStyleSheet(_BTN_SECONDARY_SS)
+        self.btn_retry.hide()
+        self.btn_retry.clicked.connect(self._start_discovery)
+        btn_row2.addWidget(self.btn_retry)
+
+        self.btn_manual = QPushButton("✏️  Ввести IP")
+        self.btn_manual.setStyleSheet(_BTN_SKIP_SS)
+        self.btn_manual.hide()
+        self.btn_manual.clicked.connect(self._on_manual_ip)
+        btn_row2.addWidget(self.btn_manual)
+
+        root.addLayout(btn_row2)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Discovery
+    # ──────────────────────────────────────────────────────────────────────────
+    def _start_discovery(self):
+        """Запускает или перезапускает UDP-поиск серверов."""
+        self.frm_error.hide()
+        self.btn_create.hide()
+        self.btn_retry.hide()
+        self.btn_manual.hide()
+        self.lbl_sub.clear()
+        self._connecting_in_progress = False   # сброс: снова можно открыть ConnectingScreen
+        self.lbl_status.setText("Поиск серверов в сети...")
+        self.lbl_status.setStyleSheet(
+            "font-size: 17px; font-weight: bold; color: #cdd6f4; "
+            "background: transparent; border: none;"
+        )
+
+        if self._worker and self._worker.isRunning():
+            self._worker.quit()
+            self._worker.wait(500)
+
+        self._worker = DiscoveryWorker(timeout=2.5)
+        self._worker.found.connect(self._on_server_found)
+        self._worker.not_found.connect(self._on_server_not_found)
+        self._worker.start()
+
+    def _on_server_found(self, info: dict):
+        """Сервер обнаружен → показываем, автоподключаемся."""
+        ip   = info.get('ip', '')
+        nick = info.get('host_nick', '?')
+        self.lbl_status.setText(f"✅  Сервер найден!")
+        self.lbl_status.setStyleSheet(
+            "font-size: 17px; font-weight: bold; color: #82e0aa; "
+            "background: transparent; border: none;"
+        )
+        self.lbl_sub.setText(f"Хост: {nick}  •  {ip}")
+        # Небольшая пауза — пользователь видит статус
+        QTimer.singleShot(400, lambda: self._open_connecting(ip))
+
+    def _on_server_not_found(self):
+        """Серверов нет — предлагаем создать или ввести IP вручную."""
+        self.lbl_status.setText("Нет серверов в сети")
+        self.lbl_status.setStyleSheet(
+            "font-size: 17px; font-weight: bold; color: #e0b060; "
+            "background: transparent; border: none;"
+        )
+        self.lbl_sub.setText("Никто ещё не создал комнату")
+        self.btn_create.show()
+        self.btn_retry.show()
+        self.btn_manual.show()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Действия
+    # ──────────────────────────────────────────────────────────────────────────
+    def _on_create_server(self):
+        # ── Блокируем UI сразу — защита от двойного клика ────────────────────
+        self.btn_create.hide()
+        self.btn_retry.hide()
+        self.btn_manual.hide()
+        self.frm_error.hide()
+        self.lbl_sub.clear()
+        self.lbl_status.setText("Запуск сервера...")
+        self.lbl_status.setStyleSheet(
+            "font-size: 17px; font-weight: bold; color: #c39ef5; background: transparent; border: none;")
+
+        # ── Запускаем встроенный сервер ───────────────────────────────────────
+        try:
+            from server_discovery import get_local_radmin_ip
+            host_ip = get_local_radmin_ip()
+            EmbeddedServerManager.get().start(host_ip, self.nick)
+        except Exception as e:
+            self.lbl_error.setText(f"⚠️  Ошибка запуска сервера:\n{e}")
+            self.frm_error.show()
+            self.lbl_sub.setText("Попробуйте ещё раз или введите IP вручную")
+            self.btn_create.show()
+            self.btn_create.setEnabled(True)
+            self.btn_retry.show()
+            self.btn_manual.show()
+            self.lbl_status.setText("Нет серверов в сети")
+            self.lbl_status.setStyleSheet(
+                "font-size: 17px; font-weight: bold; color: #e0b060; background: transparent; border: none;")
+            return
+
+        self.lbl_status.setText("✅  Сервер запущен!  Ожидание готовности...")
+        self.lbl_status.setStyleSheet(
+            "font-size: 17px; font-weight: bold; color: #82e0aa; background: transparent; border: none;")
+
+        import threading as _thr
+        import socket as _sock
+        import time as _time
+        from config import DEFAULT_PORT_TCP as _PORT
+
+        def _wait_for_server():
+            deadline = _time.time() + 5.0
+            while _time.time() < deadline:
+                try:
+                    s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+                    s.settimeout(0.3)
+                    s.connect((host_ip, _PORT))  # <-- ИСПРАВЛЕНО: используем host_ip
+                    s.close()
+                    self._ready.emit(host_ip)  # <-- ИСПРАВЛЕНО
+                    return
+                except Exception:
+                    _time.sleep(0.15)
+            # Таймаут — всё равно пробуем подключиться
+            self._ready.emit(host_ip)  # <-- ИСПРАВЛЕНО
+
+        _thr.Thread(target=_wait_for_server, daemon=True, name="srv-ready-probe").start()
+
+    def _on_manual_ip(self):
+        """Открывает LoginWindow для ручного ввода IP."""
+        self.open_login.emit('', self.nick, self.avatar)
+        self.hide()
+
+    def _open_connecting(self, ip: str):
+        """Переходит к ConnectingScreen с уже известным IP."""
+        if getattr(self, '_connecting_in_progress', False):
+            return
+        self._connecting_in_progress = True
+
+        try:
+            from video_engine import patch_aiortc_nvenc
+            patch_aiortc_nvenc()
+        except Exception as e:
+            print(f"[Discovery] patch_aiortc_nvenc error: {e}")
+
+        # <-- ИСПРАВЛЕНО: Получаем Radmin IP для проверки
+        try:
+            from server_discovery import get_local_radmin_ip
+            local_ip = get_local_radmin_ip()
+        except Exception:
+            local_ip = '127.0.0.1'
+
+        skip_upd = (ip in ('127.0.0.1', local_ip))  # <-- ИСПРАВЛЕНО
+
+        self._connecting_screen = ConnectingScreen(
+            ip, self.nick, self.avatar,
+            skip_update_check=skip_upd,
+        )
+        self._connecting_screen.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
+        self._connecting_screen.show_login.connect(self._on_return_to_login)
+        self._connecting_screen.show()
+        self.hide()
+
+    def _on_return_to_login(self, ip: str, nick: str, avatar: str):
+        self._connecting_in_progress = False
+
+        try:
+            from server_discovery import get_local_radmin_ip
+            local_ip = get_local_radmin_ip()
+        except Exception:
+            local_ip = '127.0.0.1'
+
+        own_server_running = (
+                ip in ('127.0.0.1', local_ip)  # <-- ИСПРАВЛЕНО
+                and EmbeddedServerManager.get().is_running()
+        )
+
+        if own_server_running:
+            self.lbl_status.setText("Ошибка подключения")
+            self.lbl_status.setStyleSheet(
+                "font-size: 17px; font-weight: bold; color: #ff8080; background: transparent; border: none;")
+            self.lbl_sub.setText("Сервер запущен, но подключиться не удалось")
+            self.frm_error.hide()
+            self.btn_create.hide()
+            self.btn_retry.show()
+            self.btn_manual.show()
+            self.show()
+        else:
+            self.open_login.emit(ip, nick, avatar)
+            self.hide()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Точка входа
 # ══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
+    # ── ЗАЩИТА ОТ ФОРК-БОМБ И SUBPROCESS-ВЫЗОВОВ ────────────────────────────
+    import sys
+    import multiprocessing
+
+    multiprocessing.freeze_support()
+
+    # Сторонние библиотеки (aiortc, ffmpeg и т.д.) могут вызывать .exe-шник
+    # с аргументами типа "-c" или "-m" для проверки кодеков.
+    # Завершаем процесс тихо, чтобы не плодить новые окна GUI по кругу.
+    if len(sys.argv) > 1:
+        sys.exit(0)
+
+    if multiprocessing.current_process().name != 'MainProcess':
+        sys.exit(0)
+    # ────────────────────────────────────────────────────────────────────────
+
     # ── Дамп аудио-устройств до создания QApplication ───────────────────────
     # Если PortAudio крашится уже при query_devices() — увидим это в логе.
     try:
@@ -1085,12 +1558,14 @@ if __name__ == "__main__":
     config = load_config()
 
     if config:
-        # ── Конфиг найден → авто-коннект ────────────────────────────────
-        ip     = config.get("ip",     "127.0.0.1")
+        # ── Конфиг найден → автообнаружение сервера ─────────────────────
+        # IP из конфига больше НЕ используется как прямой адрес сервера —
+        # сервер теперь обнаруживается автоматически через UDP broadcast.
+        # Сохраняем nick/avatar из конфига, IP игнорируем.
         nick   = config.get("nick",   "User")
         avatar = config.get("avatar", "1.svg")
 
-        _connect_screen = ConnectingScreen(ip, nick, avatar)
+        _connect_screen = DiscoveryScreen(nick, avatar)
         _connect_screen.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
 
         def _fallback_to_login(f_ip: str, f_nick: str, f_avatar: str):
@@ -1104,12 +1579,12 @@ if __name__ == "__main__":
                 error_msg=(
                     f"⚠️  Сервер недоступен: {f_ip}\n"
                     "Измените адрес и нажмите «Войти»."
-                )
+                ) if f_ip else ""
             )
             _login_window.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
             _login_window.show()
 
-        _connect_screen.show_login.connect(_fallback_to_login)
+        _connect_screen.open_login.connect(_fallback_to_login)
         _connect_screen.show()
 
     else:

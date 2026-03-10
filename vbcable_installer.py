@@ -56,14 +56,27 @@ def is_vbcable_installed() -> bool:
 
 def find_zip():
     """
-    Ищет архив VB-CABLE в текущей папке и папке рядом с этим модулем.
-    Возвращает полный путь или None.
+    Ищет архив VB-CABLE в папке рядом с программой.
+
+    В dev-режиме: CWD и папка рядом с этим модулем.
+    В frozen-режиме (PyInstaller exe): папка рядом с InPulse.exe.
+      ВАЖНО: os.path.dirname(__file__) в frozen даёт _MEIPASS (временная папка),
+      НЕ папку exe — поэтому в frozen явно используем sys.executable.
     """
-    search_dirs = [
-        os.path.abspath("."),
-        os.path.dirname(os.path.abspath(__file__)),
-    ]
+    search_dirs = [os.path.abspath(".")]
+
+    if getattr(sys, "frozen", False):
+        # Frozen: zip должен лежать рядом с InPulse.exe
+        search_dirs.append(os.path.dirname(sys.executable))
+    else:
+        # Dev: ищем рядом с модулем
+        search_dirs.append(os.path.dirname(os.path.abspath(__file__)))
+
+    seen = set()
     for directory in search_dirs:
+        if directory in seen:
+            continue
+        seen.add(directory)
         for name in VBCABLE_ZIP_NAMES:
             path = os.path.join(directory, name)
             if os.path.exists(path):

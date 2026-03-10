@@ -208,6 +208,12 @@ class MainWindow(QMainWindow):
         # Входящий запрос файловой передачи от другого пользователя
         self.net.file_offer_received.connect(self._on_file_offer_received)
 
+        # ── Встроенный сервер: миграция хоста ────────────────────────────────
+        # become_host      — нам нужно стать новым хостом сервера.
+        # server_migrating — сервер переезжает к другому хосту.
+        self.net.become_host.connect(self._on_become_host)
+        self.net.server_migrating.connect(self._on_server_migrating)
+
         self.ui_timer = QTimer()
         self.ui_timer.timeout.connect(self.refresh_ui)
         self.ui_timer.start(100)
@@ -535,6 +541,57 @@ class MainWindow(QMainWindow):
         self._lost_status_lbl.setText("Попытка переподключения...")
         self._btn_reconnect.setEnabled(False)
         self.net.manual_reconnect()
+
+    # ── Встроенный сервер: стать хостом ──────────────────────────────────────
+
+    def _on_become_host(self):
+        print("[UI] _on_become_host: запускаем встроенный сервер")
+
+        self._lost_title_lbl.setText("Переключение хоста")
+        self._lost_status_lbl.setText(
+            "Запускаем сервер на вашем ПК...\nОстальные подключатся автоматически."
+        )
+        self._btn_reconnect.setEnabled(False)
+        self._stack.setCurrentIndex(1)
+
+        try:
+            from client_main import EmbeddedServerManager
+            from server_discovery import get_local_radmin_ip
+            host_ip = get_local_radmin_ip()
+            EmbeddedServerManager.get().start(host_ip, self.nick)
+        except Exception as e:
+            print(f"[UI] _on_become_host error: {e}")
+            self._lost_status_lbl.setText(f"Ошибка запуска сервера:\n{e}\n\nПопробуйте перезапустить.")
+            self._btn_reconnect.setEnabled(True)
+            return
+
+        def _reconnect_to_self():
+            self.net._ip = host_ip  # <-- ИСПРАВЛЕНО: было '127.0.0.1'
+            self.net._reconnecting = True
+            self.net._reconnect_attempts = 0
+            self.net.running = False
+            import threading
+            threading.Thread(
+                target=self.net._reconnect_loop,
+                daemon=True,
+                name="host-reconnect",
+            ).start()
+
+        QTimer.singleShot(700, _reconnect_to_self)
+
+    def _on_server_migrating(self, new_host_ip: str):
+        """
+        Вызывается когда сервер переезжает к другому хосту (мы — не новый хост).
+        Показываем индикатор. Сетевой движок сам переподключится через _migrate_reconnect().
+        """
+        print(f"[UI] _on_server_migrating: новый хост {new_host_ip}")
+        self._lost_title_lbl.setText("Смена хоста")
+        self._lost_status_lbl.setText(
+            f"Сервер переезжает...\nНовый хост: {new_host_ip}\n"
+            "Переподключение через несколько секунд."
+        )
+        self._btn_reconnect.setEnabled(False)
+        self._stack.setCurrentIndex(1)
 
     def setWindowTitle(self, title: str):
         """Переопределяем — синхронно обновляем кастомный title bar."""
@@ -1535,7 +1592,42 @@ class MainWindow(QMainWindow):
             is_streaming=is_streaming,
             on_watch_stream=watch_cb,
             net=self.net,
+            # Передача сервера: callback виден только хосту (первый в host_order)
+            on_transfer_server=(
+                (lambda _uid=uid: self._on_request_server_transfer(_uid))
+                if self._is_server_host() and uid != self.audio.my_uid
+                else None
+            ),
         ).show()
+
+    def _is_server_host(self) -> bool:
+        """
+        Возвращает True если текущий пользователь является хозяином сервера.
+        Используется для отображения кнопки «Передать сервер» в контекстном меню.
+        """
+        my_uid = getattr(self.audio, 'my_uid', 0)
+        server_uid = getattr(self.net, '_server_host_uid', 0)
+        return bool(my_uid and my_uid == server_uid)
+
+    def _on_request_server_transfer(self, target_uid: int):
+        """
+        Запрашивает подтверждение и отправляет CMD_SERVER_TRANSFER на сервер.
+        Вызывается из UserOverlayPanel при клике «Передать сервер».
+        """
+        target_info = self.known_uids.get(target_uid, {})
+        target_nick = target_info.get('nick', f'uid={target_uid}')
+
+        reply = QMessageBox.question(
+            self,
+            "Передача сервера",
+            f"Передать роль хоста пользователю {target_nick!r}?\n\n"
+            "Все участники переподключатся к его ПК автоматически.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.net.send_server_transfer(target_uid)
+            print(f"[UI] Запрошена передача сервера → {target_nick} (uid={target_uid})")
 
     def open_video_window(self, uid, nick):
         if uid not in self.stream_windows or not self.stream_windows[uid].isVisible():
@@ -2006,6 +2098,14 @@ class MainWindow(QMainWindow):
             pass
         self.audio.stop()
         self.net.running = False
+        # Если мы хост встроенного сервера — корректная передача хостинга
+        try:
+            from client_main import EmbeddedServerManager
+            mgr = EmbeddedServerManager.get()
+            if mgr.is_running():
+                mgr.stop()   # stop_gracefully: broadcast server_migrate → 600 мс → close
+        except Exception as ex:
+            print(f"[UI] closeEvent EmbeddedServer stop error: {ex}")
         from PyQt6.QtWidgets import QApplication
         QApplication.quit()
         e.accept()

@@ -122,14 +122,25 @@ def patch_aiortc_nvenc() -> bool:
     hw_profiles = [
         # 1. NVIDIA NVENC (если доступен в сборке PyAV)
         {
-            'codec': 'h264_nvenc',
-            'name':  'NVIDIA NVENC',
+            'codec': 'h264',
+            'name': 'NVIDIA NVENC',
             'options': {
-                'preset':      'p4',
-                'tune':        'll',
+                'preset': 'p4',
+                'tune': 'll',
                 'zerolatency': '1',
-                'rc':          'cbr',       # постоянный битрейт — меньше джиттера
-                'b':           str(VIDEO_BITRATE),
+
+                # Контроль битрейта (эластичность для сети)
+                'rc': 'vbr',  # VBR вместо CBR
+                'b': str(VIDEO_BITRATE // 2),  # Средний битрейт (позволяем падать на статике)
+                'maxrate': str(VIDEO_BITRATE),  # Жесткий верхний лимит
+                'bufsize': str(VIDEO_BITRATE),  # Ограничиваем буфер VBV (равен maxrate для минимизации лага)
+
+                # Оптимизация для слабых зрителей
+                'bf': '0',  # Отключаем B-кадры: минус задержка, легче декодировать
+                'profile': 'main',  # Баланс между сжатием и легкостью декодирования
+
+                # Визуальное качество
+                'spatial_aq': '1',  # Адаптивное квантование: делает текст и мелкие детали четче
             },
         },
 

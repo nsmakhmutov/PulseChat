@@ -146,3 +146,28 @@ def get_appdata_dir() -> str:
 
 USER_CONFIG_PATH = os.path.join(get_appdata_dir(), "user_config.json")
 KNOWN_USERS_PATH = os.path.join(get_appdata_dir(), "known_users.json")
+# ── Встроенный сервер: обнаружение в сети (Discovery) ────────────────────────
+#
+# Клиент при старте слушает UDP broadcast на DISCOVERY_PORT.
+# Встроенный сервер (EmbeddedServer) рассылает анонсы каждые DISCOVERY_INTERVAL с.
+# Если за DISCOVERY_TIMEOUT с никто не ответил — предлагаем создать сервер.
+#
+# Порт 5002 выбран чтобы не конфликтовать с TCP (5000) и UDP голоса (5001).
+DISCOVERY_PORT     = 5002   # UDP broadcast: поиск / анонс встроенного сервера
+DISCOVERY_INTERVAL = 3.0    # секунды между анонсами ServerAnnouncer
+DISCOVERY_TIMEOUT  = 2.5    # секунды ожидания при поиске (DiscoveryScreen)
+
+# ── Передача/миграция сервера ─────────────────────────────────────────────────
+#
+# Два сценария:
+#   1. Ручная: хост ПКМ → «Передать сервер» → CMD_SERVER_TRANSFER (client→server)
+#              Сервер находит IP цели, рассылает CMD_SERVER_MIGRATE всем.
+#              Цель стартует встроенный сервер; остальные переподключаются.
+#
+#   2. Авто:   Хост уходит без предупреждения (выключил ПК, упал инет).
+#              Клиенты видят обрыв соединения, запускают _auto_host_check().
+#              Первый в host_order стартует сервер; остальные обнаруживают его
+#              через UDP broadcast (ServerDiscovery) и переподключаются.
+#
+CMD_SERVER_TRANSFER = 'server_transfer'  # клиент → сервер: передать хостинг uid
+CMD_SERVER_MIGRATE  = 'server_migrate'   # сервер → все:    IP нового хоста 
