@@ -77,6 +77,7 @@ from config import (
     CMD_WEBRTC_OFFER, CMD_WEBRTC_ANSWER, CMD_WEBRTC_ICE,
     WEBRTC_ICE_TIMEOUT,
     CMD_SERVER_MIGRATE,
+    CMD_QUICK_MSG, QUICK_MSG_MAX_LEN,
 )
 
 MAX_SILENT_RECONNECT_ATTEMPTS = 4
@@ -128,6 +129,9 @@ class NetworkClient(QObject):
 
     # Входящее предложение файловой передачи
     file_offer_received = pyqtSignal(dict)
+
+    # Быстрый чат: (uid, from_nick, text)
+    quick_msg_received  = pyqtSignal(int, str, str)
 
     # ── Встроенный сервер: сигналы миграции хоста ────────────────────────────
     # become_host      — нам нужно стать новым хостом (запустить embedded server).
@@ -1043,6 +1047,14 @@ class NetworkClient(QObject):
         elif act in ('file_offer', 'file_offer_room'):
             self.file_offer_received.emit(msg)
 
+        # ── Быстрый чат ────────────────────────────────────────────────────
+        elif act == CMD_QUICK_MSG:
+            sender_uid  = int(msg.get('uid', 0))
+            from_nick   = str(msg.get('from_nick', '?'))
+            text        = str(msg.get('text', ''))
+            if text:
+                self.quick_msg_received.emit(sender_uid, from_nick, text)
+
         # ── Миграция сервера (встроенный режим) ────────────────────────────
         elif act == CMD_SERVER_MIGRATE:
             new_host_uid = msg.get('new_host_uid', 0)
@@ -1151,6 +1163,13 @@ class NetworkClient(QObject):
             'target_uid': target_uid,
         })
         print(f"[Net] Nudge vote sent → target_uid={target_uid}")
+
+    def send_quick_msg(self, text: str) -> None:
+        """Отправить быстрое сообщение в комнату (≤ QUICK_MSG_MAX_LEN символов)."""
+        text = text.strip()[:QUICK_MSG_MAX_LEN]
+        if not text:
+            return
+        self.send_json({'action': CMD_QUICK_MSG, 'text': text})
 
     def _nudge_get_endpoint_vol(self):
         """

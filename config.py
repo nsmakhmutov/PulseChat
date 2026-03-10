@@ -170,4 +170,11 @@ DISCOVERY_TIMEOUT  = 2.5    # секунды ожидания при поиск�
 #              через UDP broadcast (ServerDiscovery) и переподключаются.
 #
 CMD_SERVER_TRANSFER = 'server_transfer'  # клиент → сервер: передать хостинг uid
-CMD_SERVER_MIGRATE  = 'server_migrate'   # сервер → все:    IP нового хоста 
+CMD_SERVER_MIGRATE  = 'server_migrate'   # сервер → все:    IP нового хоста
+
+# ── Быстрый чат (Quick Message) ───────────────────────────────────────────────
+# Лёгкий обмен короткими сообщениями без БД и истории.
+# Сообщение живёт 5 секунд в UI рядом с ником отправителя.
+# Максимальная длина текста: QUICK_MSG_MAX_LEN символов.
+CMD_QUICK_MSG     = 'quick_msg'   # клиент → сервер → все в комнате
+QUICK_MSG_MAX_LEN = 20            # символов — ограничение на клиенте и сервере

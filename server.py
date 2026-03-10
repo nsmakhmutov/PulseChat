@@ -62,6 +62,7 @@ from config import (
     CMD_WEBRTC_OFFER, CMD_WEBRTC_ANSWER, CMD_WEBRTC_ICE,
     WEBRTC_ICE_TIMEOUT,
     CMD_SERVER_TRANSFER, CMD_SERVER_MIGRATE,
+    CMD_QUICK_MSG, QUICK_MSG_MAX_LEN,
 )
 
 # ── Опциональный импорт aiortc (только для WebRTCSFU) ────────────────────────
@@ -1105,6 +1106,44 @@ class SFUServer:
                                     f"[Server] 📁 file_offer_room: "
                                     f"uid={uid} → {len(room_conns)} получателей"
                                 )
+
+                        # ── Быстрый чат ───────────────────────────────────────
+                        elif action == CMD_QUICK_MSG:
+                            text = str(msg.get('text', '')).strip()[:QUICK_MSG_MAX_LEN]
+                            if not text:
+                                pass
+                            else:
+                                with self.clients_lock:
+                                    sender_nick = (
+                                        self.clients[conn]['nick']
+                                        if conn in self.clients else '?'
+                                    )
+                                    sender_uid_qm = (
+                                        self.clients[conn]['uid']
+                                        if conn in self.clients else 0
+                                    )
+                                    sender_room_qm = (
+                                        self.clients[conn]['room']
+                                        if conn in self.clients else None
+                                    )
+                                    room_conns_qm = []
+                                    if sender_room_qm:
+                                        room_conns_qm = [
+                                            c_conn
+                                            for c_conn, c_data in self.clients.items()
+                                            if c_data['room'] == sender_room_qm
+                                        ]
+                                broadcast_qm = json.dumps({
+                                    'action':     CMD_QUICK_MSG,
+                                    'uid':        sender_uid_qm,
+                                    'from_nick':  sender_nick,
+                                    'text':       text,
+                                }).encode('utf-8')
+                                for bc in room_conns_qm:
+                                    try:
+                                        bc.sendall(broadcast_qm)
+                                    except Exception:
+                                        pass
 
                     except json.JSONDecodeError:
                         break

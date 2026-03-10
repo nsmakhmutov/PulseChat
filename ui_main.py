@@ -11,9 +11,9 @@ from ui_video import VideoWindow
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QPushButton, QTreeWidget, QTreeWidgetItem,
                              QHeaderView, QMessageBox, QStackedWidget,
-                             QFrame, QSizeGrip, QFileDialog)
-from PyQt6.QtCore import Qt, QTimer, QSize, QSettings, QRect, QPoint
-from PyQt6.QtGui import QIcon, QFont, QFontDatabase, QBrush, QColor
+                             QFrame, QSizeGrip, QFileDialog, QLineEdit)
+from PyQt6.QtCore import Qt, QTimer, QSize, QSettings, QRect, QPoint, QEvent
+from PyQt6.QtGui import QIcon, QFont, QFontDatabase, QBrush, QColor, QCursor, QFontMetrics
 
 from config import *
 from audio_engine import AudioHandler
@@ -23,7 +23,119 @@ from ui_dialogs import (UserOverlayPanel, SettingsDialog, SoundboardDialog,
                         FileReceiverWorker, FileTransferProgressWidget,
                         _show_float_widget, _format_size)
 from version import APP_VERSION, APP_NAME, GITHUB_REPO
+from config import QUICK_MSG_MAX_LEN
 
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# QuickMsgBubble — стеклянный пузырь быстрого сообщения
+# ──────────────────────────────────────────────────────────────────────────────
+class QuickMsgBubble(QWidget):
+    """
+    Frameless tool-окно: появляется поверх всего приложения (и поверх дерева).
+    Позиционируется слева от аватарки отправителя по глобальным координатам.
+    Имеет маленький хвостик ▶ справа — указывает на аватарку.
+
+    Жизненный цикл управляется из MainWindow._quick_bubbles.
+    Создаётся один раз на uid, текст обновляется в update().
+    """
+
+    MAX_W = 210   # максимальная ширина пузыря, px
+
+    def __init__(self, parent=None):
+        super().__init__(
+            parent,
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.NoDropShadowWindowHint,
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # ── Стеклянный контейнер ──────────────────────────────────────────────
+        self._card = QFrame()
+        self._card.setObjectName("qbCard")
+        self._card.setStyleSheet("""
+            QFrame#qbCard {
+                background-color: rgba(16, 18, 32, 220);
+                border: 1px solid rgba(91, 142, 245, 0.60);
+                border-radius: 10px;
+            }
+        """)
+        card_lay = QVBoxLayout(self._card)
+        card_lay.setContentsMargins(10, 7, 10, 7)
+        card_lay.setSpacing(0)
+
+        # Текст сообщения с переносом строк
+        self._text_lbl = QLabel()
+        self._text_lbl.setWordWrap(True)
+        self._text_lbl.setStyleSheet(
+            "color: #eaf0ff; font-size: 13px; font-weight: 600;"
+            "background: transparent; border: none;"
+        )
+        card_lay.addWidget(self._text_lbl)
+
+        outer.addWidget(self._card)
+
+        # ── Хвостик ▶ справа (указывает на аватарку) ─────────────────────────
+        self._tail = QLabel("▶")
+        self._tail.setFixedWidth(12)
+        self._tail.setStyleSheet(
+            "color: rgba(91, 142, 245, 0.60);"
+            "font-size: 11px; background: transparent; border: none;"
+            "padding: 0; margin: 0;"
+        )
+        self._tail.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
+        outer.addWidget(self._tail)
+
+    def update(self, text: str) -> None:  # type: ignore[override]
+        self._text_lbl.setText(text)
+
+        # QFontMetrics напрямую измеряет пиксельную ширину текста —
+        # независимо от setFixedWidth/wordWrap/sizeHint лейбла.
+        # Это единственный надёжный способ: sizeHint() у wordWrap-лейбла
+        # всегда возвращает ширину контейнера, а не текста.
+        padding_h = 10 * 2          # card_lay contentsMargins left+right
+        fm = QFontMetrics(self._text_lbl.font())
+        text_w = fm.horizontalAdvance(text) + 8   # +8px запас на сглаживание
+        content_w = min(text_w, self.MAX_W - padding_h)
+
+        self._text_lbl.setFixedWidth(content_w)
+        self._card.setFixedWidth(content_w + padding_h)
+        self.adjustSize()
+
+    def place_left_of(self, global_item_tl, item_h: int) -> None:
+        """
+        Позиционирует пузырь слева от аватарки.
+        global_item_tl — глобальные экранные координаты верхнего-левого угла
+        строки пользователя в дереве.
+        Аватарка — первые 32px ширины строки.
+        """
+        bw = self.width()
+        bh = self.height()
+        # Правый край пузыря (вместе с хвостиком) = левый край аватарки − 2 px
+        x = global_item_tl.x() - bw - 2
+        # Вертикальный центр = центр строки
+        y = global_item_tl.y() + (item_h - bh) // 2
+
+        # Защита от выхода за левый край экрана
+        from PyQt6.QtWidgets import QApplication
+        screen = QApplication.screenAt(global_item_tl)
+        if screen:
+            sg = screen.geometry()
+            if x < sg.left():
+                # Не влезает слева → показываем справа от аватарки (32px)
+                x = global_item_tl.x() + 32 + 6
+            # Защита по вертикали
+            y = max(sg.top() + 4, min(y, sg.bottom() - bh - 4))
+
+        self.move(x, y)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -146,6 +258,7 @@ class MainWindow(QMainWindow):
             "unmute":     resource_path("assets/music/unmute.wav"),
             "stream_on":  resource_path("assets/music/stream_on.wav"),
             "stream_off": resource_path("assets/music/stream_off.wav"),
+            "quick_msg":  resource_path("assets/music/message.wav"),
         }
         self.prev_room_uids: set = set()
         self.prev_streaming_uids: set = set()
@@ -159,6 +272,11 @@ class MainWindow(QMainWindow):
         self._resize_start_pos: QPoint | None = None
         self._resize_start_geom: QRect | None = None
         self.setMouseTracking(True)
+
+        # Приложение-уровневый фильтр для корректного сброса курсора ресайза
+        # когда мышь уходит с края рамки на дочерние виджеты (tree, кнопки и т.п.)
+        from PyQt6.QtWidgets import QApplication
+        QApplication.instance().installEventFilter(self)
 
         # Предзагрузка звуков уведомлений: каждый звук загружается ОДИН РАЗ.
         # Хранится как (data, sr) кортеж — sounddevice воспроизводит напрямую без
@@ -207,6 +325,12 @@ class MainWindow(QMainWindow):
 
         # Входящий запрос файловой передачи от другого пользователя
         self.net.file_offer_received.connect(self._on_file_offer_received)
+
+        # Быстрый чат: всплывающий пузырь у ника отправителя
+        self.net.quick_msg_received.connect(self._on_quick_msg_received)
+        # Словарь активных пузырей: uid → (QLabel, QTimer)
+        # Хранение предотвращает создание нескольких пузырей для одного юзера.
+        self._quick_bubbles: dict[int, tuple] = {}
 
         # ── Встроенный сервер: миграция хоста ────────────────────────────────
         # become_host      — нам нужно стать новым хостом сервера.
@@ -346,8 +470,8 @@ class MainWindow(QMainWindow):
         main_page = QWidget()
         main_page.setObjectName("centralWidget")
         layout = QVBoxLayout(main_page)
-        layout.setContentsMargins(12, 10, 12, 0)
-        layout.setSpacing(8)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(6)
 
         self.tree = QTreeWidget()
         self.tree.setColumnCount(5)
@@ -393,6 +517,33 @@ class MainWindow(QMainWindow):
         )
         self._whisper_banner.setFixedHeight(40)
         layout.addWidget(self._whisper_banner)
+
+        # ── Быстрый чат: строка ввода ─────────────────────────────────────
+        # Прозрачная стеклянная панель над панелью управления.
+        # Ограничение QUICK_MSG_MAX_LEN символов — проставляется и на QLineEdit.
+        self._quick_chat_bar = QFrame()
+        self._quick_chat_bar.setObjectName("quickChatBar")
+        self._quick_chat_bar.setFixedHeight(44)
+        qc_lay = QHBoxLayout(self._quick_chat_bar)
+        qc_lay.setContentsMargins(10, 0, 10, 0)
+        qc_lay.setSpacing(6)
+
+        self._quick_chat_input = QLineEdit()
+        self._quick_chat_input.setObjectName("quickChatInput")
+        self._quick_chat_input.setPlaceholderText("Быстрое сообщение…")
+        self._quick_chat_input.setMaxLength(QUICK_MSG_MAX_LEN)
+        self._quick_chat_input.setFixedHeight(32)
+        self._quick_chat_input.returnPressed.connect(self._send_quick_msg)
+        qc_lay.addWidget(self._quick_chat_input, stretch=1)
+
+        self._quick_chat_send_btn = QPushButton("➤")
+        self._quick_chat_send_btn.setObjectName("quickChatSendBtn")
+        self._quick_chat_send_btn.setFixedSize(32, 32)
+        self._quick_chat_send_btn.setToolTip("Отправить (Enter)")
+        self._quick_chat_send_btn.clicked.connect(self._send_quick_msg)
+        qc_lay.addWidget(self._quick_chat_send_btn)
+
+        layout.addWidget(self._quick_chat_bar)
 
         # ── Нижняя панель кнопок управления ─────────────────────────────────
         # Отдельный QFrame с собственным фоном — визуальная иерархия:
@@ -601,28 +752,18 @@ class MainWindow(QMainWindow):
 
     # ── Edge-resize для безрамочного окна ────────────────────────────────────
     _EDGE_CURSORS = {
-        "top-left":     Qt.CursorShape.SizeFDiagCursor,
-        "top-right":    Qt.CursorShape.SizeBDiagCursor,
         "bottom-left":  Qt.CursorShape.SizeBDiagCursor,
         "bottom-right": Qt.CursorShape.SizeFDiagCursor,
-        "left":         Qt.CursorShape.SizeHorCursor,
-        "right":        Qt.CursorShape.SizeHorCursor,
-        "top":          Qt.CursorShape.SizeVerCursor,
         "bottom":       Qt.CursorShape.SizeVerCursor,
     }
 
     def _edge_at(self, pos: QPoint) -> str | None:
         m = self._resize_margin
         x, y, w, h = pos.x(), pos.y(), self.width(), self.height()
-        l, r, t, b = x <= m, x >= w - m, y <= m, y >= h - m
-        if t and l:   return "top-left"
-        if t and r:   return "top-right"
-        if b and l:   return "bottom-left"
-        if b and r:   return "bottom-right"
-        if l:         return "left"
-        if r:         return "right"
-        if t:         return "top"
-        if b:         return "bottom"
+        b = y >= h - m
+        if b and x <= m:      return "bottom-left"
+        if b and x >= w - m:  return "bottom-right"
+        if b:                 return "bottom"
         return None
 
     def mousePressEvent(self, e):
@@ -641,21 +782,52 @@ class MainWindow(QMainWindow):
                 and e.buttons() == Qt.MouseButton.LeftButton
                 and self._resize_start_pos is not None
                 and self._resize_start_geom is not None):
+
             delta = e.globalPosition().toPoint() - self._resize_start_pos
-            g = QRect(self._resize_start_geom)
-            d = self._resize_direction
-            if "right"  in d: g.setRight(g.right()   + delta.x())
-            if "bottom" in d: g.setBottom(g.bottom() + delta.y())
-            if "left"   in d: g.setLeft(g.left()     + delta.x())
-            if "top"    in d: g.setTop(g.top()       + delta.y())
-            if g.width() >= self.minimumWidth() and g.height() >= self.minimumHeight():
-                self.setGeometry(g)
+            orig  = self._resize_start_geom
+            g     = QRect(orig)
+            min_h = self.minimumHeight()
+
+            # Только нижняя граница, ширина не меняется
+            new_bottom = orig.bottom() + delta.y()
+            g.setBottom(max(new_bottom, orig.top() + min_h))
+
+            self.setGeometry(g)
             e.accept()
             return
+
         if not self.isMaximized():
             edge = self._edge_at(e.pos())
             self.setCursor(self._EDGE_CURSORS[edge]) if edge else self.unsetCursor()
         super().mouseMoveEvent(e)
+
+    def eventFilter(self, obj, event):
+        """
+        Приложение-уровневый фильтр: перехватывает MouseMove у ЛЮБОГО дочернего
+        виджета и пересчитывает курсор относительно границ главного окна.
+
+        Проблема без этого фильтра:
+          MainWindow.mouseMoveEvent вызывается только когда курсор находится
+          прямо над главным окном (не над дочерними виджетами). Как только
+          мышь попадает на QTreeWidget или кнопки — события уходят им, а
+          setCursor(SizeXxx), выставленный у края рамки, «застревает» навсегда.
+
+        Решение:
+          При каждом MouseMove в любом виджете вычисляем pos относительно
+          MainWindow (через QCursor.pos() → mapFromGlobal). Если ресайз не активен
+          и не у края — вызываем unsetCursor().
+        """
+        if (event.type() == QEvent.Type.MouseMove
+                and not self._resize_direction
+                and not self.isMaximized()):
+            # Глобальные координаты → локальные координаты MainWindow
+            pos = self.mapFromGlobal(QCursor.pos())
+            edge = self._edge_at(pos)
+            if edge:
+                self.setCursor(self._EDGE_CURSORS[edge])
+            else:
+                self.unsetCursor()
+        return False   # никогда не поглощаем событие
 
     def mouseReleaseEvent(self, e):
         self._resize_direction = None
@@ -667,6 +839,18 @@ class MainWindow(QMainWindow):
         # перетаскивания, а setCursor() остаётся в силе пока явно не вызван unsetCursor().
         self.unsetCursor()
         super().mouseReleaseEvent(e)
+
+    def moveEvent(self, e):
+        """При перемещении окна синхронно двигаем все активные пузыри чата."""
+        super().moveEvent(e)
+        if hasattr(self, '_quick_bubbles') and self._quick_bubbles:
+            self._reposition_quick_bubbles()
+
+    def resizeEvent(self, e):
+        """При изменении размера окна тоже пересчитываем позиции пузырей."""
+        super().resizeEvent(e)
+        if hasattr(self, '_quick_bubbles') and self._quick_bubbles:
+            self._reposition_quick_bubbles()
 
     def apply_theme(self, theme_name):
         font_f = self.custom_font_family
@@ -860,9 +1044,15 @@ class MainWindow(QMainWindow):
             /* ── Нижняя панель кнопок ───────────────────────────────────────── */
             #bottomBar {{
                 background-color: {bottom_bg};
-                border-top: 1px solid {bottom_sep};
-                border-bottom-left-radius: 9px;
-                border-bottom-right-radius: 9px;
+                border: 1px solid {bottom_sep};
+                border-radius: 12px;
+            }}
+
+            /* ── Быстрый чат ────────────────────────────────────────────────── */
+            #quickChatBar {{
+                background-color: {bottom_bg};
+                border: 1px solid {bottom_sep};
+                border-radius: 12px;
             }}
 
             /* Все кнопки в bottomBar */
@@ -947,6 +1137,39 @@ class MainWindow(QMainWindow):
 
             /* QDialog / QScrollArea / etc. — не трогаем стиль диалогов отсюда */
             QDialog {{ background: transparent; }}
+
+            #quickChatInput {{
+                background-color: {btn_bg};
+                border: 1px solid {btn_border};
+                border-radius: 8px;
+                padding: 0 10px;
+                color: {text};
+                font-size: 13px;
+                selection-background-color: {accent};
+            }}
+            #quickChatInput:focus {{
+                border-color: {accent};
+                background-color: {btn_hover};
+            }}
+            #quickChatInput::placeholder {{
+                color: {text_dim};
+            }}
+            #quickChatSendBtn {{
+                background-color: {btn_bg};
+                border: 1px solid {btn_border};
+                border-radius: 8px;
+                color: {accent};
+                font-size: 16px;
+                font-weight: bold;
+                padding: 0;
+            }}
+            #quickChatSendBtn:hover {{
+                background-color: {btn_hover};
+                border-color: {accent};
+            }}
+            #quickChatSendBtn:pressed {{
+                background-color: {hover_solid};
+            }}
         """)
 
         # ── Кэш цветов для refresh_ui: пересоздаём при смене темы ────────────
@@ -1197,6 +1420,115 @@ class MainWindow(QMainWindow):
         self._whisper_banner.setVisible(False)
         self._whisper_overlay.hide_overlay()
 
+    # ── Быстрый чат ────────────────────────────────────────────────────────────
+
+    def _send_quick_msg(self):
+        """Отправить сообщение из строки ввода быстрого чата."""
+        text = self._quick_chat_input.text().strip()
+        if not text:
+            return
+        self.net.send_quick_msg(text)
+        self._quick_chat_input.clear()
+
+    def _on_quick_msg_received(self, sender_uid: int, from_nick: str, text: str):
+        """
+        Входящее быстрое сообщение.
+
+        Создаёт (или обновляет) QuickMsgBubble — frameless tool-окно поверх
+        всего приложения. Пузырь позиционируется слева от аватарки отправителя
+        по глобальным координатам экрана.
+
+        Повторное сообщение от того же uid обновляет текст без пересоздания.
+        Автоскрытие — 5 секунд.
+        """
+        # ── Звук уведомления ─────────────────────────────────────────────────
+        self.play_notification("quick_msg")
+
+        # ── Глобальные координаты строки пользователя в дереве ───────────────
+        global_tl = None
+        item_h    = 44   # высота строки по умолчанию
+        data = self.known_uids.get(sender_uid)
+        if data:
+            try:
+                rect = self.tree.visualItemRect(data['item'])
+                item_h = max(rect.height(), 1)
+                global_tl = self.tree.viewport().mapToGlobal(rect.topLeft())
+            except RuntimeError:
+                pass
+
+        # ── Переиспользуем существующий пузырь ───────────────────────────────
+        existing = self._quick_bubbles.get(sender_uid)
+        if existing:
+            bubble, timer = existing
+            try:
+                bubble.update(text)
+                if global_tl:
+                    bubble.place_left_of(global_tl, item_h)
+                bubble.raise_()
+                bubble.show()
+                timer.stop()
+                timer.start(5000)
+                return
+            except RuntimeError:
+                self._quick_bubbles.pop(sender_uid, None)
+
+        # ── Создаём новый пузырь ──────────────────────────────────────────────
+        bubble = QuickMsgBubble()   # top-level frameless tool window
+        bubble.update(text)
+
+        if global_tl:
+            bubble.place_left_of(global_tl, item_h)
+        else:
+            # Отправитель не виден в дереве — по центру над нижней панелью
+            gp = self.mapToGlobal(
+                QPoint(
+                    self.width() // 2 - bubble.width() // 2,
+                    self._bottom_bar.y() - bubble.height() - 12,
+                )
+            )
+            bubble.move(gp)
+
+        bubble.show()
+
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.setInterval(5000)
+        timer.timeout.connect(lambda uid=sender_uid: self._hide_quick_bubble(uid))
+        timer.start()
+
+        self._quick_bubbles[sender_uid] = (bubble, timer)
+
+    def _hide_quick_bubble(self, uid: int):
+        """Скрыть и удалить пузырь быстрого сообщения для данного uid."""
+        entry = self._quick_bubbles.pop(uid, None)
+        if entry:
+            bubble, timer = entry
+            try:
+                timer.stop()
+                bubble.hide()
+                bubble.deleteLater()
+            except RuntimeError:
+                pass
+
+    def _reposition_quick_bubbles(self):
+        """
+        Репозиционировать все активные пузыри после пересборки дерева.
+        Вызывается из update_user_tree() после expandAll().
+        Использует глобальные экранные координаты — работает корректно
+        даже если пузырь выходит за границы главного окна.
+        """
+        for uid, (bubble, _timer) in list(self._quick_bubbles.items()):
+            d = self.known_uids.get(uid)
+            if not d:
+                continue
+            try:
+                rect   = self.tree.visualItemRect(d['item'])
+                item_h = max(rect.height(), 1)
+                global_tl = self.tree.viewport().mapToGlobal(rect.topLeft())
+                bubble.place_left_of(global_tl, item_h)
+            except RuntimeError:
+                pass
+
     def _on_user_volume_zero(self, uid: int, is_zero: bool):
         """
         Вызывается немедленно когда ползунок громкости пользователя
@@ -1432,6 +1764,9 @@ class MainWindow(QMainWindow):
 
         self.tree.expandAll()
         self._update_known_users_registry(users_map)
+
+        # Репозиционируем активные пузыри быстрого чата
+        self._reposition_quick_bubbles()
 
     def refresh_ui(self):
         try:
