@@ -34,7 +34,7 @@ CHUNK_SIZE      = int(SAMPLE_RATE * (FRAME_DURATION / 1000))  # 960 сэмпло
 # ── Видео настройки (захват DXCam → WebRTC) ──────────────────────────────────
 VIDEO_WIDTH   = 1280
 VIDEO_HEIGHT  = 720
-VIDEO_FPS     = 60
+VIDEO_FPS     = 30
 # VIDEO_BITRATE: начальный целевой битрейт для WebRTC.
 # aiortc + TWCC будут адаптировать его динамически.
 VIDEO_BITRATE = 3_000_000   # 3 Mbps

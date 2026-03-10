@@ -13,6 +13,48 @@ import time
 import ctypes
 import os
 
+# ── FIX: RUST_LOG на уровне модуля — ДО любых DLL ───────────────────────────
+# Rust DLL читает RUST_LOG через GetEnvironmentVariableW (Win32 API).
+# Устанавливаем через ВСЕ возможные механизмы:
+#   1) kernel32.SetEnvironmentVariableW — основной Win32 API (видят все CRT)
+#   2) ucrtbase._wputenv_s — UCRT CRT блок (на случай старого Rust/MSVC)
+#   3) os.environ — Python CRT блок
+# Сначала УДАЛЯЕМ текущее значение (в т.ч. невалидный ""), потом ставим "warn".
+def _setup_rust_env():
+    _k32 = ctypes.windll.kernel32
+    _k32.SetEnvironmentVariableW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+    _k32.SetEnvironmentVariableW.restype  = ctypes.c_bool
+    # Удаляем — передача NULL второго аргумента = DeleteEnvironmentVariable
+    _k32.SetEnvironmentVariableW("RUST_LOG",       None)
+    _k32.SetEnvironmentVariableW("DF_LEVEL",       None)
+    _k32.SetEnvironmentVariableW("RUST_LOG_STYLE", None)
+    # Ставим валидные значения
+    _k32.SetEnvironmentVariableW("RUST_LOG",       "warn")
+    _k32.SetEnvironmentVariableW("DF_LEVEL",       "warn")
+    _k32.SetEnvironmentVariableW("RUST_LOG_STYLE", "never")
+    # Через UCRT (ucrtbase.dll) — Rust на Windows компилируется против него
+    try:
+        _ucrt = ctypes.CDLL("ucrtbase.dll")
+        _ucrt._wputenv_s.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+        _ucrt._wputenv_s("RUST_LOG",       "warn")
+        _ucrt._wputenv_s("DF_LEVEL",       "warn")
+        _ucrt._wputenv_s("RUST_LOG_STYLE", "never")
+    except Exception:
+        pass
+    # Python (CRT копия)
+    os.environ.pop("RUST_LOG",       None)
+    os.environ.pop("DF_LEVEL",       None)
+    os.environ.pop("RUST_LOG_STYLE", None)
+    os.environ["RUST_LOG"]       = "warn"
+    os.environ["DF_LEVEL"]       = "warn"
+    os.environ["RUST_LOG_STYLE"] = "never"
+    # Диагностика: проверяем что kernel32 видит то, что мы выставили
+    _buf = ctypes.create_unicode_buffer(256)
+    _k32.GetEnvironmentVariableW("RUST_LOG", _buf, 256)
+    print(f"[DFN] module init: RUST_LOG(kernel32)='{_buf.value}'", flush=True)
+
+_setup_rust_env()
+
 import av
 from aiortc import AudioStreamTrack
 # ── Встроенная замена scipy.signal (butter / sosfilt / sosfilt_zi) ─────────────
@@ -90,33 +132,152 @@ class DeepFilterEngine:
             raise FileNotFoundError(f"deep_filter.dll не найдена: {dll_path}")
 
         # Создаём / проверяем tar-архив моделей.
-        # df_create принимает путь к TAR-файлу, а не к директории.
         tar_path = self._ensure_tar(model_dir)
+
+        # ── SUBPROCESS PROBE ─────────────────────────────────────────────────
+        # Rust panic() → os::process::abort() — это НЕ Python exception.
+        # try/except никогда не поймает abort(). Весь процесс умирает.
+        #
+        # Решение: запускаем df_create в отдельном subprocess.
+        # Если он упал (returncode != 0) → выбрасываем обычный RuntimeError,
+        # который caller (AudioHandler.__init__) поймает через except Exception
+        # и продолжит работу с RNNoise вместо DFN.
+        if not self._probe_dll(dll_path, tar_path):
+            raise RuntimeError(
+                "deep_filter.dll аварийно завершила subprocess при инициализации "
+                "(Rust abort/panic). DFN недоступен — используется RNNoise."
+            )
+
+        # Probe выжил → DLL безопасна. Загружаем в основной процесс.
+        # Повторно форсируем RUST_LOG непосредственно перед загрузкой DLL.
+        _k32 = ctypes.windll.kernel32
+        _k32.SetEnvironmentVariableW("RUST_LOG",       "warn")
+        _k32.SetEnvironmentVariableW("DF_LEVEL",       "warn")
+        _k32.SetEnvironmentVariableW("RUST_LOG_STYLE", "never")
+        try:
+            _ucrt = ctypes.CDLL("ucrtbase.dll")
+            _ucrt._wputenv_s.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p]
+            _ucrt._wputenv_s("RUST_LOG", "warn")
+            _ucrt._wputenv_s("DF_LEVEL", "warn")
+        except Exception:
+            pass
 
         self.lib = ctypes.CDLL(dll_path)
 
-        # Настройка типов C-API
-        self.lib.df_create.argtypes = [ctypes.c_char_p]
-        self.lib.df_create.restype  = ctypes.c_void_p
+        # ── Настройка типов C-API ─────────────────────────────────────────────
+        #
+        # КОРЕНЬ ВСЕХ ПРЕДЫДУЩИХ ПАНИК: сигнатура df_create в capi.rs:
+        #   fn df_create(path, atten_lim: f32, log_level: *const c_char) -> *mut DFState
+        #
+        # Мы передавали только path (1 аргумент вместо 3).
+        # atten_lim читался из мусора в стеке → случайное float-значение (норм).
+        # log_level читался из мусора → случайный указатель → Rust пытался
+        # распарсить мусорную строку как log level → ParseLevelError → panic!
+        #
+        # Исправление: передаём все 3 аргумента явно.
+        #   atten_lim = 100.0  — нет ограничения на подавление (макс. эффект)
+        #   log_level = None   — NULL pointer → Rust берёт ветку None → логгер
+        #                        не инициализируется → паники нет
+        self.lib.df_create.argtypes = [
+            ctypes.c_char_p,    # path: путь к tar.gz модели
+            ctypes.c_float,     # atten_lim: предел подавления в dB
+            ctypes.c_char_p,    # log_level: NULL = без логгера (не паникует)
+        ]
+        self.lib.df_create.restype = ctypes.c_void_p
+
         self.lib.df_process_frame.argtypes = [
             ctypes.c_void_p,
             ctypes.POINTER(ctypes.c_float),
             ctypes.POINTER(ctypes.c_float),
         ]
-        self.lib.df_process_frame.restype = ctypes.c_int
+        self.lib.df_process_frame.restype = ctypes.c_float  # возвращает local SNR
 
-        # Передаём путь к TAR-архиву (не к директории!)
-        self.handle = self.lib.df_create(tar_path.encode('utf-8'))
+        # Передаём путь к TAR-архиву + корректные аргументы
+        self.handle = self.lib.df_create(
+            tar_path.encode('utf-8'),
+            ctypes.c_float(100.0),  # atten_lim: 100 dB — без ограничений
+            None,                   # log_level: NULL → Rust не создаёт логгер
+        )
         if not self.handle:
-            raise RuntimeError("df_create вернул NULL — ошибка инициализации модели DFN")
+            raise RuntimeError("df_create вернул NULL — модель не загружена")
 
-        # DFN3: фиксированный размер кадра 480 сэмплов (10 мс @ 48 кГц).
-        # df_get_frame_len может отсутствовать в некоторых сборках DLL.
+        # DFN3: размер кадра.
+        # Функция называется df_get_frame_LENGTH (не df_get_frame_LEN).
         try:
-            self.lib.df_get_frame_len.restype = ctypes.c_size_t
-            self.frame_len = int(self.lib.df_get_frame_len(self.handle))
+            self.lib.df_get_frame_length.argtypes = [ctypes.c_void_p]
+            self.lib.df_get_frame_length.restype  = ctypes.c_size_t
+            self.frame_len = int(self.lib.df_get_frame_length(self.handle))
         except AttributeError:
             self.frame_len = 480  # стандарт DFN3 @ 48 kHz
+
+    @staticmethod
+    def _probe_dll(dll_path: str, tar_path: str) -> bool:
+        """
+        Тестирует deep_filter.dll в изолированном subprocess.
+        Возвращает True если DLL инициализировалась без краша.
+
+        Rust panic() → abort() завершает ВЕСЬ процесс на уровне ОС.
+        Python try/except не способен перехватить abort().
+        Единственная защита — тест в дочернем процессе.
+        """
+        import subprocess
+        import sys
+        import json
+
+        # Код для subprocess: загружает DLL и вызывает df_create с правильными аргументами.
+        # log_level=None → NULL pointer → Rust не создаёт логгер → нет паники.
+        probe_code = (
+            "import ctypes,sys;"
+            f"lib=ctypes.CDLL({json.dumps(dll_path)});"
+            "lib.df_create.argtypes=[ctypes.c_char_p,ctypes.c_float,ctypes.c_char_p];"
+            "lib.df_create.restype=ctypes.c_void_p;"
+            f"h=lib.df_create({json.dumps(tar_path)}.encode(),ctypes.c_float(100.0),None);"
+            "print('DFN_PROBE_OK' if h else 'DFN_PROBE_NULL',flush=True);"
+            "sys.exit(0)"
+        )
+
+        probe_env = {
+            **os.environ,
+            "RUST_LOG": "warn",
+            "DF_LEVEL": "warn",
+            "RUST_LOG_STYLE": "never",
+        }
+
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", probe_code],
+                capture_output=True,
+                timeout=20,
+                env=probe_env,
+                creationflags=0x08000000,  # CREATE_NO_WINDOW
+            )
+            stdout = result.stdout.decode(errors="replace")
+            stderr = result.stderr.decode(errors="replace")
+
+            if result.returncode != 0:
+                print(
+                    f"[DFN] Probe FAILED exit={result.returncode} "
+                    f"(0x{result.returncode & 0xFFFFFFFF:08X}). "
+                    f"DFN недоступен, будет использован RNNoise.",
+                    flush=True,
+                )
+                if stderr.strip():
+                    print(f"[DFN] Probe stderr: {stderr[:200]}", flush=True)
+                return False
+
+            if "DFN_PROBE_OK" in stdout:
+                print("[DFN] Probe OK — DLL работает, загружаем в основной процесс.", flush=True)
+                return True
+            else:
+                print(f"[DFN] Probe: df_create вернул NULL (модель не загружена).", flush=True)
+                return False
+
+        except subprocess.TimeoutExpired:
+            print("[DFN] Probe timeout — DLL зависла. DFN недоступен.", flush=True)
+            return False
+        except Exception as e:
+            print(f"[DFN] Probe exception: {e}", flush=True)
+            return False
 
     def process(self, audio_np_float32):
         # audio_np_float32 имеет размер CHUNK=960. Проходим его двумя кадрами по 480.

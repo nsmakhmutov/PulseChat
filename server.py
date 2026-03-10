@@ -31,6 +31,14 @@
 #   Все локи и их дисциплина (clients_lock, udp_lock, watchers_lock, nudge_lock)
 #   send_global_state(), _send_to_watchers(), stats_monitor()
 #
+# ─── ИСПРАВЛЕНИЯ (v2) ──────────────────────────────────────────────────────────
+#
+#   [FIX-4] asyncio.get_event_loop() заменён на asyncio.get_running_loop() во всех
+#           async-методах WebRTCSFU (_send_async, _wait_ice_gathering).
+#           asyncio.get_event_loop() устарел в Python 3.10 и вызывает
+#           DeprecationWarning в уже запущенном loop; get_running_loop() — правильный
+#           способ получить текущий loop из coroutine/async-контекста.
+#
 # ───────────────────────────────────────────────────────────────────────────────
 
 import asyncio
@@ -154,9 +162,13 @@ class WebRTCSFU:
         """
         Отправляет JSON-пакет клиенту из asyncio-контекста.
         run_in_executor: conn.sendall() блокирующий → не блокируем asyncio loop.
+
+        [FIX-4] asyncio.get_event_loop() → asyncio.get_running_loop().
+        get_running_loop() — правильный способ получить loop из coroutine.
+        get_event_loop() устарел в Python 3.10+ в уже запущенном loop.
         """
         payload = json.dumps(msg).encode('utf-8')
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
             await loop.run_in_executor(None, conn.sendall, payload)
         except Exception as e:
@@ -167,10 +179,14 @@ class WebRTCSFU:
         """
         Ждёт завершения ICE gathering с таймаутом.
         На RadminVPN (host-only ICE) gathering завершается за ~50–200 мс.
+
+        [FIX-4] asyncio.get_event_loop() → asyncio.get_running_loop().
+        Оба вызова заменены — метод вызывается только из async-контекста.
         """
-        deadline = asyncio.get_event_loop().time() + timeout
+        loop     = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
         while pc.iceGatheringState != "complete":
-            if asyncio.get_event_loop().time() >= deadline:
+            if loop.time() >= deadline:
                 print(f"[SFU] ICE gathering timeout ({timeout}s) — отправляем что есть")
                 break
             await asyncio.sleep(0.05)
@@ -222,8 +238,8 @@ class WebRTCSFU:
             print(
                 f"[SFU] Стример uid={streamer_uid}: трек получен kind={track.kind}"
             )
-            # Обрабатываем ожидавших зрителей (подключились до стримера)
-            # Запускаем через ensure_future — не блокируем on_track callback
+            # Обрабатываем ожидавших зрителей (подключились до стримера).
+            # ensure_future — не блокируем on_track callback.
             pending = self._pending_viewers.pop(streamer_uid, [])
             for v_uid, v_conn in pending:
                 asyncio.ensure_future(
@@ -366,11 +382,11 @@ class WebRTCSFU:
             await self._wait_ice_gathering(pc)
 
             await self._send_async(viewer_conn, {
-                'action':      CMD_WEBRTC_OFFER,
-                'role':        'viewer',
+                'action':       CMD_WEBRTC_OFFER,
+                'role':         'viewer',
                 'streamer_uid': streamer_uid,
-                'sdp':         pc.localDescription.sdp,
-                'type':        pc.localDescription.type,
+                'sdp':          pc.localDescription.sdp,
+                'type':         pc.localDescription.type,
             })
             print(
                 f"[SFU] Offer отправлен зрителю uid={viewer_uid} "
@@ -503,8 +519,8 @@ class SFUServer:
 
         # --- UDP (только голос комнаты + ping) ---
         self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # SO_RCVBUF 8MB: голосовые пакеты не дропаются пока handler занят.
-        # SO_SNDBUF 8MB: исходящая очередь не блокирует recv-путь.
+        # SO_RCVBUF 2MB: голосовые пакеты не дропаются пока handler занят.
+        # SO_SNDBUF 2MB: исходящая очередь не блокирует recv-путь.
         self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, UDP_RECV_BUFFER_SIZE)
         self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, UDP_SEND_BUFFER_SIZE)
         self.udp_sock.bind((host, DEFAULT_PORT_UDP))
@@ -790,9 +806,9 @@ class SFUServer:
                             if streamer_uid is not None:
                                 with self.clients_lock:
                                     if conn in self.clients:
-                                        watcher      = self.clients[conn]
-                                        w_uid        = watcher['uid']
-                                        watcher_nick = watcher['nick']
+                                        watcher        = self.clients[conn]
+                                        w_uid          = watcher['uid']
+                                        watcher_nick   = watcher['nick']
                                         watcher_avatar = watcher.get('avatar', '1.svg')
                                 with self.watchers_lock:
                                     if streamer_uid not in self.watchers:
@@ -1061,12 +1077,10 @@ class SFUServer:
                     self.uid_to_room.pop(u_id, None)
 
                 # Убираем пользователя из списков зрителей всех стримеров
-                affected_streamers = []
                 with self.watchers_lock:
                     for s_uid in list(self.watchers.keys()):
                         if u_id in self.watchers[s_uid]:
                             self.watchers[s_uid].pop(u_id, None)
-                            affected_streamers.append(s_uid)
                     self.watchers.pop(u_id, None)
 
                 # Закрываем WebRTC сессии отключившегося пользователя

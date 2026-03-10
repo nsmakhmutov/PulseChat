@@ -31,23 +31,72 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
-# ── Добавляем папку проекта в поиск DLL (opus.dll, rnnoise.dll) ──────────────
+# ── Добавляем папки в поиск DLL (opus.dll, rnnoise.dll, deep_filter.dll) ─────
 # Делаем это ДО любых импортов, которые грузят нативные библиотеки.
+#
+# ПОЧЕМУ os.add_dll_directory НЕДОСТАТОЧНО ДЛЯ opuslib:
+#   opuslib использует ctypes.util.find_library('opus'), которая на Windows
+#   ищет через PATH (не через директории из add_dll_directory).
+#   Решение — два шага:
+#     1. Добавить dlls/ в PATH (для find_library).
+#     2. Предзагрузить opus.dll через ctypes.CDLL напрямую (гарантия).
+#   После предзагрузки DLL уже в памяти процесса → opuslib найдёт её
+#   при любом способе поиска.
+#
+# FIX RUST_LOG: deep_filter.dll (Rust) читает RUST_LOG при инициализации.
+#   PyCharm выставляет RUST_LOG="" → ParseLevelError → panic → abort.
+#   Устанавливаем "error" до загрузки любых DLL.
+if not os.environ.get("RUST_LOG"):
+    os.environ["RUST_LOG"] = "error"
+
 _project_dir = os.path.dirname(os.path.abspath(__file__))
-os.add_dll_directory(_project_dir)
+_dlls_dir    = os.path.join(_project_dir, "dlls")
+_dfn_dir     = os.path.join(_dlls_dir, "DeepFilterNet3")
+
+# ── 1. PATH — нужен для ctypes.util.find_library (opuslib) ──────────────────
+_extra_paths = [p for p in [_dlls_dir, _dfn_dir, _project_dir] if os.path.isdir(p)]
+if _extra_paths:
+    os.environ["PATH"] = os.pathsep.join(_extra_paths) + os.pathsep + os.environ.get("PATH", "")
+
+# ── 2. os.add_dll_directory — нужен для ctypes.CDLL без абсолютного пути ────
+for _d in _extra_paths:
+    os.add_dll_directory(_d)
 try:
-    os.add_dll_directory(sys._MEIPASS)
+    os.add_dll_directory(sys._MEIPASS)      # PyInstaller frozen bundle
 except Exception:
     pass
 
-# Сообщаем системе, что мы поддерживаем DPI (High DPI Aware)
-try:
-    ctypes.windll.shcore.SetProcessDpiAwareness(1)
-except Exception:
-    try:
-        ctypes.windll.user32.SetProcessDPIAware()
-    except Exception:
-        pass
+# ── 3. Предзагрузка opus.dll через абсолютный путь ──────────────────────────
+# opuslib ищет DLL по имени ('opus', 'libopus-0' и т.д.).
+# Если предзагрузить через ctypes.CDLL(абсолютный_путь), DLL оказывается
+# в таблице процесса и opuslib находит её при LoadLibrary('opus') без PATH.
+_opus_candidates = [
+    os.path.join(_dlls_dir, "opus.dll"),
+    os.path.join(_dlls_dir, "libopus.dll"),
+    os.path.join(_dlls_dir, "libopus-0.dll"),
+    os.path.join(_project_dir, "opus.dll"),
+]
+_opus_loaded = False
+for _opus_path in _opus_candidates:
+    if os.path.exists(_opus_path):
+        try:
+            ctypes.CDLL(_opus_path)
+            print(f"[DLL] opus предзагружен: {_opus_path}", flush=True)
+            _opus_loaded = True
+            break
+        except Exception as _e:
+            print(f"[DLL] Не удалось загрузить {_opus_path}: {_e}", flush=True)
+if not _opus_loaded:
+    print(f"[DLL] ВНИМАНИЕ: opus.dll не найдена в {_dlls_dir}", flush=True)
+
+# DPI Awareness:
+# Qt6 самостоятельно устанавливает DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+# через SetProcessDpiAwarenessContext() при старте QApplication.
+# Ручной вызов SetProcessDpiAwareness(1) ПОСЛЕ Qt — конфликт, Windows
+# возвращает E_ACCESSDENIED, Qt печатает предупреждение в консоль:
+#   "qt.qpa.window: SetProcessDpiAwarenessContext() failed"
+# Решение: убираем ручной вызов — Qt6 делает это лучше нас.
+# (Оставляем пустой блок на случай если кто-то добавит что-то в будущем)
 
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QLineEdit, QPushButton, QLabel, QCheckBox, QFrame,

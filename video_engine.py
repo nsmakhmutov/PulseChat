@@ -28,6 +28,8 @@
 #   — Ручной _decode_worker / decode_queues (aiortc декодирует сам)
 #   — IDR-management (_last_keyframe_req, _idr_cooldown, request_viewer_keyframe)
 #   — Jitter Buffer (JITTER_BUFFER_SIZE — WebRTC берёт на себя)
+#   — _put_frame_safe (заменён на _convert_to_yuv + _enqueue_frame — исправление
+#     критического бага: конвертация теперь в capture thread, а не в asyncio loop)
 #
 # ЧТО СОХРАНЕНО / ПЕРЕИСПОЛЬЗОВАНО:
 #   — Логика выбора NVENC/libx264 → перенесена в patch_aiortc_nvenc()
@@ -35,6 +37,27 @@
 #   — frame_received / stream_stats_updated сигналы → API совместимость
 #   — cleanup_users, stop_viewer_for_uid → управление зрителями
 #   — GC + Windows heap trim при stop_streaming → сохранено
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# ИСПРАВЛЕНИЯ (v2):
+#   [FIX-1] _put_frame_safe вызывался через call_soon_threadsafe → выполнялся
+#           в asyncio event loop, блокируя WebRTC (NACK/PLI/ICE keepalive).
+#           Исправлено: конвертация RGB→YUV теперь в capture thread (_convert_to_yuv),
+#           в asyncio loop доставляется только готовый av.VideoFrame (_enqueue_frame).
+#
+#   [FIX-2] VIDEO_BITRATE из config не применялся к CodecContext. Добавлено
+#           ctx.bit_rate = VIDEO_BITRATE в _patched_encode.
+#
+#   [FIX-3] profile=baseline упоминался в комментарии, но отсутствовал в options
+#           x264_profile. Добавлены: profile=baseline, level=3.1, g=60,
+#           sc_threshold=0 — снижает нагрузку на декодер у зрителей и стабилизирует
+#           битрейт при переходе сцен.
+#
+#   [FIX-4] patch_aiortc_nvenc: добавлена диагностика если codec_attr is None —
+#           раньше патч тихо не применялся без каких-либо сообщений.
+#
+#   [FIX-5] VideoReceiver.stop(): добавлен вызов track.stop() для быстрого
+#           выхода из recv_loop (без ожидания 5-секундного timeout).
 # ─────────────────────────────────────────────────────────────────────────────
 
 import asyncio
@@ -47,7 +70,7 @@ import numpy as np
 from PyQt6.QtCore import QObject, pyqtSignal
 from PyQt6.QtGui import QImage
 
-from config import VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_FPS
+from config import VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_FPS, VIDEO_BITRATE
 
 # ─── Опциональные зависимости ─────────────────────────────────────────────────
 
@@ -80,117 +103,152 @@ except ImportError:
 
 def patch_aiortc_nvenc() -> bool:
     """
-    Активирует h264_nvenc в aiortc вместо libx264 (программного кодека).
+    Подменяет H264Encoder в aiortc: вместо дефолтного libx264 использует
+    аппаратный NVENC / Windows MF / AMF, или тюнингованный libx264 (ultrafast
+    baseline) в качестве fallback.
 
-    Механизм:
-        aiortc.codecs.h264.H264Encoder создаёт PyAV CodecContext лениво —
-        при первом вызове encode(). Monkey-patch оборачивает этот метод:
-        при первой инициализации codec-контекста пробуем 'h264_nvenc' первым.
-        При ошибке (нет GPU / нет nvenc-драйвера) — тихо откатываемся к
-        оригинальному поведению (libx264).
+    Вызывать ОДИН РАЗ в client_main.py ДО первого RTCPeerConnection.
 
-    Опции nvenc (ULL + VBR):
-        preset=p4  — баланс скорость/качество (p1 давал мыло при VBR)
-        tune=ull   — Ultra Low Latency, компенсирует задержку p4
-        rc=vbr     — тратим биты только там, где есть движение
-        cq=28      — целевое качество; при статике GPU тратит 50-200 kbps
-        spatial-aq=1 — чёткость текста/UI при низком битрейте
-        forced-idr=1 — разрешаем форсированный IDR через frame.pict_type='I'
-        delay=0    — нулевая задержка выхода пакетов (критично для стрима)
+    Возвращает True если найден аппаратный кодек, False если используется CPU.
 
-    Когда вызывать:
-        client_main.py, до создания первого RTCPeerConnection (до QApplication
-        или сразу после — до LoginWindow._open_connecting → network_engine).
-
-    Возвращает:
-        True  — h264_nvenc активирован
-        False — nvenc недоступен, aiortc использует libx264 (всё работает)
+    [FIX-2] Теперь передаёт VIDEO_BITRATE из config в CodecContext.
+    [FIX-3] CPU-fallback (libx264) теперь включает profile=baseline, level=3.1,
+            g=60, sc_threshold=0 для минимальной нагрузки на декодер у зрителей.
+    [FIX-4] Добавлена диагностика если codec_attr не найден в H264Encoder.
     """
     if not (AV_AVAILABLE and AIORTC_AVAILABLE):
         return False
 
-    # ── Шаг 1: быстрая проверка доступности h264_nvenc ────────────────────────
-    try:
-        _test_ctx = av.CodecContext.create('h264_nvenc', 'w')
-        _test_ctx.width    = 64
-        _test_ctx.height   = 64
-        _test_ctx.pix_fmt  = 'yuv420p'
-        _test_ctx.time_base = Fraction(1, 30)
-        _test_ctx.open()
-        del _test_ctx
-    except Exception as e:
-        print(f"[Video] patch_aiortc_nvenc: h264_nvenc недоступен — {e}")
-        print("[Video] aiortc использует libx264 (программный кодек)")
-        return False
+    hw_profiles = [
+        # 1. NVIDIA NVENC (если доступен в сборке PyAV)
+        {
+            'codec': 'h264_nvenc',
+            'name':  'NVIDIA NVENC',
+            'options': {
+                'preset':      'p4',
+                'tune':        'll',
+                'zerolatency': '1',
+                'rc':          'cbr',       # постоянный битрейт — меньше джиттера
+                'b':           str(VIDEO_BITRATE),
+            },
+        },
 
-    # ── Шаг 2: monkey-patch H264Encoder.encode() ──────────────────────────────
+        # 2. Windows Media Foundation (RTX 5060 / любой GPU с MF-поддержкой)
+        {
+            'codec': 'h264_mf',
+            'name':  'Windows MF (GPU)',
+            'options': {
+                'scenario':    'livestreaming',
+                'quality_vs_speed': '100',  # max скорость
+            },
+        },
+
+        # 3. AMD AMF
+        {
+            'codec': 'h264_amf',
+            'name':  'AMD AMF',
+            'options': {
+                'usage':   'lowlatency',
+                'quality': 'speed',
+            },
+        },
+    ]
+
+    working_profile = None
+
+    # Ищем доступный аппаратный кодек
+    for profile in hw_profiles:
+        try:
+            _test_ctx = av.CodecContext.create(profile['codec'], 'w')
+            _test_ctx.width    = 128
+            _test_ctx.height   = 128
+            _test_ctx.pix_fmt  = 'yuv420p'
+            _test_ctx.open()
+            del _test_ctx
+            working_profile = profile
+            break
+        except Exception:
+            continue
+
+    # [FIX-3] CPU-fallback: ultrafast + baseline + keyframe каждые 2 секунды.
+    # profile=baseline — вдвое меньше нагрузки на декодер у зрителей.
+    # g=60 при 30fps — keyframe каждые 2 с, зрители быстро восстанавливают картинку.
+    # sc_threshold=0 — запрет keyframe на смене сцены (иначе битрейт скачет).
+    x264_profile = {
+        'codec': 'libx264',
+        'name':  'libx264 (Ultrafast CPU)',
+        'options': {
+            'preset':        'ultrafast',
+            'tune':          'zerolatency',
+            'profile':       'baseline',
+            'level':         '3.1',
+            'g':             '60',
+            'sc_threshold':  '0',
+        },
+    }
+
+    selected_profile = working_profile if working_profile else x264_profile
+    print(f"[Video] Выбран видеокодек: {selected_profile['name']}")
+
+    # Монки-патч энкодера aiortc
     try:
         import aiortc.codecs.h264 as _h264_mod
 
-        _OrigEncoder = _h264_mod.H264Encoder
-        _orig_encode = _OrigEncoder.encode
+        _OrigEncoder  = _h264_mod.H264Encoder
+        _orig_encode  = _OrigEncoder.encode
 
-        # Атрибуты для поиска "не инициализированного кодека" в разных версиях aiortc.
-        # Проверяем оба имени — в разных версиях может отличаться.
-        _CODEC_ATTRS = ('_codec', '_encoder', '_context', '_av_codec')
-
-        # Флаг: первый nvenc-контекст уже создан (для однократного лога)
-        _nvenc_active = [False]
+        _CODEC_ATTRS  = ('_codec', '_encoder', '_context', '_av_codec')
+        _active_flag  = [False]
+        _warn_flag    = [False]    # [FIX-4] однократное предупреждение
 
         def _patched_encode(self_enc, frame, force_keyframe: bool = False):
-            """
-            Перехватываем первую инициализацию кодека.
-            Если внутренний codec-атрибут ещё None — устанавливаем h264_nvenc.
-            Затем вызываем оригинальный encode() — он уже найдёт готовый контекст.
-            """
-            # Ищем атрибут внутреннего кодека (None = ещё не создан)
             codec_attr = next(
                 (a for a in _CODEC_ATTRS
                  if hasattr(self_enc, a) and getattr(self_enc, a) is None),
-                None
+                None,
             )
 
             if codec_attr is not None:
-                # Кодек ещё не инициализирован — внедряем nvenc
                 try:
-                    ctx = av.CodecContext.create('h264_nvenc', 'w')
-                    ctx.width    = frame.width
-                    ctx.height   = frame.height
-                    ctx.pix_fmt  = 'yuv420p'
-                    ctx.time_base = frame.time_base
-
-                    # ULL + VBR: низкая задержка + адаптивный битрейт
-                    ctx.options = {
-                        'preset':      'p4',
-                        'tune':        'ull',
-                        'rc':          'vbr',
-                        'cq':          '28',
-                        'forced-idr':  '1',
-                        'delay':       '0',
-                        'spatial-aq':  '1',
-                    }
+                    ctx = av.CodecContext.create(selected_profile['codec'], 'w')
+                    ctx.options    = selected_profile['options']
+                    ctx.width      = frame.width
+                    ctx.height     = frame.height
+                    ctx.pix_fmt    = 'yuv420p'
+                    ctx.time_base  = frame.time_base
+                    # [FIX-2] Передаём целевой битрейт из config.
+                    # Для hw-кодеков он дублируется в options (выше), здесь
+                    # устанавливаем на случай если options не применились.
+                    ctx.bit_rate   = VIDEO_BITRATE
                     ctx.open()
+
                     setattr(self_enc, codec_attr, ctx)
 
-                    if not _nvenc_active[0]:
-                        _nvenc_active[0] = True
+                    if not _active_flag[0]:
+                        _active_flag[0] = True
                         print(
-                            f"[Video] aiortc H264Encoder: "
-                            f"h264_nvenc активирован (ULL+VBR, cq=28)"
+                            f"[Video] aiortc H264Encoder: инициализирован "
+                            f"{selected_profile['name']}, bitrate={VIDEO_BITRATE//1000} kbps"
                         )
+
                 except Exception as e:
-                    # nvenc не сработал в рантайме — fallback к libx264
-                    # (оригинальный encode() создаст libx264 сам)
+                    print(f"[Video] aiortc H264Encoder: ошибка контекста ({e}) — fallback")
+
+            else:
+                # [FIX-4] Если ни одного ожидаемого атрибута не нашли — патч
+                # не применится. Печатаем предупреждение один раз.
+                if not _active_flag[0] and not _warn_flag[0]:
+                    _warn_flag[0] = True
+                    available = [a for a in dir(self_enc) if not a.startswith('__')]
                     print(
-                        f"[Video] aiortc H264Encoder: nvenc init failed ({e}) "
-                        f"— libx264 fallback"
+                        f"[Video] WARN: patch_aiortc_nvenc — codec_attr не найден. "
+                        f"Патч не применён. Доступные атрибуты H264Encoder: {available}"
                     )
 
             return _orig_encode(self_enc, frame, force_keyframe)
 
         _OrigEncoder.encode = _patched_encode
-        print("[Video] patch_aiortc_nvenc: monkey-patch применён к H264Encoder")
-        return True
+        return bool(working_profile)
 
     except Exception as e:
         print(f"[Video] patch_aiortc_nvenc: ошибка патча — {e}")
@@ -207,25 +265,33 @@ class DXCamTrack(_AiortcVideoStreamTrack):
 
     Архитектура двух потоков:
         Поток захвата (threading.Thread):
-            dxcam.get_latest_frame() → loop.call_soon_threadsafe → asyncio.Queue
+            dxcam.get_latest_frame()
+            → _convert_to_yuv()     ← тяжёлая конвертация RGB→YUV здесь!
+            → loop.call_soon_threadsafe(_enqueue_frame, av_frame)
 
-        Корутина recv() (asyncio event loop):
-            next_timestamp() → asyncio.Queue.get() → av.VideoFrame → aiortc
+        asyncio event loop (WebRTC thread):
+            _enqueue_frame(av_frame) ← только put_nowait, лёгкая операция
+            recv() → queue.get_nowait() → aiortc H264Encoder → RTP
+
+    [FIX-1] Конвертация RGB→YUV выполняется в capture thread, а НЕ в asyncio loop.
+    Прежний вариант (_put_frame_safe через call_soon_threadsafe) запускал
+    av.VideoFrame.from_ndarray() + reformat() внутри WebRTC event loop, что
+    блокировало NACK/PLI/ICE keepalive и порождало подёргивания у зрителей
+    при насыщенных сценах (166 MB/s данных при 720p30).
 
     Очередь maxsize=2:
-        При 60fps каждый лишний кадр в очереди = +16 мс задержки.
+        При 30fps каждый лишний кадр в очереди = +33 мс задержки.
         2 слота — энкодер не голодает при кратковременных пиках,
         но задержка не накапливается. Старый кадр дропается при переполнении.
 
     Повтор последнего кадра:
         Если захват не успел положить новый кадр к моменту recv() —
-        отдаём копию предыдущего (aiortc ожидает кадр каждые 1/fps секунд).
-        Это нормально: пустой экран хуже чем повтор.
+        отдаём предыдущий. Это нормально: чёрный экран хуже чем повтор.
 
     Параметры:
         monitor_idx — индекс монитора (0 = основной)
         fps         — целевой FPS захвата (совпадает с VIDEO_FPS из config)
-        width/height — разрешение выходного потока (reformat в yuv420p)
+        width/height — разрешение выходного потока
     """
 
     kind = "video"
@@ -233,9 +299,9 @@ class DXCamTrack(_AiortcVideoStreamTrack):
     def __init__(
         self,
         monitor_idx: int = 0,
-        fps: int = VIDEO_FPS,
-        width: int = VIDEO_WIDTH,
-        height: int = VIDEO_HEIGHT,
+        fps:         int = VIDEO_FPS,
+        width:       int = VIDEO_WIDTH,
+        height:      int = VIDEO_HEIGHT,
     ):
         super().__init__()
         self._monitor_idx = monitor_idx
@@ -243,16 +309,18 @@ class DXCamTrack(_AiortcVideoStreamTrack):
         self._width       = width
         self._height      = height
 
-        # asyncio.Queue живёт в event loop WebRTC (устанавливается в start())
+        # asyncio.Queue живёт в event loop WebRTC (устанавливается в start()).
+        # Хранит готовые av.VideoFrame (yuv420p) — конвертация выполняется
+        # в capture thread (_convert_to_yuv), а не здесь.
         self._queue: asyncio.Queue | None = None
         self._loop:  asyncio.AbstractEventLoop | None = None
 
         self._capture_thread: threading.Thread | None = None
         self._running = False
 
-        # Кэш последнего захваченного кадра (numpy array RGB)
-        # Используется как заглушка если новый кадр ещё не пришёл
-        self._last_frame_np: np.ndarray | None = None
+        # Кэш последнего захваченного кадра (av.VideoFrame yuv420p).
+        # Используется как заглушка если новый кадр ещё не пришёл.
+        self._last_frame: 'av.VideoFrame | None' = None
 
     # ------------------------------------------------------------------
     # Управление жизненным циклом
@@ -263,12 +331,12 @@ class DXCamTrack(_AiortcVideoStreamTrack):
         Запускает поток захвата экрана.
 
         loop — asyncio event loop WebRTC (создан в network_engine).
-        Вызывать ПОСЛЕ того как loop запущен (threading.Thread + asyncio.run).
+        Вызывать ПОСЛЕ того как loop запущен (threading.Thread + run_forever).
         """
         if self._running:
             return
-        self._loop  = loop
-        self._queue = asyncio.Queue(maxsize=2)
+        self._loop    = loop
+        self._queue   = asyncio.Queue(maxsize=2)
         self._running = True
         self._capture_thread = threading.Thread(
             target=self._capture_loop,
@@ -283,7 +351,7 @@ class DXCamTrack(_AiortcVideoStreamTrack):
         if self._capture_thread:
             self._capture_thread.join(timeout=3)
             self._capture_thread = None
-        self._last_frame_np = None
+        self._last_frame = None
 
     # ------------------------------------------------------------------
     # aiortc интерфейс
@@ -296,46 +364,67 @@ class DXCamTrack(_AiortcVideoStreamTrack):
         next_timestamp() обеспечивает правильный timing для WebRTC:
             — вычисляет PTS в единицах 90000 Hz clock
             — делает asyncio.sleep до момента следующего кадра
-        После пробуждения берём самый свежий кадр из очереди.
-        Если очередь пуста — повторяем последний (предпочтительнее чёрного экрана).
+
+        Очередь хранит готовые av.VideoFrame (yuv420p) — RGB→YUV конвертация
+        уже выполнена в capture thread (_convert_to_yuv), поэтому asyncio loop
+        НЕ тратит CPU на тяжёлую операцию reformat().
+
+        Если очередь пуста — повторяем последний кадр (лучше чем чёрный экран).
         """
         pts, time_base = await self.next_timestamp()
 
-        # Берём кадр без ожидания (захват быстрее recv на fast FPS)
-        frame_np = None
+        av_frame = None
         if self._queue is not None:
             try:
-                frame_np = self._queue.get_nowait()
-                self._last_frame_np = frame_np
+                av_frame = self._queue.get_nowait()
+                self._last_frame = av_frame
             except asyncio.QueueEmpty:
-                frame_np = self._last_frame_np
+                av_frame = self._last_frame
 
-        # Крайний случай: ещё нет ни одного кадра (первые ~16 мс)
-        if frame_np is None:
-            frame_np = np.zeros((self._height, self._width, 3), dtype=np.uint8)
-
-        # rgb24 → yuv420p (формат, который ждёт H264Encoder)
-        av_frame = av.VideoFrame.from_ndarray(frame_np, format='rgb24')
-        if av_frame.width != self._width or av_frame.height != self._height:
-            av_frame = av_frame.reformat(
-                width=self._width, height=self._height, format='yuv420p'
-            )
-        else:
-            av_frame = av_frame.reformat(format='yuv420p')
+        # Крайний случай: ещё нет ни одного кадра (первые ~33 мс при 30fps)
+        if av_frame is None:
+            av_frame = av.VideoFrame(self._width, self._height, 'yuv420p')
 
         av_frame.pts       = pts
         av_frame.time_base = time_base
         return av_frame
 
     # ------------------------------------------------------------------
-    # Поток захвата (не asyncio)
+    # [FIX-1] Конвертация в capture thread (не в asyncio loop)
     # ------------------------------------------------------------------
 
-    def _put_frame_safe(self, frame_np: np.ndarray) -> None:
+    def _convert_to_yuv(self, frame_np: np.ndarray) -> 'av.VideoFrame | None':
         """
-        Кладёт кадр в asyncio.Queue из threading-потока.
-        Вызывается через loop.call_soon_threadsafe — thread-safe.
-        При переполнении дропает старый кадр (drop-oldest стратегия).
+        Конвертирует np.ndarray (RGB) в av.VideoFrame (yuv420p).
+
+        Вызывается ТОЛЬКО из capture thread (_capture_loop / _capture_loop_fallback).
+        Тяжёлая операция (~83 MB/s при 720p30) выполняется здесь,
+        чтобы НЕ блокировать asyncio event loop WebRTC.
+
+        av.VideoFrame.from_ndarray() копирует данные из numpy-массива →
+        copy() перед вызовом не нужен.
+        """
+        try:
+            av_frame = av.VideoFrame.from_ndarray(frame_np, format='rgb24')
+            if av_frame.width != self._width or av_frame.height != self._height:
+                return av_frame.reformat(
+                    width=self._width, height=self._height, format='yuv420p'
+                )
+            return av_frame.reformat(format='yuv420p')
+        except Exception as e:
+            print(f"[DXCamTrack] Ошибка конвертации кадра: {e}")
+            return None
+
+    def _enqueue_frame(self, av_frame: 'av.VideoFrame') -> None:
+        """
+        Кладёт готовый av.VideoFrame в asyncio.Queue.
+
+        Выполняется в asyncio event loop через call_soon_threadsafe.
+        Это единственная операция в event loop — лёгкая (только put_nowait).
+        Тяжёлая конвертация уже выполнена в capture thread (_convert_to_yuv).
+
+        Drop-oldest стратегия: если очередь заполнена — выбрасываем старый кадр,
+        кладём новый. Новый кадр всегда актуальнее старого.
         """
         if self._queue is None:
             return
@@ -345,9 +434,13 @@ class DXCamTrack(_AiortcVideoStreamTrack):
             except asyncio.QueueEmpty:
                 pass
         try:
-            self._queue.put_nowait(frame_np)
+            self._queue.put_nowait(av_frame)
         except asyncio.QueueFull:
             pass
+
+    # ------------------------------------------------------------------
+    # Поток захвата (не asyncio)
+    # ------------------------------------------------------------------
 
     def _capture_loop(self) -> None:
         """
@@ -355,6 +448,9 @@ class DXCamTrack(_AiortcVideoStreamTrack):
 
         Пробует dxcam.start() (нативный DXGI loop с target_fps).
         При неудаче — fallback на dxcam.grab() с ручным timing.
+
+        [FIX-1] Конвертация RGB→YUV выполняется ЗДЕСЬ через _convert_to_yuv(),
+        и только готовый av.VideoFrame передаётся в asyncio loop (_enqueue_frame).
         """
         camera = None
         try:
@@ -384,10 +480,14 @@ class DXCamTrack(_AiortcVideoStreamTrack):
             try:
                 frame_np = camera.get_latest_frame()
                 if frame_np is not None and self._loop is not None:
-                    # copy() критично: dxcam может переиспользовать буфер
-                    self._loop.call_soon_threadsafe(
-                        self._put_frame_safe, frame_np.copy()
-                    )
+                    # [FIX-1] Конвертация в capture thread, а не в asyncio loop.
+                    # _convert_to_yuv копирует данные из frame_np →
+                    # нет необходимости в frame_np.copy().
+                    av_frame = self._convert_to_yuv(frame_np)
+                    if av_frame is not None:
+                        self._loop.call_soon_threadsafe(
+                            self._enqueue_frame, av_frame
+                        )
             except Exception as e:
                 print(f"[DXCamTrack] Ошибка захвата: {e}")
                 time.sleep(0.1)
@@ -408,6 +508,8 @@ class DXCamTrack(_AiortcVideoStreamTrack):
         """
         Fallback: ручной grab() с sleep-таймингом.
         Используется если dxcam не поддерживает video_mode на данном GPU/ОС.
+
+        [FIX-1] Та же схема: конвертация в capture thread через _convert_to_yuv.
         """
         frame_time = 1.0 / self._fps
         print(f"[DXCamTrack] Fallback grab() @ {self._fps} FPS")
@@ -417,9 +519,12 @@ class DXCamTrack(_AiortcVideoStreamTrack):
             try:
                 frame_np = camera.grab()
                 if frame_np is not None and self._loop is not None:
-                    self._loop.call_soon_threadsafe(
-                        self._put_frame_safe, frame_np.copy()
-                    )
+                    # [FIX-1] Конвертация здесь, в capture thread
+                    av_frame = self._convert_to_yuv(frame_np)
+                    if av_frame is not None:
+                        self._loop.call_soon_threadsafe(
+                            self._enqueue_frame, av_frame
+                        )
                 elapsed = time.perf_counter() - t_start
                 sleep_t = frame_time - elapsed
                 if sleep_t > 0:
@@ -459,6 +564,9 @@ class VideoReceiver(QObject):
         stream_stats_updated эмитируется каждые 2 секунды.
         fps  — реальный декодированный FPS
         loss — 0 (WebRTC обрабатывает потери через RTCP/NACK сам)
+
+    [FIX-5] stop() теперь вызывает track.stop() для немедленного завершения
+    recv_loop без ожидания 5-секундного timeout.
     """
 
     # Сигналы идентичны старому VideoEngine — ui_main.py не меняется
@@ -469,14 +577,14 @@ class VideoReceiver(QObject):
 
     def __init__(
         self,
-        uid: int,
+        uid:   int,
         track,
-        loop: asyncio.AbstractEventLoop,
+        loop:  asyncio.AbstractEventLoop,
     ):
         super().__init__()
-        self.uid    = uid
-        self._track = track
-        self._loop  = loop
+        self.uid      = uid
+        self._track   = track
+        self._loop    = loop
         self._running = True
 
         # Счётчики для stream_stats_updated
@@ -495,15 +603,13 @@ class VideoReceiver(QObject):
         Основной цикл приёма кадров от WebRTC трека.
 
         track.recv() блокируется до следующего RTP-пакета.
-        Используем asyncio.wait_for(timeout=5) чтобы не зависнуть при
-        потере соединения — loop завершится и VideoReceiver освободится.
+        asyncio.wait_for(timeout=5) — защита от зависания при потере соединения.
         """
         try:
             while self._running:
                 try:
                     frame = await asyncio.wait_for(self._track.recv(), timeout=5.0)
                 except asyncio.TimeoutError:
-                    # Нет кадров 5 секунд — стрим завис или стример отключился
                     if self._running:
                         print(f"[VideoReceiver] uid={self.uid}: timeout 5s, жду...")
                     continue
@@ -514,15 +620,12 @@ class VideoReceiver(QObject):
 
                 # ── av.VideoFrame → QImage ───────────────────────────────
                 try:
-                    # to_ndarray(format='rgb24') — единственный гарантированный
-                    # способ. frame.to_image() → PIL требует Pillow, исключаем
-                    # дополнительную зависимость.
+                    # to_ndarray(format='rgb24') — гарантированный способ
+                    # без зависимости от Pillow.
                     img_np = frame.to_ndarray(format='rgb24')
                     h, w, c = img_np.shape
 
                     # QImage не копирует данные — нужен .copy() перед emit.
-                    # q_img.copy() создаёт независимую копию буфера,
-                    # img_np может быть удалён сразу после.
                     q_img = QImage(
                         img_np.data, w, h, w * c,
                         QImage.Format.Format_RGB888
@@ -538,8 +641,7 @@ class VideoReceiver(QObject):
                         elapsed = max(now - self._stats_last_time, 0.001)
                         fps = int(self._stats_decoded / elapsed)
                         # loss_pct = 0: WebRTC управляет повтором и потерями
-                        # через RTCP NACK сам — зрителю не нужно об этом знать.
-                        # При необходимости расширить через pc.getStats().
+                        # через RTCP NACK — зрителю не нужно об этом знать.
                         self.stream_stats_updated.emit(self.uid, fps, 0)
                         self._stats_decoded   = 0
                         self._stats_last_time = now
@@ -556,8 +658,19 @@ class VideoReceiver(QObject):
     # ------------------------------------------------------------------
 
     def stop(self) -> None:
-        """Сигнализирует recv_loop о завершении (loop сам завершится при timeout)."""
+        """
+        Сигнализирует recv_loop о завершении.
+
+        [FIX-5] Вызывает track.stop() если доступно — это прерывает
+        заблокированный track.recv() немедленно, без ожидания 5-секундного
+        timeout. Особенно важно при 13 зрителях (было бы до 65 сек задержки).
+        """
         self._running = False
+        try:
+            if hasattr(self._track, 'stop'):
+                self._track.stop()
+        except Exception:
+            pass
 
 
 # =============================================================================
@@ -611,7 +724,7 @@ class VideoEngine(QObject):
         Устанавливает asyncio event loop для WebRTC.
 
         Вызывается из network_engine сразу после запуска asyncio потока
-        (threading.Thread с asyncio.run). DXCamTrack и VideoReceiver
+        (threading.Thread с run_forever). DXCamTrack и VideoReceiver
         используют этот loop для thread-safe операций.
         """
         self._webrtc_loop = loop
@@ -765,7 +878,7 @@ class VideoEngine(QObject):
         UDP-сборка кадров → VideoReceiver.recv() через aiortc.
         Заглушка: вызов игнорируется.
         """
-        pass  # WebRTC трек заменяет UDP сборку
+        pass
 
     def force_keyframe(self) -> None:
         """
