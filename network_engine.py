@@ -25,28 +25,7 @@
 #     _handle_viewer_offer_coro() — принять offer от SFU, создать answer
 #     send_webrtc_offer/answer/ice — отправить WebRTC signaling через TCP
 #
-# ─── Что УДАЛЕНО по сравнению с предыдущей версией ────────────────────────────
-#
-#   video_pacing_queue          — UDP-pacing для видеочанков
-#   send_video_frame_chunks()   — UDP-отправка видеочанков
-#   send_video_packet()         — compat wrapper
-#   video_pacing_loop()         — leaky bucket (заменён WebRTC)
-#   FLAG_VIDEO ветка в udp_receive_loop — видео теперь через WebRTC
-#   FLAG_STREAM_AUDIO ветка (loopback) — audio loopback через WebRTC
-#   process_message: CMD_ADJUST_BITRATE — WebRTC TWCC управляет битрейтом
-#   process_message: CMD_LQ_NEEDED     — simulcast управляется SFU
-#   process_message: CMD_NACK_RELAY    — NACK через WebRTC RTCP
-#   process_message: request_keyframe  — WebRTC PLI вместо ручного IDR
-#
-# ─── Что СОХРАНЕНО как заглушки (инкрементальная миграция) ────────────────────
-#
-#   send_bitrate_feedback()     — stub (no-op), вызывается из ui_video.py
-#   send_nack()                 — stub (no-op)
-#   request_viewer_keyframe()   — stub (no-op)
-#   send_video_frame_chunks()   — stub (no-op), вызывается из video_engine stubs
-#   bitrate_adjusted сигнал     — сохранён, никогда не эмитируется
-#
-# ───────────────────────────────────────────────────────────────────────────────
+
 
 import asyncio
 import base64
@@ -141,6 +120,13 @@ class NetworkClient(QObject):
     #                    переподключения, network_engine сам reconnect'ится.
     become_host      = pyqtSignal()
     server_migrating = pyqtSignal(str)   # new_host_ip
+
+    # ── Каналы и мульти-серверная архитектура ────────────────────────────────
+    channel_created      = pyqtSignal(str)        # channel_name
+    channel_deleted      = pyqtSignal(str)        # channel_name
+    join_room_denied     = pyqtSignal(str, str)   # room, reason
+    channel_auth_ok      = pyqtSignal(str)        # channel_name
+    channel_list_updated = pyqtSignal(list)       # list[dict]
 
     def __init__(self, audio):
         super().__init__()
@@ -431,6 +417,61 @@ class NetworkClient(QObject):
         self._reconnect_attempts = 0
         self.running = False
         threading.Thread(target=self._reconnect_loop, daemon=True).start()
+
+    def fast_switch_to(self, new_ip: str) -> None:
+        """
+        Быстрое намеренное переключение на другой сервер.
+
+        Отличие от _reconnect_loop:
+          — БЕЗ паузы RECONNECT_DELAY (3 сек) между попытками: сеть жива,
+            новый сервер уже работает, ждать нечего.
+          — MAX_ATTEMPTS = 8 с паузой 0.3 сек: суммарно ~2.5 сек на случай
+            если сервер только стартует.
+          — Не трогает connection_lost / connection_restored сигналы:
+            UI переключается через _on_switch_server который сам показывает
+            нужный экран.
+
+        Вызывается из MainWindow._on_switch_server().
+        """
+        if self._reconnecting:
+            print("[Net] fast_switch_to: уже идёт переподключение, пропускаем")
+            return
+        print(f"[Net] fast_switch_to: → {new_ip}")
+        self._ip             = new_ip
+        self.running         = False
+        self._reconnecting   = True
+        self._reconnect_attempts = 0
+        threading.Thread(
+            target=self._fast_switch_loop,
+            daemon=True,
+            name="fast-switch",
+        ).start()
+
+    def _fast_switch_loop(self) -> None:
+        """
+        Цикл переподключения для намеренной смены сервера.
+        Попытки без паузы RECONNECT_DELAY — сервер уже запущен и доступен.
+        """
+        MAX_ATTEMPTS = 8
+        FAST_DELAY   = 0.35   # сек между попытками
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            print(f"[Net] fast_switch attempt {attempt}/{MAX_ATTEMPTS} → {self._ip}")
+            try:
+                self._init_sockets()
+                self._do_connect()
+                self._reconnecting       = False
+                self._reconnect_attempts = 0
+                print("[Net] fast_switch: подключено успешно!")
+                self.connection_restored.emit()
+                return
+            except Exception as e:
+                print(f"[Net] fast_switch attempt {attempt} failed: {e}")
+            time.sleep(FAST_DELAY)
+
+        # Все попытки провалились — показываем ошибку
+        self._reconnecting = False
+        print("[Net] fast_switch: все попытки исчерпаны")
+        self.reconnect_failed.emit()
 
     # ------------------------------------------------------------------
     # Миграция сервера (встроенный режим)
@@ -943,7 +984,7 @@ class NetworkClient(QObject):
                     self.packets_sent += 1
                 except Exception as e:
                     print(f"[Net] Ping error: {e}")
-            time.sleep(7)
+            time.sleep(3)
 
     # ------------------------------------------------------------------
     # TCP — команды сервера
@@ -990,7 +1031,37 @@ class NetworkClient(QObject):
             # Обновляем локальный кэш host_order и server_host_uid
             self._host_order      = msg.get('host_order', [])
             self._server_host_uid = msg.get('server_host_uid', 0)
+            # Эмитим список каналов перед обновлением дерева
+            channel_list = msg.get('channel_list', [])
+            if channel_list:
+                self.channel_list_updated.emit(channel_list)
             self.global_state_update.emit(msg.get('all_users', {}))
+
+        elif act == 'channel_created':
+            ch_name = msg.get('channel_name', '')
+            if ch_name:
+                self.channel_created.emit(ch_name)
+
+        elif act == 'channel_deleted':
+            ch_name = msg.get('channel_name', '')
+            if ch_name:
+                self.channel_deleted.emit(ch_name)
+
+        elif act == 'join_room_denied':
+            self.join_room_denied.emit(
+                msg.get('room', ''),
+                msg.get('reason', ''),
+            )
+
+        elif act == 'channel_auth_result':
+            if msg.get('ok'):
+                self.channel_auth_ok.emit(msg.get('channel_name', ''))
+            else:
+                # wrong_password или not_found → передаём как denied
+                self.join_room_denied.emit(
+                    msg.get('channel_name', ''),
+                    msg.get('reason', 'wrong_password'),
+                )
 
         elif act == 'play_soundboard':
             self.play_soundboard_file(
@@ -1387,34 +1458,3 @@ class NetworkClient(QObject):
 
         finally:
             self._nudge_restore_volume(prev_scalar, was_muted)
-
-    # ------------------------------------------------------------------
-    # Устаревшие методы — заглушки для инкрементальной миграции
-    # ------------------------------------------------------------------
-    # Вызываются из: ui_video.py (_send_abr_feedback → send_bitrate_feedback),
-    # видео-движок (заглушки video_engine.py), ui_main.py.
-    # После обновления ui_video.py (Шаг 7) и ui_main.py (Шаг 6) — удалить.
-    # ------------------------------------------------------------------
-
-    def send_video_frame_chunks(self, chunks: list, flags: int = 0) -> None:
-        """УСТАРЕЛО: видео передаётся через WebRTC DXCamTrack. Заглушка."""
-        pass
-
-    def send_video_packet(self, payload) -> None:
-        """УСТАРЕЛО: compat wrapper. Заглушка."""
-        pass
-
-    def send_bitrate_feedback(self, ping_ms: int) -> None:
-        """
-        УСТАРЕЛО: WebRTC управляет битрейтом через TWCC автоматически.
-        Вызывается из VideoWindow._send_abr_feedback() — no-op до Шага 7.
-        """
-        pass
-
-    def send_nack(self, streamer_uid: int, frame_id: int, chunk_idx: int) -> None:
-        """УСТАРЕЛО: NACK через WebRTC RTCP. Заглушка."""
-        pass
-
-    def request_viewer_keyframe(self, streamer_uid: int) -> None:
-        """УСТАРЕЛО: WebRTC PLI (Picture Loss Indication). Заглушка."""
-        pass

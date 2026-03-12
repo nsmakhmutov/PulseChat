@@ -18,18 +18,6 @@
 #                             start_streaming, stop_streaming, cleanup_users.
 #
 # ─────────────────────────────────────────────────────────────────────────────
-# ЧТО УДАЛЕНО (по сравнению со старым video_engine.py):
-#   — UDP-фрагментация (_fragment_and_send, VIDEO_CHUNK_HEADER, MAX_VIDEO_PAYLOAD)
-#   — FEC (_fec_buffer, _try_fec_reconstruct, FEC_GROUP_SIZE/FEC_MARKER)
-#   — NACK retransmit (_retransmit_buffer, handle_retransmit, CMD_NACK)
-#   — Сборка входящих UDP-кадров (incoming_buffer, assembly_info, _frame_cleanup_loop)
-#   — Simulcast LQ-поток (codec_lq, set_lq_needed, FLAG_VIDEO_LQ, LQ_VIDEO_*)
-#   — Upload ABR (set_bitrate, _target_bitrate, ABR_TIERS, CMD_ADJUST_BITRATE)
-#   — Ручной _decode_worker / decode_queues (aiortc декодирует сам)
-#   — IDR-management (_last_keyframe_req, _idr_cooldown, request_viewer_keyframe)
-#   — Jitter Buffer (JITTER_BUFFER_SIZE — WebRTC берёт на себя)
-#   — _put_frame_safe (заменён на _convert_to_yuv + _enqueue_frame — исправление
-#     критического бага: конвертация теперь в capture thread, а не в asyncio loop)
 #
 # ЧТО СОХРАНЕНО / ПЕРЕИСПОЛЬЗОВАНО:
 #   — Логика выбора NVENC/libx264 → перенесена в patch_aiortc_nvenc()

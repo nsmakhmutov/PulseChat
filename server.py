@@ -63,6 +63,9 @@ from config import (
     WEBRTC_ICE_TIMEOUT,
     CMD_SERVER_TRANSFER, CMD_SERVER_MIGRATE,
     CMD_QUICK_MSG, QUICK_MSG_MAX_LEN,
+    CMD_CREATE_CHANNEL, CMD_CHANNEL_CREATED, CMD_CHANNEL_DELETED,
+    CMD_JOIN_CHANNEL_AUTH, CHANNEL_NAME_MAX_LEN, CHANNEL_PASS_MAX_LEN,
+    SERVER_NAME_DEFAULT,
 )
 
 # ── Опциональный импорт aiortc (только для WebRTCSFU) ────────────────────────
@@ -512,7 +515,7 @@ class WebRTCSFU:
 # =============================================================================
 
 class SFUServer:
-    def __init__(self, host='0.0.0.0'):
+    def __init__(self, host='0.0.0.0', server_name=''):
         # --- TCP ---
         self.tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -576,6 +579,89 @@ class SFUServer:
         self._is_embedded: bool       = False
         self._accepting:   bool       = True
         self._announcer               = None   # ServerAnnouncer | None
+
+        # ── Имя сервера (отображается в списке серверов у клиентов) ──────────
+        self._server_name = server_name or SERVER_NAME_DEFAULT
+
+        # ── Временные каналы ─────────────────────────────────────────────────
+        # channel_name → {'password': str|None, 'permanent': bool}
+        self._channels: dict = {
+            'General': {'password': None, 'permanent': True},
+        }
+        self._channels_lock = threading.Lock()
+
+        # Кэш авторизованных клиентов для защищённых каналов
+        # conn → set[channel_name]
+        self._channel_auth: dict = {}
+        self._channel_auth_lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # Управление каналами
+    # ------------------------------------------------------------------
+    def get_client_count(self) -> int:
+        """Возвращает текущее число подключённых клиентов. Используется ServerAnnouncer."""
+        with self.clients_lock:
+            return len(self.clients)
+
+    def _get_channel_list(self) -> list:
+        """Снимок списка каналов для включения в sync_users."""
+        with self._channels_lock:
+            return [
+                {
+                    'name':         name,
+                    'has_password': ch['password'] is not None,
+                    'permanent':    ch['permanent'],
+                }
+                for name, ch in self._channels.items()
+            ]
+
+    def _create_temp_channel(self, name: str, password) -> bool:
+        """Создаёт временный канал. True если создан, False если уже существует."""
+        with self._channels_lock:
+            if name in self._channels:
+                return False
+            self._channels[name] = {'password': password, 'permanent': False}
+        print(f"[Server] 📢 Создан канал '{name}' (пароль: {'да' if password else 'нет'})")
+        return True
+
+    def _cleanup_temp_channels(self, leaving_room: str):
+        """Удаляет пустой временный канал и рассылает CMD_CHANNEL_DELETED."""
+        with self._channels_lock:
+            ch = self._channels.get(leaving_room)
+            if not ch or ch['permanent']:
+                return
+            with self.clients_lock:
+                occupants = sum(
+                    1 for c in self.clients.values()
+                    if c.get('room') == leaving_room
+                )
+            if occupants > 0:
+                return
+            self._channels.pop(leaving_room, None)
+
+        print(f"[Server] 🗑 Временный канал '{leaving_room}' удалён (пустой)")
+        payload = json.dumps({
+            'action':       CMD_CHANNEL_DELETED,
+            'channel_name': leaving_room,
+        }).encode('utf-8')
+        with self.clients_lock:
+            conns = list(self.clients.keys())
+        for c in conns:
+            try:
+                c.sendall(payload)
+            except Exception:
+                pass
+
+    def _check_channel_auth(self, conn, channel_name: str) -> bool:
+        """True если conn авторизован для входа в channel_name."""
+        with self._channels_lock:
+            ch = self._channels.get(channel_name)
+        if ch is None:
+            return False
+        if ch['password'] is None:
+            return True
+        with self._channel_auth_lock:
+            return channel_name in self._channel_auth.get(conn, set())
 
     # ------------------------------------------------------------------
     # Вспомогательный метод: отправка JSON клиенту из любого потока
@@ -761,13 +847,93 @@ class SFUServer:
 
                         # ── Join Room ─────────────────────────────────────────
                         elif action == CMD_JOIN_ROOM:
-                            new_room = msg.get('room', 'General')
-                            with self.clients_lock:
-                                if conn in self.clients:
-                                    self.clients[conn]['room'] = new_room
-                            with self.udp_lock:
-                                self.uid_to_room[uid] = new_room
-                            self.send_global_state()
+                            new_room = msg.get('room', 'General')[:CHANNEL_NAME_MAX_LEN]
+
+                            # Проверяем существование и пароль канала
+                            with self._channels_lock:
+                                ch = self._channels.get(new_room)
+
+                            if new_room != 'General' and ch is None:
+                                conn.sendall(json.dumps({
+                                    'action': 'join_room_denied',
+                                    'reason': 'not_found',
+                                    'room':   new_room,
+                                }).encode('utf-8'))
+                            elif ch and ch['password'] is not None and not self._check_channel_auth(conn, new_room):
+                                conn.sendall(json.dumps({
+                                    'action': 'join_room_denied',
+                                    'reason': 'channel_auth_required',
+                                    'room':   new_room,
+                                }).encode('utf-8'))
+                            else:
+                                old_room = None
+                                with self.clients_lock:
+                                    if conn in self.clients:
+                                        old_room = self.clients[conn].get('room')
+                                        self.clients[conn]['room'] = new_room
+                                with self.udp_lock:
+                                    self.uid_to_room[uid] = new_room
+                                if old_room and old_room != new_room:
+                                    self._cleanup_temp_channels(old_room)
+                                self.send_global_state()
+
+                        # ── Аутентификация для защищённого канала ─────────────
+                        elif action == CMD_JOIN_CHANNEL_AUTH:
+                            ch_name = msg.get('channel_name', '')[:CHANNEL_NAME_MAX_LEN]
+                            ch_pass = msg.get('password', '')[:CHANNEL_PASS_MAX_LEN]
+
+                            with self._channels_lock:
+                                ch = self._channels.get(ch_name)
+
+                            if ch is None:
+                                conn.sendall(json.dumps({
+                                    'action': 'channel_auth_result',
+                                    'ok': False, 'reason': 'not_found',
+                                    'channel_name': ch_name,
+                                }).encode('utf-8'))
+                            elif ch['password'] is None or ch['password'] == ch_pass:
+                                with self._channel_auth_lock:
+                                    self._channel_auth.setdefault(conn, set()).add(ch_name)
+                                conn.sendall(json.dumps({
+                                    'action': 'channel_auth_result',
+                                    'ok': True,
+                                    'channel_name': ch_name,
+                                }).encode('utf-8'))
+                            else:
+                                conn.sendall(json.dumps({
+                                    'action': 'channel_auth_result',
+                                    'ok': False, 'reason': 'wrong_password',
+                                    'channel_name': ch_name,
+                                }).encode('utf-8'))
+
+                        # ── Создание временного канала (только хост) ──────────
+                        elif action == CMD_CREATE_CHANNEL:
+                            with self._host_order_lock:
+                                is_host = bool(self._host_order and self._host_order[0] == uid)
+                            if not is_host:
+                                conn.sendall(json.dumps({
+                                    'action': 'create_channel_result',
+                                    'ok': False, 'reason': 'not_host',
+                                }).encode('utf-8'))
+                            else:
+                                ch_name = msg.get('channel_name', '').strip()[:CHANNEL_NAME_MAX_LEN]
+                                ch_pass = msg.get('password', '').strip()[:CHANNEL_PASS_MAX_LEN] or None
+                                if not ch_name or ch_name.lower() == 'general':
+                                    conn.sendall(json.dumps({
+                                        'action': 'create_channel_result',
+                                        'ok': False, 'reason': 'invalid_name',
+                                    }).encode('utf-8'))
+                                elif self._create_temp_channel(ch_name, ch_pass):
+                                    conn.sendall(json.dumps({
+                                        'action': 'create_channel_result',
+                                        'ok': True, 'channel_name': ch_name,
+                                    }).encode('utf-8'))
+                                    self.send_global_state()
+                                else:
+                                    conn.sendall(json.dumps({
+                                        'action': 'create_channel_result',
+                                        'ok': False, 'reason': 'already_exists',
+                                    }).encode('utf-8'))
 
                         # ── Update User ───────────────────────────────────────
                         elif action == 'update_user':
@@ -1180,6 +1346,14 @@ class SFUServer:
                     if u_id in self._host_order:
                         self._host_order.remove(u_id)
 
+                # Очищаем auth-кэш отключившегося клиента
+                with self._channel_auth_lock:
+                    self._channel_auth.pop(conn, None)
+
+                # Удаляем временные каналы если они опустели
+                if room and room != 'General':
+                    self._cleanup_temp_channels(room)
+
                 # Убираем пользователя из списков зрителей всех стримеров
                 with self.watchers_lock:
                     for s_uid in list(self.watchers.keys()):
@@ -1271,7 +1445,8 @@ class SFUServer:
         payload = json.dumps(
             {'action': CMD_SYNC_USERS, 'all_users': state,
              'host_order': host_order_snapshot,
-             'server_host_uid': server_host_uid}
+             'server_host_uid': server_host_uid,
+             'channel_list': self._get_channel_list()}
         ).encode('utf-8')
 
         for c_conn in conns_snapshot:
@@ -1320,7 +1495,13 @@ class SFUServer:
         # Запускаем broadcast-анонс
         try:
             from server_discovery import ServerAnnouncer
-            self._announcer = ServerAnnouncer(host_ip, DEFAULT_PORT_TCP, host_nick)
+            self._announcer = ServerAnnouncer(
+                server_ip      = host_ip,
+                server_port    = DEFAULT_PORT_TCP,
+                host_nick      = host_nick,
+                server_name    = self._server_name,
+                get_user_count = self.get_client_count,
+            )
             self._announcer.start()
         except Exception as e:
             print(f"[Server] ServerAnnouncer error: {e}")

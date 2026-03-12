@@ -133,7 +133,7 @@ if not _opus_loaded:
 
 from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout,
                              QLineEdit, QPushButton, QLabel, QCheckBox, QFrame,
-                             QSizePolicy, QProgressBar)
+                             QSizePolicy, QProgressBar, QScrollArea, QDialog)
 from PyQt6.QtCore import Qt, QTimer, QThread, pyqtSignal, QObject
 from PyQt6.QtGui import QIcon, QSurfaceFormat, QPixmap
 
@@ -195,8 +195,17 @@ def load_config() -> dict | None:
 
 def save_config(ip: str, nick: str, avatar: str) -> None:
     try:
+        # Читаем существующий конфиг чтобы сохранить server_name и другие поля
+        existing: dict = {}
+        if os.path.exists(USER_CONFIG_PATH):
+            try:
+                with open(USER_CONFIG_PATH, 'r', encoding='utf-8') as f:
+                    existing = json.load(f)
+            except Exception:
+                pass
+        existing.update({"ip": ip, "nick": nick, "avatar": avatar})
         with open(USER_CONFIG_PATH, 'w', encoding='utf-8') as f:
-            json.dump({"ip": ip, "nick": nick, "avatar": avatar}, f)
+            json.dump(existing, f)
     except Exception as e:
         print(f"[Config] Не удалось сохранить конфиг: {e}")
 
@@ -1098,7 +1107,7 @@ class EmbeddedServerManager:
             cls._instance = cls()
         return cls._instance
 
-    def start(self, host_ip: str, host_nick: str) -> None:
+    def start(self, host_ip: str, host_nick: str, server_name: str = '') -> None:
         """
         Запускает встроенный SFUServer.
         Если уже запущен — ничего не делает (idempotent).
@@ -1110,15 +1119,15 @@ class EmbeddedServerManager:
         if self.is_running():
             print("[EmbeddedServer] Уже запущен — повторный запуск пропущен")
             return
-        # Не оборачиваем в try/except — исключение должно дойти до вызывающего
         from server import SFUServer
-        self._server = SFUServer()
+        _srv_name = server_name or _load_server_name()
+        self._server = SFUServer(server_name=_srv_name)
         try:
             self._server.start_embedded(host_ip, host_nick)
         except Exception:
             self._server = None
             raise
-        print(f"[EmbeddedServer] Запущен: ip={host_ip}, nick={host_nick!r}")
+        print(f"[EmbeddedServer] Запущен: ip={host_ip}, nick={host_nick!r}, name={_srv_name!r}")
 
     def stop(self) -> None:
         """Останавливает сервер (если запущен) с корректной передачей хостинга."""
@@ -1163,7 +1172,676 @@ class DiscoveryWorker(QThread):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Экран автоматического обнаружения сервера
+# Вспомогательные функции: имя сервера
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _save_server_name(name: str) -> None:
+    """Сохраняет имя сервера в user_config.json."""
+    try:
+        cfg: dict = {}
+        if os.path.exists(USER_CONFIG_PATH):
+            try:
+                with open(USER_CONFIG_PATH, 'r', encoding='utf-8') as f:
+                    cfg = json.load(f)
+            except Exception:
+                pass
+        cfg['server_name'] = name
+        with open(USER_CONFIG_PATH, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f)
+    except Exception as e:
+        print(f"[Config] save_server_name error: {e}")
+
+
+def _load_server_name() -> str:
+    """Загружает сохранённое имя сервера или возвращает дефолт."""
+    try:
+        if os.path.exists(USER_CONFIG_PATH):
+            with open(USER_CONFIG_PATH, 'r', encoding='utf-8') as f:
+                return json.load(f).get('server_name', 'InPulse Server')
+    except Exception:
+        pass
+    return 'InPulse Server'
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Стили карточек серверов
+# ══════════════════════════════════════════════════════════════════════════════
+
+_SERVER_ITEM_SS_IDLE = """
+    QFrame#serverItem {
+        background-color: rgba(255,255,255,0.06);
+        border: 1px solid rgba(255,255,255,0.12);
+        border-radius: 10px;
+    }
+    QFrame#serverItem:hover {
+        background-color: rgba(91,142,245,0.16);
+        border-color: rgba(91,142,245,0.55);
+    }
+"""
+
+_SERVER_ITEM_SS_SELECTED = """
+    QFrame#serverItem {
+        background-color: rgba(91,142,245,0.22);
+        border: 1px solid rgba(91,142,245,0.80);
+        border-radius: 10px;
+    }
+"""
+
+_BTN_CREATE_SS = (
+    "QPushButton {"
+    "  background-color: rgba(39,174,96,0.28);"
+    "  color: #82e0aa;"
+    "  border: 1px solid rgba(46,204,113,0.55);"
+    "  border-radius: 8px;"
+    "  font-size: 14px;"
+    "  font-weight: bold;"
+    "  padding: 9px 0;"
+    "}"
+    "QPushButton:hover {"
+    "  background-color: rgba(39,174,96,0.48);"
+    "  border-color: rgba(46,204,113,0.85);"
+    "  color: #ffffff;"
+    "}"
+    "QPushButton:pressed { background-color: rgba(39,174,96,0.65); }"
+)
+
+_BTN_CONNECT_SS = (
+    "QPushButton {"
+    "  background-color: rgba(52,152,219,0.28);"
+    "  color: #7ec8e3;"
+    "  border: 1px solid rgba(52,152,219,0.55);"
+    "  border-radius: 8px;"
+    "  font-size: 14px;"
+    "  font-weight: bold;"
+    "  padding: 9px 0;"
+    "}"
+    "QPushButton:hover {"
+    "  background-color: rgba(52,152,219,0.48);"
+    "  border-color: rgba(52,152,219,0.85);"
+    "  color: #ffffff;"
+    "}"
+    "QPushButton:disabled { opacity: 0.4; }"
+)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DiscoveryAllWorker — QThread: discover_all() в фоне
+# ══════════════════════════════════════════════════════════════════════════════
+
+class DiscoveryAllWorker(QThread):
+    """Запускает ServerDiscovery.discover_all() в отдельном потоке."""
+    done = pyqtSignal(list)
+
+    def __init__(self, timeout: float = 2.5):
+        super().__init__()
+        self._timeout = timeout
+
+    def run(self):
+        try:
+            from server_discovery import ServerDiscovery
+            results = ServerDiscovery().discover_all(self._timeout)
+            self.done.emit(results)
+        except Exception as e:
+            print(f"[DiscoveryAll] Worker error: {e}")
+            self.done.emit([])
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _CreateServerDialog — диалог создания сервера
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _CreateServerDialog(QDialog):
+    """Диалог: ввод имени сервера перед его созданием."""
+
+    def __init__(self, parent=None, default_nick: str = "User"):
+        super().__init__(parent)
+        self.setWindowTitle("Создать сервер")
+        self.setModal(True)
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFixedSize(320, 185)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        card = QWidget()
+        card.setObjectName("glassCard")
+        card.setStyleSheet(_GLASS_CARD_SS)
+        outer.addWidget(card)
+
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(22, 18, 22, 18)
+        lay.setSpacing(10)
+
+        lbl = QLabel("🖥  Создать сервер")
+        lbl.setStyleSheet(
+            "font-size: 16px; font-weight: bold; color: #cdd6f4;"
+            "background: transparent; border: none;"
+        )
+        lay.addWidget(lbl)
+
+        sub = QLabel("Введите имя вашего сервера:")
+        sub.setStyleSheet(
+            "font-size: 12px; color: #8899bb; background: transparent; border: none;"
+        )
+        lay.addWidget(sub)
+
+        self._inp = QLineEdit(f"Сервер {default_nick}")
+        self._inp.setMaxLength(40)
+        self._inp.setStyleSheet(
+            "background-color: rgba(255,255,255,0.08);"
+            "border: 1px solid rgba(255,255,255,0.18);"
+            "border-radius: 7px; padding: 7px 11px;"
+            "color: #dde3f0; font-size: 14px;"
+        )
+        self._inp.selectAll()
+        lay.addWidget(self._inp)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+
+        btn_ok = QPushButton("✔  Создать")
+        btn_ok.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_ok.setStyleSheet(_BTN_CREATE_SS)
+        btn_ok.clicked.connect(self.accept)
+
+        btn_cancel = QPushButton("Отмена")
+        btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_cancel.setStyleSheet(
+            "QPushButton { background: rgba(127,140,141,0.22); color: #8899aa;"
+            " border: 1px solid rgba(127,140,141,0.40); border-radius: 8px;"
+            " font-size: 13px; padding: 9px 0; }"
+            "QPushButton:hover { background: rgba(149,165,166,0.35); color: #c8d0e0; }"
+        )
+        btn_cancel.clicked.connect(self.reject)
+
+        btn_row.addWidget(btn_ok)
+        btn_row.addWidget(btn_cancel)
+        lay.addLayout(btn_row)
+
+        self._inp.returnPressed.connect(self.accept)
+
+    def get_name(self) -> str:
+        return self._inp.text().strip() or "InPulse Server"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _PingWorker — измеряет TCP-latency до сервера в фоне
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _PingWorker(QThread):
+    """
+    Измеряет время TCP-соединения к серверу и возвращает RTT в мс.
+    Запускается из _ServerItemWidget — не блокирует UI.
+    """
+    result = pyqtSignal(int)   # ping_ms; -1 = недоступен
+
+    def __init__(self, ip: str, port: int = DEFAULT_PORT_TCP, parent=None):
+        super().__init__(parent)
+        self._ip   = ip
+        self._port = port
+
+    def run(self):
+        import time as _t
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(2.0)
+            t0 = _t.perf_counter()
+            s.connect((self._ip, self._port))
+            ms = int((_t.perf_counter() - t0) * 1000)
+            s.close()
+            self.result.emit(ms)
+        except Exception:
+            self.result.emit(-1)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# _ServerItemWidget — карточка одного сервера в списке
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _ServerItemWidget(QFrame):
+    """Кликабельная карточка сервера: имя, хост, IP, счётчик."""
+    clicked = pyqtSignal()
+
+    def __init__(self, info: dict, parent=None):
+        super().__init__(parent)
+        self.info = info
+        self.setObjectName("serverItem")
+        self._selected = False
+        self._apply_style()
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedHeight(56)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(12, 8, 12, 8)
+        lay.setSpacing(8)
+
+        ico = QLabel("🖥")
+        ico.setFixedWidth(22)
+        ico.setStyleSheet("background: transparent; border: none; font-size: 18px;")
+        lay.addWidget(ico)
+
+        info_col = QVBoxLayout()
+        info_col.setSpacing(1)
+
+        lbl_name = QLabel(info.get('server_name', 'InPulse Server'))
+        lbl_name.setStyleSheet(
+            "font-size: 14px; font-weight: bold; color: #eaeef8;"
+            "background: transparent; border: none;"
+        )
+        info_col.addWidget(lbl_name)
+
+        lbl_sub = QLabel(f"Хост: {info.get('host_nick','?')}  •  {info.get('ip','')}")
+        lbl_sub.setStyleSheet(
+            "font-size: 11px; color: rgba(180,190,210,0.70);"
+            "background: transparent; border: none;"
+        )
+        info_col.addWidget(lbl_sub)
+        lay.addLayout(info_col, stretch=1)
+
+        cnt = info.get('user_count', 0)
+        lbl_cnt = QLabel(f"👤 {cnt}")
+        lbl_cnt.setStyleSheet(
+            "font-size: 12px; color: #82e0aa; font-weight: bold;"
+            "background: transparent; border: none;"
+        )
+        lbl_cnt.setFixedWidth(50)
+        lbl_cnt.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        lay.addWidget(lbl_cnt)
+
+        # ── Пинг ──────────────────────────────────────────────────────────────
+        self._lbl_ping = QLabel("…")
+        self._lbl_ping.setStyleSheet(
+            "font-size: 11px; color: rgba(180,190,210,0.55); font-weight: normal;"
+            "background: transparent; border: none;"
+        )
+        self._lbl_ping.setFixedWidth(52)
+        self._lbl_ping.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        lay.addWidget(self._lbl_ping)
+
+        # Запускаем измерение в фоне
+        ip = info.get('ip', '')
+        if ip:
+            self._ping_worker = _PingWorker(ip)
+            self._ping_worker.result.connect(self._on_ping)
+            self._ping_worker.start()
+
+    def _on_ping(self, ms: int):
+        if ms < 0:
+            self._lbl_ping.setText("—")
+            self._lbl_ping.setStyleSheet(
+                "font-size: 11px; color: rgba(180,190,210,0.40); font-weight: normal;"
+                "background: transparent; border: none;"
+            )
+            return
+        col = "#2ecc71" if ms < 60 else "#f1c40f" if ms < 150 else "#e74c3c"
+        self._lbl_ping.setText(f"{ms} мс")
+        self._lbl_ping.setStyleSheet(
+            f"font-size: 11px; color: {col}; font-weight: bold;"
+            "background: transparent; border: none;"
+        )
+
+    def _apply_style(self):
+        self.setStyleSheet(
+            _SERVER_ITEM_SS_SELECTED if self._selected else _SERVER_ITEM_SS_IDLE
+        )
+
+    def set_selected(self, selected: bool):
+        self._selected = selected
+        self._apply_style()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(e)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MultiServerScreen — стартовый экран выбора сервера
+# ══════════════════════════════════════════════════════════════════════════════
+
+class MultiServerScreen(QWidget):
+    """
+    Стартовый экран: список всех найденных серверов в сети.
+    Заменяет DiscoveryScreen.
+    """
+    open_login = pyqtSignal(str, str, str)
+    _ready     = pyqtSignal(str)
+
+    def __init__(self, nick: str, avatar: str, server_name: str = ''):
+        super().__init__()
+        self.nick        = nick
+        self.avatar      = avatar
+        self.server_name = server_name or 'InPulse Server'
+
+        self._worker: DiscoveryAllWorker | None     = None
+        self._connecting_screen: QWidget | None    = None
+        self._connecting_in_progress: bool         = False
+        self._selected_info: dict | None           = None
+        self._item_widgets: list[_ServerItemWidget] = []
+
+        self._build_ui()
+        self._ready.connect(self._open_connecting)
+        self._start_discovery()
+
+    def _build_ui(self):
+        from version import APP_NAME, APP_VERSION
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
+        self.setFixedSize(480, 560)
+        self.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        card = QWidget()
+        card.setObjectName("glassCard")
+        card.setStyleSheet(_GLASS_CARD_SS)
+        outer.addWidget(card)
+
+        card_lay = QVBoxLayout(card)
+        card_lay.setContentsMargins(0, 0, 0, 0)
+        card_lay.setSpacing(0)
+
+        _tb = _AppTitleBar(self, f"{APP_NAME} — Выбор сервера")
+        card_lay.addWidget(_tb)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setFixedHeight(1)
+        sep.setStyleSheet("background: rgba(255,255,255,0.08); border: none;")
+        card_lay.addWidget(sep)
+
+        root = QVBoxLayout()
+        root.setSpacing(10)
+        root.setContentsMargins(20, 16, 20, 14)
+        card_lay.addLayout(root)
+
+        self.lbl_status = QLabel("Поиск серверов в сети...")
+        self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_status.setStyleSheet(
+            "font-size: 15px; font-weight: bold; color: #cdd6f4;"
+            "background: transparent; border: none;"
+        )
+        root.addWidget(self.lbl_status)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet("""
+            QScrollArea { background: transparent; border: none; }
+            QScrollBar:vertical {
+                background: rgba(255,255,255,0.07); width: 5px; border-radius: 2px;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(255,255,255,0.22); border-radius: 2px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+        """)
+
+        self._list_container = QWidget()
+        self._list_container.setStyleSheet("background: transparent;")
+        self._list_layout = QVBoxLayout(self._list_container)
+        self._list_layout.setSpacing(6)
+        self._list_layout.setContentsMargins(0, 0, 0, 0)
+        self._list_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        self._lbl_empty = QLabel("Нет серверов в сети\nНикто ещё не создал комнату")
+        self._lbl_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._lbl_empty.setStyleSheet(
+            "font-size: 14px; color: rgba(200,210,224,0.55);"
+            "background: transparent; border: none; padding: 20px;"
+        )
+        self._lbl_empty.hide()
+        self._list_layout.addWidget(self._lbl_empty)
+
+        scroll.setWidget(self._list_container)
+        root.addWidget(scroll, stretch=1)
+
+        self.btn_connect = QPushButton("🔗  Подключиться")
+        self.btn_connect.setStyleSheet(_BTN_CONNECT_SS)
+        self.btn_connect.setEnabled(False)
+        self.btn_connect.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_connect.clicked.connect(self._on_connect_selected)
+        root.addWidget(self.btn_connect)
+
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.Shape.HLine)
+        sep2.setFixedHeight(1)
+        sep2.setStyleSheet("background: rgba(255,255,255,0.06); border: none;")
+        root.addWidget(sep2)
+
+        bot_row = QHBoxLayout()
+        bot_row.setSpacing(8)
+
+        self.btn_create = QPushButton("➕  Создать сервер")
+        self.btn_create.setStyleSheet(_BTN_CREATE_SS)
+        self.btn_create.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_create.clicked.connect(self._on_create_server)
+        bot_row.addWidget(self.btn_create, stretch=2)
+
+        self.btn_retry = QPushButton("🔁")
+        self.btn_retry.setFixedWidth(40)
+        self.btn_retry.setToolTip("Обновить список серверов")
+        self.btn_retry.setStyleSheet(
+            "QPushButton { background: rgba(255,255,255,0.10); color: #aab4c8;"
+            " border: 1px solid rgba(255,255,255,0.16); border-radius: 8px;"
+            " font-size: 16px; padding: 6px; }"
+            "QPushButton:hover { background: rgba(255,255,255,0.18); color: #fff; }"
+        )
+        self.btn_retry.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_retry.clicked.connect(self._start_discovery)
+        bot_row.addWidget(self.btn_retry)
+
+        self.btn_manual = QPushButton("✏️  IP")
+        self.btn_manual.setFixedWidth(56)
+        self.btn_manual.setToolTip("Ввести IP вручную")
+        self.btn_manual.setStyleSheet(
+            "QPushButton { background: rgba(255,255,255,0.08); color: #8899aa;"
+            " border: 1px solid rgba(127,140,141,0.35); border-radius: 8px;"
+            " font-size: 13px; padding: 6px; }"
+            "QPushButton:hover { background: rgba(149,165,166,0.28); color: #c8d0e0; }"
+        )
+        self.btn_manual.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_manual.clicked.connect(self._on_manual_ip)
+        bot_row.addWidget(self.btn_manual)
+
+        root.addLayout(bot_row)
+
+    # ── Discovery ─────────────────────────────────────────────────────────────
+
+    def _start_discovery(self):
+        self._selected_info = None
+        self.btn_connect.setEnabled(False)
+        self.lbl_status.setText("Поиск серверов в сети...")
+        self.lbl_status.setStyleSheet(
+            "font-size: 15px; font-weight: bold; color: #cdd6f4;"
+            "background: transparent; border: none;"
+        )
+        self._connecting_in_progress = False
+        self._clear_list()
+
+        if self._worker and self._worker.isRunning():
+            self._worker.quit()
+            self._worker.wait(500)
+
+        self._worker = DiscoveryAllWorker(timeout=2.5)
+        self._worker.done.connect(self._on_discovery_done)
+        self._worker.start()
+
+    def _clear_list(self):
+        for w in self._item_widgets:
+            try:
+                w.hide()
+                w.deleteLater()
+            except RuntimeError:
+                pass
+        self._item_widgets.clear()
+        self._lbl_empty.hide()
+
+    def _on_discovery_done(self, servers: list):
+        if not servers:
+            self.lbl_status.setText("Нет серверов в сети")
+            self.lbl_status.setStyleSheet(
+                "font-size: 15px; font-weight: bold; color: #e0b060;"
+                "background: transparent; border: none;"
+            )
+            self._lbl_empty.show()
+            return
+
+        cnt = len(servers)
+        self.lbl_status.setText(f"Найдено серверов: {cnt}  •  выберите для подключения")
+        self.lbl_status.setStyleSheet(
+            "font-size: 14px; font-weight: bold; color: #82e0aa;"
+            "background: transparent; border: none;"
+        )
+        for info in servers:
+            w = _ServerItemWidget(info)
+            w.clicked.connect(lambda i=info, widget=w: self._on_item_selected(i, widget))
+            self._list_layout.addWidget(w)
+            self._item_widgets.append(w)
+
+    def _on_item_selected(self, info: dict, widget: _ServerItemWidget):
+        for w in self._item_widgets:
+            try:
+                w.set_selected(False)
+            except RuntimeError:
+                pass
+        try:
+            widget.set_selected(True)
+        except RuntimeError:
+            pass
+        self._selected_info = info
+        self.btn_connect.setEnabled(True)
+
+    # ── Действия ──────────────────────────────────────────────────────────────
+
+    def _on_connect_selected(self):
+        if self._selected_info:
+            ip = self._selected_info.get('ip', '')
+            if ip:
+                self._open_connecting(ip)
+
+    def _on_create_server(self):
+        if self._connecting_in_progress:
+            return
+
+        dlg = _CreateServerDialog(self, default_nick=self.nick)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        server_name = dlg.get_name()
+        self.btn_create.setEnabled(False)
+        self.lbl_status.setText("Запуск сервера...")
+        self.lbl_status.setStyleSheet(
+            "font-size: 15px; font-weight: bold; color: #c39ef5;"
+            "background: transparent; border: none;"
+        )
+
+        try:
+            from server_discovery import get_local_radmin_ip
+            host_ip = get_local_radmin_ip()
+            EmbeddedServerManager.get().start(host_ip, self.nick, server_name=server_name)
+            _save_server_name(server_name)
+        except Exception as e:
+            self.lbl_status.setText("Ошибка запуска сервера")
+            self.lbl_status.setStyleSheet(
+                "font-size: 14px; font-weight: bold; color: #ff8080;"
+                "background: transparent; border: none;"
+            )
+            print(f"[MultiServerScreen] create server error: {e}")
+            self.btn_create.setEnabled(True)
+            return
+
+        self.lbl_status.setText("✅  Сервер запущен!  Подключение...")
+        self.lbl_status.setStyleSheet(
+            "font-size: 14px; font-weight: bold; color: #82e0aa;"
+            "background: transparent; border: none;"
+        )
+
+        import threading as _thr
+        import socket as _sock
+        import time as _time
+
+        def _wait_for_server():
+            deadline = _time.time() + 5.0
+            while _time.time() < deadline:
+                try:
+                    s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+                    s.settimeout(0.3)
+                    s.connect((host_ip, DEFAULT_PORT_TCP))
+                    s.close()
+                    self._ready.emit(host_ip)
+                    return
+                except Exception:
+                    _time.sleep(0.15)
+            self._ready.emit(host_ip)
+
+        _thr.Thread(target=_wait_for_server, daemon=True, name="srv-ready-probe").start()
+
+    def _on_manual_ip(self):
+        self.open_login.emit('', self.nick, self.avatar)
+        self.hide()
+
+    def _open_connecting(self, ip: str):
+        if self._connecting_in_progress:
+            return
+        self._connecting_in_progress = True
+
+        try:
+            from video_engine import patch_aiortc_nvenc
+            patch_aiortc_nvenc()
+        except Exception as e:
+            print(f"[MultiServer] patch_aiortc_nvenc error: {e}")
+
+        try:
+            from server_discovery import get_local_radmin_ip
+            local_ip = get_local_radmin_ip()
+        except Exception:
+            local_ip = '127.0.0.1'
+
+        skip_upd = (ip in ('127.0.0.1', local_ip))
+
+        self._connecting_screen = ConnectingScreen(
+            ip, self.nick, self.avatar,
+            skip_update_check=skip_upd,
+        )
+        self._connecting_screen.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
+        self._connecting_screen.show_login.connect(self._on_return_to_login)
+        self._connecting_screen.show()
+        self.hide()
+
+    def _on_return_to_login(self, ip: str, nick: str, avatar: str):
+        self._connecting_in_progress = False
+
+        try:
+            from server_discovery import get_local_radmin_ip
+            local_ip = get_local_radmin_ip()
+        except Exception:
+            local_ip = '127.0.0.1'
+
+        own_server_running = (
+            ip in ('127.0.0.1', local_ip)
+            and EmbeddedServerManager.get().is_running()
+        )
+
+        if own_server_running:
+            self.lbl_status.setText("Ошибка подключения к своему серверу")
+            self.lbl_status.setStyleSheet(
+                "font-size: 14px; font-weight: bold; color: #ff8080;"
+                "background: transparent; border: none;"
+            )
+            self.btn_create.setEnabled(True)
+            self.show()
+        else:
+            self.open_login.emit(ip, nick, avatar)
+            self.hide()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Экран автоматического обнаружения сервера (ОСТАВЛЕН ДЛЯ СОВМЕСТИМОСТИ)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class DiscoveryScreen(QWidget):
@@ -1558,14 +2236,12 @@ if __name__ == "__main__":
     config = load_config()
 
     if config:
-        # ── Конфиг найден → автообнаружение сервера ─────────────────────
-        # IP из конфига больше НЕ используется как прямой адрес сервера —
-        # сервер теперь обнаруживается автоматически через UDP broadcast.
-        # Сохраняем nick/avatar из конфига, IP игнорируем.
-        nick   = config.get("nick",   "User")
-        avatar = config.get("avatar", "1.svg")
+        # ── Конфиг найден → мульти-серверный экран ──────────────────────
+        nick        = config.get("nick",        "User")
+        avatar      = config.get("avatar",      "1.svg")
+        server_name = config.get("server_name", "InPulse Server")
 
-        _connect_screen = DiscoveryScreen(nick, avatar)
+        _connect_screen = MultiServerScreen(nick, avatar, server_name=server_name)
         _connect_screen.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
 
         def _fallback_to_login(f_ip: str, f_nick: str, f_avatar: str):

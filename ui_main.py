@@ -11,8 +11,10 @@ from ui_video import VideoWindow
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QPushButton, QTreeWidget, QTreeWidgetItem,
                              QHeaderView, QMessageBox, QStackedWidget,
-                             QFrame, QSizeGrip, QFileDialog, QLineEdit)
-from PyQt6.QtCore import Qt, QTimer, QSize, QSettings, QRect, QPoint, QEvent
+                             QFrame, QSizeGrip, QFileDialog, QLineEdit,
+                             QScrollArea, QDialog, QCheckBox,
+                             QMenu, QApplication)
+from PyQt6.QtCore import Qt, QTimer, QSize, QSettings, QRect, QPoint, QEvent, QThread, pyqtSignal
 from PyQt6.QtGui import QIcon, QFont, QFontDatabase, QBrush, QColor, QCursor, QFontMetrics
 
 from config import *
@@ -238,6 +240,209 @@ class CustomTitleBar(QWidget):
             self._toggle_maximize()
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Диалоги каналов
+# ══════════════════════════════════════════════════════════════════════════════
+
+_DIALOG_CHANNEL_SS = """
+    QWidget#dlgCard {
+        background-color: rgba(22, 24, 35, 252);
+        border: 1px solid rgba(255,255,255,0.10);
+        border-radius: 14px;
+    }
+    QLabel { color: #c8d0e0; background: transparent; border: none; }
+    QLineEdit {
+        background-color: rgba(255,255,255,0.07);
+        border: 1px solid rgba(255,255,255,0.14);
+        border-radius: 7px; padding: 7px 11px;
+        color: #dde3f0; font-size: 14px;
+    }
+    QLineEdit:focus { border-color: rgba(91,142,245,0.70); }
+    QCheckBox { color: #9aa5bb; font-size: 13px; background: transparent; }
+    QCheckBox::indicator {
+        width: 16px; height: 16px;
+        border: 1px solid rgba(255,255,255,0.20);
+        border-radius: 4px;
+        background: rgba(255,255,255,0.06);
+    }
+    QCheckBox::indicator:checked { background: #5b8ef5; border-color: #5b8ef5; }
+"""
+
+
+class _CreateChannelDialog(QDialog):
+    """Диалог создания временного канала (хост → ПКМ по дереву)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Создать канал")
+        self.setModal(True)
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFixedSize(320, 230)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        card = QWidget()
+        card.setObjectName("dlgCard")
+        card.setStyleSheet(_DIALOG_CHANNEL_SS)
+        outer.addWidget(card)
+
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(22, 18, 22, 18)
+        lay.setSpacing(10)
+
+        lbl_title = QLabel("🔊  Создать временный канал")
+        lbl_title.setStyleSheet(
+            "font-size: 15px; font-weight: bold; color: #cdd6f4;"
+            "background: transparent; border: none;"
+        )
+        lay.addWidget(lbl_title)
+
+        lbl_name = QLabel("Название канала:")
+        lbl_name.setStyleSheet("font-size: 12px; color: #8899bb;")
+        lay.addWidget(lbl_name)
+
+        self._inp_name = QLineEdit()
+        self._inp_name.setPlaceholderText("Например: Игровой чат")
+        self._inp_name.setMaxLength(32)
+        lay.addWidget(self._inp_name)
+
+        self._cb_pass = QCheckBox("Защитить паролем")
+        self._cb_pass.setChecked(False)
+        self._cb_pass.toggled.connect(self._on_pass_toggle)
+        lay.addWidget(self._cb_pass)
+
+        self._inp_pass = QLineEdit()
+        self._inp_pass.setPlaceholderText("Пароль для входа")
+        self._inp_pass.setMaxLength(64)
+        self._inp_pass.setEchoMode(QLineEdit.EchoMode.Password)
+        self._inp_pass.setVisible(False)
+        lay.addWidget(self._inp_pass)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+
+        btn_ok = QPushButton("✔  Создать")
+        btn_ok.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_ok.setStyleSheet(
+            "QPushButton { background: rgba(39,174,96,0.28); color: #82e0aa;"
+            " border: 1px solid rgba(46,204,113,0.55); border-radius: 8px;"
+            " font-size: 14px; font-weight: bold; padding: 9px 0; }"
+            "QPushButton:hover { background: rgba(39,174,96,0.48); border-color: rgba(46,204,113,0.85); color: #fff; }"
+        )
+        btn_ok.clicked.connect(self._on_ok)
+
+        btn_cancel = QPushButton("Отмена")
+        btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_cancel.setStyleSheet(
+            "QPushButton { background: rgba(127,140,141,0.22); color: #8899aa;"
+            " border: 1px solid rgba(127,140,141,0.40); border-radius: 8px;"
+            " font-size: 13px; padding: 9px 0; }"
+            "QPushButton:hover { background: rgba(149,165,166,0.35); color: #c8d0e0; }"
+        )
+        btn_cancel.clicked.connect(self.reject)
+
+        btn_row.addWidget(btn_ok)
+        btn_row.addWidget(btn_cancel)
+        lay.addLayout(btn_row)
+
+        self._inp_name.returnPressed.connect(self._on_ok)
+
+    def _on_pass_toggle(self, checked: bool):
+        self._inp_pass.setVisible(checked)
+        if checked:
+            self._inp_pass.setFocus()
+        self.setFixedHeight(260 if checked else 230)
+
+    def _on_ok(self):
+        name = self._inp_name.text().strip()
+        if not name:
+            self._inp_name.setPlaceholderText("⚠ Введите название!")
+            self._inp_name.setFocus()
+            return
+        self.accept()
+
+    def get_channel_name(self) -> str:
+        return self._inp_name.text().strip()
+
+    def get_password(self):
+        if self._cb_pass.isChecked():
+            p = self._inp_pass.text().strip()
+            return p if p else None
+        return None
+
+
+class _ChannelPasswordDialog(QDialog):
+    """Запрашивает пароль для входа в защищённый канал."""
+
+    def __init__(self, channel_name: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Пароль канала")
+        self.setModal(True)
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setFixedSize(300, 165)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        card = QWidget()
+        card.setObjectName("dlgCard")
+        card.setStyleSheet(_DIALOG_CHANNEL_SS)
+        outer.addWidget(card)
+
+        lay = QVBoxLayout(card)
+        lay.setContentsMargins(22, 18, 22, 18)
+        lay.setSpacing(10)
+
+        lbl = QLabel(f"🔒  Канал «{channel_name}» защищён")
+        lbl.setStyleSheet(
+            "font-size: 14px; font-weight: bold; color: #cdd6f4;"
+            "background: transparent; border: none;"
+        )
+        lbl.setWordWrap(True)
+        lay.addWidget(lbl)
+
+        self._inp = QLineEdit()
+        self._inp.setPlaceholderText("Введите пароль...")
+        self._inp.setEchoMode(QLineEdit.EchoMode.Password)
+        lay.addWidget(self._inp)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+
+        btn_ok = QPushButton("Войти")
+        btn_ok.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_ok.setStyleSheet(
+            "QPushButton { background: rgba(39,174,96,0.28); color: #82e0aa;"
+            " border: 1px solid rgba(46,204,113,0.55); border-radius: 8px;"
+            " font-size: 14px; font-weight: bold; padding: 8px 0; }"
+            "QPushButton:hover { background: rgba(39,174,96,0.48); color: #fff; }"
+        )
+        btn_ok.clicked.connect(self.accept)
+
+        btn_cancel = QPushButton("Отмена")
+        btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_cancel.setStyleSheet(
+            "QPushButton { background: rgba(127,140,141,0.22); color: #8899aa;"
+            " border: 1px solid rgba(127,140,141,0.40); border-radius: 8px;"
+            " font-size: 13px; padding: 8px 0; }"
+            "QPushButton:hover { background: rgba(149,165,166,0.35); color: #c8d0e0; }"
+        )
+        btn_cancel.clicked.connect(self.reject)
+
+        btn_row.addWidget(btn_ok)
+        btn_row.addWidget(btn_cancel)
+        lay.addLayout(btn_row)
+
+        self._inp.returnPressed.connect(self.accept)
+
+    def get_password(self) -> str:
+        return self._inp.text().strip()
+
+
 class MainWindow(QMainWindow):
     def __init__(self, ip, nick, avatar):
         super().__init__()
@@ -249,19 +454,41 @@ class MainWindow(QMainWindow):
         self.app_settings = QSettings("MyVoiceChat", "GlobalSettings")
         self.known_uids = {}
         self.current_room = "General"
-        self.default_rooms = ["General", "Gaming", "Music", "Work"]
+        self.default_rooms = ["General"]
+        # Актуальный список каналов (обновляется из sync_users → channel_list)
+        self._channel_list: list = [
+            {'name': 'General', 'has_password': False, 'permanent': True}
+        ]
+        self._pending_channel_join: str | None = None
         self.sound_files = {
             "self_move":  resource_path("assets/music/user_join.wav"),
             "other_join": resource_path("assets/music/user_join.wav"),
             "other_exit": resource_path("assets/music/disconnected.wav"),
             "mute":       resource_path("assets/music/mute.wav"),
             "unmute":     resource_path("assets/music/unmute.wav"),
-            "stream_on":  resource_path("assets/music/stream_on.wav"),
-            "stream_off": resource_path("assets/music/stream_off.wav"),
-            "quick_msg":  resource_path("assets/music/message.wav"),
+            "stream_on":      resource_path("assets/music/stream_on.wav"),
+            "stream_off":     resource_path("assets/music/stream_off.wav"),
+            "quick_msg":      resource_path("assets/music/message.wav"),
+            # ── Новые звуки ───────────────────────────────────────────────────
+            # friend_connect.wav — воспроизводится когда ЛЮБОЙ пользователь
+            # появляется на сервере (подключается впервые в текущей сессии).
+            # file_received.wav  — воспроизводится при входящем предложении файла.
+            "friend_connect": resource_path("assets/music/friend_connect.wav"),
+            "file_received":  resource_path("assets/music/file.wav"),
         }
         self.prev_room_uids: set = set()
         self.prev_streaming_uids: set = set()
+        # ── Состояние для звука подключения друга ─────────────────────────────
+        # prev_all_uids — UIDs всех пользователей на сервере (без себя) с прошлого
+        # обновления. Используется в update_user_tree() для детектирования новых
+        # подключений к серверу (не только к текущей комнате).
+        #
+        # _server_users_initialized — False сразу после (пере)подключения.
+        # При первом sync_users просто засеваем prev_all_uids без звука,
+        # чтобы не воспроизводить friend_connect для ВСЕХ уже подключённых
+        # пользователей в момент входа в сервер.
+        self.prev_all_uids: set = set()
+        self._server_users_initialized: bool = False
 
         self.audio = AudioHandler()
         self.net = NetworkClient(self.audio)
@@ -337,6 +564,13 @@ class MainWindow(QMainWindow):
         # server_migrating — сервер переезжает к другому хосту.
         self.net.become_host.connect(self._on_become_host)
         self.net.server_migrating.connect(self._on_server_migrating)
+
+        # ── Каналы и мульти-серверная панель ─────────────────────────────────
+        self.net.channel_created.connect(self._on_channel_created)
+        self.net.channel_deleted.connect(self._on_channel_deleted)
+        self.net.join_room_denied.connect(self._on_join_room_denied)
+        self.net.channel_auth_ok.connect(self._on_channel_auth_ok)
+        self.net.channel_list_updated.connect(self._on_channel_list_updated)
 
         self.ui_timer = QTimer()
         self.ui_timer.timeout.connect(self.refresh_ui)
@@ -434,7 +668,7 @@ class MainWindow(QMainWindow):
 
     def setup_ui(self):
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — {self.nick}")
-        self.setMinimumSize(450, 600)
+        self.setMinimumSize(400, 600)
         self.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
         # Прозрачность по краям окна — углы и 4px внешний отступ становятся
@@ -497,6 +731,7 @@ class MainWindow(QMainWindow):
         self.tree.itemDoubleClicked.connect(self.on_tree_double_click)
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.show_context_menu)
+
         layout.addWidget(self.tree, stretch=1)
 
         # ── Баннер автообновления (скрыт до обнаружения новой версии) ─────────
@@ -587,6 +822,18 @@ class MainWindow(QMainWindow):
         self.btn_stream.setCheckable(True)
         self.btn_stream.clicked.connect(self.toggle_stream)
 
+        # ── Кнопка лобби: открыть экран выбора сервера ────────────────────────
+        # Пользователь остаётся подключённым к текущему серверу пока явно
+        # не выберет другой. Кнопка просто открывает MultiServerScreen поверх
+        # главного окна, не обрывая соединение.
+        self.btn_lobby = QPushButton()
+        self.btn_lobby.setFixedSize(46, 46)
+        self.btn_lobby.setObjectName("barBtn")
+        self.btn_lobby.setIcon(QIcon(resource_path("assets/icon/lobby.svg")))
+        self.btn_lobby.setIconSize(QSize(26, 26))
+        self.btn_lobby.setToolTip("Лобби — выбрать сервер")
+        self.btn_lobby.clicked.connect(self._open_lobby)
+
         # --- Индикатор качества соединения стримера ---
         # Маленький QLabel с иконкой connection_bad.svg, появляется рядом
         # с кнопкой трансляции когда сервер понизил битрейт из-за плохого
@@ -603,9 +850,17 @@ class MainWindow(QMainWindow):
             QIcon(resource_path("assets/icon/connection_bad.svg")).pixmap(QSize(22, 22))
         )
 
-        self.ping_lbl = QLabel("0 ms")
-        self.ping_lbl.setObjectName("pingLabel")
-        self.ping_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # ── Иконка пинга (latency.svg) ────────────────────────────────────────
+        # QPushButton с тем же barBtn стилем что у других кнопок (46×46).
+        # Пинг виден только при ховере через QToolTip.
+        self._latency_btn = QPushButton()
+        self._latency_btn.setFixedSize(46, 46)
+        self._latency_btn.setObjectName("barBtn")
+        self._latency_btn.setIcon(QIcon(resource_path("assets/icon/latency.svg")))
+        self._latency_btn.setIconSize(QSize(26, 26))
+        self._latency_btn.setToolTip("Пинг: -- мс")
+        # Пока нет пинга — нейтральная серая заливка (совпадает с barBtn по умолчанию)
+        self._latency_btn._ping_style_set = False
 
         btn_set = QPushButton()
         btn_set.setFixedSize(46, 46)
@@ -619,8 +874,9 @@ class MainWindow(QMainWindow):
         btns.addWidget(self.btn_sb)
         btns.addWidget(self.btn_stream)
         btns.addWidget(self._stream_conn_lbl)
+        btns.addWidget(self.btn_lobby)
         btns.addStretch()
-        btns.addWidget(self.ping_lbl)
+        btns.addWidget(self._latency_btn)
         btns.addWidget(btn_set)
 
         layout.addWidget(self._bottom_bar)
@@ -706,10 +962,11 @@ class MainWindow(QMainWindow):
         self._stack.setCurrentIndex(1)
 
         try:
-            from client_main import EmbeddedServerManager
+            from client_main import EmbeddedServerManager, _load_server_name
             from server_discovery import get_local_radmin_ip
-            host_ip = get_local_radmin_ip()
-            EmbeddedServerManager.get().start(host_ip, self.nick)
+            host_ip     = get_local_radmin_ip()
+            server_name = _load_server_name()
+            EmbeddedServerManager.get().start(host_ip, self.nick, server_name=server_name)
         except Exception as e:
             print(f"[UI] _on_become_host error: {e}")
             self._lost_status_lbl.setText(f"Ошибка запуска сервера:\n{e}\n\nПопробуйте перезапустить.")
@@ -1083,12 +1340,7 @@ class MainWindow(QMainWindow):
                 border-color: {accent};
             }}
 
-            #pingLabel {{
-                font-size: 12px;
-                color: {text_dim};
-                background: transparent;
-                border: none;
-            }}
+
 
             /* ── Баннер обновления ──────────────────────────────────────────── */
             QPushButton#updateBanner {{
@@ -1608,6 +1860,12 @@ class MainWindow(QMainWindow):
 
             self.play_notification("self_move")
 
+            # Сброс состояния «подключение друга» при каждом (пере)подключении.
+            # При первом sync_users после входа просто засеваем prev_all_uids —
+            # без звука, чтобы не «приветствовать» уже находящихся на сервере.
+            self.prev_all_uids = set()
+            self._server_users_initialized = False
+
             self._stack.setCurrentIndex(0)
 
             self._btn_reconnect.setEnabled(True)
@@ -1692,6 +1950,25 @@ class MainWindow(QMainWindow):
         self.prev_room_uids = current_room_uids
         self.prev_streaming_uids = current_streaming_uids
 
+        # ── Звук подключения друга к серверу ──────────────────────────────────
+        # Сравниваем всех пользователей на сервере (без себя) с предыдущим снимком.
+        # Первый вызов после (пере)подключения только засевает prev_all_uids —
+        # звука нет, чтобы не «приветствовать» тех, кто уже был на сервере.
+        #
+        # Один звук на весь «пакет» новых подключений — не плодим N звуков если
+        # несколько людей подключились между двумя sync_users (раз в ~1–2 сек).
+        # Этого достаточно: пользователь видит обновлённый список и слышит сигнал.
+        all_server_uids = all_active_uids - {self.audio.my_uid}
+        if not self._server_users_initialized:
+            # Первый sync после входа — просто засеваем, без звука
+            self.prev_all_uids = all_server_uids
+            self._server_users_initialized = True
+        else:
+            new_arrivals = all_server_uids - self.prev_all_uids
+            if new_arrivals:
+                self.play_notification("friend_connect")
+            self.prev_all_uids = all_server_uids
+
         self.tree.clear()
         self.known_uids.clear()
 
@@ -1718,8 +1995,16 @@ class MainWindow(QMainWindow):
                     self.audio.register_ip_mapping(uid, ip_addr)
 
                 item_u = QTreeWidgetItem(item_r, [f"  {u['nick']}", "", "", "", ""])
-                item_u.setIcon(0, QIcon(resource_path(f"assets/avatars/{u.get('avatar', '1.svg')}")))
-                item_u.setFont(0, font_u)
+                avatar_name = u.get('avatar', '1.svg')
+                host_uid    = getattr(self.net, '_server_host_uid', 0)
+                is_host     = (uid == host_uid and host_uid != 0)
+                item_u.setIcon(0, QIcon(resource_path(f"assets/avatars/{avatar_name}")))
+                if is_host:
+                    _font_host = QFont(font_u)
+                    _font_host.setBold(True)
+                    item_u.setFont(0, _font_host)
+                else:
+                    item_u.setFont(0, font_u)
                 item_u.setData(0, Qt.ItemDataRole.UserRole, uid)
 
                 # ── Колонка 1: статус дела (иконка SVG из assets/status/) ──────
@@ -1771,9 +2056,34 @@ class MainWindow(QMainWindow):
     def refresh_ui(self):
         try:
             ping = self.net.current_ping
-            self.ping_lbl.setText(f"Ping: {ping} ms")
-            col = "#2ecc71" if ping < 60 else "#f1c40f" if ping < 150 else "#e74c3c"
-            self.ping_lbl.setStyleSheet(f"color: {col}; font-weight: bold; font-size: 13px; margin-right: 10px;")
+            if ping < 60:
+                col    = "#2ecc71"
+                bg     = "rgba(46,204,113,0.25)"
+                border = "rgba(46,204,113,0.60)"
+            elif ping < 150:
+                col    = "#f1c40f"
+                bg     = "rgba(241,196,15,0.25)"
+                border = "rgba(241,196,15,0.60)"
+            else:
+                col    = "#e74c3c"
+                bg     = "rgba(231,76,60,0.25)"
+                border = "rgba(231,76,60,0.60)"
+            self._latency_btn.setToolTip(
+                f"<span style='color:{col}; font-weight:bold; font-size:13px;'>"
+                f"Пинг: {ping} мс</span>"
+            )
+            self._latency_btn.setStyleSheet(
+                f"QPushButton#barBtn {{"
+                f"  background-color: {bg};"
+                f"  border: 1px solid {border};"
+                f"  border-radius: 10px;"
+                f"  padding: 4px;"
+                f"}}"
+                f"QPushButton#barBtn:hover {{"
+                f"  background-color: {bg.replace('0.25','0.40')};"
+                f"  border-color: {col};"
+                f"}}"
+            )
 
             now = time.time()
 
@@ -1860,15 +2170,38 @@ class MainWindow(QMainWindow):
 
     def on_tree_double_click(self, item, col):
         if item.data(0, Qt.ItemDataRole.UserRole) == "ROOM_HEADER":
-            self.net.send_json({"action": CMD_JOIN_ROOM, "room": item.data(1, Qt.ItemDataRole.UserRole)})
+            room_name = item.data(1, Qt.ItemDataRole.UserRole)
+            # Проверяем: защищён ли канал паролем?
+            ch_info = next(
+                (ch for ch in self._channel_list if ch['name'] == room_name),
+                None
+            )
+            if ch_info and ch_info.get('has_password', False):
+                self._on_join_room_denied(room_name, 'channel_auth_required')
+            else:
+                self.net.send_json({"action": CMD_JOIN_ROOM, "room": room_name})
 
     def show_context_menu(self, pos):
         item = self.tree.itemAt(pos)
-        if not item:
+
+        # ── ПКМ по пустому месту или заголовку канала — создать канал ─────────
+        if not item or item.data(0, Qt.ItemDataRole.UserRole) == "ROOM_HEADER":
+            if self._is_server_host():
+                menu = QMenu(self)
+                menu.setStyleSheet(
+                    "QMenu { background: rgba(20,22,35,245); border: 1px solid rgba(255,255,255,0.14);"
+                    " border-radius: 8px; padding: 4px; color: #c8d0e0; font-size: 13px; }"
+                    "QMenu::item { padding: 6px 18px; border-radius: 5px; }"
+                    "QMenu::item:selected { background: rgba(91,142,245,0.30); color: #fff; }"
+                )
+                act_create = menu.addAction("🔊  Создать временный канал")
+                chosen = menu.exec(self.tree.viewport().mapToGlobal(pos))
+                if chosen == act_create:
+                    self._on_create_channel_requested()
             return
 
         uid = item.data(0, Qt.ItemDataRole.UserRole)
-        if not uid or uid == "ROOM_HEADER":
+        if not uid:
             return
 
         # ── Правый клик по СЕБЕ → оверлей выбора статуса ─────────────────────
@@ -2211,6 +2544,10 @@ class MainWindow(QMainWindow):
             print(f"[UI] file_offer: неполные данные — игнорируем ({msg})")
             return
 
+        # Звуковое оповещение о входящем файле — до показа toast,
+        # чтобы пользователь услышал сигнал даже если окно не в фокусе.
+        self.play_notification("file_received")
+
         size_str = _format_size(filesize)
         self._show_file_offer_toast(filename, size_str, sender_ip, port, token, filesize)
 
@@ -2423,8 +2760,222 @@ class MainWindow(QMainWindow):
         )
         self._update_banner.setVisible(True)
 
+    # ══════════════════════════════════════════════════════════════════════════
+    # Методы управления каналами
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def _on_create_channel_requested(self):
+        """Хост открывает диалог создания временного канала."""
+        dlg = _CreateChannelDialog(parent=self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        name     = dlg.get_channel_name()
+        password = dlg.get_password()
+        self.net.send_json({
+            'action':       'create_channel',
+            'channel_name': name,
+            'password':     password or '',
+        })
+        print(f"[UI] Запрос создания канала: '{name}' (пароль: {'да' if password else 'нет'})")
+
+    def _on_channel_created(self, channel_name: str):
+        """Сервер создал новый канал."""
+        names = [ch['name'] for ch in self._channel_list]
+        if channel_name not in names:
+            self._channel_list.append({
+                'name':         channel_name,
+                'has_password': False,
+                'permanent':    False,
+            })
+        print(f"[UI] Канал создан: '{channel_name}'")
+
+    def _on_channel_deleted(self, channel_name: str):
+        """Сервер удалил временный канал (он опустел)."""
+        self._channel_list = [
+            ch for ch in self._channel_list
+            if ch['name'] != channel_name
+        ]
+        print(f"[UI] Канал удалён: '{channel_name}'")
+        if self.current_room == channel_name:
+            self.net.send_json({'action': 'join_room', 'room': 'General'})
+
+    def _on_join_room_denied(self, room: str, reason: str):
+        """Вход в канал отклонён — запрашиваем пароль или показываем ошибку."""
+        if reason == 'channel_auth_required':
+            dlg = _ChannelPasswordDialog(channel_name=room, parent=self)
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            password = dlg.get_password()
+            self.net.send_json({
+                'action':       'join_channel_auth',
+                'channel_name': room,
+                'password':     password,
+            })
+            self._pending_channel_join = room
+        elif reason == 'wrong_password':
+            print(f"[UI] Неверный пароль для канала '{room}'")
+        elif reason == 'not_found':
+            print(f"[UI] Канал '{room}' не найден")
+
+    def _on_channel_auth_ok(self, channel_name: str):
+        """Авторизация прошла — входим в канал."""
+        if self._pending_channel_join == channel_name:
+            self._pending_channel_join = None
+            self.net.send_json({'action': 'join_room', 'room': channel_name})
+
+    def _on_channel_list_updated(self, channel_list: list):
+        """Получен актуальный список каналов от сервера."""
+        self._channel_list = channel_list
+
+        # Строим список каналов для отображения в дереве.
+        #
+        # БЫЛО (баг): только permanent-каналы (General и т.п.).
+        # Временный пустой канал не попадал ни в users_map.keys() (никого нет),
+        # ни в default_rooms → дерево его не показывало вообще, пользователь
+        # не мог никуда кликнуть чтобы зайти в созданный канал.
+        #
+        # СТАЛО: все каналы идут в default_rooms.
+        # Порядок: сначала постоянные (General…), потом временные (по алфавиту).
+        # Временный канал виден сразу после создания, даже если он пустой.
+        permanent = [ch['name'] for ch in channel_list if ch.get('permanent', False)]
+        temporary = [ch['name'] for ch in channel_list if not ch.get('permanent', False)]
+        self.default_rooms = (permanent or ['General']) + sorted(temporary)
+
+    def _open_lobby(self):
+        """
+        Открывает экран выбора сервера (MultiServerScreen) поверх главного окна.
+
+        Пользователь остаётся подключённым к текущему серверу до тех пор пока
+        явно не выберет другой и нажмёт «Подключиться». Соединение не обрывается.
+        Повторное нажатие — если лобби уже открыто, поднимаем его вперёд.
+
+        Ключевой трюк: переопределяем _open_connecting у MultiServerScreen,
+        чтобы выбор сервера вёл через _on_switch_server, а не через отдельный
+        ConnectingScreen + новый MainWindow.
+        """
+        # Если лобби уже открыто — просто поднимаем поверх
+        if hasattr(self, '_lobby_screen') and self._lobby_screen is not None:
+            try:
+                if self._lobby_screen.isVisible():
+                    self._lobby_screen.raise_()
+                    self._lobby_screen.activateWindow()
+                    return
+            except RuntimeError:
+                self._lobby_screen = None
+
+        try:
+            from client_main import MultiServerScreen, _load_server_name
+            server_name = _load_server_name()
+            screen = MultiServerScreen(self.nick, self.avatar, server_name=server_name)
+            screen.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
+
+            # ── Перехватываем выбор сервера ───────────────────────────────────
+            # MultiServerScreen._open_connecting() по умолчанию создаёт новый
+            # ConnectingScreen → новый MainWindow. Нам это не нужно: MainWindow
+            # уже открыт. Подменяем метод чтобы переключение шло через нас.
+            _main = self   # ссылка на MainWindow для замыкания
+
+            def _lobby_open_connecting(ip: str):
+                """Перехватчик: закрываем лобби, вызываем быстрое переключение."""
+                try:
+                    screen.hide()
+                except RuntimeError:
+                    pass
+                _main._lobby_screen = None
+                # Ищем имя сервера по IP из последнего списка Discovery
+                server_info = {'ip': ip, 'server_name': ip}
+                try:
+                    for srv in (screen._worker.result if hasattr(screen._worker, 'result') else []):
+                        if srv.get('ip') == ip:
+                            server_info = srv
+                            break
+                except Exception:
+                    pass
+                _main._on_switch_server(server_info)
+
+            screen._open_connecting = _lobby_open_connecting
+
+            # При «Ввести IP вручную» — закрываем лобби, открываем LoginWindow
+            screen.open_login.connect(self._on_lobby_manual_ip)
+
+            self._lobby_screen = screen
+            screen.show()
+        except Exception as e:
+            print(f"[UI] _open_lobby error: {e}")
+
+    def _on_lobby_manual_ip(self, ip: str, nick: str, avatar: str):
+        """
+        Из лобби нажали «Ввести IP вручную».
+        Закрываем лобби, переключаемся на введённый IP если он не пустой.
+        """
+        if hasattr(self, '_lobby_screen') and self._lobby_screen is not None:
+            try:
+                self._lobby_screen.hide()
+            except RuntimeError:
+                pass
+            self._lobby_screen = None
+        if ip and ip != self.ip:
+            self._on_switch_server({'ip': ip, 'server_name': ip})
+
+    def _on_switch_server(self, info: dict):
+        """
+        Переключение на другой сервер из лобби.
+
+        ВАЖНО: использует fast_switch_to() вместо _reconnect_loop.
+        fast_switch_to() не ждёт RECONNECT_DELAY (3 сек) между попытками —
+        сервер уже работает, сеть жива, нужно просто быстро переподключиться.
+        """
+        new_ip = info.get('ip', '')
+        if not new_ip or new_ip == self.ip:
+            # Закрываем лобби если пользователь выбрал текущий сервер
+            if hasattr(self, '_lobby_screen') and self._lobby_screen is not None:
+                try:
+                    self._lobby_screen.hide()
+                except RuntimeError:
+                    pass
+                self._lobby_screen = None
+            return
+
+        # Закрываем лобби при успешном переключении
+        if hasattr(self, '_lobby_screen') and self._lobby_screen is not None:
+            try:
+                self._lobby_screen.hide()
+            except RuntimeError:
+                pass
+            self._lobby_screen = None
+
+        # Останавливаем встроенный сервер если мы хост
+        if self._is_server_host():
+            try:
+                from client_main import EmbeddedServerManager
+                mgr = EmbeddedServerManager.get()
+                if mgr.is_running():
+                    mgr.stop()
+            except Exception as e:
+                print(f"[UI] _on_switch_server stop error: {e}")
+
+        self.ip = new_ip
+
+        # Показываем экран переключения
+        self._lost_title_lbl.setText("Переключение сервера")
+        self._lost_status_lbl.setText(
+            f"Подключение к {info.get('server_name', 'Сервер')}\n{new_ip}..."
+        )
+        self._btn_reconnect.setEnabled(False)
+        self._stack.setCurrentIndex(1)
+
+        # fast_switch_to: без задержки RECONNECT_DELAY, быстрые попытки 0.35 сек
+        self.net.fast_switch_to(new_ip)
+
     def closeEvent(self, e):
         """При нажатии ✕ — корректно завершаем приложение."""
+        # Скрываем лобби если открыто
+        if hasattr(self, '_lobby_screen') and self._lobby_screen is not None:
+            try:
+                self._lobby_screen.close()
+            except Exception:
+                pass
+            self._lobby_screen = None
         # Скрываем системный оверлей (поверх всех окон — должен исчезнуть первым)
         try:
             self._whisper_overlay.hide_overlay()
