@@ -1327,8 +1327,10 @@ class AudioHandler(QObject):
         self.dfn_available = False  # Инициализируем до try — на случай непредвиденного исключения
 
         # nr_mode: 0=выкл, 1=RNNoise, 2=DeepFilterNet
-        # По умолчанию 0 — пользователь сам выбирает в настройках.
-        self.nr_mode = int(self.global_settings.value("audio/nr_mode", 0))
+        # По умолчанию 1 (RNNoise) для новых установок — хорошее соотношение
+        # качество/нагрузка без зависимостей. set_nr_mode() откатится на 0
+        # только если pyrnnoise недоступен (первый запуск без библиотеки).
+        self.nr_mode = int(self.global_settings.value("audio/nr_mode", 1))
 
         # 1. Сначала пробуем инициализировать DeepFilterNet
         try:
@@ -1346,6 +1348,16 @@ class AudioHandler(QObject):
                 print("[Audio] RNNoise инициализирован.")
             except Exception as e:
                 print(f"[Audio] Ошибка RNNoise: {e}")
+
+        # Защита: если дефолт nr_mode=1 (RNNoise), но библиотека недоступна —
+        # откатываемся на 0 (выкл) без записи в QSettings, чтобы при следующем
+        # запуске с установленным pyrnnoise он включился автоматически.
+        if self.nr_mode == 1 and not PYRNNOISE_AVAILABLE:
+            print("[Audio] RNNoise недоступен, шумоподавление отключено.")
+            self.nr_mode = 0
+        elif self.nr_mode == 2 and not self.dfn_available:
+            print("[Audio] DeepFilterNet недоступен, откат на RNNoise.")
+            self.nr_mode = 1 if PYRNNOISE_AVAILABLE else 0
 
         self.incoming_packets = queue.Queue(maxsize=500)
         self.send_queue = queue.Queue(maxsize=100)
@@ -1853,8 +1865,10 @@ class AudioHandler(QObject):
                     self.pending_volumes[uid] = saved_vol
 
     def set_user_volume(self, uid, vol):
-        # Зажимаем в [0.0 … 2.0]. vol=0.0 → «тихий мут» через ползунок.
-        vol = max(0.0, min(2.0, float(vol)))
+        # Зажимаем в [0.0 … 20.0]. vol=0.0 → «тихий мут» через ползунок.
+        # Верхняя граница 20.0 оставляет запас для «Буст звука» (_BOOST_VOL=15x).
+        # Soft-limiter в audio-callback (0.95-normalise) защищает от клиппинга.
+        vol = max(0.0, min(20.0, float(vol)))
         emit_zero_state = None  # None = состояние не изменилось
 
         with self.users_lock:

@@ -66,6 +66,7 @@ from config import (
     CMD_CREATE_CHANNEL, CMD_CHANNEL_CREATED, CMD_CHANNEL_DELETED,
     CMD_JOIN_CHANNEL_AUTH, CHANNEL_NAME_MAX_LEN, CHANNEL_PASS_MAX_LEN,
     SERVER_NAME_DEFAULT,
+    CMD_HOST_MUTE, CMD_FORCE_MUTED,
 )
 
 # ── Опциональный импорт aiortc (только для WebRTCSFU) ────────────────────────
@@ -1310,6 +1311,35 @@ class SFUServer:
                                         bc.sendall(broadcast_qm)
                                     except Exception:
                                         pass
+
+                        # ── Принудительный мут участника (только хост) ────────
+                        # Хост может заглушить любого: mic + deaf.
+                        # Снять мут через эту команду НЕЛЬЗЯ — намеренно.
+                        # Сервер не меняет clients[conn]['mute/deaf'] —
+                        # state хранится на клиенте; sync_users покажет иконки
+                        # после того как клиент сам отправит update_status.
+                        elif action == CMD_HOST_MUTE:
+                            with self._host_order_lock:
+                                is_host = bool(
+                                    self._host_order and self._host_order[0] == uid
+                                )
+                            if is_host:
+                                target_uid_hm = int(msg.get('target_uid', 0))
+                                # Хост не может заглушить сам себя
+                                if target_uid_hm and target_uid_hm != uid:
+                                    with self.clients_lock:
+                                        target_conn_hm = next(
+                                            (c for c, d in self.clients.items()
+                                             if d.get('uid') == target_uid_hm),
+                                            None
+                                        )
+                                    if target_conn_hm:
+                                        try:
+                                            target_conn_hm.sendall(json.dumps({
+                                                'action': CMD_FORCE_MUTED,
+                                            }).encode('utf-8'))
+                                        except Exception:
+                                            pass
 
                     except json.JSONDecodeError:
                         break

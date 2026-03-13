@@ -57,6 +57,7 @@ from config import (
     WEBRTC_ICE_TIMEOUT,
     CMD_SERVER_MIGRATE,
     CMD_QUICK_MSG, QUICK_MSG_MAX_LEN,
+    CMD_HOST_MUTE, CMD_FORCE_MUTED,
 )
 
 MAX_SILENT_RECONNECT_ATTEMPTS = 4
@@ -127,6 +128,11 @@ class NetworkClient(QObject):
     join_room_denied     = pyqtSignal(str, str)   # room, reason
     channel_auth_ok      = pyqtSignal(str)        # channel_name
     channel_list_updated = pyqtSignal(list)       # list[dict]
+
+    # ── Принудительный мут от хоста ─────────────────────────────────────────
+    # Эмитируется когда сервер прислал CMD_FORCE_MUTED (хост заглушил нас).
+    # MainWindow подключается и блокирует кнопки mic + deaf.
+    force_muted = pyqtSignal()
 
     def __init__(self, audio):
         super().__init__()
@@ -1126,6 +1132,12 @@ class NetworkClient(QObject):
             if text:
                 self.quick_msg_received.emit(sender_uid, from_nick, text)
 
+        # ── Принудительный мут от хоста ───────────────────────────────────
+        elif act == CMD_FORCE_MUTED:
+            # Сервер прислал нам команду «хост тебя заглушил».
+            # Эмитируем сигнал — MainWindow применит mute + deaf и заблокирует кнопки.
+            self.force_muted.emit()
+
         # ── Миграция сервера (встроенный режим) ────────────────────────────
         elif act == CMD_SERVER_MIGRATE:
             new_host_uid = msg.get('new_host_uid', 0)
@@ -1241,6 +1253,14 @@ class NetworkClient(QObject):
         if not text:
             return
         self.send_json({'action': CMD_QUICK_MSG, 'text': text})
+
+    def send_host_mute(self, target_uid: int) -> None:
+        """
+        Хост принудительно заглушает участника (mic + deaf).
+        Сервер проверит что мы действительно host_order[0].
+        Снять мут через эту команду нельзя — намеренное ограничение.
+        """
+        self.send_json({'action': CMD_HOST_MUTE, 'target_uid': int(target_uid)})
 
     def _nudge_get_endpoint_vol(self):
         """

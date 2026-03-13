@@ -23,7 +23,7 @@ from audio_engine import PYRNNOISE_AVAILABLE
 # 7 секунд MP3 @ 128kbps ≈ 112 KB, @ 320kbps ≈ 280 KB.
 # 1 MB с большим запасом перекрывает любой типичный 7-секундный звук.
 CUSTOM_SOUND_MAX_BYTES = 1 * 1024 * 1024   # 1 MB
-CUSTOM_SOUND_SLOTS     = 4                  # количество кастомных слотов
+CUSTOM_SOUND_SLOTS     = 6                  # количество кастомных слотов
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -53,6 +53,11 @@ def _vol_to_slider(vol: float) -> int:
     if vol <= 0.0:
         return 0
     return max(0, min(200, int(math.log10(vol) * 100 + 100)))
+
+# Громкость буста: применяется сверх максимума слайдера (10x = +20 дБ).
+# 15x ≈ +23.5 дБ — заметный прирост для тихих микрофонов; ограничен
+# soft-limiter'ом в аудио-движке, поэтому клиппинга не будет.
+_BOOST_VOL = 15.0
 from version import APP_VERSION, APP_NAME, APP_AUTHOR,QA_TESTERS, APP_YEAR, ABOUT_TEXT, GITHUB_REPO
 
 
@@ -605,7 +610,7 @@ class UserOverlayPanel(QFrame):
 
     def __init__(self, nick: str, current_vol: float, uid: int, audio_handler, global_pos,
                  parent=None, is_streaming: bool = False, on_watch_stream=None,
-                 net=None, on_transfer_server=None):
+                 net=None, on_transfer_server=None, on_host_mute=None):
         super().__init__(
             parent,
             Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint
@@ -617,6 +622,7 @@ class UserOverlayPanel(QFrame):
         self._on_watch_stream = on_watch_stream
         self._net = net
         self._on_transfer_server = on_transfer_server
+        self._on_host_mute = on_host_mute
 
         # ── Прозрачность окна + рисуем фон сами в paintEvent ─────────────────
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -686,6 +692,17 @@ class UserOverlayPanel(QFrame):
         vol_row.addWidget(self.sl_vol)
         vol_row.addWidget(self.lbl_vol)
         card_lay.addLayout(vol_row)
+
+        # ── Загружаем состояние буста (персистентное между сессиями) ─────────
+        _s_boost = QSettings("MyVoiceChat", "GlobalSettings")
+        self._is_boosted: bool = _s_boost.value(f"vol_boost_{uid}", "false") == "true"
+        if self._is_boosted:
+            # Слайдер визуально показывает максимум, но неактивен
+            self.sl_vol.blockSignals(True)
+            self.sl_vol.setValue(200)
+            self.sl_vol.blockSignals(False)
+            self.sl_vol.setEnabled(False)
+            self.lbl_vol.setText("⚡")
 
         # ── Разделитель ───────────────────────────────────────────────────────
         sep = QFrame()
@@ -758,6 +775,32 @@ class UserOverlayPanel(QFrame):
         )
         self._lbl_whisper_hint.setStyleSheet(self._lbl_whisper_hint_idle_style)
         card_lay.addWidget(self._lbl_whisper_hint)
+
+        # ── Кнопка: Буст звука ────────────────────────────────────────────────
+        # Устанавливает громкость 15x (+23.5 дБ) для тихих пользователей.
+        # При активации слайдер блокируется. Состояние сохраняется в QSettings.
+        sep_b = QFrame()
+        sep_b.setFrameShape(QFrame.Shape.HLine)
+        sep_b.setStyleSheet(
+            "background: rgba(255,255,255,0.08); border: none; max-height: 1px;"
+        )
+        sep_b.setMaximumHeight(1)
+        card_lay.addWidget(sep_b)
+
+        self.btn_boost = self._make_btn("⚡  Буст звука", checkable=True, checked=self._is_boosted)
+        self.btn_boost.setStyleSheet(self.btn_boost.styleSheet() + """
+            QPushButton:checked {
+                background-color: rgba(255, 200, 0, 0.25);
+                border-color: rgba(255, 190, 0, 0.70);
+                color: #ffe066;
+            }
+            QPushButton:not(:checked):hover {
+                background-color: rgba(255, 200, 0, 0.10);
+                border-color: rgba(255, 190, 0, 0.40);
+            }
+        """)
+        self.btn_boost.clicked.connect(self._on_toggle_boost)
+        card_lay.addWidget(self.btn_boost)
 
         # ── Кнопка: Пнуть (Nudge) — удержание 3 секунды ─────────────────────
         # NudgeHoldButton: заполняется оранжевым за 3 с, только тогда отправляет.
@@ -876,6 +919,34 @@ class UserOverlayPanel(QFrame):
             """)
             self.btn_transfer_server.clicked.connect(self._on_transfer_server_clicked)
             card_lay.addWidget(self.btn_transfer_server)
+
+        # ── Кнопка: Выключить микрофон участника (только хост) ───────────────
+        # Видна только хосту. Выключает только микрофон цели — уши не трогает.
+        # Участник может включить микрофон обратно сам в любой момент.
+        if self._on_host_mute is not None:
+            sep_hm = QFrame()
+            sep_hm.setFrameShape(QFrame.Shape.HLine)
+            sep_hm.setStyleSheet(
+                "background: rgba(255,255,255,0.08); border: none; max-height: 1px;"
+            )
+            sep_hm.setMaximumHeight(1)
+            card_lay.addWidget(sep_hm)
+
+            self.btn_host_mute = self._make_btn("🎤  Выключить микрофон")
+            self.btn_host_mute.setStyleSheet(self.btn_host_mute.styleSheet() + """
+                QPushButton { border-color: rgba(220,60,60,0.45); color: #ff9090; }
+                QPushButton:hover {
+                    background-color: rgba(220,60,60,0.18);
+                    border-color: rgba(220,60,60,0.80);
+                }
+                QPushButton:pressed {
+                    background-color: rgba(220,60,60,0.35);
+                    color: #ffffff;
+                }
+            """)
+            self.btn_host_mute.clicked.connect(self._on_host_mute_clicked)
+            card_lay.addWidget(self.btn_host_mute)
+
         # Это гарантирует, что место под hint уже учтено и панель
         # не будет прыгать при появлении текста.
         self.adjustSize()
@@ -945,6 +1016,51 @@ class UserOverlayPanel(QFrame):
     def _on_toggle_mute(self):
         state = self.audio.toggle_user_mute(self.uid)
         self.btn_mute.setText("🔊  Разглушить" if state else "🔇  Заглушить")
+
+    def _on_toggle_boost(self, checked: bool):
+        """
+        Активирует / деактивирует буст громкости пользователя.
+
+        Логика:
+          ВКЛ: сохраняем текущий слайдер в QSettings (vol_pre_boost_{uid}),
+               ставим флаг vol_boost_{uid}="true", применяем _BOOST_VOL (15x).
+               Слайдер блокируется — случайное движение мышью его не сбросит.
+          ВЫКЛ: восстанавливаем сохранённый слайдер, удаляем ключи буста,
+                разблокируем слайдер и применяем соответствующую громкость.
+
+        Ключи QSettings (GlobalSettings / MyVoiceChat):
+          vol_boost_{uid}      — "true" / "false"
+          vol_pre_boost_{uid}  — int-значение слайдера перед бустом (0-200)
+
+        Громкость также сохраняется через audio.set_user_volume() в vol_ip_{ip}
+        по обычному механизму — совместимость с register_ip_mapping().
+        """
+        _s = QSettings("MyVoiceChat", "GlobalSettings")
+        self._is_boosted = checked
+        if checked:
+            # Сохраняем текущий уровень слайдера перед бустом
+            _s.setValue(f"vol_pre_boost_{self.uid}", self.sl_vol.value())
+            _s.setValue(f"vol_boost_{self.uid}", "true")
+            # Слайдер: визуально в максимум, сигналы заблокированы
+            self.sl_vol.blockSignals(True)
+            self.sl_vol.setValue(200)
+            self.sl_vol.blockSignals(False)
+            self.sl_vol.setEnabled(False)
+            self.lbl_vol.setText("⚡")
+            # Применяем буст — выше потолка слайдера (10x)
+            self.audio.set_user_volume(self.uid, _BOOST_VOL)
+        else:
+            # Восстанавливаем громкость до буста
+            pre_slider = int(_s.value(f"vol_pre_boost_{self.uid}", 100))
+            _s.setValue(f"vol_boost_{self.uid}", "false")
+            _s.remove(f"vol_pre_boost_{self.uid}")
+            self.sl_vol.setEnabled(True)
+            self.sl_vol.blockSignals(True)
+            self.sl_vol.setValue(pre_slider)
+            self.sl_vol.blockSignals(False)
+            self.lbl_vol.setText("🔇" if pre_slider == 0 else f"{pre_slider}%")
+            # Применяем восстановленную громкость
+            self.audio.set_user_volume(self.uid, _slider_to_vol(pre_slider))
 
     def _on_whisper_press(self):
         """Начинаем шёпот при нажатии."""
@@ -1079,6 +1195,17 @@ class UserOverlayPanel(QFrame):
         self.close()
         if self._on_transfer_server is not None:
             self._on_transfer_server()
+
+    def _on_host_mute_clicked(self):
+        """
+        Хост нажал «🎤 Выключить микрофон».
+        Закрываем popup до вызова callback — Popup-тип перехватывает
+        события мыши и может помешать последующим диалогам.
+        Участник может включить микрофон обратно сам в любой момент.
+        """
+        self.close()
+        if self._on_host_mute is not None:
+            self._on_host_mute()
 
     def hideEvent(self, event):
         """Если панель закрылась пока шептали — останавливаем шёпот."""
@@ -1999,7 +2126,8 @@ class SettingsDialog(QDialog):
         bitrate_options = {
             "24 kbps (Рация)": 24,
             "48 kbps (Стандарт)": 48,
-            "64 kbps (Хорошее)": 64
+            "64 kbps (Хорошее)": 64,
+            "128 kbps (Лучшее)": 128
         }
         for text, val in bitrate_options.items():
             self.cb_bitrate.addItem(text, val)
