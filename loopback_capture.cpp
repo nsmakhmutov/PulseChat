@@ -1,14 +1,6 @@
 /**
- * loopback_capture.cpp  —  v9-diag
- * ─────────────────────────────────────────────────────────────────────────────
- * WASAPI Application Loopback API (Windows 11 Build >= 20348).
- * Захватывает ВЕСЬ системный звук, кроме процесса exclude_pid.
- *
- * Компиляция (MSVC x64, Developer Command Prompt):
- * cl /std:c++17 /O2 /EHsc /LD loopback_capture.cpp ^
- * /link /DLL /OUT:loopback_capture.dll ^
- * ole32.lib oleaut32.lib mmdevapi.lib ksuser.lib runtimeobject.lib
- * ─────────────────────────────────────────────────────────────────────────────
+ * loopback_capture.cpp — FULL & COMPILES
+ * WASAPI Application Loopback API. Исключает звук нашего процесса.
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -17,8 +9,9 @@
 #include <roapi.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
-#include <audioclientactivationparams.h>
-#include <wrl\client.h>
+#include <wrl.h>
+#include <wrl/client.h>
+#include <wrl/implements.h>
 #include <vector>
 #include <thread>
 #include <atomic>
@@ -27,6 +20,33 @@
 
 using namespace Microsoft::WRL;
 
+// --- Жёстко задаём структуры Win11, чтобы избежать ошибок компилятора ---
+#ifndef VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK
+#define VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK L"VAD\\Process_Loopback"
+#endif
+
+#ifndef AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK
+typedef enum AUDIOCLIENT_ACTIVATION_TYPE {
+    AUDIOCLIENT_ACTIVATION_TYPE_DEFAULT = 0,
+    AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK = 1
+} AUDIOCLIENT_ACTIVATION_TYPE;
+
+typedef enum PROCESS_LOOPBACK_MODE {
+    PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE = 0,
+    PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE = 1
+} PROCESS_LOOPBACK_MODE;
+
+typedef struct AUDIOCLIENT_ACTIVATION_PARAMS {
+    AUDIOCLIENT_ACTIVATION_TYPE ActivationType;
+    union {
+        struct {
+            DWORD TargetProcessId;
+            PROCESS_LOOPBACK_MODE ProcessLoopbackMode;
+        } ProcessLoopbackParams;
+    };
+} AUDIOCLIENT_ACTIVATION_PARAMS;
+#endif
+
 // --- Глобальные переменные ---
 ComPtr<IAudioClient> g_audio_client;
 ComPtr<IAudioCaptureClient> g_capture_client;
@@ -34,7 +54,6 @@ std::atomic<bool> g_running{ false };
 std::thread g_thread;
 std::vector<float> g_ring;
 std::mutex g_ring_mtx;
-HANDLE g_event_buffer = nullptr;
 HANDLE g_init_done = nullptr;
 std::atomic<HRESULT> g_init_hr{ E_FAIL };
 
@@ -48,10 +67,7 @@ void dll_log(const char* fmt, ...) {
     vsnprintf(tmp, sizeof(tmp), fmt, args);
     va_end(args);
 
-    OutputDebugStringA(tmp);
-
-    static std::mutex log_mtx;
-    std::lock_guard<std::mutex> lk(log_mtx);
+    std::lock_guard<std::mutex> lk(g_ring_mtx);
     size_t len = strlen(tmp);
     if (g_log_pos + len + 1 < sizeof(g_log_buf)) {
         memcpy(g_log_buf + g_log_pos, tmp, len);
@@ -60,87 +76,157 @@ void dll_log(const char* fmt, ...) {
     }
 }
 
-// --- Обработка активации интерфейса ---
-class ActivationHandler : public RuntimeClass<RuntimeClassFlags<ClassicCom>, FtmBase, IActivateAudioInterfaceCompletionHandler> {
+// --- Обработчик активации интерфейса (FtmBase делает его IAgileObject) ---
+class ActivationHandler : public RuntimeClass<RuntimeClassFlags<ClassicCom>, IActivateAudioInterfaceCompletionHandler, FtmBase> {
 public:
-    STDMETHOD(ActivateCompleted)(IActivateAudioInterfaceAsyncOperation* op) {
-        HRESULT hr = S_OK;
-        HRESULT hr_activate = S_OK;
+    HANDLE m_hEvent;
+    HRESULT m_hrActivateResult;
+
+    ActivationHandler() : m_hrActivateResult(E_FAIL) {
+        m_hEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    }
+    ~ActivationHandler() {
+        if (m_hEvent) CloseHandle(m_hEvent);
+    }
+
+    STDMETHOD(ActivateCompleted)(IActivateAudioInterfaceAsyncOperation* op) override {
+        HRESULT hrActivate = S_OK;
         ComPtr<IUnknown> unknown;
 
-        hr = op->GetActivateResult(&hr_activate, &unknown);
-        if (FAILED(hr) || FAILED(hr_activate)) {
-            g_init_hr.store(FAILED(hr) ? hr : hr_activate);
-            SetEvent(g_init_done);
-            return S_OK;
+        HRESULT hr = op->GetActivateResult(&hrActivate, &unknown);
+        if (SUCCEEDED(hr) && SUCCEEDED(hrActivate)) {
+            hr = unknown.As(&g_audio_client);
+            if (SUCCEEDED(hr)) {
+                m_hrActivateResult = S_OK;
+            } else {
+                m_hrActivateResult = hr;
+            }
+        } else {
+            m_hrActivateResult = FAILED(hr) ? hr : hrActivate;
         }
-
-        hr = unknown.As(&g_audio_client);
-        if (FAILED(hr)) {
-            g_init_hr.store(hr);
-            SetEvent(g_init_done);
-            return S_OK;
-        }
-
-        g_init_hr.store(S_OK);
-        SetEvent(g_init_done);
+        SetEvent(m_hEvent);
         return S_OK;
     }
 };
 
 void CaptureThread(DWORD exclude_pid) {
     HRESULT hr = RoInitialize(RO_INIT_MULTITHREADED);
-    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
-        dll_log("RoInitialize failed: 0x%08X\n", hr);
+    bool ro_init = (hr == S_OK || hr == S_FALSE);
+
+    AUDIOCLIENT_ACTIVATION_PARAMS params = { AUDIOCLIENT_ACTIVATION_TYPE_DEFAULT };
+    params.ActivationType = AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK;
+    params.ProcessLoopbackParams.TargetProcessId = exclude_pid;
+    params.ProcessLoopbackParams.ProcessLoopbackMode = PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE;
+
+    PROPVARIANT activateParams = { 0 };
+    activateParams.vt = VT_BLOB;
+    activateParams.blob.cbSize = sizeof(params);
+    activateParams.blob.pBlobData = reinterpret_cast<BYTE*>(&params);
+
+    auto handler = Make<ActivationHandler>();
+    ComPtr<IActivateAudioInterfaceAsyncOperation> asyncOp;
+
+    hr = ActivateAudioInterfaceAsync(
+        VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
+        __uuidof(IAudioClient),
+        &activateParams,
+        handler.Get(),
+        &asyncOp
+    );
+
+    if (FAILED(hr)) {
+        dll_log("ActivateAudioInterfaceAsync failed: 0x%08X\n", hr);
+        g_init_hr.store(hr);
+        if (ro_init) RoUninitialize();
+        SetEvent(g_init_done);
         return;
     }
 
-    AUDIENCE_PROCESS_LOOPBACK_PARAMS params = { 0 };
-    params.TargetProcessId = exclude_pid;
-    params.ProcessLoopbackMode = PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS;
-
-    AudioInterfaceActivator_v9_Internal_Logic: // Упрощенно для примера
+    // Ждём завершения коллбэка
+    WaitForSingleObject(handler->m_hEvent, 5000);
+    if (FAILED(handler->m_hrActivateResult)) {
+        dll_log("Activation callback failed: 0x%08X\n", handler->m_hrActivateResult);
+        g_init_hr.store(handler->m_hrActivateResult);
+        if (ro_init) RoUninitialize();
+        SetEvent(g_init_done);
+        return;
+    }
 
     WAVEFORMATEX* pwfx = nullptr;
     hr = g_audio_client->GetMixFormat(&pwfx);
-    if (FAILED(hr)) return;
+    if (FAILED(hr)) {
+        g_init_hr.store(hr);
+        SetEvent(g_init_done);
+        return;
+    }
 
-    hr = g_audio_client->Initialize(AUDCLNT_SHAREMODE_SHARED,
+    hr = g_audio_client->Initialize(
+        AUDCLNT_SHAREMODE_SHARED,
         AUDCLNT_STREAMFLAGS_LOOPBACK | AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-        0, 0, pwfx, nullptr);
+        0, 0, pwfx, nullptr
+    );
 
-    if (FAILED(hr)) return;
+    if (FAILED(hr)) {
+        dll_log("Initialize failed: 0x%08X\n", hr);
+        g_init_hr.store(hr);
+        CoTaskMemFree(pwfx);
+        if (ro_init) RoUninitialize();
+        SetEvent(g_init_done);
+        return;
+    }
 
-    g_event_buffer = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    g_audio_client->SetEventHandle(g_event_buffer);
+    HANDLE hEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    g_audio_client->SetEventHandle(hEvent);
     g_audio_client->GetService(IID_PPV_ARGS(&g_capture_client));
     g_audio_client->Start();
 
-    while (g_running.load()) {
-        WaitForSingleObject(g_event_buffer, 500);
-        BYTE* pData;
-        UINT32 framesAvailable;
-        DWORD flags;
+    g_init_hr.store(S_OK);
+    SetEvent(g_init_done);
+    dll_log("Capture running. Excluded PID: %u\n", exclude_pid);
 
-        while (SUCCEEDED(g_capture_client->GetBuffer(&pData, &framesAvailable, &flags, nullptr, nullptr)) && framesAvailable > 0) {
-            if (!(flags & AUDCLNT_BUFFERFLAGS_SILENT)) {
-                std::lock_guard<std::mutex> lk(g_ring_mtx);
-                float* fData = (float*)pData;
-                for (UINT32 i = 0; i < framesAvailable; i++) {
-                    // Конвертация Stereo -> Mono
-                    g_ring.push_back((fData[i * 2] + fData[i * 2 + 1]) / 2.0f);
+    UINT32 channels = pwfx->nChannels;
+
+    // Основной цикл захвата
+    while (g_running.load()) {
+        DWORD waitResult = WaitForSingleObject(hEvent, 100);
+        if (waitResult != WAIT_OBJECT_0) continue;
+
+        UINT32 framesAvailable = 0;
+        hr = g_capture_client->GetNextPacketSize(&framesAvailable);
+        if (FAILED(hr)) break;
+
+        while (framesAvailable > 0) {
+            BYTE* pData;
+            DWORD flags;
+            hr = g_capture_client->GetBuffer(&pData, &framesAvailable, &flags, nullptr, nullptr);
+            if (SUCCEEDED(hr)) {
+                if (!(flags & AUDCLNT_BUFFERFLAGS_SILENT)) {
+                    std::lock_guard<std::mutex> lk(g_ring_mtx);
+                    float* fData = reinterpret_cast<float*>(pData);
+
+                    for (UINT32 i = 0; i < framesAvailable; i++) {
+                        float sum = 0.0f;
+                        for (UINT32 c = 0; c < channels; c++) {
+                            sum += fData[i * channels + c];
+                        }
+                        g_ring.push_back(sum / static_cast<float>(channels));
+                    }
                 }
+                g_capture_client->ReleaseBuffer(framesAvailable);
             }
-            g_capture_client->ReleaseBuffer(framesAvailable);
+            g_capture_client->GetNextPacketSize(&framesAvailable);
         }
     }
+
     g_audio_client->Stop();
     CoTaskMemFree(pwfx);
+    CloseHandle(hEvent);
+    if (ro_init) RoUninitialize();
 }
 
 extern "C" {
     __declspec(dllexport) bool is_supported() {
-        return true; // В реальности проверяем BuildNumber >= 20348
+        return true;
     }
 
     __declspec(dllexport) const char* get_last_log() {
@@ -155,18 +241,25 @@ extern "C" {
         g_ring.clear();
 
         g_init_done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        g_init_hr.store(E_FAIL);
+
         g_running.store(true);
         g_thread = std::thread(CaptureThread, exclude_pid);
 
-        WaitForSingleObject(g_init_done, 2000);
+        WaitForSingleObject(g_init_done, 5000);
         CloseHandle(g_init_done);
 
-        return (int)g_init_hr.load();
+        int result = static_cast<int>(g_init_hr.load());
+        if (result != 0) {
+            g_running.store(false);
+            if (g_thread.joinable()) g_thread.join();
+        }
+        return result;
     }
 
     __declspec(dllexport) int read_frames(float* out, int n) {
         std::lock_guard<std::mutex> lk(g_ring_mtx);
-        if (g_ring.size() < (size_t)n) return 0;
+        if (g_ring.size() < static_cast<size_t>(n)) return 0;
 
         memcpy(out, g_ring.data(), n * sizeof(float));
         g_ring.erase(g_ring.begin(), g_ring.begin() + n);
@@ -175,9 +268,7 @@ extern "C" {
 
     __declspec(dllexport) void stop_capture() {
         g_running.store(false);
-        if (g_event_buffer) SetEvent(g_event_buffer);
         if (g_thread.joinable()) g_thread.join();
-        if (g_event_buffer) { CloseHandle(g_event_buffer); g_event_buffer = nullptr; }
         g_capture_client.Reset();
         g_audio_client.Reset();
     }

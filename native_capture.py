@@ -1,5 +1,5 @@
 """
-native_capture.py — v6
+native_capture.py
 Python-обёртка над loopback_capture.dll.
 """
 
@@ -16,7 +16,14 @@ except ImportError:
         base = getattr(sys, "_MEIPASS", os.path.abspath("."))
         return os.path.join(base, rel)
 
+
 class NativeLoopbackCapture:
+    @staticmethod
+    def dll_available() -> bool:
+        """Проверяет физическое наличие DLL перед её загрузкой."""
+        dll_path = resource_path(os.path.join("dlls", "loopback_capture.dll"))
+        return os.path.exists(dll_path)
+
     def __init__(self):
         self._lib: Optional[ctypes.CDLL] = None
         self._last_err: str = ""
@@ -49,7 +56,8 @@ class NativeLoopbackCapture:
         res = self._lib.init_capture(ctypes.c_uint32(exclude_pid))
         if res != 0:
             log = self._lib.get_last_log().decode('utf-8', errors='replace')
-            print(f"[NativeCapture] Ошибка init (HRESULT {hex(res & 0xFFFFFFFF)}): {log}")
+            self._last_err = f"HRESULT {hex(res & 0xFFFFFFFF)}"
+            print(f"[NativeCapture] Ошибка init ({self._last_err}): {log}")
             return False
         return True
 
@@ -64,3 +72,7 @@ class NativeLoopbackCapture:
 
     def get_last_error(self) -> str:
         return self._last_err
+
+    def get_dll_log(self) -> str:
+        if not self._lib: return ""
+        return self._lib.get_last_log().decode('utf-8', errors='replace')
