@@ -1335,8 +1335,10 @@ class AudioHandler(QObject):
         self.dfn_available = False  # Инициализируем до try — на случай непредвиденного исключения
 
         # nr_mode: 0=выкл, 1=RNNoise, 2=DeepFilterNet
-        # По умолчанию 0 — пользователь сам выбирает в настройках.
-        self.nr_mode = int(self.global_settings.value("audio/nr_mode", 0))
+        # По умолчанию 1 (RNNoise) для новых установок — хорошее качество
+        # без тяжёлых зависимостей. Если pyrnnoise недоступен — откат на 0
+        # без записи в QSettings (при следующей установке библиотеки включится сам).
+        self.nr_mode = int(self.global_settings.value("audio/nr_mode", 1))
 
         # 1. Сначала пробуем инициализировать DeepFilterNet
         try:
@@ -1354,6 +1356,14 @@ class AudioHandler(QObject):
                 print("[Audio] RNNoise инициализирован.")
             except Exception as e:
                 print(f"[Audio] Ошибка RNNoise: {e}")
+
+        # Защита: дефолт nr_mode=1, но библиотека недоступна → откат на 0
+        if self.nr_mode == 1 and not PYRNNOISE_AVAILABLE:
+            print("[Audio] RNNoise недоступен, шумоподавление отключено.")
+            self.nr_mode = 0
+        elif self.nr_mode == 2 and not self.dfn_available:
+            print("[Audio] DeepFilterNet недоступен, откат на RNNoise.")
+            self.nr_mode = 1 if PYRNNOISE_AVAILABLE else 0
 
         self.incoming_packets = queue.Queue(maxsize=500)
         self.send_queue = queue.Queue(maxsize=100)
@@ -1948,11 +1958,11 @@ class AudioHandler(QObject):
                     self.pending_volumes[uid] = saved_vol
 
     def set_user_volume(self, uid, vol):
-        # FIX: Зажимаем в [0.0 … 10.0].
-        # Слайдер 0-200 → экспоненциальная кривая → max = 10^((200-100)/100) = 10.0.
-        # Старый клэмп min(2.0, ...) обрезал slider=200 до 2.0, которое обратно
-        # конвертировалось в _vol_to_slider(2.0) = 130 → пользователь видел 130 вместо 200.
-        vol = max(0.0, min(10.0, float(vol)))
+        # Зажимаем в [0.0 … 20.0].
+        # Слайдер 0-200 → экспоненциальная кривая → max = 10.0 (слайдер 200).
+        # Верхняя граница 20.0 оставляет запас для «Буст звука» (_BOOST_VOL=15x).
+        # Soft-limiter в audio_callback (0.95-нормализация) защищает от клиппинга.
+        vol = max(0.0, min(20.0, float(vol)))
         emit_zero_state = None  # None = состояние не изменилось
 
         with self.users_lock:

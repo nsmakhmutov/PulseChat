@@ -547,6 +547,9 @@ class MainWindow(QMainWindow):
         self.net.nudge_received.connect(self._on_nudge_received)
         self.net.nudge_triggered.connect(self._on_nudge_triggered)
 
+        # Хост выключил наш микрофон
+        self.net.force_muted.connect(self._on_force_muted)
+
         # ABR-сигнал (bitrate_adjusted) удалён: WebRTC управляет битрейтом через TWCC.
         # _stream_conn_lbl оставлен в UI — будет подключён к WebRTC getStats() позже.
 
@@ -1881,10 +1884,30 @@ class MainWindow(QMainWindow):
         else:
             self.play_notification("mute" if is_d else "unmute")
 
+    def _on_force_muted(self):
+        """
+        Хост выключил наш микрофон (CMD_FORCE_MUTED от сервера).
+        Только mic off — уши не трогаем, динамики остаются включены.
+        Кнопки НЕ блокируются — участник может нажать mic и включить
+        микрофон обратно в любой момент.
+        """
+        if not self.audio.is_muted:
+            self.btn_mute.setChecked(True)
+            self.toggle_mute()
+        # Тост над нижней панелью
+        self._sb_toast.setText("🎤  Хост выключил ваш микрофон")
+        self._sb_toast.adjustSize()
+        tw = self._sb_toast.width()
+        tx = (self.width() - tw) // 2
+        ty = self._bottom_bar.y() - self._sb_toast.height() - 28
+        self._sb_toast.move(tx, max(4, ty))
+        self._sb_toast.raise_()
+        self._sb_toast.setVisible(True)
+        self._sb_toast_timer.start()
+
     def on_connected(self, msg):
         try:
             self.audio.my_uid = msg['uid']
-
             self.audio.start(
                 self.app_settings.value("device_in_name"),
                 self.app_settings.value("device_out_name")
@@ -2034,7 +2057,10 @@ class MainWindow(QMainWindow):
                 if is_host:
                     _font_host = QFont(font_u)
                     _font_host.setBold(True)
+                    _font_host.setUnderline(True)
                     item_u.setFont(0, _font_host)
+                    # Убираем ведущие пробелы — подчёркивание начинается с первой буквы
+                    item_u.setText(0, u['nick'])
                 else:
                     item_u.setFont(0, font_u)
                 item_u.setData(0, Qt.ItemDataRole.UserRole, uid)
@@ -2302,6 +2328,12 @@ class MainWindow(QMainWindow):
                 if self._is_server_host() and uid != self.audio.my_uid
                 else None
             ),
+            # Выключить микрофон: только хост, участник может включить сам
+            on_host_mute=(
+                (lambda _uid=uid: self.net.send_host_mute(_uid))
+                if self._is_server_host() and uid != self.audio.my_uid
+                else None
+            ),
         ).show()
 
     def _is_server_host(self) -> bool:
@@ -2492,7 +2524,7 @@ class MainWindow(QMainWindow):
         # а не относительно окна → тост позиционировался почти у заголовка.
         tw = self._sb_toast.width()
         tx = (self.width() - tw) // 2
-        ty = self._bottom_bar.y() - self._sb_toast.height() - 8
+        ty = self._bottom_bar.y() - self._sb_toast.height() - 28
         self._sb_toast.move(tx, max(4, ty))
         self._sb_toast.raise_()
         self._sb_toast.setVisible(True)
