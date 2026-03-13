@@ -3048,36 +3048,12 @@ class StreamSettingsDialog(QDialog):
         sep.setStyleSheet("color: gray; font-size: 11px;")
         layout.addWidget(sep)
 
-        self.cb_stream_audio = QCheckBox("🔊 Транслировать звук")
+        self.cb_stream_audio = QCheckBox("🔊 Транслировать звук системы")
         self.cb_stream_audio.setChecked(False)
+        self.cb_stream_audio.setToolTip(
+            "Звук приложения и ваши голоса будут автоматически исключены из трансляции"
+        )
         layout.addWidget(self.cb_stream_audio)
-
-        self._vbc_banner = QLabel()
-        self._vbc_banner.setWordWrap(True)
-        self._vbc_banner.setStyleSheet("border-radius: 6px; padding: 8px; font-size: 12px;")
-        layout.addWidget(self._vbc_banner)
-
-        self._btn_vbc_install = QPushButton("⬇  Установить VB-CABLE")
-        self._btn_vbc_install.setStyleSheet(
-            "background-color: #e67e22; color: white; font-weight: bold; height: 34px;"
-        )
-        self._btn_vbc_install.clicked.connect(self._on_install_vbcable)
-        layout.addWidget(self._btn_vbc_install)
-
-        self._hint_lbl = QLabel(
-            "💡 Направьте вывод игры/плеера на «CABLE Input»\n"
-            "    (Настройки Windows → Звук → Приложения)\n"
-            "    Ваши наушники оставьте основным устройством."
-        )
-        self._hint_lbl.setStyleSheet(
-            "background-color: #1a5276; color: #aed6f1; "
-            "border-radius: 6px; padding: 8px; font-size: 11px;"
-        )
-        self._hint_lbl.setWordWrap(True)
-        layout.addWidget(self._hint_lbl)
-
-        self._refresh_vbc_ui()
-        self.cb_stream_audio.toggled.connect(self._on_audio_toggled)
 
         layout.addSpacing(8)
 
@@ -3118,85 +3094,6 @@ class StreamSettingsDialog(QDialog):
         layout.addWidget(btn_cancel)
 
         self.adjustSize()
-
-    def _refresh_vbc_ui(self):
-        try:
-            from vbcable_installer import is_vbcable_installed, find_zip
-            installed = is_vbcable_installed()
-        except ImportError:
-            installed = False
-            find_zip = lambda: None
-
-        audio_on = self.cb_stream_audio.isChecked()
-
-        if installed:
-            self._vbc_banner.setText("✅  VB-CABLE установлен — захват без эха активен")
-            self._vbc_banner.setStyleSheet(
-                "background-color: #1e8449; color: #a9dfbf; "
-                "border-radius: 6px; padding: 8px; font-size: 12px;"
-            )
-            self._btn_vbc_install.setVisible(False)
-            self._hint_lbl.setVisible(audio_on)
-        else:
-            try:
-                from vbcable_installer import find_zip
-                zip_found = find_zip() is not None
-            except ImportError:
-                zip_found = False
-
-            if zip_found:
-                self._vbc_banner.setText(
-                    "⚠  VB-CABLE не установлен.\n"
-                    "Архив найден в папке проекта — нажмите кнопку ниже."
-                )
-                self._btn_vbc_install.setEnabled(True)
-            else:
-                self._vbc_banner.setText(
-                    "⚠  VB-CABLE не установлен.\n"
-                    "Без него звук стрима будет захватываться через WASAPI Loopback\n"
-                    "и зрители могут слышать эхо своего голоса.\n\n"
-                    "Скачайте VBCABLE_Driver_Pack45.zip с vb-audio.com\n"
-                    "и положите его в папку с программой."
-                )
-                self._btn_vbc_install.setEnabled(False)
-
-            self._vbc_banner.setStyleSheet(
-                "background-color: #7d6608; color: #fef9e7; "
-                "border-radius: 6px; padding: 8px; font-size: 12px;"
-            )
-            self._btn_vbc_install.setVisible(True)
-            self._hint_lbl.setVisible(False)
-
-        self._vbc_banner.setVisible(audio_on)
-        self._btn_vbc_install.setVisible(
-            audio_on and not installed and self._btn_vbc_install.isVisible()
-        )
-        self._hint_lbl.setVisible(audio_on and installed)
-        self.adjustSize()
-
-    def _on_audio_toggled(self, checked):
-        self._refresh_vbc_ui()
-
-    def _on_install_vbcable(self):
-        try:
-            from vbcable_installer import install_vbcable, find_zip
-        except ImportError:
-            from PyQt6.QtWidgets import QMessageBox
-            QMessageBox.critical(self, "VB-CABLE",
-                "Модуль vbcable_installer.py не найден рядом с программой.")
-            return
-
-        from PyQt6.QtWidgets import QMessageBox
-        self._btn_vbc_install.setEnabled(False)
-        self._btn_vbc_install.setText("Устанавливаю…")
-        success, msg = install_vbcable()
-        if success:
-            QMessageBox.information(self, "VB-CABLE", msg)
-        else:
-            QMessageBox.warning(self, "VB-CABLE — ошибка", msg)
-        self._btn_vbc_install.setEnabled(True)
-        self._btn_vbc_install.setText("⬇  Установить VB-CABLE")
-        self._refresh_vbc_ui()
 
     def get_settings(self):
         res_text = self.res_combo.currentText()

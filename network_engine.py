@@ -174,6 +174,9 @@ class NetworkClient(QObject):
         # RTCPeerConnection стримера (если текущий клиент стримит)
         self._streamer_pc = None
 
+        # SystemAudioTrack стримера (если stream_audio=True)
+        self._streamer_audio_track = None
+
         # RTCPeerConnection зрителя (если текущий клиент смотрит)
         self._viewer_pc   = None
 
@@ -694,14 +697,17 @@ class NetworkClient(QObject):
             print("[Net] start_streaming_webrtc: VideoEngine.start_streaming() вернул False")
             return
 
-        self._run_in_webrtc_loop(self._start_streaming_coro())
+        stream_audio = bool((settings or {}).get('stream_audio', False))
+        print(f"[Net] start_streaming_webrtc: stream_audio={stream_audio}")
+        self._run_in_webrtc_loop(self._start_streaming_coro(stream_audio))
 
-    async def _start_streaming_coro(self) -> None:
+    async def _start_streaming_coro(self, stream_audio: bool = False) -> None:
         """
         Корутина создания WebRTC PC стримера.
 
         Закрывает старый PC если был (переподключение без перезапуска).
         Добавляет DXCamTrack из VideoEngine.
+        Если stream_audio=True — добавляет SystemAudioTrack.
         Создаёт offer → ждёт ICE gathering → отправляет серверу.
         """
         if self._streamer_pc is not None:
@@ -709,6 +715,14 @@ class NetworkClient(QObject):
                 await self._streamer_pc.close()
             except Exception:
                 pass
+
+        # Останавливаем старый аудиотрек если был
+        if self._streamer_audio_track is not None:
+            try:
+                self._streamer_audio_track.stop()
+            except Exception:
+                pass
+            self._streamer_audio_track = None
 
         cfg = RTCConfiguration(iceServers=[])
         pc  = RTCPeerConnection(cfg)
@@ -721,6 +735,20 @@ class NetworkClient(QObject):
             return
 
         pc.addTrack(dxcam_track)
+        print("[Net] _start_streaming_coro: видеотрек добавлен")
+
+        # Добавляем аудиотрек если пользователь включил «Транслировать звук»
+        if stream_audio:
+            try:
+                from audio_engine import SystemAudioTrack
+                audio_track = SystemAudioTrack()
+                pc.addTrack(audio_track)
+                self._streamer_audio_track = audio_track
+                print("[Net] _start_streaming_coro: SystemAudioTrack добавлен в PC ✔")
+            except Exception as e:
+                print(f"[Net] _start_streaming_coro: ошибка создания SystemAudioTrack: {e}")
+        else:
+            print("[Net] _start_streaming_coro: stream_audio=False — аудиотрек не добавляется")
 
         @pc.on("icecandidate")
         def on_ice(candidate):
@@ -780,12 +808,20 @@ class NetworkClient(QObject):
     def stop_streaming_webrtc(self) -> None:
         """
         Останавливает WebRTC-стрим.
-        Закрывает PC стримера и останавливает DXCamTrack.
+        Закрывает PC стримера, останавливает DXCamTrack и SystemAudioTrack.
         Должен вызываться вместе с (или после) CMD_STREAM_STOP.
         """
         if self._streamer_pc is not None:
             self._run_in_webrtc_loop(self._close_pc_coro(self._streamer_pc))
             self._streamer_pc = None
+
+        if self._streamer_audio_track is not None:
+            try:
+                self._streamer_audio_track.stop()
+                print("[Net] stop_streaming_webrtc: SystemAudioTrack остановлен")
+            except Exception:
+                pass
+            self._streamer_audio_track = None
 
         if self.video:
             self.video.stop_streaming()

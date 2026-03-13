@@ -13,6 +13,9 @@ import time
 import ctypes
 import os
 
+# NativeLoopbackCapture импортируется лениво внутри StreamAudioCapture._try_dll()
+# чтобы DLL не грузилась при старте приложения — только когда нужен стрим.
+
 # ── FIX: RUST_LOG на уровне модуля — ДО любых DLL ───────────────────────────
 # Rust DLL читает RUST_LOG через GetEnvironmentVariableW (Win32 API).
 # Устанавливаем через ВСЕ возможные механизмы:
@@ -462,92 +465,47 @@ except ImportError:
     PYRNNOISE_AVAILABLE = False
     print("[Audio] Внимание: Модуль pyrnnoise не найден.")
 
-# pyaudiowpatch — форк PyAudio с официальным патчем WASAPI Loopback для Windows.
-# Содержит флаг isLoopbackDevice в device info — единственный надёжный способ
-# отличить loopback endpoint от реального микрофона.
-# Установка: pip install pyaudiowpatch
-try:
-    import pyaudiowpatch as _pyaudio
-    PYAUDIOWPATCH_AVAILABLE = True
-    print("[StreamAudio] pyaudiowpatch доступен — будет использован для WASAPI Loopback")
-except ImportError:
-    _pyaudio = None
-    PYAUDIOWPATCH_AVAILABLE = False
-    print("[StreamAudio] pyaudiowpatch не найден. "
-          "Для надёжного захвата системного звука: pip install pyaudiowpatch")
+
+
 
 
 class StreamAudioCapture:
     """
-    Захват системного аудио через WASAPI Loopback для трансляции зрителям.
+    Захват системного аудио для стрима → WebRTC.
 
-    Открывает loopback-поток на выбранном устройстве вывода Windows (динамики /
-    наушники), кодирует в Opus и кладёт готовые пакеты в send_queue с флагом
-    FLAG_STREAM_AUDIO. Зрители слышат именно то, что играет на экране стримера
-    (игры, музыку, системные звуки).
+    Два метода захвата с автоматическим fallback:
+      [0] loopback_capture.dll v8 (WASAPI Application Loopback API, Win 11+)
+          Захват ВСЕГО звука системы, кроме нашего процесса (exclude_pid).
+          Требует: Windows Build >= 20348, dlls/loopback_capture.dll.
+      [1] pyaudiowpatch WASAPI loopback
+          Захват звука дефолтного выходного устройства.
+          Работает на Windows 10/11, не требует спецдрайверов.
+          Недостаток: не исключает звук нашего приложения (но на практике
+          наше приложение в стрим-аудио не попадает т.к. оно тихое).
 
     Жизненный цикл:
-        capture = StreamAudioCapture(send_queue, lambda: audio.my_uid)
-        capture.start(device_idx=2)   # перед стримом
-        capture.stop()                # после остановки стрима
+        capture = StreamAudioCapture(pcm_callback)
+        capture.start()
+        # ... стрим идёт ...
+        capture.stop()
     """
 
-    def __init__(self, pcm_callback: "Callable[[np.ndarray], None] | None" = None):
+    def __init__(self, pcm_callback=None):
         """
-        pcm_callback(chunk: np.ndarray) — вызывается для каждого 20-мс PCM-фрейма
-        (float32, моно, CHUNK_SIZE сэмплов). Используется SystemAudioTrack для
-        подачи фреймов в WebRTC вместо кодирования Opus + UDP-отправки.
-        Если None — фреймы молча дропаются (захват работает, но данные никуда не идут).
+        pcm_callback(chunk: np.ndarray) — вызывается на каждый готовый
+        20-мс PCM-фрейм (float32, моно, CHUNK_SIZE=960 сэмплов).
         """
         self._pcm_callback = pcm_callback
-        self._running = threading.Event()
-        self._thread = None
-        self._native_sr: int = SAMPLE_RATE
+        self._running      = threading.Event()
+        self._thread       = None
 
-        # Промежуточный буфер для сборки точных 20ms фреймов (CHUNK_SIZE).
-        # Предаллоцируем с запасом 8× CHUNK_SIZE — ни разу не растём при обычной работе.
-        # self._pcm_len — логическая длина данных в буфере (не size буфера).
-        # Это устраняет np.concatenate (50x/сек) → 0 аллокаций в hot path.
-        self._pcm_buf = np.empty(CHUNK_SIZE * 8, dtype=np.float32)
-        self._pcm_len = 0
-        self._buffer_lock = threading.Lock()
-        # True когда захват идёт из CABLE Output (VB-CABLE).
-        # В этом режиме AEC полностью отключён — голосов в CABLE Output нет физически.
-        self._using_vbcable: bool = False
-
-        # Локальный мониторинг VB-CABLE: очередь сырых PCM-фреймов,
-        # которые параллельно с отправкой зрителям воспроизводятся
-        # в реальные наушники стримера.  None — мониторинг не запущен.
-        self._vbcable_monitor_queue: "queue.Queue | None" = None
-        # Громкость локального мониторинга: 1.0 = оригинал.
-        # Можно снизить если стример хочет слышать игру тише чем зрители.
-        self.monitor_volume: float = 1.0
-
-    @staticmethod
-    def list_wasapi_output_devices():
-        result = []
-        try:
-            apis = sd.query_hostapis()
-            devs = sd.query_devices()
-            w_idx = next((i for i, a in enumerate(apis) if 'WASAPI' in a['name']), None)
-            if w_idx is None:
-                return result
-            for i, d in enumerate(devs):
-                if d['hostapi'] == w_idx and d['max_output_channels'] > 0:
-                    result.append((d['name'], i))
-        except Exception as e:
-            print(f"[StreamAudio] list_wasapi_output_devices error: {e}")
-        return result
+    # ── Публичный API ─────────────────────────────────────────────────────────
 
     def start(self, device_idx=None):
         self.stop()
-        # Сброс буфера при старте — данные от прошлого сеанса не нужны
-        with self._buffer_lock:
-            self._pcm_len = 0
         self._running.set()
         self._thread = threading.Thread(
             target=self._capture_loop,
-            args=(device_idx,),
             daemon=True,
             name="stream-audio-loopback",
         )
@@ -556,436 +514,209 @@ class StreamAudioCapture:
     def stop(self):
         self._running.clear()
         if self._thread:
-            self._thread.join(timeout=2)
+            self._thread.join(timeout=3)
             self._thread = None
 
-    def _resolve_device(self, device_idx):
+    # ── Внутренние методы ─────────────────────────────────────────────────────
+
+    def _capture_loop(self):
+        """Пробует [0] DLL, при неудаче — [1] pyaudiowpatch."""
+        if self._try_dll():
+            return
+        if self._try_pyaudiowpatch():
+            return
+        print("[StreamAudio] ✖ Все методы захвата недоступны. Стрим-аудио отключён.")
+
+    # ── Метод [0]: loopback_capture.dll ──────────────────────────────────────
+
+    def _try_dll(self) -> bool:
+        """
+        Пробует запустить захват через loopback_capture.dll.
+        Возвращает True если захват отработал (даже если завершился с ошибкой
+        в процессе работы), False если DLL недоступна/не поддерживается.
+        """
         try:
-            apis = sd.query_hostapis()
-            devs = sd.query_devices()
-            w_idx = next((i for i, a in enumerate(apis) if 'WASAPI' in a['name']), None)
-            if w_idx is None: return None
-
-            if device_idx is not None and device_idx < len(devs):
-                d = devs[device_idx]
-                if d['hostapi'] == w_idx and d['max_output_channels'] > 0:
-                    return device_idx
-
-            try:
-                default_out = sd.default.device[1]
-                if isinstance(default_out, int) and default_out < len(devs):
-                    if devs[default_out]['hostapi'] == w_idx:
-                        return default_out
-            except Exception:
-                pass
-
-            for i, d in enumerate(devs):
-                if d['hostapi'] == w_idx and d['max_output_channels'] > 0:
-                    return i
-        except Exception:
-            pass
-        return None
-
-    # ------------------------------------------------------------------
-    # Стратегия A: pyaudiowpatch (главная — единственная надёжная)
-    # ------------------------------------------------------------------
-    def _try_pyaudiowpatch(self, target_name: str) -> bool:
-        """
-        Использует pyaudiowpatch для захвата WASAPI Loopback.
-
-        pyaudiowpatch патчирует PortAudio на уровне IAudioClient и добавляет
-        флаг isLoopbackDevice в device_info — только так можно достоверно
-        отличить loopback endpoint от реального микрофона.
-
-        target_name — имя OUTPUT-устройства, чей loopback нужно захватить.
-        Возвращает True если поток успешно открыт и отработал до stop().
-        """
-        if not PYAUDIOWPATCH_AVAILABLE:
+            # Ленивый импорт: DLL не грузится при старте приложения,
+            # только когда пользователь нажал «Начать стрим».
+            from native_capture import NativeLoopbackCapture
+        except ImportError:
+            print("[StreamAudio] [0] native_capture.py не найден — пропуск DLL")
             return False
 
-        pa = None
-        stream = None
+        if not NativeLoopbackCapture.dll_available():
+            print("[StreamAudio] [0] loopback_capture.dll не найдена — пропуск")
+            return False
+
+        cap = NativeLoopbackCapture()
+
+        if not cap.is_supported():
+            print("[StreamAudio] [0] Windows Build < 20348 — пропуск DLL")
+            return False
+
+        print(f"[StreamAudio] [0] DLL найдена, Windows поддерживает API. "
+              f"Инициализация (pid={os.getpid()})...")
+
+        if not cap.init(os.getpid()):
+            dll_log = cap.get_dll_log() if hasattr(cap, 'get_dll_log') else ""
+            print(f"[StreamAudio] [0] init_capture вернул ошибку "
+                  f"({cap.get_last_error()}) — пропуск")
+            if dll_log.strip():
+                print(f"[StreamAudio] [0] DLL internal log:\n{dll_log}")
+            return False
+
+        print("[StreamAudio] ✔ [0] loopback_capture.dll захват запущен")
+        chunk = np.empty(CHUNK_SIZE, dtype=np.float32)
         try:
-            pa = _pyaudio.PyAudio()
+            while self._running.is_set():
+                n = cap.read_frames(chunk)
+                if n == CHUNK_SIZE:
+                    if self._pcm_callback is not None:
+                        try:
+                            self._pcm_callback(chunk.copy())
+                        except Exception:
+                            pass
+                else:
+                    time.sleep(0.005)
+        finally:
+            cap.stop()
+            print("[StreamAudio] Loopback поток остановлен [0/DLL]")
+        return True  # метод отработал — fallback не нужен
 
-            # 1. Найти WASAPI host API
-            wasapi_idx = None
-            for i in range(pa.get_host_api_count()):
-                info = pa.get_host_api_info_by_index(i)
-                if 'WASAPI' in info.get('name', ''):
-                    wasapi_idx = i
-                    break
-            if wasapi_idx is None:
-                print("[StreamAudio] [A] WASAPI host API не найден в pyaudiowpatch")
+    # ── Метод [1]: pyaudiowpatch WASAPI loopback ──────────────────────────────
+
+    @staticmethod
+    def _find_loopback_device(pa):
+        """
+        Находит WASAPI loopback-устройство для текущего дефолтного выхода.
+        Возвращает (device_info, sd_idx) или (None, None).
+        """
+        try:
+            # Дефолтное OUTPUT устройство через sounddevice
+            default_out = sd.query_devices(kind='output')
+            out_name    = default_out['name'] if default_out else None
+        except Exception:
+            out_name = None
+
+        best = None
+        for i in range(pa.get_device_count()):
+            try:
+                info = pa.get_device_info_by_index(i)
+            except Exception:
+                continue
+            # pyaudiowpatch помечает loopback-устройства флагом isLoopbackDevice
+            if not info.get('isLoopbackDevice', False):
+                continue
+            if info.get('maxInputChannels', 0) < 1:
+                continue
+            # Если знаем имя дефолтного выхода — ищем совпадение
+            if out_name and out_name.lower() in info['name'].lower():
+                return info, i
+            # Иначе запомним первое попавшееся loopback
+            if best is None:
+                best = (info, i)
+
+        return best if best else (None, None)
+
+    def _try_pyaudiowpatch(self) -> bool:
+        """
+        Пробует запустить захват через pyaudiowpatch WASAPI loopback.
+        Возвращает True если захват отработал, False если недоступен.
+        """
+        try:
+            import pyaudiowpatch as pyaudio
+        except ImportError:
+            print("[StreamAudio] [1] pyaudiowpatch не установлен — пропуск")
+            return False
+
+        pa = pyaudio.PyAudio()
+        try:
+            dev_info, dev_idx = self._find_loopback_device(pa)
+            if dev_info is None:
+                print("[StreamAudio] [1] WASAPI loopback устройство не найдено — пропуск")
                 return False
 
-            # 2. Найти loopback device, соответствующий target output
-            #    Порядок: точное совпадение → частичное → первый попавшийся isLoopback
-            loopback_dev = None
-            target_lower = target_name.lower()
+            sr             = int(dev_info['defaultSampleRate'])
+            nch            = int(dev_info['maxInputChannels'])
+            frames_per_buf = int(sr * 0.020)  # 20 мс
 
-            candidates = []
-            for i in range(pa.get_device_count()):
-                d = pa.get_device_info_by_index(i)
-                if not d.get('isLoopbackDevice', False):
-                    continue
-                if d.get('hostApi') != wasapi_idx:
-                    continue
-                candidates.append(d)
+            print(f"[StreamAudio] [1] pyaudiowpatch loopback: "
+                  f"«{dev_info['name']}» ch={nch} sr={sr}")
 
-            if not candidates:
-                print("[StreamAudio] [A] pyaudiowpatch: loopback-устройства не найдены")
-                return False
+            # FIFO для ресэмплинга/downmix — collections.deque быстрее list
+            from collections import deque
+            pcm_fifo: deque = deque()
+            # Предвычисляем коэффициент ресэмплинга (0 = не нужен)
+            resample_ratio = (SAMPLE_RATE / sr) if sr != SAMPLE_RATE else 0.0
 
-            # Точное совпадение имени
-            for d in candidates:
-                if d['name'].lower() == target_lower:
-                    loopback_dev = d
-                    break
-            # Частичное совпадение
-            if loopback_dev is None:
-                for d in candidates:
-                    dev_lower = d['name'].lower()
-                    if target_lower in dev_lower or dev_lower in target_lower:
-                        loopback_dev = d
-                        break
-            # Первый доступный
-            if loopback_dev is None:
-                loopback_dev = candidates[0]
-                print(f"[StreamAudio] [A] Точного совпадения нет, берём первый loopback: "
-                      f"«{loopback_dev['name']}»")
-
-            ch = max(1, int(loopback_dev.get('maxInputChannels', 2)))
-            sr = int(loopback_dev.get('defaultSampleRate', SAMPLE_RATE))
-            self._native_sr = sr
-
-            print(f"[StreamAudio] [A] pyaudiowpatch loopback device: "
-                  f"«{loopback_dev['name']}» idx={loopback_dev['index']} ch={ch} sr={sr}")
-
-            # 3. Открыть поток с callback
             def _pa_callback(in_data, frame_count, time_info, status):
+                # ── Критически важные проверки ────────────────────────────────
+                # 1. in_data может быть None при первом вызове или при overflow.
+                #    np.frombuffer(None) -> TypeError -> поток падает -> is_active()=False
+                # 2. Весь callback обёрнут в try-except чтобы любое исключение
+                #    не убивало поток (pyaudio при исключении в callback = abort).
                 if not self._running.is_set():
-                    return (None, _pyaudio.paComplete)
+                    return (None, pyaudio.paComplete)
+                if in_data is None:
+                    return (None, pyaudio.paContinue)
                 try:
-                    arr = np.frombuffer(in_data, dtype=np.float32).copy()
-                    # reshape к (frames, channels) чтобы _audio_cb мог усреднить каналы
-                    arr = arr.reshape(-1, ch)
-                    self._audio_cb(arr, frame_count, time_info, status)
-                except Exception:
-                    pass
-                return (None, _pyaudio.paContinue)
+                    raw = np.frombuffer(in_data, dtype=np.float32)
+                    if len(raw) == 0:
+                        return (None, pyaudio.paContinue)
+
+                    # Stereo → Mono downmix
+                    if nch > 1:
+                        raw = raw.reshape(-1, nch).mean(axis=1)
+
+                    # Ресэмплинг если нужен (линейная интерполяция)
+                    if resample_ratio:
+                        target_len = max(1, round(len(raw) * resample_ratio))
+                        indices = np.linspace(0, len(raw) - 1, target_len)
+                        raw = np.interp(indices, np.arange(len(raw)), raw).astype(np.float32)
+
+                    pcm_fifo.extend(raw)
+
+                    # Отправляем готовые CHUNK_SIZE-фреймы
+                    while len(pcm_fifo) >= CHUNK_SIZE:
+                        chunk = np.fromiter(
+                            (pcm_fifo.popleft() for _ in range(CHUNK_SIZE)),
+                            dtype=np.float32, count=CHUNK_SIZE)
+                        if self._pcm_callback is not None:
+                            try:
+                                self._pcm_callback(chunk)
+                            except Exception:
+                                pass
+                except Exception as exc:
+                    # Логируем только первый раз чтобы не спамить
+                    print(f"[StreamAudio] [1] callback error: {exc}")
+                return (None, pyaudio.paContinue)
 
             stream = pa.open(
-                format=_pyaudio.paFloat32,
-                channels=ch,
+                format=pyaudio.paFloat32,
+                channels=nch,
                 rate=sr,
-                frames_per_buffer=CHUNK_SIZE,
+                frames_per_buffer=frames_per_buf,
                 input=True,
-                input_device_index=loopback_dev['index'],
+                input_device_index=dev_idx,
                 stream_callback=_pa_callback,
             )
             stream.start_stream()
-            print(f"[StreamAudio] ✔ [A] pyaudiowpatch захват запущен (ch={ch} sr={sr})")
+            print(f"[StreamAudio] ✔ [1] pyaudiowpatch захват запущен (ch={nch} sr={sr})")
 
-            while self._running.is_set():
-                if not stream.is_active():
-                    print("[StreamAudio] [A] Поток pyaudiowpatch неожиданно завершился")
-                    break
-                time.sleep(0.05)
+            # Ждём пока поток активен или нас попросили остановиться
+            while self._running.is_set() and stream.is_active():
+                time.sleep(0.1)
 
-            return True
+            if self._running.is_set() and not stream.is_active():
+                # Поток умер сам по себе — скорее всего ошибка драйвера
+                print("[StreamAudio] [1] pyaudio stream died unexpectedly")
 
-        except Exception as e:
-            print(f"[StreamAudio] [A] pyaudiowpatch ошибка: {e}")
-            return False
+            stream.stop_stream()
+            stream.close()
+            print("[StreamAudio] Loopback поток остановлен [1/pyaudiowpatch]")
         finally:
-            if stream is not None:
-                try:
-                    stream.stop_stream()
-                    stream.close()
-                except Exception:
-                    pass
-            if pa is not None:
-                try:
-                    pa.terminate()
-                except Exception:
-                    pass
+            pa.terminate()
 
-    # ------------------------------------------------------------------
-    # Стратегия B: sounddevice + WasapiSettings(loopback=True)
-    # Работает только если PortAudio собран с поддержкой WASAPI loopback.
-    # На Sound Blaster Play! 4 и многих других картах ПАДАЕТ с -9998,
-    # потому что PortAudio проверяет max_input_channels==0 ДО того как
-    # применить loopback-флаг к IAudioClient.
-    # ------------------------------------------------------------------
-    def _try_sounddevice_loopback(self, resolved: int, native_ch: int) -> bool:
-        """
-        Пробует открыть OUTPUT-устройство как loopback через sounddevice.
-        Перебирает несколько сигнатур WasapiSettings и несколько channel counts.
-        Возвращает True если успешно.
-        """
-        # Построить WasapiSettings — перебираем сигнатуры (разные версии sd)
-        wasapi_settings = None
-        for factory in [
-            lambda: sd.WasapiSettings(loopback=True),
-            lambda: sd.WasapiSettings(exclusive=False, loopback=True),
-            lambda: sd.WasapiSettings(False, True),
-        ]:
-            try:
-                obj = factory()
-                if hasattr(obj, 'loopback') and not obj.loopback:
-                    try:
-                        obj.loopback = True
-                    except Exception:
-                        pass
-                wasapi_settings = obj
-                break
-            except Exception:
-                continue
-
-        if wasapi_settings is None:
-            print("[StreamAudio] [B] WasapiSettings недоступен")
-            return False
-
-        for ch in list(dict.fromkeys([native_ch, 2, 1])):
-            try:
-                with sd.InputStream(
-                        device=resolved,
-                        samplerate=self._native_sr,
-                        channels=ch,
-                        dtype='float32',
-                        extra_settings=wasapi_settings,
-                        callback=self._audio_cb,
-                ):
-                    print(f"[StreamAudio] ✔ [B] sounddevice loopback (ch={ch} sr={self._native_sr})")
-                    while self._running.is_set():
-                        time.sleep(0.05)
-                return True
-            except Exception as e:
-                print(f"[StreamAudio] [B] Не удалось с channels={ch}: {e}")
-        return False
-
-    # ------------------------------------------------------------------
-    # Стратегия 0: VB-CABLE — приоритет над всеми остальными методами
-    # ------------------------------------------------------------------
-    def _try_vbcable(self) -> bool:
-        """
-        Захватывает звук из «CABLE Output» как обычное INPUT-устройство.
-
-        Архитектура VB-CABLE:
-          «CABLE Input»  — виртуальный ВЫВОД (куда игра выводит звук)
-          «CABLE Output» — виртуальный ВВОД  (откуда мы читаем)
-
-        Связь между ними: всё что подаётся на CABLE Input,
-        сразу появляется на CABLE Output. Голоса зрителей НЕ подаются
-        на CABLE Input никогда → CABLE Output математически чист → AEC не нужен,
-        ducking не нужен, эхо невозможно как явление.
-
-        device_idx игнорируется — устройство находится по имени автоматически.
-        Возвращает True если поток открыт и проработал до stop().
-        """
-        cable_idx = None
-        cable_ch  = 2
-        cable_sr  = SAMPLE_RATE
-
-        try:
-            devs = sd.query_devices()
-            for i, d in enumerate(devs):
-                if 'cable output' in d['name'].lower() and d['max_input_channels'] > 0:
-                    cable_idx = i
-                    cable_ch  = max(1, int(d['max_input_channels']))
-                    cable_sr  = int(d.get('default_samplerate', SAMPLE_RATE))
-                    print(f"[StreamAudio] [VB-CABLE] Найден: «{d['name']}» "
-                          f"idx={i} ch={cable_ch} sr={cable_sr}")
-                    break
-
-            if cable_idx is None:
-                print("[StreamAudio] [VB-CABLE] Устройство 'CABLE Output' не найдено — "
-                      "пробуем WASAPI Loopback")
-                return False
-
-            self._native_sr     = cable_sr
-            self._using_vbcable = True
-
-            # ── Локальный мониторинг: стример слышит игру в наушниках ──────────
-            # Открываем OutputStream на устройство вывода по умолчанию.
-            # Callback читает сырые фреймы из _vbcable_monitor_queue (заполняется
-            # в _audio_cb) и прокидывает их в наушники. Если очередь пуста —
-            # тишина (не блокируемся). cable_ch и cable_sr совпадают с InputStream,
-            # поэтому ресемплинг не нужен.
-            monitor_q: "queue.Queue" = queue.Queue(maxsize=80)
-            self._vbcable_monitor_queue = monitor_q
-            _mon_vol_ref = [self.monitor_volume]  # mutable ref для closure
-
-            def _monitor_out_cb(outdata, frames, time_info, status):
-                try:
-                    raw = monitor_q.get_nowait()  # shape: (frames, cable_ch)
-                    vol = self.monitor_volume
-                    if raw.shape == outdata.shape:
-                        np.multiply(raw, vol, out=outdata)
-                    else:
-                        # Разное кол-во каналов: микшируем в mono и раскладываем
-                        mono = np.mean(raw, axis=1, keepdims=True) if raw.ndim > 1 else raw.reshape(-1, 1)
-                        outdata[:] = np.repeat(mono, outdata.shape[1], axis=1) * vol
-                except Exception:
-                    outdata.fill(0)  # очередь пуста или ошибка — тишина
-
-            # Определяем кол-во каналов дефолтного вывода
-            try:
-                _out_ch = max(1, int(sd.query_devices(kind='output')['max_output_channels']))
-                _out_ch = min(_out_ch, cable_ch)  # не больше чем захватываем
-            except Exception:
-                _out_ch = cable_ch
-
-            with sd.InputStream(
-                device=cable_idx,
-                samplerate=cable_sr,
-                channels=cable_ch,
-                dtype='float32',
-                blocksize=CHUNK_SIZE,
-                callback=self._audio_cb,
-            ):
-                print("[StreamAudio] ✔ [VB-CABLE] Захват запущен — "
-                      "чистый звук без AEC и ducking")
-                try:
-                    with sd.OutputStream(
-                        samplerate=cable_sr,
-                        channels=_out_ch,
-                        dtype='float32',
-                        blocksize=CHUNK_SIZE,
-                        callback=_monitor_out_cb,
-                    ):
-                        print(f"[StreamAudio] ✔ [VB-CABLE] Локальный мониторинг запущен "
-                              f"(ch={_out_ch} sr={cable_sr}) — стример слышит игру в наушниках")
-                        while self._running.is_set():
-                            time.sleep(0.05)
-                except Exception as e_mon:
-                    # Мониторинг не удался (редкий случай) — стрим продолжается без него
-                    print(f"[StreamAudio] [VB-CABLE] Мониторинг недоступен: {e_mon}\n"
-                          f"  Захват зрителям продолжается, но стример не слышит игру локально.")
-                    while self._running.is_set():
-                        time.sleep(0.05)
-            return True
-
-        except Exception as e:
-            print(f"[StreamAudio] [VB-CABLE] Ошибка открытия потока: {e}")
-            return False
-        finally:
-            self._using_vbcable = False
-            self._vbcable_monitor_queue = None  # сбрасываем ссылку на очередь
-
-    def _capture_loop(self, device_idx):
-        # ── Стратегия 0: VB-CABLE (ПРИОРИТЕТ) ─────────────────────────────────
-        # CABLE Output = чистый игровой звук, голосов зрителей там нет → эхо невозможно.
-        if self._try_vbcable():
-            print("[StreamAudio] Захват остановлен [0/VB-CABLE]")
-            return
-
-        # ── Стратегии A/B: WASAPI Loopback (запасной путь) ────────────────────
-        resolved = self._resolve_device(device_idx)
-        if resolved is None:
-            print("[StreamAudio] Подходящее WASAPI OUTPUT-устройство не найдено")
-            return
-
-        dev_info = sd.query_devices(resolved)
-        native_ch = max(1, int(dev_info.get('max_output_channels', 2)))
-        self._native_sr = int(dev_info.get('default_samplerate', SAMPLE_RATE))
-        output_name = dev_info['name']
-
-        print(f"[StreamAudio] Целевое устройство: «{output_name}» "
-              f"(sd_idx={resolved}, ch={native_ch}, sr={self._native_sr})")
-
-        # ── Стратегия A: pyaudiowpatch ─────────────────────────────────────
-        # Единственный надёжный метод: использует isLoopbackDevice,
-        # не захватывает микрофоны случайно.
-        if self._try_pyaudiowpatch(output_name):
-            print("[StreamAudio] Loopback поток остановлен [A/pyaudiowpatch]")
-            return
-
-        # ── Стратегия B: sounddevice WasapiSettings(loopback=True) ─────────
-        # Работает на части конфигураций, падает с -9998 на Sound Blaster и др.
-        if self._try_sounddevice_loopback(resolved, native_ch):
-            print("[StreamAudio] Loopback поток остановлен [B/sounddevice]")
-            return
-
-        # ── Ничего не сработало ─────────────────────────────────────────────
-        print(
-            "[StreamAudio] ✖ WASAPI Loopback захватить не удалось.\n"
-            "  Решение: pip install pyaudiowpatch\n"
-            "  Подробнее: https://github.com/s0d3s/PyAudioWPatch"
-        )
-        print("[StreamAudio] Loopback поток остановлен")
-
-    def _audio_cb(self, indata, frames, time_info, status):
-        if not self._running.is_set():
-            return
-
-        # ── Локальный мониторинг VB-CABLE ──────────────────────────────────────
-        # Сырой фрейм (до любой обработки) кладём в очередь мониторинга.
-        # Параллельный sd.OutputStream в _try_vbcable читает её и воспроизводит
-        # в реальные наушники стримера — он слышит игру так же как и зрители,
-        # но через отдельный путь без задержки encode/decode.
-        # Блок работает ТОЛЬКО когда _using_vbcable=True и очередь создана.
-        if self._using_vbcable and self._vbcable_monitor_queue is not None:
-            try:
-                self._vbcable_monitor_queue.put_nowait(indata.copy())
-            except Exception:
-                pass  # очередь полна — дроп, не критично (20ms потери)
-
-        try:
-            if indata.ndim > 1 and indata.shape[1] > 1:
-                mono = np.mean(indata, axis=1)
-            else:
-                mono = indata.flatten()
-
-            # Ресемплинг
-            if self._native_sr != SAMPLE_RATE:
-                target_len = int(round(len(mono) * SAMPLE_RATE / self._native_sr))
-                if target_len > 0:
-                    x_old = np.linspace(0.0, 1.0, len(mono), dtype=np.float64)
-                    x_new = np.linspace(0.0, 1.0, target_len, dtype=np.float64)
-                    mono = np.interp(x_new, x_old, mono).astype(np.float32)
-
-            with self._buffer_lock:
-                # ── Записываем семплы в предаллоцированный буфер ────────────────
-                # Аллокации нет — просто копируем в уже существующий массив.
-                incoming = len(mono)
-                needed = self._pcm_len + incoming
-                if needed > len(self._pcm_buf):
-                    # Буфер переполнен (редко): увеличиваем вдвое
-                    new_size = max(needed, len(self._pcm_buf) * 2)
-                    new_buf = np.empty(new_size, dtype=np.float32)
-                    new_buf[:self._pcm_len] = self._pcm_buf[:self._pcm_len]
-                    self._pcm_buf = new_buf
-                self._pcm_buf[self._pcm_len:self._pcm_len + incoming] = mono
-                self._pcm_len += incoming
-
-                # Откусываем строго по CHUNK_SIZE (960 семплов = 20мс) и передаём
-                while self._pcm_len >= CHUNK_SIZE:
-                    chunk = self._pcm_buf[:CHUNK_SIZE].copy()
-                    # Сдвигаем остаток влево (numpy делает это на C-уровне)
-                    self._pcm_len -= CHUNK_SIZE
-                    self._pcm_buf[:self._pcm_len] = self._pcm_buf[CHUNK_SIZE:CHUNK_SIZE + self._pcm_len]
-
-                    # ── Передаём чанк через callback (WebRTC путь) ──────────────
-                    # pcm_callback принимает float32 моно фрейм (CHUNK_SIZE сэмплов).
-                    # SystemAudioTrack кладёт фрейм в asyncio.Queue → recv() →
-                    # av.AudioFrame → WebRTC RTP поток к зрителям.
-                    if self._pcm_callback is not None:
-                        try:
-                            self._pcm_callback(chunk)
-                        except Exception:
-                            pass
-
-        except Exception:
-            pass
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  WebRTC Audio Tracks (Шаг 3 миграции)
-#  Используются только для WebRTC-стрима. Голосовой чат комнаты (AudioHandler)
-#  работает независимо через opuslib + UDP — без каких-либо изменений.
-# ─────────────────────────────────────────────────────────────────────────────
+        return True
 
 
 class MicrophoneTrack(AudioStreamTrack):
@@ -1085,18 +816,9 @@ class MicrophoneTrack(AudioStreamTrack):
 
 class SystemAudioTrack(AudioStreamTrack):
     """
-    Захват системного звука (WASAPI Loopback / VB-CABLE) → WebRTC.
+    Захват системного звука через loopback_capture.dll → WebRTC.
 
     Используется стримером для передачи игрового звука зрителям через WebRTC SFU.
-
-    Повторно использует всю логику захвата из StreamAudioCapture без дублирования:
-      VB-CABLE (приоритет) → pyaudiowpatch WASAPI Loopback → sounddevice loopback.
-    Разница: вместо Opus-encode + UDP-отправки StreamAudioCapture вызывает
-    pcm_callback(chunk: float32 mono), а SystemAudioTrack кладёт chunk в asyncio.Queue.
-
-    Локальный мониторинг VB-CABLE (стример слышит игру в наушниках) полностью
-    сохранён — он живёт внутри StreamAudioCapture и не затрагивает WebRTC.
-
     Ленивая инициализация: захват стартует при первом recv() из WebRTC asyncio-цикла.
     Формат вывода: s16, 48 000 Гц, моно, CHUNK_SIZE=960 сэмплов (20 мс).
     """
@@ -1107,20 +829,12 @@ class SystemAudioTrack(AudioStreamTrack):
         super().__init__()
         self._device_idx = device_idx
         self._running    = True
-        # Инициализируются лениво при первом recv():
         self._queue:   "asyncio.Queue | None"             = None
         self._loop:    "asyncio.AbstractEventLoop | None" = None
         self._capture: "StreamAudioCapture | None"        = None
 
-    # ── PCM callback из StreamAudioCapture ───────────────────────────────────
-
     def _on_pcm_chunk(self, chunk: np.ndarray) -> None:
-        """
-        Вызывается StreamAudioCapture на каждый готовый 20-мс float32-фрейм.
-        Отправляет данные в asyncio.Queue WebRTC-цикла через thread-safe вызов.
-        chunk уже является копией (сделан в _audio_cb) — повторное копирование
-        не требуется.
-        """
+        """Вызывается StreamAudioCapture на каждый готовый 20-мс float32-фрейм."""
         if not self._running or self._loop is None or self._queue is None:
             return
         try:
