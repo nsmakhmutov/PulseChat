@@ -29,6 +29,7 @@ import tempfile
 import zipfile
 import subprocess
 import shutil
+import ctypes
 from packaging.version import Version
 
 from version import APP_VERSION, GITHUB_REPO
@@ -420,7 +421,17 @@ def download_and_install(download_url: str, on_progress=None, on_done=None, on_e
                 'del "%~f0"',
             ]
             bat_content = "\r\n".join(bat_lines) + "\r\n"
-            with open(bat_path, "w", encoding="ascii") as bat_f:
+
+            # CMD.EXE читает .bat через OEM-кодовую страницу Windows.
+            # На русской Windows это cp866. ASCII не поддерживает кириллицу в путях
+            # (C:\Пользователи\...) — отсюда ошибка 'ordinal not in range(128)'.
+            # GetOEMCP() возвращает правильную OEM-страницу для любой локали Windows.
+            try:
+                oem_cp = f"cp{ctypes.windll.kernel32.GetOEMCP()}"
+            except Exception:
+                oem_cp = "cp866"   # fallback: русская OEM
+
+            with open(bat_path, "w", encoding=oem_cp) as bat_f:
                 bat_f.write(bat_content)
 
             print(f"[Updater] install_dir  : {install_dir}")
