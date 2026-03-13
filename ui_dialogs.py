@@ -1999,7 +1999,8 @@ class SettingsDialog(QDialog):
         bitrate_options = {
             "24 kbps (Рация)": 24,
             "48 kbps (Стандарт)": 48,
-            "64 kbps (Хорошее)": 64
+            "64 kbps (Хорошее)": 64,
+            "128 kbps (Наилучшее)": 128
         }
         for text, val in bitrate_options.items():
             self.cb_bitrate.addItem(text, val)

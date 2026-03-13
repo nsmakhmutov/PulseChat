@@ -962,7 +962,8 @@ class MainWindow(QMainWindow):
         self._stack.setCurrentIndex(1)
 
         try:
-            from client_main import EmbeddedServerManager, _load_server_name
+            from server import EmbeddedServerManager
+            from client_main import _load_server_name
             from server_discovery import get_local_radmin_ip
             host_ip     = get_local_radmin_ip()
             server_name = _load_server_name()
@@ -974,25 +975,50 @@ class MainWindow(QMainWindow):
             return
 
         def _reconnect_to_self():
-            self.net._ip = host_ip  # <-- ИСПРАВЛЕНО: было '127.0.0.1'
-            self.net._reconnecting = True
-            self.net._reconnect_attempts = 0
-            self.net.running = False
-            import threading
-            threading.Thread(
-                target=self.net._reconnect_loop,
-                daemon=True,
-                name="host-reconnect",
-            ).start()
+            # FIX (Bug F): сбрасываем _migration_pending (установлен в process_message
+            # вместе с running=False, чтобы tcp_listen не вызвал _on_connection_lost).
+            # Сбрасываем здесь — после того как сервер стартовал и мы готовы подключаться.
+            self.net._migration_pending = False
+            # Сбрасываем _reconnecting — fast_switch_to имеет guard "if _reconnecting: return"
+            self.net._reconnecting = False
+            self.net.fast_switch_to(host_ip)
 
-        QTimer.singleShot(700, _reconnect_to_self)
+        # Было 700 мс + _reconnect_loop (3с первый sleep).
+        # 150 мс: достаточно для bind/listen локальных сокетов.
+        # fast_switch_to сам ретраится 8 × 0.35с если порт ещё не готов.
+        QTimer.singleShot(150, _reconnect_to_self)
 
     def _on_server_migrating(self, new_host_ip: str):
         """
         Вызывается когда сервер переезжает к другому хосту (мы — не новый хост).
         Показываем индикатор. Сетевой движок сам переподключится через _migrate_reconnect().
+
+        ИСПРАВЛЕНИЕ — призрак сервера в лобби:
+        Если мы сами были хостом и только что передали сервер (CMD_SERVER_TRANSFER),
+        то CMD_SERVER_MIGRATE прилетает и нам тоже (broadcast всем).
+        Без явной остановки EmbeddedServerManager наш ServerAnnouncer продолжал
+        рассылать broadcast → в лобби висел старый сервер с 0 участников.
+        Теперь: если мы хост и видим миграцию к кому-то другому — останавливаемся.
         """
         print(f"[UI] _on_server_migrating: новый хост {new_host_ip}")
+
+        # FIX (Bug E): stop_silent вместо stop_announcer_only.
+        # stop_announcer_only останавливал только UDP-broadcast, но оставлял
+        # TCP/UDP listening-сокеты связанными:
+        #   - Сервер продолжал принимать соединения (видно в списке)
+        #   - mgr._server != None → become_host → новый SFUServer → bind(5000)
+        #     → "адрес уже используется" (Bug #3)
+        # stop_silent закрывает ВСЕ сокеты и устанавливает mgr._server=None.
+        # Не вызывает _broadcast_server_migrate — миграция уже разослана сервером.
+        try:
+            from server import EmbeddedServerManager
+            mgr = EmbeddedServerManager.get()
+            if mgr.is_running():
+                print("[UI] _on_server_migrating: stop_silent (порты освобождаем)")
+                mgr.stop_silent()
+        except Exception as e:
+            print(f"[UI] _on_server_migrating stop error: {e}")
+
         self._lost_title_lbl.setText("Смена хоста")
         self._lost_status_lbl.setText(
             f"Сервер переезжает...\nНовый хост: {new_host_ip}\n"
@@ -1616,7 +1642,13 @@ class MainWindow(QMainWindow):
         if entry is not None:
             try:
                 data, sr = entry
-                sd.play(data * vol, sr)
+                # FIX: sd.play() открывает новый PortAudio-поток → WASAPI
+                # перебалансирует буферы → основной callback теряет CPU →
+                # треск/провал у всех слушателей. Используем внутренний микшер.
+                if hasattr(self.audio, 'play_internal_sound') and self.audio.stream:
+                    self.audio.play_internal_sound(data, sr, vol)
+                else:
+                    sd.play(data * vol, sr)  # fallback если поток не запущен
             except Exception:
                 pass
         else:
@@ -2085,7 +2117,11 @@ class MainWindow(QMainWindow):
                 f"}}"
             )
 
-            now = time.time()
+            # FIX: perf_counter() — синхронизируем с last_packet_time и last_voice_time
+            # в audio_engine (тоже переведены на perf_counter). time.time() и
+            # perf_counter() — разные часы, их нельзя вычитать друг из друга.
+            # Без этой правки (now - last_packet_time) давало ~50_000_000 сек → никогда < 0.3.
+            now = time.perf_counter()
 
             # ВАЖН-6: тема меняется только через apply_theme() → флаг _theme_dirty.
             # Избегаем QSettings.value() (обращение к реестру) 10 раз/сек.
@@ -2383,9 +2419,23 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(2500, _deferred_cleanup)
 
     def open_settings(self):
+        # Запоминаем текущие устройства ДО открытия диалога.
+        _dev_in_before  = self.app_settings.value("device_in_name",  "")
+        _dev_out_before = self.app_settings.value("device_out_name", "")
+
         if SettingsDialog(self.audio, self).exec():
             self.setup_hotkeys()
-            self.audio.start(self.app_settings.value("device_in_name"), self.app_settings.value("device_out_name"))
+
+            _dev_in_after  = self.app_settings.value("device_in_name",  "")
+            _dev_out_after = self.app_settings.value("device_out_name", "")
+
+            # Перезапускаем аудиопоток ТОЛЬКО если устройство реально сменилось.
+            # При изменении VAD, громкости, soundboard-кнопок и т.д. —
+            # stream не трогаем: слушатели не услышат провала в 100ms.
+            if _dev_in_after != _dev_in_before or _dev_out_after != _dev_out_before:
+                self.audio.start(_dev_in_after, _dev_out_after)
+            else:
+                print("[Settings] Устройства не изменились — аудиопоток не перезапускается")
 
     # ── Статус пользователя ────────────────────────────────────────────────────
 
@@ -2944,10 +2994,27 @@ class MainWindow(QMainWindow):
                 pass
             self._lobby_screen = None
 
-        # Останавливаем встроенный сервер если мы хост
+        # FIX: net.running=False ПЕРВЫМ.
+        # stop_gracefully рассылает CMD_SERVER_MIGRATE всем клиентам, включая нас.
+        # Если running=True в момент получения CMD_SERVER_MIGRATE:
+        #   process_message → _migration_pending=True, _migrate_reconnect стартует
+        #   _migrate_reconnect: running=False, fast_switch_to(Client2.ip)
+        #   fast_switch_to видит _reconnecting=False → работает ✓
+        # НО: также server_migrating.emit → _on_server_migrating → stop_silent
+        # (наш сервер) — это лишнее, т.к. mgr.stop() ниже уже его остановит.
+        # Установив running=False сейчас, tcp_listen выйдет без _on_connection_lost,
+        # и _migration_pending-флаг тоже не успеет установиться (мы уходим сами).
+        self.net.running       = False
+        self.net._reconnecting = False   # сброс на случай зависшего флага
+
+        # Останавливаем/передаём встроенный сервер если мы хост.
+        # stop_gracefully сам выбирает нового хоста по минимальному пингу
+        # и рассылает CMD_SERVER_MIGRATE остальным участникам.
+        # send_server_transfer(0) УДАЛЁН — он создавал ДВОЙНУЮ миграцию:
+        # server_transfer → broadcast, затем stop_gracefully → снова broadcast.
         if self._is_server_host():
             try:
-                from client_main import EmbeddedServerManager
+                from server import EmbeddedServerManager
                 mgr = EmbeddedServerManager.get()
                 if mgr.is_running():
                     mgr.stop()
@@ -2986,7 +3053,7 @@ class MainWindow(QMainWindow):
         self.net.running = False
         # Если мы хост встроенного сервера — корректная передача хостинга
         try:
-            from client_main import EmbeddedServerManager
+            from server import EmbeddedServerManager
             mgr = EmbeddedServerManager.get()
             if mgr.is_running():
                 mgr.stop()   # stop_gracefully: broadcast server_migrate → 600 мс → close

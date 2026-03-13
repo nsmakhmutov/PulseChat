@@ -1183,7 +1183,15 @@ class JitterBuffer:
                 return
             heapq.heappush(self.buffer, (seq, data))
             if len(self.buffer) > self.max_size:
-                heapq.heappop(self.buffer)
+                # FIX: дропаем НАИБОЛЬШИЙ seq (самый новый), а не наименьший.
+                # heappop() на min-heap дропает наименьший — то есть именно тот
+                # пакет, который должен играть следующим. Это гарантированный треск.
+                # Правильно: убираем самый новый пакет — он пришёл из сети раньше
+                # времени и буфер слишком большой. Используем nlargest+remove.
+                # O(n) — но вызывается крайне редко (только при шторме пакетов).
+                largest = max(self.buffer, key=lambda x: x[0])
+                self.buffer.remove(largest)
+                heapq.heapify(self.buffer)
 
     def get(self):
         with self._lock:
@@ -1350,6 +1358,13 @@ class AudioHandler(QObject):
         self.incoming_packets = queue.Queue(maxsize=500)
         self.send_queue = queue.Queue(maxsize=100)
 
+        # ── Внутренний микшер UI-звуков ──────────────────────────────────────
+        # Системные уведомления, Soundboard и Nudge подаются сюда вместо sd.play().
+        # audio_callback читает список и подмешивает фреймы в mix_buffer прямо в
+        # уже открытый PortAudio-поток — никаких новых WASAPI-устройств не открывается.
+        self._local_sounds: list = []
+        self._local_sounds_lock = threading.Lock()
+
         # --- Стрим-аудио (WebRTC) ---
         # Воспроизведение стрим-аудио на стороне зрителя теперь обрабатывается
         # через WebRTC (RTCPeerConnection + AudioStreamTrack).
@@ -1453,6 +1468,37 @@ class AudioHandler(QObject):
         except Exception as e:
             print(f"[Audio] Error setting bitrate: {e}")
 
+    def play_internal_sound(self, data: np.ndarray, sr: int, vol: float = 1.0):
+        """
+        Воспроизводит звук через уже открытый PortAudio-поток без аллокации
+        нового WASAPI-устройства. Данные подмешиваются в mix_buffer прямо внутри
+        audio_callback — нулевой риск WASAPI-перебалансировки и треска.
+
+        data: float32 numpy-массив (моно или стерео)
+        sr  : частота дискретизации источника (будет ресемплирован в 48kHz)
+        vol : коэффициент громкости (квадратичная кривая уже применена снаружи)
+        """
+        try:
+            data = np.asarray(data, dtype=np.float32)
+            # Стерео → моно
+            if data.ndim > 1 and data.shape[1] > 1:
+                data = np.mean(data, axis=1)
+            elif data.ndim > 1:
+                data = data[:, 0]
+
+            # Ресемплинг только если нужен (np.interp — достаточно для кратких UI-звуков)
+            if sr != SAMPLE_RATE:
+                target_len = int(round(len(data) * SAMPLE_RATE / sr))
+                if target_len > 0:
+                    x_old = np.linspace(0.0, 1.0, len(data), dtype=np.float32)
+                    x_new = np.linspace(0.0, 1.0, target_len, dtype=np.float32)
+                    data = np.interp(x_new, x_old, data).astype(np.float32)
+
+            with self._local_sounds_lock:
+                self._local_sounds.append({'data': data, 'pos': 0, 'vol': float(vol)})
+        except Exception as e:
+            print(f"[Audio] play_internal_sound error: {e}")
+
     def set_nr_mode(self, mode: int):
         """
         Устанавливает режим шумоподавления (мгновенно, без перезапуска аудио):
@@ -1503,6 +1549,19 @@ class AudioHandler(QObject):
         self.stop()
         time.sleep(0.1)
         print("[DEBUG] AudioHandler.start: stop() выполнен", flush=True)
+
+        # FIX ROBOT-VOICE: сбрасываем Opus-декодеры и JitterBuffer'ы всех удалённых
+        # пользователей после остановки стрима. Opus — CELP-кодек с предсказательным
+        # состоянием (LPC). После паузы ≥100ms декодер ожидает следующий фрейм через
+        # ровно 20ms; получив пакеты после реального перерыва без PLC-вызова он
+        # выдаёт discontinuity → робовойс/артефакты на 1-2 фрейма.
+        # Сброс декодера к начальному состоянию + очистка JitterBuffer устраняет это.
+        with self.users_lock:
+            for user in self.remote_users.values():
+                user.decoder       = opuslib.Decoder(SAMPLE_RATE, CHANNELS)
+                user.jitter_buffer = JitterBuffer()
+            # Обновляем COW-снимок — audio_callback не должен видеть старые декодеры
+            self._audio_users_snapshot = dict(self.remote_users)
 
         print("[DEBUG] AudioHandler.start: поиск устройств...", flush=True)
         in_idx = self.find_device_index_by_name(input_name, True)
@@ -1588,7 +1647,7 @@ class AudioHandler(QObject):
 
                     if data:
                         user.jitter_buffer.add(seq, data)
-                        user.last_packet_time = time.time()
+                        user.last_packet_time = time.perf_counter()  # FIX: perf_counter точнее time.time() на Windows (15.6ms vs мкс)
 
                     # FIX #1: обновляем COW-снимок внутри лока — согласованное состояние.
                     # dict() копирует только ссылки (не RemoteUser объекты) — это быстро.
@@ -1613,7 +1672,7 @@ class AudioHandler(QObject):
             outdata.fill(0)
             return
 
-        curr_time = time.time()
+        curr_time = time.perf_counter()  # FIX: высокоточный таймер Windows (мкс вместо 15.6ms у time.time)
         raw_input = indata.flatten()
         denoised_float = raw_input
 
@@ -1777,64 +1836,100 @@ class AudioHandler(QObject):
             for uid, user in self._audio_users_snapshot.items():
                 if curr_time - user.last_packet_time < 1.5:
                     data = user.jitter_buffer.get()
-                    if data and not user.is_locally_muted and not user.volume_zero:
+                    if not user.is_locally_muted and not user.volume_zero:
                         try:
-                            decoded = user.decoder.decode(data, CHUNK_SIZE)
-                            s = np.frombuffer(decoded, dtype=np.int16).astype(np.float32) / 32767.0
+                            if data:
+                                decoded = user.decoder.decode(data, CHUNK_SIZE)
+                                s = np.frombuffer(decoded, dtype=np.int16).astype(np.float32) / 32767.0
 
-                            # ── Per-uid whisper effect ───────────────────────────────────
-                            # _active_whispers[uid] обновляется в add_incoming_whisper_packet
-                            # на каждый входящий пакет шёпота (~50 раз/сек).
-                            #
-                            # «Тёплый старт» при первом пакете (uid не в _whisper_states):
-                            # history заполняем текущим фреймом s (повторённым до 2048).
-                            # Обе читающие головки pitch-shifter'а сразу попадают в реальный
-                            # сигнал — переход ноль→сигнал отсутствует → нет треска/click.
-                            #
-                            # LP-фильтр: нулевые начальные условия оптимальны для голосового
-                            # сигнала (mean ≈ 0); sosfilt_zi(sos)*0 == zeros.
-                            #
-                            # Два шептуна одновременно: каждый uid имеет свой state dict →
-                            # независимые history/phase/lp_zi/buf → нет взаимных артефактов →
-                            # оба смешиваются в mix_buffer без потерь.
-                            _w_ts = self._active_whispers.get(uid, 0.0)
-                            if _w_ts and (curr_time - _w_ts) < 2.0:
-                                if uid not in self._whisper_states:
-                                    # Ленивое создание: тёплый старт с реальным сигналом
-                                    _warm_history = np.resize(
-                                        s.astype(np.float32), 2048).copy()
-                                    self._whisper_states[uid] = {
-                                        'history': _warm_history,
-                                        'phase':   0.0,
-                                        'lp_zi':   np.zeros(
-                                            (self._anon_lp_sos.shape[0], 2),
-                                            dtype=np.float64),
-                                        'buf':     np.zeros(
-                                            2048 + CHUNK_SIZE, dtype=np.float32),
-                                    }
-                                s = self._apply_anonymous_voice_effect(
-                                    s, self._whisper_states[uid])
+                                # ── Per-uid whisper effect ───────────────────────────────────
+                                # _active_whispers[uid] обновляется в add_incoming_whisper_packet
+                                # на каждый входящий пакет шёпота (~50 раз/сек).
+                                #
+                                # «Тёплый старт» при первом пакете (uid не в _whisper_states):
+                                # history заполняем текущим фреймом s (повторённым до 2048).
+                                # Обе читающие головки pitch-shifter'а сразу попадают в реальный
+                                # сигнал — переход ноль→сигнал отсутствует → нет треска/click.
+                                #
+                                # LP-фильтр: нулевые начальные условия оптимальны для голосового
+                                # сигнала (mean ≈ 0); sosfilt_zi(sos)*0 == zeros.
+                                #
+                                # Два шептуна одновременно: каждый uid имеет свой state dict →
+                                # независимые history/phase/lp_zi/buf → нет взаимных артефактов →
+                                # оба смешиваются в mix_buffer без потерь.
+                                _w_ts = self._active_whispers.get(uid, 0.0)
+                                if _w_ts and (curr_time - _w_ts) < 2.0:
+                                    if uid not in self._whisper_states:
+                                        # Ленивое создание: тёплый старт с реальным сигналом
+                                        _warm_history = np.resize(
+                                            s.astype(np.float32), 2048).copy()
+                                        self._whisper_states[uid] = {
+                                            'history': _warm_history,
+                                            'phase':   0.0,
+                                            'lp_zi':   np.zeros(
+                                                (self._anon_lp_sos.shape[0], 2),
+                                                dtype=np.float64),
+                                            'buf':     np.zeros(
+                                                2048 + CHUNK_SIZE, dtype=np.float32),
+                                        }
+                                    s = self._apply_anonymous_voice_effect(
+                                        s, self._whisper_states[uid])
+                                else:
+                                    # Шептун неактивен: освобождаем state (нет утечки памяти)
+                                    self._active_whispers.pop(uid, None)
+                                    self._whisper_states.pop(uid, None)
+
+                                self.mix_buffer += s * (user.volume * _speaker_gain)
+                                # Mix-Minus (FLAG_STREAM_VOICES) через UDP удалён.
+                                # Голоса участников комнаты для зрителей стрима будут
+                                # реализованы через WebRTC в следующей итерации.
                             else:
-                                # Шептун неактивен: освобождаем state (нет утечки памяти)
-                                self._active_whispers.pop(uid, None)
-                                self._whisper_states.pop(uid, None)
-
-                            self.mix_buffer += s * (user.volume * _speaker_gain)
-                            # Mix-Minus (FLAG_STREAM_VOICES) через UDP удалён.
-                            # Голоса участников комнаты для зрителей стрима будут
-                            # реализованы через WebRTC в следующей итерации.
-                        except:
+                                # FIX PLC: пакет не пришёл вовремя (jitter/потеря сети).
+                                # Вызываем Opus PLC (Packet Loss Concealment) с data=None.
+                                # Opus генерирует comfort noise и поддерживает внутреннее
+                                # LPC-состояние предсказателя синхронизированным.
+                                # Без этого вызова при следующем реальном пакете декодер
+                                # «не знает» что был пропуск → выдаёт discontinuity → треск.
+                                # Результат PLC в mix_buffer НЕ добавляем — тишина правильна
+                                # когда пакет потерян, PLC нужен только для состояния декодера.
+                                try:
+                                    user.decoder.decode(None, CHUNK_SIZE)
+                                except Exception:
+                                    pass
+                        except Exception:
                             pass
 
-        # FIX: Soft limiter вместо жёсткого clip.
-        # Жёсткий clip при пиках > 1.0 (2-3 говорящих + stream audio) создаёт
-        # waveshaping дисторшн — нелинейные гармоники, слышимые как хруст/артефакт.
-        # Решение: если пик > 0.95 — нормализуем весь буфер пропорционально.
-        # Это аналог look-ahead limiter без attack/release (приемлемо для 20 мс фреймов).
-        # np.clip остаётся как safety net для float-погрешностей.
-        _peak = np.max(np.abs(self.mix_buffer))
-        if _peak > 0.95:
-            self.mix_buffer *= (0.95 / _peak)
+        # ── Внутренний микшер UI-звуков (уведомления, Soundboard, Nudge) ────────
+        # Подмешиваем в уже заполненный mix_buffer — никаких sd.play() и
+        # новых WASAPI-устройств. Lock гарантирует атомарность доступа к списку.
+        with self._local_sounds_lock:
+            active = []
+            for snd in self._local_sounds:
+                pos  = snd['pos']
+                rem  = len(snd['data']) - pos
+                take = min(CHUNK_SIZE, rem)
+                if take > 0:
+                    self.mix_buffer[:take] += snd['data'][pos:pos + take] * snd['vol']
+                    snd['pos'] += take
+                    if snd['pos'] < len(snd['data']):
+                        active.append(snd)
+            self._local_sounds = active
+
+        # ── Математически чистый tanh soft-clipper ───────────────────────────
+        # Заменяет старый пропорциональный лимитер (self.mix_buffer *= k).
+        # Старая схема: один gain на весь кадр → резкая «ступенька» gain между
+        # соседними кадрами → слышимый щелчок/треск при пиках.
+        # tanh обрабатывает каждый семпл независимо, плавно загибая только те,
+        # что вышли за limit. Результат — аналог лампового сатуратора без артефактов.
+        _limit = 0.95
+        _over  = np.abs(self.mix_buffer) > _limit
+        if np.any(_over):
+            _excess = np.abs(self.mix_buffer[_over]) - _limit
+            self.mix_buffer[_over] = (
+                np.sign(self.mix_buffer[_over])
+                * (_limit + (1.0 - _limit) * np.tanh(_excess / (1.0 - _limit)))
+            )
+        # Safety-clip: float-погрешности после tanh
         np.clip(self.mix_buffer, -1.0, 1.0, out=self.mix_buffer)
 
         outdata[:] = self.mix_buffer.reshape(-1, 1)
@@ -1853,8 +1948,11 @@ class AudioHandler(QObject):
                     self.pending_volumes[uid] = saved_vol
 
     def set_user_volume(self, uid, vol):
-        # Зажимаем в [0.0 … 2.0]. vol=0.0 → «тихий мут» через ползунок.
-        vol = max(0.0, min(2.0, float(vol)))
+        # FIX: Зажимаем в [0.0 … 10.0].
+        # Слайдер 0-200 → экспоненциальная кривая → max = 10^((200-100)/100) = 10.0.
+        # Старый клэмп min(2.0, ...) обрезал slider=200 до 2.0, которое обратно
+        # конвертировалось в _vol_to_slider(2.0) = 130 → пользователь видел 130 вместо 200.
+        vol = max(0.0, min(10.0, float(vol)))
         emit_zero_state = None  # None = состояние не изменилось
 
         with self.users_lock:
@@ -1869,6 +1967,8 @@ class AudioHandler(QObject):
                 if ip:
                     self.settings.setValue(f"vol_ip_{ip}", vol)
                 else:
+                    # Fallback: сохраняем по uid если IP ещё не зарегистрирован.
+                    # register_ip_mapping() перезапишет правильный ключ при получении IP.
                     self.settings.setValue(f"volume_{uid}", vol)
 
         # Эмитируем сигнал ВНЕ лока — не блокируем аудиопоток
@@ -1942,7 +2042,7 @@ class AudioHandler(QObject):
           оверлей только при смене отправителя (uid != текущий) — без визуального
           мерцания. Пока идут пакеты — таймер никогда не истекает.
         """
-        now = time.time()
+        now = time.perf_counter()  # FIX: perf_counter точнее time.time() на Windows (15.6ms vs мкс)
 
         # Обновляем реестр активных шептунов — dict lookup O(1), GIL-safe.
         # audio_callback читает self._active_whispers[uid] без лока:

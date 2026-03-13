@@ -576,12 +576,25 @@ class SFUServer:
         # ── Встроенный сервер: управление ────────────────────────────────────
         # _is_embedded=True: сервер запущен внутри процесса клиента (start_embedded).
         # _accepting: False → accept-цикл завершится после следующего accept().
+        # _owner_ip: RadminVPN IP владельца сервера (кто вызвал start_embedded).
+        #   При CMD_LOGIN клиент с этим IP вставляется в host_order[0] независимо
+        #   от порядка подключения. Исправляет гонку: 150мс QTimer в _on_become_host
+        #   даёт другим клиентам (Client3 через _migrate_reconnect) подключиться
+        #   раньше владельца и захватить host_order[0] → права передачи улетают.
         self._is_embedded: bool       = False
         self._accepting:   bool       = True
         self._announcer               = None   # ServerAnnouncer | None
+        self._owner_ip:    str        = ''     # IP создателя встроенного сервера
 
         # ── Имя сервера (отображается в списке серверов у клиентов) ──────────
         self._server_name = server_name or SERVER_NAME_DEFAULT
+
+        # ── Пинги клиентов (для выбора следующего хоста по min RTT) ────────────
+        # uid → ping_ms (EWMA RTT клиента к серверу, самостоятельно измеренный)
+        # Обновляется при получении action='report_ping' от клиента.
+        # Используется _pick_best_host() при передаче/миграции сервера.
+        self._client_pings: dict[int, int] = {}
+        self._client_pings_lock = threading.Lock()
 
         # ── Временные каналы ─────────────────────────────────────────────────
         # channel_name → {'password': str|None, 'permanent': bool}
@@ -602,6 +615,54 @@ class SFUServer:
         """Возвращает текущее число подключённых клиентов. Используется ServerAnnouncer."""
         with self.clients_lock:
             return len(self.clients)
+
+    def _pick_best_host(self, exclude_uid: int = 0) -> tuple[int, str]:
+        """
+        Выбирает лучшего кандидата в новые хосты по критерию минимального RTT.
+
+        Алгоритм:
+          1. Берём всех подключённых клиентов кроме exclude_uid (текущий хост).
+          2. Сортируем по self._client_pings[uid] (чем меньше — тем лучше).
+          3. Если у клиента нет данных о пинге — считаем его пинг = 999ms
+             (хуже любого реального, но лучше "вообще нет кандидатов").
+          4. При равенстве пинга приоритет отдаётся первому в host_order
+             (они пришли раньше, сеть скорее всего надёжнее).
+
+        Возвращает (uid, ip) лучшего кандидата или (0, '') если нет кандидатов.
+        """
+        with self.clients_lock:
+            candidates = [
+                (c['uid'], c.get('ip', ''))
+                for c in self.clients.values()
+                if c['uid'] != exclude_uid and c.get('ip')
+            ]
+
+        if not candidates:
+            return 0, ''
+
+        with self._client_pings_lock:
+            pings_snapshot = dict(self._client_pings)
+
+        with self._host_order_lock:
+            order_snapshot = list(self._host_order)
+
+        def _sort_key(item):
+            uid, _ = item
+            ping = pings_snapshot.get(uid, 999)
+            # Вторичная сортировка по позиции в host_order (меньше = раньше пришёл)
+            try:
+                pos = order_snapshot.index(uid)
+            except ValueError:
+                pos = 9999
+            return (ping, pos)
+
+        best_uid, best_ip = min(candidates, key=_sort_key)
+        best_ping = pings_snapshot.get(best_uid, -1)
+        print(
+            f"[Server] _pick_best_host: лучший кандидат uid={best_uid} "
+            f"ip={best_ip} ping={best_ping}ms"
+        )
+        return best_uid, best_ip
 
     def _get_channel_list(self) -> list:
         """Снимок списка каналов для включения в sync_users."""
@@ -830,10 +891,20 @@ class SFUServer:
                                 }
                             with self.udp_lock:
                                 self.uid_to_room[uid] = 'General'
-                            # Добавляем в очередь потенциальных хостов
+                            # Добавляем в очередь потенциальных хостов.
+                            # FIX (Bug G): в embedded-режиме владелец сервера (_owner_ip)
+                            # всегда вставляется в host_order[0], независимо от порядка
+                            # подключения. 150мс QTimer в _on_become_host даёт другим
+                            # клиентам подключиться раньше — без этого они захватывали
+                            # host_order[0] и получали права передачи сервера.
                             with self._host_order_lock:
                                 if uid not in self._host_order:
-                                    self._host_order.append(uid)
+                                    if self._is_embedded and client_ip == self._owner_ip:
+                                        self._host_order.insert(0, uid)
+                                        print(f"[Server] host_order: владелец {client_nick} "
+                                              f"(uid={uid}) → position 0 (приоритет по IP)")
+                                    else:
+                                        self._host_order.append(uid)
                             conn.sendall(
                                 json.dumps({'action': 'login_success', 'uid': uid}).encode('utf-8')
                             )
@@ -950,6 +1021,15 @@ class SFUServer:
                                     self.clients[conn]['mute'] = msg.get('mute', False)
                                     self.clients[conn]['deaf'] = msg.get('deaf', False)
                             self.send_global_state()
+
+                        # ── Ping Report (тихий — без send_global_state) ────────
+                        # Клиент шлёт свой текущий RTT раз в ~3 сек из ping_loop.
+                        # Сервер сохраняет для _pick_best_host (выбор нового хоста).
+                        elif action == 'report_ping':
+                            ping_ms = msg.get('ping_ms', 0)
+                            if isinstance(ping_ms, (int, float)) and ping_ms >= 0:
+                                with self._client_pings_lock:
+                                    self._client_pings[uid] = int(ping_ms)
 
                         # ── Presence ──────────────────────────────────────────
                         elif action == CMD_UPDATE_PRESENCE:
@@ -1093,21 +1173,37 @@ class SFUServer:
                                     f"не является хостом — отклонено"
                                 )
                                 continue
-                            # Находим IP цели
-                            target_ip_st = None
-                            target_nick_st = '?'
-                            with self.clients_lock:
-                                for c_data in self.clients.values():
-                                    if c_data['uid'] == target_uid_st:
-                                        target_ip_st   = c_data.get('ip')
-                                        target_nick_st = c_data.get('nick', '?')
-                                        break
-                            if not target_ip_st:
-                                print(
-                                    f"[Server] server_transfer: "
-                                    f"uid={target_uid_st} не найден"
+
+                            # target_uid == 0 → авто-выбор по минимальному пингу
+                            if target_uid_st == 0:
+                                target_uid_st, target_ip_st = self._pick_best_host(
+                                    exclude_uid=uid
                                 )
-                                continue
+                                if not target_uid_st:
+                                    print("[Server] server_transfer auto: нет кандидатов")
+                                    continue
+                                target_nick_st = '?'
+                                with self.clients_lock:
+                                    for c_data in self.clients.values():
+                                        if c_data['uid'] == target_uid_st:
+                                            target_nick_st = c_data.get('nick', '?')
+                                            break
+                            else:
+                                # Конкретный uid — ищем его IP
+                                target_ip_st   = None
+                                target_nick_st = '?'
+                                with self.clients_lock:
+                                    for c_data in self.clients.values():
+                                        if c_data['uid'] == target_uid_st:
+                                            target_ip_st   = c_data.get('ip')
+                                            target_nick_st = c_data.get('nick', '?')
+                                            break
+                                if not target_ip_st:
+                                    print(
+                                        f"[Server] server_transfer: "
+                                        f"uid={target_uid_st} не найден"
+                                    )
+                                    continue
                             print(
                                 f"[Server] 🔀 Передача сервера: "
                                 f"uid={uid} → {target_nick_st} (uid={target_uid_st}, "
@@ -1475,6 +1571,7 @@ class SFUServer:
         """
         self._is_embedded = True
         self._accepting   = True
+        self._owner_ip    = host_ip   # FIX: сохраняем IP владельца для приоритета в host_order
 
         # WebRTCSFU
         if AIORTC_AVAILABLE:
@@ -1536,56 +1633,105 @@ class SFUServer:
         Корректная остановка встроенного сервера с передачей хостинга.
 
         Алгоритм:
-          1. Определяем следующего в host_order (первый, кто не мы).
-          2. Если нет никого — просто останавливаем сервер.
-          3. Иначе — broadcast CMD_SERVER_MIGRATE со следующим IP.
-          4. Ждём 600 мс (клиенты успеют получить пакет), затем закрываемся.
-
-        Вызывается из MainWindow.closeEvent() если _is_embedded=True.
+          1. Выбираем лучшего кандидата по RTT (_pick_best_host).
+          2. Если нет никого — просто закрываемся.
+          3. Broadcast CMD_SERVER_MIGRATE.
+          4. sleep(0.35с) — TCP_NODELAY: пакет улетает за < 10мс, 350мс запас.
+          5. shutdown(SHUT_WR) на каждый клиентский сокет — посылает TCP FIN.
+             Клиент дочитывает CMD_SERVER_MIGRATE из буфера, затем получает EOF.
+             БЕЗ этого: process-exit → ОС посылает TCP RST → Windows стирает
+             непрочитанный буфер → клиент не видит CMD_SERVER_MIGRATE →
+             _on_connection_lost → 4×3с=12с ожидания (Bug C).
+          6. Закрываем listening-сокеты.
         """
         if not self._is_embedded:
             return
 
         self._accepting = False
 
-        # Останавливаем анонсер
         if self._announcer:
             self._announcer.stop()
             self._announcer = None
 
-        # Находим следующего в очереди
         with self._host_order_lock:
-            order_copy = list(self._host_order)
+            my_uid = self._host_order[0] if self._host_order else 0
 
-        if len(order_copy) < 2:
-            # Только мы → просто закрываемся
+        next_uid, next_ip = self._pick_best_host(exclude_uid=my_uid)
+
+        if not next_uid:
             print("[Server] stop_gracefully: нет других участников, закрываемся")
             self.tcp_sock.close()
             self.udp_sock.close()
             return
 
-        # order_copy[0] — это мы (хост). Следующий — order_copy[1].
-        next_uid = order_copy[1]
-        next_ip  = None
-        with self.clients_lock:
-            for c_data in self.clients.values():
-                if c_data['uid'] == next_uid:
-                    next_ip = c_data.get('ip')
-                    break
+        print(f"[Server] stop_gracefully: передаём хостинг uid={next_uid} ({next_ip})")
+        self._broadcast_server_migrate(next_uid, next_ip)
 
-        if next_ip:
-            print(
-                f"[Server] stop_gracefully: передаём хостинг "
-                f"uid={next_uid} ({next_ip})"
-            )
-            self._broadcast_server_migrate(next_uid, next_ip)
-            # Даём клиентам 600 мс принять пакет
-            import time as _time
-            _time.sleep(0.6)
+        import time as _time
+        _time.sleep(0.35)
+
+        # FIX: SHUT_WR посылает FIN (graceful half-close) вместо RST при выходе.
+        # Клиент успевает прочитать CMD_SERVER_MIGRATE из recv-буфера.
+        with self.clients_lock:
+            conns = list(self.clients.keys())
+        for c in conns:
+            try:
+                c.shutdown(socket.SHUT_WR)
+            except Exception:
+                pass
 
         self.tcp_sock.close()
         self.udp_sock.close()
         print("[Server] Встроенный сервер остановлен")
+
+    def stop_silent(self) -> None:
+        """
+        Немедленная тихая остановка без broadcast CMD_SERVER_MIGRATE.
+
+        Используется в двух случаях:
+          1. _on_server_migrating: мы (как хост) уже разослали CMD_SERVER_MIGRATE
+             через сервер, теперь надо закрыть свой embedded server.
+          2. Когда мы сами получили CMD_SERVER_MIGRATE и нужно освободить порты
+             до того как новый хост захочет стать хостом снова.
+
+        НЕ вызывает _broadcast_server_migrate — миграция уже обработана.
+        НЕ спит — мгновенная операция.
+
+        Закрывает ВСЕ сокеты (Bug E: stop_announcer_only оставлял их открытыми):
+          - listening TCP/UDP → порты 5000/5001 освобождены для нового SFUServer
+          - принятые клиентские сокеты → _accepting цикл выходит
+        Устанавливает mgr._server=None → is_running()=False → start() сработает.
+        """
+        if not self._is_embedded:
+            return
+        print("[Server] stop_silent: освобождаем сокеты")
+        self._accepting = False
+
+        if self._announcer:
+            try:
+                self._announcer.stop()
+            except Exception:
+                pass
+            self._announcer = None
+
+        with self.clients_lock:
+            conns = list(self.clients.keys())
+        for c in conns:
+            try:
+                c.shutdown(socket.SHUT_RDWR)
+                c.close()
+            except Exception:
+                pass
+
+        try:
+            self.tcp_sock.close()
+        except Exception:
+            pass
+        try:
+            self.udp_sock.close()
+        except Exception:
+            pass
+        print("[Server] stop_silent: готово")
 
     def _broadcast_server_migrate(self, new_host_uid: int, new_host_ip: str) -> None:
         """
@@ -1635,6 +1781,77 @@ class SFUServer:
                 daemon=True,
             ).start()
 
+
+# =============================================================================
+# EmbeddedServerManager — менеджер встроенного сервера
+# =============================================================================
+class EmbeddedServerManager:
+    """
+    Singleton-менеджер встроенного SFUServer внутри процесса клиента.
+    Вынесен сюда для предотвращения двойного импорта (__main__ vs module).
+    """
+    _instance: 'EmbeddedServerManager | None' = None
+
+    def __init__(self):
+        self._server = None  # SFUServer | None
+
+    @classmethod
+    def get(cls) -> 'EmbeddedServerManager':
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def start(self, host_ip: str, host_nick: str, server_name: str = '') -> None:
+        if self.is_running():
+            print("[EmbeddedServer] Уже запущен — повторный запуск пропущен")
+            return
+
+        if not server_name:
+            import os, json
+            from config import USER_CONFIG_PATH
+            try:
+                if os.path.exists(USER_CONFIG_PATH):
+                    with open(USER_CONFIG_PATH, 'r', encoding='utf-8') as f:
+                        server_name = json.load(f).get('server_name', 'InPulse Server')
+            except Exception:
+                pass
+            server_name = server_name or 'InPulse Server'
+
+        self._server = SFUServer(server_name=server_name)
+        try:
+            self._server.start_embedded(host_ip, host_nick)
+        except Exception:
+            self._server = None
+            raise
+        print(f"[EmbeddedServer] Запущен: ip={host_ip}, nick={host_nick!r}, name={server_name!r}")
+
+    def stop(self) -> None:
+        if self._server is not None:
+            try:
+                self._server.stop_gracefully()
+            except Exception as e:
+                print(f"[EmbeddedServer] Ошибка остановки: {e}")
+            self._server = None
+
+    def stop_silent(self) -> None:
+        if self._server is not None:
+            try:
+                self._server.stop_silent()
+            except Exception as e:
+                print(f"[EmbeddedServer] stop_silent error: {e}")
+            self._server = None
+
+    def stop_announcer_only(self) -> None:
+        if self._server is not None and self._server._announcer is not None:
+            try:
+                self._server._announcer.stop()
+                self._server._announcer = None
+                print("[EmbeddedServer] Анонсер остановлен (передача хостинга)")
+            except Exception as e:
+                print(f"[EmbeddedServer] stop_announcer_only error: {e}")
+
+    def is_running(self) -> bool:
+        return self._server is not None
 
 if __name__ == "__main__":
     SFUServer().start()

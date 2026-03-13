@@ -154,8 +154,8 @@ KNOWN_USERS_PATH = os.path.join(get_appdata_dir(), "known_users.json")
 #
 # Порт 5002 выбран чтобы не конфликтовать с TCP (5000) и UDP голоса (5001).
 DISCOVERY_PORT     = 5002   # UDP broadcast: поиск / анонс встроенного сервера
-DISCOVERY_INTERVAL = 3.0    # секунды между анонсами ServerAnnouncer
-DISCOVERY_TIMEOUT  = 2.5    # секунды ожидания при поиске (DiscoveryScreen)
+DISCOVERY_INTERVAL = 0.5    # было 1.5с — анонс 2 раза в секунду, сервер виден мгновенно
+DISCOVERY_TIMEOUT  = 1.5    # было 3.5с — за 1.5с клиент получит 3 анонса (при 0.5с интервале)
 
 # ── Передача/миграция сервера ─────────────────────────────────────────────────
 #

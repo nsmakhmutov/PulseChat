@@ -59,8 +59,8 @@ from config import (
     CMD_QUICK_MSG, QUICK_MSG_MAX_LEN,
 )
 
-MAX_SILENT_RECONNECT_ATTEMPTS = 4
-RECONNECT_DELAY               = 3.0
+MAX_SILENT_RECONNECT_ATTEMPTS = 2    # было 4: 4×3с=12с → 2×1с=2с до auto_host_check
+RECONNECT_DELAY               = 1.0  # было 3.0с
 
 # Устанавливаем точность системного таймера в 1 мс на Windows.
 # Без этого time.sleep(0.001) может спать 10-15 мс — аудио глитчи.
@@ -154,13 +154,18 @@ class NetworkClient(QObject):
         self._sb_playing = threading.Event()
 
         # ── Встроенный сервер: состояние хост-очереди и миграции ─────────────
-        # _host_order     — UID в порядке входа на сервер (хранится локально).
-        #                   Используется при авто-переключении хоста.
-        # _server_host_uid — uid текущего хозяина сервера (host_order[0]).
-        # _migration_pending — получен CMD_SERVER_MIGRATE, ждём запуска нового хоста.
-        self._host_order:       list[int] = []
-        self._server_host_uid:  int       = 0
-        self._migration_pending: bool     = False   # уже стартовали авто-переход
+        # _host_order      — UID участников в порядке входа на сервер.
+        # _server_host_uid — UID текущего хоста (host_order[0]).
+        # _migration_pending — получен CMD_SERVER_MIGRATE, ждём нового хоста.
+        # _host_order_ips  — UID → RadminVPN IP всех участников группы.
+        #                    Обновляется при каждом sync_users.
+        #                    Ключевой факт: в нём ТОЛЬКО наши люди — те, кто
+        #                    был на нашем сервере. При дропе хоста мы ищем
+        #                    нового хоста ТОЛЬКО среди них, не через discovery.
+        self._host_order:       list[int]      = []
+        self._server_host_uid:  int            = 0
+        self._migration_pending: bool          = False
+        self._host_order_ips:   dict[int, str] = {}  # uid → ip
 
         # --- WebRTC ---
         # asyncio event loop WebRTC (создаётся один раз при первом подключении)
@@ -240,8 +245,18 @@ class NetworkClient(QObject):
                 try:
                     self._sb_playing.set()
                     data, sr = sf.read(audio_source, dtype='float32')
-                    sd.play(data * vol, sr)
-                    sd.wait()
+                    # FIX: sd.play() открывает новый PortAudio/WASAPI поток → фриз.
+                    # Используем внутренний микшер AudioHandler — звук подаётся прямо
+                    # в уже открытый 20ms callback без аллокации новых устройств.
+                    if hasattr(self.audio, 'play_internal_sound') and self.audio.stream:
+                        self.audio.play_internal_sound(data, sr, vol)
+                        # Ждём пока звук отыграет (как sd.wait()) чтобы корректно
+                        # снять флаг _sb_playing и не наслоить следующий трек.
+                        duration = len(data) / sr
+                        time.sleep(duration)
+                    else:
+                        sd.play(data * vol, sr)
+                        sd.wait()
                 except Exception as e:
                     print(f"[Net] Soundboard playback error: {e}")
                 finally:
@@ -478,87 +493,147 @@ class NetworkClient(QObject):
     # ------------------------------------------------------------------
     def _migrate_reconnect(self) -> None:
         """
-        Выполняет переподключение к новому хосту после CMD_SERVER_MIGRATE.
+        Переподключение к новому хосту после CMD_SERVER_MIGRATE.
 
-        Ждёт 1.5 сек (новый хост успевает поднять сервер), затем запускает
-        обычный reconnect_loop к новому _ip.
+        Порядок операций важен:
+          1. running=False ПЕРВЫМ — если tcp_listen выйдет раньше (FIN от сервера),
+             он увидит running=False и не запустит _on_connection_lost.
+          2. _migration_pending=False — сигнал что мы обрабатываем миграцию.
+          3. _reconnecting=False — сбрасываем флаг для fast_switch_to.
+          4. fast_switch_to — 8 попыток × 0.35с ≈ 2.8с окно.
+             Новый хост стартует за ~150–300мс (QTimer 150мс + bind).
+             fast_switch_to подключится с 1-2 попытки.
 
-        Не запускается если мы сами становимся хостом (become_host.emit).
+        Убрана статичная задержка 2.5с (Bug A).
         """
-        time.sleep(1.5)
         if not self._migration_pending:
-            return   # уже переподключились другим способом
-        self._migration_pending  = False
-        self._reconnecting       = True
-        self._reconnect_attempts = 0
-        self.running             = False
-        self._reconnect_loop()
+            return
+        # Шаг 1: running=False ДО сброса _migration_pending
+        self.running = False
+        # Шаг 2-3: сбрасываем флаги
+        self._migration_pending = False
+        self._reconnecting      = False
+        # Шаг 4: быстрое переподключение к новому хосту
+        self.fast_switch_to(self._ip)
 
     def _auto_host_check(self) -> None:
         """
-        Запускается после полного провала reconnect_loop (reconnect_failed).
+        Запускается после полного провала reconnect_loop (хост упал / обрыв сети).
 
-        Логика авто-переключения хоста:
-          1. Определяем нашу позицию в _host_order.
-          2. Ждём position × 4 секунды (нулевая позиция = сразу).
-          3. Проверяем discovery: может кто-то уже поднял сервер?
-          4. Если нашли → reconnect к нему.
-          5. Если не нашли И мы первые в очереди → emit become_host.
-          6. Иначе → ждём ещё, потом снова discovery (max 60 сек).
+        ИСПРАВЛЕНИЕ: раньше использовался ServerDiscovery().discover() который
+        находил ЛЮБОЙ сервер в RadminVPN — включая чужих (Владик и брат).
+        Участники группы улетали к посторонним людям.
 
-        Такой механизм гарантирует что сервер поднимется ровно у одного
-        участника даже без какой-либо центральной координации.
+        Новая логика работает только внутри своей группы:
+          1. Берём _host_order (порядок входа) и _host_order_ips (их IP).
+             Оба поля обновлялись при каждом sync_users с нашего сервера.
+          2. Убираем упавшего хоста из рассмотрения.
+          3. Если остались другие участники — они по очереди пробуют стать хостом:
+             - Первый в оставшейся очереди → сразу emit become_host.
+             - Остальные ждут (позиция - 1) × 3 сек, затем пробуют подключиться
+               к первому. Если он поднял сервер — подключаются. Нет — следующий
+               в очереди тоже станет хостом, и тогда подключаются к нему.
+          4. Никаких ServerDiscovery — только наши IP.
         """
         try:
-            my_uid = getattr(self.audio, 'my_uid', 0)
+            my_uid   = getattr(self.audio, 'my_uid', 0)
+            old_host = self._server_host_uid  # упавший хост
+
+            # Оставшиеся участники группы (без упавшего хоста)
+            remaining_order = [uid for uid in self._host_order if uid != old_host]
+
+            if not remaining_order:
+                print("[Net] Auto-host: группа пуста после дропа хоста, становимся хостом")
+                self.become_host.emit()
+                return
+
             try:
-                my_pos = self._host_order.index(my_uid)
+                my_pos = remaining_order.index(my_uid)
             except ValueError:
-                my_pos = -1   # нас нет в очереди (незнакомый пользователь)
-
-            if my_pos < 0:
-                # Не в очереди запасных хостов → периодически ищем новый сервер
-                self._discovery_reconnect_loop()
+                # Нас нет в очереди — просто ждём пока первый поднимет сервер
+                first_ip = self._host_order_ips.get(remaining_order[0], '')
+                print(f"[Net] Auto-host: нас нет в очереди, ждём первого ({first_ip})")
+                if first_ip:
+                    self._wait_and_connect_group(first_ip)
                 return
 
-            # Ждём своей очереди: позиция × 4 сек
-            wait_sec = my_pos * 4.0
-            if wait_sec > 0:
-                print(
-                    f"[Net] Auto-host: позиция {my_pos}, "
-                    f"ждём {wait_sec:.0f}с..."
-                )
-                time.sleep(wait_sec)
-
-            # Проверяем: не появился ли сервер пока ждали
-            from server_discovery import ServerDiscovery
-            discovered = ServerDiscovery().discover(timeout=2.0)
-            if discovered:
-                print(
-                    f"[Net] Auto-host: обнаружен сервер "
-                    f"{discovered['ip']} (хост {discovered['host_nick']!r})"
-                )
-                self._ip = discovered['ip']
-                self._migration_pending  = False
-                self._reconnecting       = True
-                self._reconnect_attempts = 0
-                self._reconnect_loop()
+            if my_pos == 0:
+                # Мы первые в оставшейся очереди → немедленно становимся хостом
+                print(f"[Net] Auto-host: мы первые в группе из {len(remaining_order)}, "
+                      f"запускаем сервер")
+                self.become_host.emit()
                 return
 
-            # Сервер не найден — становимся хостом
-            print(f"[Net] Auto-host: становимся хостом (позиция {my_pos})")
+            # Ждём (позиция) × 1.5 сек — первый должен успеть поднять сервер.
+            # Было × 3.0с: при 2 клиентах это давало 3с лишнего ожидания.
+            # 1.5с: за 2с reconnect_loop + 1.5с ожидание = 3.5с суммарно для клиента 3.
+            wait_sec = my_pos * 1.5
+            print(f"[Net] Auto-host: позиция {my_pos} в группе, ждём {wait_sec:.1f}с...")
+            time.sleep(wait_sec)
+
+            # Пробуем подключиться к кандидатам раньше нас по очереди
+            for candidate_uid in remaining_order[:my_pos]:
+                candidate_ip = self._host_order_ips.get(candidate_uid, '')
+                if not candidate_ip:
+                    continue
+                print(f"[Net] Auto-host: пробуем uid={candidate_uid} ip={candidate_ip}")
+                if self._try_group_connect(candidate_ip):
+                    return  # успешно подключились к новому хосту из своей группы
+
+            # Никто не ответил — становимся хостом сами
+            print(f"[Net] Auto-host: никто из группы не ответил, берём хостинг")
             self.become_host.emit()
 
         except Exception as e:
             print(f"[Net] _auto_host_check error: {e}")
 
+    def _try_group_connect(self, ip: str, max_attempts: int = 6) -> bool:
+        """
+        Пробует подключиться к участнику своей группы (новый хост).
+        max_attempts × 0.5 сек = 3 сек окно ожидания.
+        Возвращает True если порт доступен и запущен fast_switch_to.
+
+        FIX (Bug D): было _reconnect_loop() после probe → добавляло 3с sleep
+        в начале. Теперь fast_switch_to: 8 попыток × 0.35с без начального sleep.
+        """
+        from config import DEFAULT_PORT_TCP
+        import socket as _sock
+        for attempt in range(1, max_attempts + 1):
+            try:
+                s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+                s.settimeout(1.0)
+                s.connect((ip, DEFAULT_PORT_TCP))
+                s.close()
+                print(f"[Net] _try_group_connect: {ip} ответил (попытка {attempt})")
+                # fast_switch_to сам выставит running=False и _reconnecting=True
+                self._reconnecting = False   # сброс чтобы fast_switch_to прошёл guard
+                self.fast_switch_to(ip)
+                return True
+            except Exception:
+                pass
+            time.sleep(0.5)
+        print(f"[Net] _try_group_connect: {ip} не поднял сервер")
+        return False
+
+    def _wait_and_connect_group(self, ip: str) -> None:
+        """
+        Ждёт пока первый в очереди поднимет сервер (до 15 сек), затем подключается.
+        Для участников не в host_order (например зашли позже).
+        """
+        print(f"[Net] _wait_and_connect_group: ждём {ip}...")
+        if self._try_group_connect(ip, max_attempts=30):  # 30 × 0.5с = 15 сек
+            return
+        # Так и не поднял — показываем ошибку
+        self.reconnect_failed.emit()
+
     def _discovery_reconnect_loop(self) -> None:
         """
-        Периодически ищет новый сервер через UDP discovery (для не-первых в очереди).
-        Выполняется в daemon-потоке, не блокирует UI.
+        УСТАРЕЛО: больше не вызывается из _auto_host_check.
+        Оставлено только для возможного внешнего использования.
+        Ищет любой сервер через UDP broadcast (может найти чужой).
         """
         from server_discovery import ServerDiscovery
-        max_elapsed = 90.0   # максимум 90 секунд ожидания
+        max_elapsed = 90.0
         elapsed     = 0.0
         probe_interval = 3.5
 
@@ -575,7 +650,6 @@ class NetworkClient(QObject):
                 return
             elapsed += probe_interval
 
-        # Так и не нашли за 90 секунд — испускаем сигнал ещё раз (UI покажет кнопку)
         print("[Net] Discovery reconnect: сервер не найден за 90 сек")
         self.reconnect_failed.emit()
 
@@ -939,11 +1013,22 @@ class NetworkClient(QObject):
                     # Обычный голос чата
                     self.audio.add_incoming_packet(uid, seq, data[UDP_HEADER_SIZE:], flags)
 
+            except OSError as e:
+                # WinError 10038 — операция на закрытом сокете (другой поток закрыл).
+                # WinError 10022 — недопустимый аргумент (сокет уже недействителен).
+                # WinError 10054 — соединение сброшено удалённой стороной.
+                # Во всех случаях это штатное завершение — break без traceback.
+                err = getattr(e, 'winerror', None)
+                if not self.running or err in (10038, 10022, 10054):
+                    break
+                import traceback
+                print(f"[Net] UDP receive error: {e}\n{traceback.format_exc()}")
+                break
             except Exception as e:
                 if self.running:
                     import traceback
                     print(f"[Net] UDP receive error: {e}\n{traceback.format_exc()}")
-                continue
+                # Не break — обычные не-сокетные ошибки могут быть разовыми
 
     # ------------------------------------------------------------------
     # Отправка аудио-пакетов из очереди AudioHandler
@@ -984,6 +1069,15 @@ class NetworkClient(QObject):
                     self.packets_sent += 1
                 except Exception as e:
                     print(f"[Net] Ping error: {e}")
+
+                # Отправляем текущий RTT серверу (тихо — без sync_users broadcast).
+                # Сервер накапливает пинги для _pick_best_host при выборе нового хоста.
+                if self.current_ping > 0:
+                    try:
+                        self.send_json({'action': 'report_ping', 'ping_ms': self.current_ping})
+                    except Exception:
+                        pass
+
             time.sleep(3)
 
     # ------------------------------------------------------------------
@@ -1017,7 +1111,13 @@ class NetworkClient(QObject):
                 break
 
         print("[Net] TCP listener stopped")
-        if self.running:
+        # FIX (Bug B): не вызываем _on_connection_lost если идёт миграция.
+        # При CMD_SERVER_MIGRATE сервер закрывает наш сокет (FIN/RST) →
+        # tcp_listen выходит. Без этой проверки запускается ВТОРОЙ reconnect_loop
+        # параллельно с _migrate_reconnect — они конкурируют за сокеты.
+        # _migration_pending=True означает что _migrate_reconnect уже занимается
+        # переподключением. running=False означает что мы сами инициировали остановку.
+        if self.running and not self._migration_pending:
             self._on_connection_lost()
 
     def process_message(self, msg: dict):
@@ -1028,14 +1128,26 @@ class NetworkClient(QObject):
             print(f"[Net] Login success, UID: {msg.get('uid')}")
 
         elif act == 'sync_users':
-            # Обновляем локальный кэш host_order и server_host_uid
             self._host_order      = msg.get('host_order', [])
             self._server_host_uid = msg.get('server_host_uid', 0)
-            # Эмитим список каналов перед обновлением дерева
+
+            # Строим карту uid → ip из all_users.
+            # Это IP-адреса наших людей — нужны _auto_host_check при дропе хоста,
+            # чтобы пробовать только своих, а не любой сервер через broadcast.
+            all_users = msg.get('all_users', {})
+            new_ips: dict[int, str] = {}
+            for users_in_room in all_users.values():
+                for u in users_in_room:
+                    u_uid = u.get('uid', 0)
+                    u_ip  = u.get('ip',  '')
+                    if u_uid and u_ip:
+                        new_ips[u_uid] = u_ip
+            self._host_order_ips = new_ips
+
             channel_list = msg.get('channel_list', [])
             if channel_list:
                 self.channel_list_updated.emit(channel_list)
-            self.global_state_update.emit(msg.get('all_users', {}))
+            self.global_state_update.emit(all_users)
 
         elif act == 'channel_created':
             ch_name = msg.get('channel_name', '')
@@ -1136,7 +1248,14 @@ class NetworkClient(QObject):
             )
             my_uid = getattr(self.audio, 'my_uid', 0)
             if new_host_uid == my_uid:
-                # Мы — новый хост: сигнализируем UI запустить embedded server
+                # Мы — новый хост: сигнализируем UI запустить embedded server.
+                # FIX (Bug F): устанавливаем running=False и _migration_pending=True
+                # ДО emit, чтобы когда старый сервер разорвёт TCP-соединение,
+                # tcp_listen увидел эти флаги и НЕ вызвал _on_connection_lost().
+                # Без этого _on_connection_lost запускал _reconnect_loop параллельно
+                # с fast_switch_to из _on_become_host → гонка → бесконечный цикл.
+                self.running            = False
+                self._migration_pending = True
                 self.become_host.emit()
             elif new_host_ip:
                 # Переподключаемся к новому хосту
@@ -1450,8 +1569,13 @@ class NetworkClient(QObject):
 
             try:
                 data, sr = sf.read(sound_path, dtype='float32')
-                sd.play(data, sr)
-                sd.wait()
+                # FIX: аналогично soundboard — внутренний микшер вместо sd.play()
+                if hasattr(self.audio, 'play_internal_sound') and self.audio.stream:
+                    self.audio.play_internal_sound(data, sr, 1.0)
+                    time.sleep(len(data) / sr)
+                else:
+                    sd.play(data, sr)
+                    sd.wait()
                 print("[Nudge] Danger.mp3 воспроизведён успешно")
             except Exception as e:
                 print(f"[Nudge] playback error: {e}")

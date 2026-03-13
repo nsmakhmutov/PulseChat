@@ -5,6 +5,7 @@ import sys
 import socket
 import traceback
 import faulthandler
+from server import EmbeddedServerManager
 
 # ── UTF-8 консоль ─────────────────────────────────────────────────────────────
 # На Windows кодировка консоли по умолчанию cp1251 (Russian) или cp866.
@@ -1078,70 +1079,6 @@ class LoginWindow(QWidget):
         # ✅ show() — окно уже живое, просто было скрыто через hide()
         self.show()
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Встроенный сервер: менеджер жизненного цикла
-# ══════════════════════════════════════════════════════════════════════════════
-
-class EmbeddedServerManager:
-    """
-    Singleton-менеджер встроенного SFUServer внутри процесса клиента.
-
-    Жизненный цикл:
-      start(host_ip, host_nick) — поднимает TCP/UDP/WebRTC сервер в потоках.
-                                  Запускает ServerAnnouncer (UDP broadcast).
-      stop()                    — корректная остановка (server_migrate → все).
-      is_running()              — True пока сервер работает.
-
-    Хранит ссылку на SFUServer чтобы Python GC не убил объект.
-    """
-    _instance: 'EmbeddedServerManager | None' = None
-
-    def __init__(self):
-        self._server = None   # SFUServer | None
-
-    @classmethod
-    def get(cls) -> 'EmbeddedServerManager':
-        """Возвращает единственный экземпляр."""
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
-
-    def start(self, host_ip: str, host_nick: str, server_name: str = '') -> None:
-        """
-        Запускает встроенный SFUServer.
-        Если уже запущен — ничего не делает (idempotent).
-
-        ВАЖНО: исключения НЕ глотаются — пробрасываются наружу,
-        чтобы вызывающий код (DiscoveryScreen, _on_become_host) мог
-        показать ошибку пользователю.
-        """
-        if self.is_running():
-            print("[EmbeddedServer] Уже запущен — повторный запуск пропущен")
-            return
-        from server import SFUServer
-        _srv_name = server_name or _load_server_name()
-        self._server = SFUServer(server_name=_srv_name)
-        try:
-            self._server.start_embedded(host_ip, host_nick)
-        except Exception:
-            self._server = None
-            raise
-        print(f"[EmbeddedServer] Запущен: ip={host_ip}, nick={host_nick!r}, name={_srv_name!r}")
-
-    def stop(self) -> None:
-        """Останавливает сервер (если запущен) с корректной передачей хостинга."""
-        if self._server is not None:
-            try:
-                self._server.stop_gracefully()
-            except Exception as e:
-                print(f"[EmbeddedServer] Ошибка остановки: {e}")
-            self._server = None
-
-    def is_running(self) -> bool:
-        return self._server is not None
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # Вспомогательный поток: UDP discovery
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1521,7 +1458,7 @@ class MultiServerScreen(QWidget):
         self._item_widgets: list[_ServerItemWidget] = []
 
         self._build_ui()
-        self._ready.connect(self._open_connecting)
+        self._ready.connect(lambda ip: self._open_connecting(ip))
         self._start_discovery()
 
     def _build_ui(self):
@@ -1881,7 +1818,7 @@ class DiscoveryScreen(QWidget):
         # PyQt6 гарантирует доставку сигнала в GUI-поток вне зависимости от
         # того, из какого потока он испущен. QTimer.singleShot из plain-потока
         # (не QThread) ненадёжен и может просто не сработать.
-        self._ready.connect(self._open_connecting)
+        self._ready.connect(lambda ip: self._open_connecting(ip))
         self._start_discovery()
 
     # ──────────────────────────────────────────────────────────────────────────
