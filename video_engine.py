@@ -113,22 +113,28 @@ def patch_aiortc_nvenc() -> bool:
             'codec': 'h264',
             'name': 'NVIDIA NVENC',
             'options': {
-                'preset': 'p4',
-                'tune': 'll',
-                'zerolatency': '1',
+                # p6 = высокое качество, выше p4 при той же задержке (low-latency tune)
+                'preset': 'p6',
+                'tune': 'll',          # low-latency — минимальный буфер кодека
 
-                # Контроль битрейта (эластичность для сети)
-                'rc': 'vbr',  # VBR вместо CBR
-                'b': str(VIDEO_BITRATE // 2),  # Средний битрейт (позволяем падать на статике)
-                'maxrate': str(VIDEO_BITRATE),  # Жесткий верхний лимит
-                'bufsize': str(VIDEO_BITRATE),  # Ограничиваем буфер VBV (равен maxrate для минимизации лага)
+                # VBR: средний = 2/3 от макс, пиковый = максимум
+                # bufsize = 2×maxrate — даём кодеку «карман» для сложных сцен
+                'rc': 'vbr',
+                'b': str(VIDEO_BITRATE * 2 // 3),   # avg bitrate (напр. 4 Mbps при 6)
+                'maxrate': str(VIDEO_BITRATE),        # жёсткий потолок
+                'bufsize': str(VIDEO_BITRATE * 2),    # VBV буфер — больше → лучше качество
 
-                # Оптимизация для слабых зрителей
-                'bf': '0',  # Отключаем B-кадры: минус задержка, легче декодировать
-                'profile': 'main',  # Баланс между сжатием и легкостью декодирования
+                # Без B-кадров: нет задержки декодера у зрителей
+                'bf': '0',
+                'profile': 'high',     # high вместо main: лучше коэффициент сжатия
 
-                # Визуальное качество
-                'spatial_aq': '1',  # Адаптивное квантование: делает текст и мелкие детали четче
+                # Адаптивное квантование в пространстве и времени:
+                # текст, мелкие детали, движущиеся объекты становятся чётче
+                'spatial_aq': '1',
+                'temporal_aq': '1',
+
+                # Keyframe каждые 2 секунды — зрители быстро восстанавливают картинку
+                'g': '60',
             },
         },
 
@@ -927,3 +933,35 @@ class VideoEngine(QObject):
         for uid in list(self._receivers.keys()):
             if uid not in active_uids:
                 self.stop_viewer_for_uid(uid)
+
+    def shutdown(self) -> None:
+        """
+        Полная остановка VideoEngine при закрытии приложения.
+
+        Останавливает:
+          — DXCamTrack (захват экрана): _running=False → поток завершается,
+            dxcam.stop() и camera.release() вызываются внутри _capture_loop.
+          — Все VideoReceiver (_receivers): track.stop() прерывает
+            заблокированный track.recv() немедленно (без 5-секундного timeout).
+
+        Вызывать из MainWindow.closeEvent() ПОСЛЕ net.stop().
+        """
+        print("[VideoEngine] shutdown(): останавливаем все компоненты...")
+
+        # Останавливаем захват экрана стримера
+        if self._dxcam_track is not None:
+            try:
+                self._dxcam_track.stop()
+            except Exception as e:
+                print(f"[VideoEngine] DXCamTrack stop error: {e}")
+            self._dxcam_track = None
+
+        # Останавливаем все VideoReceiver зрителей
+        for uid in list(self._receivers.keys()):
+            try:
+                self._receivers[uid].stop()
+            except Exception as e:
+                print(f"[VideoEngine] VideoReceiver uid={uid} stop error: {e}")
+        self._receivers.clear()
+
+        print("[VideoEngine] shutdown(): готово")

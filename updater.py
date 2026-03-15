@@ -40,7 +40,7 @@ _HTTP_TIMEOUT = 8
 _DOWNLOAD_TIMEOUT = 300
 
 # User-Agent для всех запросов — GitHub CDN блокирует запросы без него.
-_USER_AGENT = "InPulse-Updater/1.0"
+_USER_AGENT = "VoiceChat-Updater/1.0"
 
 # Поддерживаемые расширения архивов (в порядке приоритета)
 _SUPPORTED_EXTENSIONS = (".zip", ".7z")

@@ -223,7 +223,13 @@ class NetworkClient(QObject):
                 print(f"[Net] Soundboard: пропущен {filename!r} — звук ещё играет")
                 return
 
-            raw = int(QSettings("MyVoiceChat", "GlobalSettings").value("soundboard_volume", 40)) / 100.0
+            # FIX #9: читаем громкость из уже существующего QSettings AudioHandler,
+            # вместо создания нового QSettings (обращение к реестру Windows) при
+            # каждом воспроизведении. Fallback: создаём один раз если audio недоступен.
+            _gs = getattr(self.audio, 'global_settings', None)
+            if _gs is None:
+                _gs = QSettings("MyVoiceChat", "GlobalSettings")
+            raw = int(_gs.value("soundboard_volume", 40)) / 100.0
             vol = raw ** 2   # квадратичная кривая громкости
 
             if data_b64:
@@ -658,6 +664,57 @@ class NetworkClient(QObject):
         print("[Net] Discovery reconnect: сервер не найден за 90 сек")
         self.reconnect_failed.emit()
 
+    def stop(self) -> None:
+        """
+        Корректная остановка NetworkClient при закрытии приложения.
+
+        Порядок важен:
+          1. running=False — все петли udp/tcp читают флаг и выходят.
+          2. Закрываем RTCPeerConnection стримера и зрителя (если активны).
+          3. Останавливаем WebRTC asyncio loop (loop.stop → run_forever завершается).
+          4. Закрываем TCP/UDP сокеты — разблокирует recv/recvfrom в потоках.
+
+        Потоки daemon=True — они завершатся сами после выхода из цикла.
+        Явный join не нужен: ОС освободит ресурсы при выходе процесса.
+        Но закрытие сокетов гарантирует выход из блокирующих recv() немедленно,
+        без ожидания следующего тайм-аута или пакета.
+        """
+        print("[Net] stop(): завершаем сетевые потоки...")
+        self.running = False
+        self._is_connected = False
+
+        # Закрываем WebRTC PeerConnections
+        if self._webrtc_loop is not None and not self._webrtc_loop.is_closed():
+            if self._streamer_pc is not None:
+                asyncio.run_coroutine_threadsafe(
+                    self._close_pc_coro(self._streamer_pc), self._webrtc_loop
+                )
+                self._streamer_pc = None
+            if self._viewer_pc is not None:
+                asyncio.run_coroutine_threadsafe(
+                    self._close_pc_coro(self._viewer_pc), self._webrtc_loop
+                )
+                self._viewer_pc = None
+
+            # Даём 200мс на закрытие PC, потом останавливаем loop
+            import time as _t
+            _t.sleep(0.2)
+            try:
+                self._webrtc_loop.call_soon_threadsafe(self._webrtc_loop.stop)
+            except Exception:
+                pass
+
+        # Закрываем сокеты — разблокирует блокирующие recv() в потоках
+        for attr in ('tcp_sock', 'udp_sock'):
+            sock = getattr(self, attr, None)
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+        print("[Net] stop(): готово")
+
     def send_server_transfer(self, target_uid: int) -> None:
         """
         Инициирует передачу хостинга другому участнику.
@@ -1001,7 +1058,10 @@ class NetworkClient(QObject):
                     if speaker_uid == self.audio.my_uid:
                         continue
                     opus_payload = data[UDP_HEADER_SIZE + STREAM_VOICE_HEADER_SIZE:]
-                    self.audio.add_incoming_stream_packet(
+                    # FIX #1: add_incoming_stream_packet удалён вместе с UDP стрим-аудио.
+                    # Mix-Minus голоса зрителей идут через обычный add_incoming_packet —
+                    # FLAG_STREAM_VOICES передаётся как flags, декодер тот же Opus.
+                    self.audio.add_incoming_packet(
                         speaker_uid, seq, opus_payload, flags
                     )
 

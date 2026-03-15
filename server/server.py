@@ -1,46 +1,4 @@
-# server.py — SFU сервер InPulse (UDP голос + TCP команды + WebRTC видео)
-#
-# ─── Архитектура после рефакторинга ────────────────────────────────────────────
-#
-#   SFUServer   — существующий синхронный сервер.
-#                 TCP: команды, чат, файлы, presence, nudge, soundboard.
-#                 UDP: голос комнаты, whisper, ping/keepalive.  ← БЕЗ ИЗМЕНЕНИЙ
-#
-#   WebRTCSFU   — НОВЫЙ asyncio-класс в отдельном daemon-потоке.
-#                 Принимает WebRTC-offer от стримера, сохраняет треки через MediaRelay.
-#                 Создаёт WebRTC-offer зрителю, форвардит ему треки стримера.
-#                 Сигнализация: 3 новые TCP-команды поверх существующего JSON-протокола.
-#
-# ─── Что УДАЛЕНО по сравнению с предыдущей версией ────────────────────────────
-#
-#   UDP-видео маршрутизация     (is_video/is_stream_audio ветки в udp_handler)
-#   Simulcast HQ/LQ             (_streamer_simulcast, _lq_needed_state, _send_to_watchers_routed)
-#   Viewer-side ABR             (abr_viewer_bitrates, abr_current, abr_last_upgrade, _abr_update)
-#   Upload ABR                  (_streamer_rx_bytes, _streamer_rx_start, _upload_abr_loop)
-#   NACK relay                  (CMD_NACK → CMD_NACK_RELAY → стример)
-#   IDR relay                   (request_keyframe TCP relay — WebRTC PLI берёт на себя)
-#   CMD_BITRATE_FEEDBACK        (зритель больше не измеряет RTT вручную)
-#   CMD_ADJUST_BITRATE          (WebRTC управляет через TWCC)
-#   CMD_LQ_NEEDED               (simulcast на WebRTC SFU-уровне в будущем)
-#
-# ─── Что СОХРАНЕНО без изменений ───────────────────────────────────────────────
-#
-#   UDP: голос комнаты, whisper, ping/keepalive
-#   TCP: login, join_room, update_user, update_status, presence
-#   TCP: stream_start/stop, stream_watch_start/stop, soundboard, nudge, file_offer
-#   Все локи и их дисциплина (clients_lock, udp_lock, watchers_lock, nudge_lock)
-#   send_global_state(), _send_to_watchers(), stats_monitor()
-#
-# ─── ИСПРАВЛЕНИЯ (v2) ──────────────────────────────────────────────────────────
-#
-#   [FIX-4] asyncio.get_event_loop() заменён на asyncio.get_running_loop() во всех
-#           async-методах WebRTCSFU (_send_async, _wait_ice_gathering).
-#           asyncio.get_event_loop() устарел в Python 3.10 и вызывает
-#           DeprecationWarning в уже запущенном loop; get_running_loop() — правильный
-#           способ получить текущий loop из coroutine/async-контекста.
-#
-# ───────────────────────────────────────────────────────────────────────────────
-
+# server.py — SFUServer + EmbeddedServerManager
 import asyncio
 import json
 import secrets
@@ -60,7 +18,6 @@ from config import (
     CMD_NUDGE_VOTE, CMD_PLAY_NUDGE, CMD_NUDGE_TRIGGERED, NUDGE_COOLDOWN_SEC,
     CMD_FILE_OFFER, CMD_FILE_OFFER_ROOM,
     CMD_WEBRTC_OFFER, CMD_WEBRTC_ANSWER, CMD_WEBRTC_ICE,
-    WEBRTC_ICE_TIMEOUT,
     CMD_SERVER_TRANSFER, CMD_SERVER_MIGRATE,
     CMD_QUICK_MSG, QUICK_MSG_MAX_LEN,
     CMD_CREATE_CHANNEL, CMD_CHANNEL_CREATED, CMD_CHANNEL_DELETED,
@@ -68,447 +25,7 @@ from config import (
     SERVER_NAME_DEFAULT,
     CMD_HOST_MUTE, CMD_FORCE_MUTED,
 )
-
-# ── Опциональный импорт aiortc (только для WebRTCSFU) ────────────────────────
-# При отсутствии aiortc — сервер работает без WebRTC (голос/чат работают).
-try:
-    from aiortc import (
-        RTCPeerConnection, RTCSessionDescription,
-        RTCConfiguration,
-    )
-    from aiortc.contrib.media import MediaRelay
-    AIORTC_AVAILABLE = True
-except ImportError:
-    AIORTC_AVAILABLE = False
-    print("[Server] WARNING: aiortc не установлен — WebRTC видео недоступно")
-
-
-# =============================================================================
-# WebRTCSFU — asyncio SFU для видео/аудио стримов
-# =============================================================================
-
-class WebRTCSFU:
-    """
-    asyncio-based SFU (Selective Forwarding Unit) для WebRTC видео/аудио.
-
-    Запускается в отдельном daemon-потоке с собственным asyncio event loop.
-    tcp_handler вызывает методы через asyncio.run_coroutine_threadsafe().
-
-    ─── Жизненный цикл стримера ────────────────────────────────────────────
-    1. tcp_handler получает CMD_WEBRTC_OFFER (role="streamer") → вызывает
-       handle_streamer_offer(uid, sdp, conn)
-    2. SFU создаёт RTCPeerConnection, принимает video/audio треки,
-       оборачивает их в MediaRelay
-    3. Ждёт завершения ICE-gathering (host-only на RadminVPN = ~50 мс)
-    4. Отправляет CMD_WEBRTC_ANSWER стримеру через conn.sendall()
-
-    ─── Жизненный цикл зрителя ─────────────────────────────────────────────
-    1. tcp_handler получает stream_watch_start → регистрирует в watchers,
-       вызывает handle_viewer_connect(viewer_uid, streamer_uid, viewer_conn)
-    2. SFU создаёт RTCPeerConnection для зрителя, добавляет реле-треки стримера
-    3. Создаёт offer, ждёт ICE-gathering, отправляет CMD_WEBRTC_OFFER зрителю
-    4. Зритель отвечает CMD_WEBRTC_ANSWER → handle_viewer_answer(uid, sdp)
-
-    ─── ICE стратегия ──────────────────────────────────────────────────────
-    В RadminVPN все клиенты в одной виртуальной сети (26.x.x.x).
-    Host ICE кандидаты достаточны — STUN не нужен.
-    Используем "gather-and-send" вместо trickle ICE для простоты:
-    ждём завершения gathering, затем отправляем SDP со всеми кандидатами.
-    CMD_WEBRTC_ICE поддерживается для будущей совместимости с STUN.
-
-    ─── MediaRelay ──────────────────────────────────────────────────────────
-    Треки от одного RTCPeerConnection нельзя напрямую добавить в другой.
-    MediaRelay создаёт прокси-треки с общим буфером — один входящий трек
-    может быть подписан несколькими зрителями без копирования данных.
-    """
-
-    def __init__(self):
-        self._loop   = asyncio.new_event_loop()
-        self._thread = threading.Thread(
-            target=self._run_loop, daemon=True, name="webrtc-sfu"
-        )
-        self._thread.start()
-
-        # streamer_uid → {'pc': RTCPeerConnection, 'relay': MediaRelay,
-        #                  'tracks': {kind: relayed_track}, 'conn': conn}
-        self._streamer_entries: dict = {}
-
-        # viewer_uid → {'pc': RTCPeerConnection, 'conn': conn,
-        #                'streamer_uid': int}
-        self._viewer_entries: dict = {}
-
-        # Буфер ожидающих зрителей: streamer_uid → [(viewer_uid, conn)]
-        # Используется если зритель подключился до завершения offer стримера.
-        self._pending_viewers: dict[int, list] = {}
-
-        # Входящие ICE-кандидаты до момента создания PC:
-        # uid → [candidate_dict]
-        self._pending_ice: dict[int, list] = {}
-
-    # ------------------------------------------------------------------
-    # Запуск asyncio loop
-    # ------------------------------------------------------------------
-
-    def _run_loop(self) -> None:
-        asyncio.set_event_loop(self._loop)
-        self._loop.run_forever()
-
-    def call_async(self, coro):
-        """
-        Отправляет корутину в asyncio loop из threading-контекста (tcp_handler).
-        Возвращает concurrent.futures.Future — можно игнорировать для fire-and-forget.
-        """
-        return asyncio.run_coroutine_threadsafe(coro, self._loop)
-
-    # ------------------------------------------------------------------
-    # Вспомогательные методы
-    # ------------------------------------------------------------------
-
-    async def _send_async(self, conn, msg: dict) -> None:
-        """
-        Отправляет JSON-пакет клиенту из asyncio-контекста.
-        run_in_executor: conn.sendall() блокирующий → не блокируем asyncio loop.
-
-        [FIX-4] asyncio.get_event_loop() → asyncio.get_running_loop().
-        get_running_loop() — правильный способ получить loop из coroutine.
-        get_event_loop() устарел в Python 3.10+ в уже запущенном loop.
-        """
-        payload = json.dumps(msg).encode('utf-8')
-        loop = asyncio.get_running_loop()
-        try:
-            await loop.run_in_executor(None, conn.sendall, payload)
-        except Exception as e:
-            print(f"[SFU] send_async error: {e}")
-
-    @staticmethod
-    async def _wait_ice_gathering(pc, timeout: float = WEBRTC_ICE_TIMEOUT) -> None:
-        """
-        Ждёт завершения ICE gathering с таймаутом.
-        На RadminVPN (host-only ICE) gathering завершается за ~50–200 мс.
-
-        [FIX-4] asyncio.get_event_loop() → asyncio.get_running_loop().
-        Оба вызова заменены — метод вызывается только из async-контекста.
-        """
-        loop     = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
-        while pc.iceGatheringState != "complete":
-            if loop.time() >= deadline:
-                print(f"[SFU] ICE gathering timeout ({timeout}s) — отправляем что есть")
-                break
-            await asyncio.sleep(0.05)
-
-    # ------------------------------------------------------------------
-    # Стример: обработка offer
-    # ------------------------------------------------------------------
-
-    async def handle_streamer_offer(
-        self, streamer_uid: int, sdp: str, sdp_type: str, conn
-    ) -> None:
-        """
-        Принимает WebRTC offer от стримера.
-
-        1. Закрывает старый PC стримера (переподключение).
-        2. Создаёт новый RTCPeerConnection.
-        3. on("track") → оборачивает трек в MediaRelay, сохраняет.
-        4. setRemoteDescription(offer) → createAnswer → setLocalDescription.
-        5. Ждёт завершения ICE gathering.
-        6. Отправляет answer стримеру.
-        7. Обрабатывает ожидающих зрителей.
-        """
-        # Закрываем предыдущую сессию если была
-        old = self._streamer_entries.pop(streamer_uid, None)
-        if old:
-            try:
-                await old['pc'].close()
-            except Exception:
-                pass
-
-        cfg = RTCConfiguration(iceServers=[])
-        pc  = RTCPeerConnection(cfg)
-
-        relay = MediaRelay()
-        entry = {
-            'pc':     pc,
-            'relay':  relay,
-            'tracks': {},
-            'conn':   conn,
-        }
-        self._streamer_entries[streamer_uid] = entry
-
-        @pc.on("track")
-        def on_track(track):
-            # MediaRelay.subscribe(buffered=False): нет буферизации → минимальная задержка.
-            # Несколько зрителей подпишутся на один и тот же физический трек.
-            relayed = relay.subscribe(track, buffered=False)
-            entry['tracks'][track.kind] = relayed
-            print(
-                f"[SFU] Стример uid={streamer_uid}: трек получен kind={track.kind}"
-            )
-            # Обрабатываем ожидавших зрителей (подключились до стримера).
-            # ensure_future — не блокируем on_track callback.
-            pending = self._pending_viewers.pop(streamer_uid, [])
-            for v_uid, v_conn in pending:
-                asyncio.ensure_future(
-                    self.handle_viewer_connect(v_uid, streamer_uid, v_conn)
-                )
-
-        @pc.on("icecandidate")
-        def on_ice(candidate):
-            # Trickle ICE (для будущей поддержки STUN).
-            # При host-only ICE кандидаты уже в SDP после gathering → эта ветка редка.
-            if candidate:
-                asyncio.ensure_future(self._send_async(conn, {
-                    'action':     CMD_WEBRTC_ICE,
-                    'target_uid': streamer_uid,
-                    'candidate': {
-                        'sdpMid':        candidate.sdpMid,
-                        'sdpMLineIndex': candidate.sdpMLineIndex,
-                        'candidate':     candidate.candidate,
-                    },
-                }))
-
-        @pc.on("connectionstatechange")
-        async def on_state():
-            state = pc.connectionState
-            print(f"[SFU] Стример uid={streamer_uid}: PC state → {state}")
-            if state in ("failed", "closed", "disconnected"):
-                await self.close_streamer(streamer_uid)
-
-        # Принимаем offer, создаём answer
-        try:
-            await pc.setRemoteDescription(
-                RTCSessionDescription(sdp=sdp, type=sdp_type)
-            )
-            # Добавляем буферизованные ICE-кандидаты (если клиент использует trickle)
-            for ice in self._pending_ice.pop(streamer_uid, []):
-                try:
-                    from aiortc import RTCIceCandidate
-                    cand = RTCIceCandidate(
-                        sdpMid=ice['sdpMid'],
-                        sdpMLineIndex=ice['sdpMLineIndex'],
-                        candidate=ice['candidate'],
-                    )
-                    await pc.addIceCandidate(cand)
-                except Exception as e:
-                    print(f"[SFU] addIceCandidate error: {e}")
-
-            answer = await pc.createAnswer()
-            await pc.setLocalDescription(answer)
-
-            # Ждём завершения ICE gathering (host-only = быстро)
-            await self._wait_ice_gathering(pc)
-
-            await self._send_async(conn, {
-                'action': CMD_WEBRTC_ANSWER,
-                'sdp':    pc.localDescription.sdp,
-                'type':   pc.localDescription.type,
-            })
-            print(f"[SFU] Answer отправлен стримеру uid={streamer_uid}")
-
-        except Exception as e:
-            print(f"[SFU] handle_streamer_offer error uid={streamer_uid}: {e}")
-            self._streamer_entries.pop(streamer_uid, None)
-
-    # ------------------------------------------------------------------
-    # Зритель: создание offer и подключение
-    # ------------------------------------------------------------------
-
-    async def handle_viewer_connect(
-        self, viewer_uid: int, streamer_uid: int, viewer_conn
-    ) -> None:
-        """
-        Создаёт WebRTC соединение для нового зрителя.
-
-        Если треки стримера ещё не готовы — кладём зрителя в pending_viewers.
-        Как только on("track") от стримера сработает — pending обработается автоматически.
-
-        Порядок:
-        1. Проверяем наличие relay-треков стримера.
-        2. Создаём RTCPeerConnection для зрителя.
-        3. Добавляем relay-треки: viewer_pc.addTrack(relayed_track).
-        4. on("track") → video_engine.add_receiver() (на клиентской стороне).
-        5. createOffer → setLocalDescription → wait ICE → send offer зрителю.
-        """
-        entry = self._streamer_entries.get(streamer_uid)
-        if entry is None or not entry['tracks']:
-            # Стример ещё не прислал offer или треки не готовы
-            self._pending_viewers.setdefault(streamer_uid, []).append(
-                (viewer_uid, viewer_conn)
-            )
-            print(
-                f"[SFU] Зритель uid={viewer_uid}: стример uid={streamer_uid} "
-                f"ещё не готов — помещён в pending"
-            )
-            return
-
-        # Закрываем предыдущий PC зрителя (переподключение)
-        old = self._viewer_entries.pop(viewer_uid, None)
-        if old:
-            try:
-                await old['pc'].close()
-            except Exception:
-                pass
-
-        cfg = RTCConfiguration(iceServers=[])
-        pc  = RTCPeerConnection(cfg)
-
-        # Добавляем relay-треки стримера
-        for kind, relayed_track in entry['tracks'].items():
-            pc.addTrack(relayed_track)
-
-        self._viewer_entries[viewer_uid] = {
-            'pc':           pc,
-            'conn':         viewer_conn,
-            'streamer_uid': streamer_uid,
-        }
-
-        @pc.on("icecandidate")
-        def on_ice(candidate):
-            if candidate:
-                asyncio.ensure_future(self._send_async(viewer_conn, {
-                    'action':     CMD_WEBRTC_ICE,
-                    'target_uid': viewer_uid,
-                    'candidate': {
-                        'sdpMid':        candidate.sdpMid,
-                        'sdpMLineIndex': candidate.sdpMLineIndex,
-                        'candidate':     candidate.candidate,
-                    },
-                }))
-
-        @pc.on("connectionstatechange")
-        async def on_state():
-            state = pc.connectionState
-            print(f"[SFU] Зритель uid={viewer_uid}: PC state → {state}")
-            if state in ("failed", "closed", "disconnected"):
-                await self.close_viewer(viewer_uid)
-
-        try:
-            offer = await pc.createOffer()
-            await pc.setLocalDescription(offer)
-            await self._wait_ice_gathering(pc)
-
-            await self._send_async(viewer_conn, {
-                'action':       CMD_WEBRTC_OFFER,
-                'role':         'viewer',
-                'streamer_uid': streamer_uid,
-                'sdp':          pc.localDescription.sdp,
-                'type':         pc.localDescription.type,
-            })
-            print(
-                f"[SFU] Offer отправлен зрителю uid={viewer_uid} "
-                f"(стример uid={streamer_uid})"
-            )
-        except Exception as e:
-            print(f"[SFU] handle_viewer_connect error uid={viewer_uid}: {e}")
-            self._viewer_entries.pop(viewer_uid, None)
-
-    # ------------------------------------------------------------------
-    # Зритель: обработка answer
-    # ------------------------------------------------------------------
-
-    async def handle_viewer_answer(
-        self, viewer_uid: int, sdp: str, sdp_type: str
-    ) -> None:
-        """
-        Принимает WebRTC answer от зрителя.
-        Завершает ICE negotiation на стороне сервера.
-        """
-        entry = self._viewer_entries.get(viewer_uid)
-        if entry is None:
-            print(f"[SFU] handle_viewer_answer: нет PC для uid={viewer_uid}")
-            return
-        try:
-            await entry['pc'].setRemoteDescription(
-                RTCSessionDescription(sdp=sdp, type=sdp_type)
-            )
-            # Добавляем буферизованные ICE-кандидаты
-            for ice in self._pending_ice.pop(viewer_uid, []):
-                try:
-                    from aiortc import RTCIceCandidate
-                    cand = RTCIceCandidate(
-                        sdpMid=ice['sdpMid'],
-                        sdpMLineIndex=ice['sdpMLineIndex'],
-                        candidate=ice['candidate'],
-                    )
-                    await entry['pc'].addIceCandidate(cand)
-                except Exception:
-                    pass
-            print(f"[SFU] Answer принят от зрителя uid={viewer_uid}")
-        except Exception as e:
-            print(f"[SFU] handle_viewer_answer error uid={viewer_uid}: {e}")
-
-    # ------------------------------------------------------------------
-    # ICE кандидаты (trickle ICE)
-    # ------------------------------------------------------------------
-
-    async def handle_ice_candidate(
-        self, uid: int, candidate_dict: dict
-    ) -> None:
-        """
-        Добавляет ICE-кандидат к нужному PC.
-        Буферизует если PC ещё не создан (гонка: ICE пришёл до offer/answer).
-        """
-        pc = None
-        if uid in self._streamer_entries:
-            pc = self._streamer_entries[uid]['pc']
-        elif uid in self._viewer_entries:
-            pc = self._viewer_entries[uid]['pc']
-
-        if pc is None:
-            # PC ещё не создан — буферизуем
-            self._pending_ice.setdefault(uid, []).append(candidate_dict)
-            return
-
-        try:
-            from aiortc import RTCIceCandidate
-            cand = RTCIceCandidate(
-                sdpMid=candidate_dict.get('sdpMid'),
-                sdpMLineIndex=candidate_dict.get('sdpMLineIndex'),
-                candidate=candidate_dict.get('candidate'),
-            )
-            await pc.addIceCandidate(cand)
-        except Exception as e:
-            print(f"[SFU] handle_ice_candidate uid={uid}: {e}")
-
-    # ------------------------------------------------------------------
-    # Закрытие соединений
-    # ------------------------------------------------------------------
-
-    async def close_streamer(self, streamer_uid: int) -> None:
-        """
-        Закрывает PC стримера и все PC его зрителей.
-        Вызывается при CMD_STREAM_STOP или потере соединения.
-        """
-        entry = self._streamer_entries.pop(streamer_uid, None)
-        if entry:
-            try:
-                await entry['pc'].close()
-            except Exception:
-                pass
-            print(f"[SFU] Стример uid={streamer_uid}: PC закрыт")
-
-        # Закрываем всех зрителей этого стримера
-        victims = [
-            v_uid for v_uid, ve in list(self._viewer_entries.items())
-            if ve['streamer_uid'] == streamer_uid
-        ]
-        for v_uid in victims:
-            await self.close_viewer(v_uid)
-
-        self._pending_viewers.pop(streamer_uid, None)
-
-    async def close_viewer(self, viewer_uid: int) -> None:
-        """
-        Закрывает PC зрителя.
-        Вызывается при stream_watch_stop или потере соединения.
-        """
-        entry = self._viewer_entries.pop(viewer_uid, None)
-        if entry:
-            try:
-                await entry['pc'].close()
-            except Exception:
-                pass
-            print(f"[SFU] Зритель uid={viewer_uid}: PC закрыт")
+from .server_webrtc import WebRTCSFU, AIORTC_AVAILABLE
 
 
 # =============================================================================
@@ -565,6 +82,16 @@ class SFUServer:
 
         # --- WebRTC SFU (создаётся в start()) ---
         self.sfu: WebRTCSFU | None = None
+
+        # ── Кэш payload send_global_state (FIX 8) ───────────────────────────
+        # send_global_state сериализует всех юзеров в JSON и шлёт всем клиентам.
+        # При 20 юзерах: ~4 KB × 11+ вызовов/сек × 20 клиентов = ~880 KB/сек зря.
+        # Решение: кэшируем bytes-payload и пересобираем только при реальных
+        # изменениях состояния (_state_dirty=True).
+        # Грязный флаг выставляется при каждом изменении clients/watchers/channels.
+        # После сборки payload флаг сбрасывается — повторные вызовы отдают кэш.
+        self._cached_payload: bytes | None = None
+        self._state_dirty: bool = True   # True при старте → первый вызов всегда строит
 
         # ── Встроенный сервер: host_order ────────────────────────────────────
         # Упорядоченный список UID в порядке первого входа на сервер.
@@ -688,17 +215,36 @@ class SFUServer:
 
     def _cleanup_temp_channels(self, leaving_room: str):
         """Удаляет пустой временный канал и рассылает CMD_CHANNEL_DELETED."""
+        # FIX #6: исправлен дедлок вложенных локов.
+        # Было: with _channels_lock → with clients_lock (порядок A→B).
+        # tcp_handler держит clients_lock и берёт _channels_lock (порядок B→A).
+        # Два потока = классический deadlock.
+        #
+        # Решение: трёхфазный подход без вложенности:
+        #   1. Читаем канал под _channels_lock (не трогаем clients_lock).
+        #   2. Считаем occupants под clients_lock (не трогаем _channels_lock).
+        #   3. Удаляем и рассылаем под _channels_lock, затем clients_lock — строго по очереди.
+
+        # Фаза 1: проверяем что канал существует и не постоянный
         with self._channels_lock:
             ch = self._channels.get(leaving_room)
             if not ch or ch['permanent']:
                 return
-            with self.clients_lock:
-                occupants = sum(
-                    1 for c in self.clients.values()
-                    if c.get('room') == leaving_room
-                )
-            if occupants > 0:
-                return
+
+        # Фаза 2: считаем occupants БЕЗ _channels_lock
+        with self.clients_lock:
+            occupants = sum(
+                1 for c in self.clients.values()
+                if c.get('room') == leaving_room
+            )
+        if occupants > 0:
+            return
+
+        # Фаза 3: удаляем канал (проверяем снова — канал мог измениться)
+        with self._channels_lock:
+            ch = self._channels.get(leaving_room)
+            if not ch or ch['permanent']:
+                return  # уже удалён или стал постоянным между фазами
             self._channels.pop(leaving_room, None)
 
         print(f"[Server] 🗑 Временный канал '{leaving_room}' удалён (пустой)")
@@ -915,6 +461,7 @@ class SFUServer:
                                 f"[Server] ✔ {client_nick} подключился "
                                 f"(General, IP: {client_ip}) | Онлайн: {remaining}"
                             )
+                            self._mark_dirty()
                             self.send_global_state()
 
                         # ── Join Room ─────────────────────────────────────────
@@ -947,6 +494,7 @@ class SFUServer:
                                     self.uid_to_room[uid] = new_room
                                 if old_room and old_room != new_room:
                                     self._cleanup_temp_channels(old_room)
+                                self._mark_dirty()
                                 self.send_global_state()
 
                         # ── Аутентификация для защищённого канала ─────────────
@@ -1000,6 +548,7 @@ class SFUServer:
                                         'action': 'create_channel_result',
                                         'ok': True, 'channel_name': ch_name,
                                     }).encode('utf-8'))
+                                    self._mark_dirty()
                                     self.send_global_state()
                                 else:
                                     conn.sendall(json.dumps({
@@ -1013,16 +562,31 @@ class SFUServer:
                                 if conn in self.clients:
                                     self.clients[conn]['nick']   = msg.get('nick',   self.clients[conn]['nick'])
                                     self.clients[conn]['avatar'] = msg.get('avatar', self.clients[conn]['avatar'])
+                            self._mark_dirty()
                             self.send_global_state()
 
                         # ── Update Status ─────────────────────────────────────
                         elif action == 'update_status':
+                            # FIX #10: UDP-keepalive шлёт update_status каждую секунду
+                            # на каждого пользователя — даже если mute/deaf не менялись.
+                            # С 20 юзерами: 20 send_global_state/сек × (сериализация всех
+                            # + 20 sendall) = 400 sendall/сек зря.
+                            # Решение: сравниваем старое и новое значения; broadcast
+                            # только если что-то реально изменилось.
+                            new_mute = msg.get('mute', False)
+                            new_deaf = msg.get('deaf', False)
+                            _status_changed = False
                             with self.clients_lock:
                                 if conn in self.clients:
-                                    self.clients[conn]['mute'] = msg.get('mute', False)
-                                    self.clients[conn]['deaf'] = msg.get('deaf', False)
-                            self.send_global_state()
-
+                                    _status_changed = (
+                                        self.clients[conn].get('mute') != new_mute
+                                        or self.clients[conn].get('deaf') != new_deaf
+                                    )
+                                    self.clients[conn]['mute'] = new_mute
+                                    self.clients[conn]['deaf'] = new_deaf
+                            if _status_changed:
+                                self._mark_dirty()
+                                self.send_global_state()
                         # ── Ping Report (тихий — без send_global_state) ────────
                         # Клиент шлёт свой текущий RTT раз в ~3 сек из ping_loop.
                         # Сервер сохраняет для _pick_best_host (выбор нового хоста).
@@ -1040,6 +604,7 @@ class SFUServer:
                                 if conn in self.clients:
                                     self.clients[conn]['status_icon'] = icon
                                     self.clients[conn]['status_text'] = text
+                            self._mark_dirty()
                             self.send_global_state()
 
                         # ── Stream Start ──────────────────────────────────────
@@ -1048,6 +613,7 @@ class SFUServer:
                                 if conn in self.clients:
                                     self.clients[conn]['is_streaming'] = True
                                     print(f"[Server] {self.clients[conn]['nick']} запустил стрим")
+                            self._mark_dirty()
                             self.send_global_state()
 
                         # ── Stream Stop ───────────────────────────────────────
@@ -1066,6 +632,7 @@ class SFUServer:
                                     self.sfu.call_async(
                                         self.sfu.close_streamer(stopped_uid)
                                     )
+                            self._mark_dirty()
                             self.send_global_state()
 
                         # ── Stream Watch Start ────────────────────────────────
@@ -1097,6 +664,7 @@ class SFUServer:
                                             w_uid, streamer_uid, conn
                                         )
                                     )
+                            self._mark_dirty()
                             self.send_global_state()
 
                         # ── Stream Watch Stop ─────────────────────────────────
@@ -1117,6 +685,7 @@ class SFUServer:
                                         self.sfu.call_async(
                                             self.sfu.close_viewer(w_uid)
                                         )
+                            self._mark_dirty()
                             self.send_global_state()
 
                         # ── WebRTC Offer (от стримера или зрителя) ────────────
@@ -1474,6 +1043,27 @@ class SFUServer:
                 with self._channel_auth_lock:
                     self._channel_auth.pop(conn, None)
 
+                # FIX #11: очищаем RTT-пинг отключившегося клиента.
+                # _client_pings[uid] никогда не удалялся при дисконнекте —
+                # при 20 пользователях, которые периодически входят/выходят,
+                # словарь рос бесконечно. Для приложения с максимум 20 юзерами
+                # это незначительно по объёму, но семантически некорректно:
+                # _pick_best_host мог учитывать RTT давно отключившегося клиента.
+                with self._client_pings_lock:
+                    self._client_pings.pop(u_id, None)
+
+                # FIX 10: удаляем голоса отключившегося из nudge_votes.
+                # Без этого voter_uid записи и target_uid-цели накапливались вечно.
+                # Голоса хранятся внутри: {room → {target_uid → {voter_uid → ts}}}.
+                # Удаляем u_id как voter и как target во всех комнатах.
+                with self.nudge_lock:
+                    for r_votes in self.nudge_votes.values():
+                        # Как target — удаляем всю группу голосов за него
+                        r_votes.pop(u_id, None)
+                        # Как voter — удаляем его голос у каждой цели
+                        for target_votes in r_votes.values():
+                            target_votes.pop(u_id, None)
+
                 # Удаляем временные каналы если они опустели
                 if room and room != 'General':
                     self._cleanup_temp_channels(room)
@@ -1500,6 +1090,7 @@ class SFUServer:
                 print(f"[Server] ✖ Незарегистрированный клиент {addr[0]} отключился")
 
             conn.close()
+            self._mark_dirty()
             self.send_global_state()
 
     # ------------------------------------------------------------------
@@ -1530,49 +1121,74 @@ class SFUServer:
     # ------------------------------------------------------------------
     # Рассылка глобального состояния по TCP
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Кэш состояния
+    # ------------------------------------------------------------------
+    def _mark_dirty(self) -> None:
+        """Помечает кэш payload как устаревший. Вызывать при каждом изменении состояния."""
+        self._state_dirty = True
+
+    # ------------------------------------------------------------------
+    # Рассылка глобального состояния по TCP
+    # ------------------------------------------------------------------
     def send_global_state(self):
         """
-        FIX #2: sendall() выполняется вне clients_lock.
-        FIX nested-lock: watchers_lock не захватывается внутри clients_lock.
+        FIX 8: кэшированная версия — payload пересобирается только при изменениях.
 
-        1. Под watchers_lock берём снимок watchers.
-        2. Под clients_lock строим payload, используя снимок.
-        3. sendall() без каких-либо локов.
+        Было: json.dumps(~4KB) × 11+ вызовов/сек × 20 клиентов = ~880 KB/сек сериализации.
+        Стало: при отсутствии изменений (update_status без реального изменения,
+        повторные вызовы) — используем bytes-кэш без аллокации и сериализации.
+
+        _state_dirty выставляется через _mark_dirty() при каждом реальном изменении
+        clients / watchers / channels / host_order.
         """
-        with self.watchers_lock:
-            watchers_snapshot = {uid: dict(ws) for uid, ws in self.watchers.items()}
+        # ── Шаг 1: строим payload только если состояние изменилось ───────────
+        if self._state_dirty:
+            with self.watchers_lock:
+                watchers_snapshot = {uid: dict(ws) for uid, ws in self.watchers.items()}
 
-        with self._host_order_lock:
-            host_order_snapshot  = list(self._host_order)
-            server_host_uid = self._host_order[0] if self._host_order else 0
+            with self._host_order_lock:
+                host_order_snapshot = list(self._host_order)
+                server_host_uid = self._host_order[0] if self._host_order else 0
 
-        with self.clients_lock:
-            state = {}
-            conns_snapshot = []
-            for c_conn, c in self.clients.items():
-                c_uid = c['uid']
-                watchers_list = list(watchers_snapshot.get(c_uid, {}).values())
-                state.setdefault(c['room'], []).append({
-                    'nick':         c['nick'],
-                    'uid':          c_uid,
-                    'avatar':       c.get('avatar', '1.svg'),
-                    'mute':         c.get('mute', False),
-                    'deaf':         c.get('deaf', False),
-                    'ip':           c.get('ip', ''),
-                    'is_streaming': c.get('is_streaming', False),
-                    'watchers':     watchers_list,
-                    'status_icon':  c.get('status_icon', ''),
-                    'status_text':  c.get('status_text', ''),
-                })
-                conns_snapshot.append(c_conn)
+            with self.clients_lock:
+                state = {}
+                conns_snapshot = []
+                for c_conn, c in self.clients.items():
+                    c_uid = c['uid']
+                    watchers_list = list(watchers_snapshot.get(c_uid, {}).values())
+                    state.setdefault(c['room'], []).append({
+                        'nick':         c['nick'],
+                        'uid':          c_uid,
+                        'avatar':       c.get('avatar', '1.svg'),
+                        'mute':         c.get('mute', False),
+                        'deaf':         c.get('deaf', False),
+                        'ip':           c.get('ip', ''),
+                        'is_streaming': c.get('is_streaming', False),
+                        'watchers':     watchers_list,
+                        'status_icon':  c.get('status_icon', ''),
+                        'status_text':  c.get('status_text', ''),
+                    })
+                    conns_snapshot.append(c_conn)
 
-        payload = json.dumps(
-            {'action': CMD_SYNC_USERS, 'all_users': state,
-             'host_order': host_order_snapshot,
-             'server_host_uid': server_host_uid,
-             'channel_list': self._get_channel_list()}
-        ).encode('utf-8')
+            self._cached_payload = json.dumps(
+                {'action': CMD_SYNC_USERS, 'all_users': state,
+                 'host_order': host_order_snapshot,
+                 'server_host_uid': server_host_uid,
+                 'channel_list': self._get_channel_list()}
+            ).encode('utf-8')
+            self._state_dirty = False
 
+        else:
+            # Кэш актуален — только снимаем список соединений
+            with self.clients_lock:
+                conns_snapshot = list(self.clients.keys())
+
+        payload = self._cached_payload
+        if payload is None:
+            return
+
+        # ── Шаг 2: рассылаем (всегда, даже при кэше) ─────────────────────────
         for c_conn in conns_snapshot:
             try:
                 c_conn.sendall(payload)
@@ -1710,6 +1326,15 @@ class SFUServer:
 
         self.tcp_sock.close()
         self.udp_sock.close()
+
+        # Останавливаем WebRTC SFU (закрывает все PC и asyncio loop)
+        if self.sfu is not None:
+            try:
+                self.sfu.shutdown()
+            except Exception as e:
+                print(f"[Server] SFU shutdown error: {e}")
+            self.sfu = None
+
         print("[Server] Встроенный сервер остановлен")
 
     def stop_silent(self) -> None:
@@ -1759,6 +1384,15 @@ class SFUServer:
             self.udp_sock.close()
         except Exception:
             pass
+
+        # Останавливаем WebRTC SFU
+        if self.sfu is not None:
+            try:
+                self.sfu.shutdown()
+            except Exception as e:
+                print(f"[Server] SFU shutdown error: {e}")
+            self.sfu = None
+
         print("[Server] stop_silent: готово")
 
     def _broadcast_server_migrate(self, new_host_uid: int, new_host_ip: str) -> None:
@@ -1819,14 +1453,23 @@ class EmbeddedServerManager:
     Вынесен сюда для предотвращения двойного импорта (__main__ vs module).
     """
     _instance: 'EmbeddedServerManager | None' = None
+    # FIX #12: лок для потокобезопасного singleton.
+    # Без него два потока (например auto-host и UI) могут одновременно
+    # войти в get() при _instance is None и создать два экземпляра.
+    # При 20 юзерах вероятность невысока, но последствия — двойной bind
+    # на один и тот же TCP/UDP порт → OSError: address already in use.
+    _lock: threading.Lock = threading.Lock()
 
     def __init__(self):
         self._server = None  # SFUServer | None
 
     @classmethod
     def get(cls) -> 'EmbeddedServerManager':
+        # FIX #12: double-checked locking — быстрый путь без лока если уже создан.
         if cls._instance is None:
-            cls._instance = cls()
+            with cls._lock:
+                if cls._instance is None:
+                    cls._instance = cls()
         return cls._instance
 
     def start(self, host_ip: str, host_nick: str, server_name: str = '') -> None:

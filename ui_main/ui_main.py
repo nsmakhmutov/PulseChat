@@ -1,4 +1,5 @@
 import os
+import base64
 import gc
 import json
 import sounddevice as sd
@@ -17,430 +18,32 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
 from PyQt6.QtCore import Qt, QTimer, QSize, QSettings, QRect, QPoint, QEvent, QThread, pyqtSignal
 from PyQt6.QtGui import QIcon, QFont, QFontDatabase, QBrush, QColor, QCursor, QFontMetrics
 
-from config import *
+from config import (
+    resource_path,
+    KNOWN_USERS_PATH,
+    QUICK_MSG_MAX_LEN,
+    CMD_JOIN_ROOM, CMD_STREAM_START, CMD_STREAM_STOP,
+    CMD_SOUNDBOARD, CMD_SERVER_TRANSFER, CMD_SERVER_MIGRATE,
+    CMD_FORCE_MUTED,
+)
 from audio_engine import AudioHandler
 from network_engine import NetworkClient
-from ui_dialogs import (UserOverlayPanel, SettingsDialog, SoundboardDialog,
-                        WhisperSystemOverlay, SelfStatusOverlayPanel,
+from ui_dialogs import (UserOverlayPanel, WhisperSystemOverlay, SelfStatusOverlayPanel,
                         FileReceiverWorker, FileTransferProgressWidget,
                         _show_float_widget, _format_size)
+from ui_dialogs.ui_settings import SettingsDialog
+from ui_dialogs.ui_soundboard import SoundboardPanel, SoundboardDialog
+from .ui_widgets import QuickMsgBubble, CustomTitleBar
+from .ui_channel import _CreateChannelDialog, _ChannelPasswordDialog
 from version import APP_VERSION, APP_NAME, GITHUB_REPO
-from config import QUICK_MSG_MAX_LEN
+
 
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # QuickMsgBubble — стеклянный пузырь быстрого сообщения
 # ──────────────────────────────────────────────────────────────────────────────
-class QuickMsgBubble(QWidget):
-    """
-    Frameless tool-окно: появляется поверх всего приложения (и поверх дерева).
-    Позиционируется слева от аватарки отправителя по глобальным координатам.
-    Имеет маленький хвостик ▶ справа — указывает на аватарку.
 
-    Жизненный цикл управляется из MainWindow._quick_bubbles.
-    Создаётся один раз на uid, текст обновляется в update().
-    """
-
-    MAX_W = 210   # максимальная ширина пузыря, px
-
-    def __init__(self, parent=None):
-        super().__init__(
-            parent,
-            Qt.WindowType.Tool
-            | Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
-            | Qt.WindowType.NoDropShadowWindowHint,
-        )
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-
-        outer = QHBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-
-        # ── Стеклянный контейнер ──────────────────────────────────────────────
-        self._card = QFrame()
-        self._card.setObjectName("qbCard")
-        self._card.setStyleSheet("""
-            QFrame#qbCard {
-                background-color: rgba(16, 18, 32, 220);
-                border: 1px solid rgba(91, 142, 245, 0.60);
-                border-radius: 10px;
-            }
-        """)
-        card_lay = QVBoxLayout(self._card)
-        card_lay.setContentsMargins(10, 7, 10, 7)
-        card_lay.setSpacing(0)
-
-        # Текст сообщения с переносом строк
-        self._text_lbl = QLabel()
-        self._text_lbl.setWordWrap(True)
-        self._text_lbl.setStyleSheet(
-            "color: #eaf0ff; font-size: 13px; font-weight: 600;"
-            "background: transparent; border: none;"
-        )
-        card_lay.addWidget(self._text_lbl)
-
-        outer.addWidget(self._card)
-
-        # ── Хвостик ▶ справа (указывает на аватарку) ─────────────────────────
-        self._tail = QLabel("▶")
-        self._tail.setFixedWidth(12)
-        self._tail.setStyleSheet(
-            "color: rgba(91, 142, 245, 0.60);"
-            "font-size: 11px; background: transparent; border: none;"
-            "padding: 0; margin: 0;"
-        )
-        self._tail.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
-        outer.addWidget(self._tail)
-
-    def update(self, text: str) -> None:  # type: ignore[override]
-        self._text_lbl.setText(text)
-
-        # QFontMetrics напрямую измеряет пиксельную ширину текста —
-        # независимо от setFixedWidth/wordWrap/sizeHint лейбла.
-        # Это единственный надёжный способ: sizeHint() у wordWrap-лейбла
-        # всегда возвращает ширину контейнера, а не текста.
-        padding_h = 10 * 2          # card_lay contentsMargins left+right
-        fm = QFontMetrics(self._text_lbl.font())
-        text_w = fm.horizontalAdvance(text) + 8   # +8px запас на сглаживание
-        content_w = min(text_w, self.MAX_W - padding_h)
-
-        self._text_lbl.setFixedWidth(content_w)
-        self._card.setFixedWidth(content_w + padding_h)
-        self.adjustSize()
-
-    def place_left_of(self, global_item_tl, item_h: int) -> None:
-        """
-        Позиционирует пузырь слева от аватарки.
-        global_item_tl — глобальные экранные координаты верхнего-левого угла
-        строки пользователя в дереве.
-        Аватарка — первые 32px ширины строки.
-        """
-        bw = self.width()
-        bh = self.height()
-        # Правый край пузыря (вместе с хвостиком) = левый край аватарки − 2 px
-        x = global_item_tl.x() - bw - 2
-        # Вертикальный центр = центр строки
-        y = global_item_tl.y() + (item_h - bh) // 2
-
-        # Защита от выхода за левый край экрана
-        from PyQt6.QtWidgets import QApplication
-        screen = QApplication.screenAt(global_item_tl)
-        if screen:
-            sg = screen.geometry()
-            if x < sg.left():
-                # Не влезает слева → показываем справа от аватарки (32px)
-                x = global_item_tl.x() + 32 + 6
-            # Защита по вертикали
-            y = max(sg.top() + 4, min(y, sg.bottom() - bh - 4))
-
-        self.move(x, y)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Кастомная строка заголовка окна (вместо системного title bar Windows)
-# ──────────────────────────────────────────────────────────────────────────────
-class CustomTitleBar(QWidget):
-    """
-    Кастомный title bar для безрамочного окна.
-    Поддерживает: перетаскивание окна, сворачивание, разворачивание/восстановление,
-    закрытие, двойной клик для maximize/restore.
-    """
-
-    def __init__(self, parent_window, title=""):
-        super().__init__(parent_window)
-        self._win = parent_window
-        self._drag_pos = None
-        self.setFixedHeight(40)
-        self.setObjectName("customTitleBar")
-
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(10, 0, 4, 0)
-        layout.setSpacing(6)
-
-        # Иконка приложения (logo.ico — единый источник иконки по всему проекту)
-        self._icon_lbl = QLabel()
-        self._icon_lbl.setFixedSize(22, 22)
-        self._icon_lbl.setPixmap(
-            QIcon(resource_path("assets/icon/logo.ico")).pixmap(22, 22)
-        )
-        # Inline-стиль намеренно НЕ устанавливается: у QLabel без своего
-        # setStyleSheet() родительский stylesheet (#customTitleBar *) применяется
-        # корректно и задаёт прозрачный фон через CSS.
-        layout.addWidget(self._icon_lbl)
-
-        # Текст заголовка
-        # ВАЖНО: не вызываем self._title_lbl.setStyleSheet() здесь.
-        # Если у виджета есть собственный stylesheet (даже без color:), Qt полностью
-        # блокирует наследование цвета из родительского stylesheet — именно поэтому
-        # #titleBarText { color: ... } в apply_theme не работал в светлой теме.
-        # Всё оформление делается через apply_theme CSS-правила.
-        self._title_lbl = QLabel(title)
-        self._title_lbl.setObjectName("titleBarText")
-        layout.addWidget(self._title_lbl, stretch=1)
-
-        # ── Кнопки управления окном ──────────────────────────────────────────
-        # Размеры задаём через setFixedSize, а не через inline stylesheet —
-        # по той же причине: inline stylesheet блокирует цвет из apply_theme.
-        self._btn_min = QPushButton("─")
-        self._btn_min.setObjectName("titleBtnMin")
-        self._btn_min.setFixedSize(34, 30)
-        self._btn_min.clicked.connect(parent_window.showMinimized)
-
-        self._btn_max = QPushButton("□")
-        self._btn_max.setObjectName("titleBtnMax")
-        self._btn_max.setFixedSize(34, 30)
-        self._btn_max.clicked.connect(self._toggle_maximize)
-
-        self._btn_close = QPushButton("✕")
-        self._btn_close.setObjectName("titleBtnClose")
-        self._btn_close.setFixedSize(34, 30)
-        self._btn_close.clicked.connect(parent_window.close)
-
-        layout.addWidget(self._btn_min)
-        layout.addWidget(self._btn_max)
-        layout.addWidget(self._btn_close)
-
-    def set_title(self, title: str):
-        self._title_lbl.setText(title)
-
-    def _toggle_maximize(self):
-        if self._win.isMaximized():
-            self._win.showNormal()
-            self._btn_max.setText("□")
-        else:
-            self._win.showMaximized()
-            self._btn_max.setText("❐")
-
-    # ── Drag to move ─────────────────────────────────────────────────────────
-    def mousePressEvent(self, e):
-        if e.button() == Qt.MouseButton.LeftButton:
-            self._drag_pos = e.globalPosition().toPoint() - self._win.frameGeometry().topLeft()
-        super().mousePressEvent(e)
-
-    def mouseMoveEvent(self, e):
-        if e.buttons() == Qt.MouseButton.LeftButton and self._drag_pos is not None:
-            if self._win.isMaximized():
-                self._win.showNormal()
-                self._btn_max.setText("□")
-                # Пересчитываем drag_pos после восстановления нормального размера
-                self._drag_pos = QPoint(self._win.width() // 2, 20)
-            self._win.move(e.globalPosition().toPoint() - self._drag_pos)
-        super().mouseMoveEvent(e)
-
-    def mouseReleaseEvent(self, e):
-        self._drag_pos = None
-        super().mouseReleaseEvent(e)
-
-    def mouseDoubleClickEvent(self, e):
-        if e.button() == Qt.MouseButton.LeftButton:
-            self._toggle_maximize()
-
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Диалоги каналов
-# ══════════════════════════════════════════════════════════════════════════════
-
-_DIALOG_CHANNEL_SS = """
-    QWidget#dlgCard {
-        background-color: rgba(22, 24, 35, 252);
-        border: 1px solid rgba(255,255,255,0.10);
-        border-radius: 14px;
-    }
-    QLabel { color: #c8d0e0; background: transparent; border: none; }
-    QLineEdit {
-        background-color: rgba(255,255,255,0.07);
-        border: 1px solid rgba(255,255,255,0.14);
-        border-radius: 7px; padding: 7px 11px;
-        color: #dde3f0; font-size: 14px;
-    }
-    QLineEdit:focus { border-color: rgba(91,142,245,0.70); }
-    QCheckBox { color: #9aa5bb; font-size: 13px; background: transparent; }
-    QCheckBox::indicator {
-        width: 16px; height: 16px;
-        border: 1px solid rgba(255,255,255,0.20);
-        border-radius: 4px;
-        background: rgba(255,255,255,0.06);
-    }
-    QCheckBox::indicator:checked { background: #5b8ef5; border-color: #5b8ef5; }
-"""
-
-
-class _CreateChannelDialog(QDialog):
-    """Диалог создания временного канала (хост → ПКМ по дереву)."""
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Создать канал")
-        self.setModal(True)
-        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setFixedSize(320, 230)
-
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-
-        card = QWidget()
-        card.setObjectName("dlgCard")
-        card.setStyleSheet(_DIALOG_CHANNEL_SS)
-        outer.addWidget(card)
-
-        lay = QVBoxLayout(card)
-        lay.setContentsMargins(22, 18, 22, 18)
-        lay.setSpacing(10)
-
-        lbl_title = QLabel("🔊  Создать временный канал")
-        lbl_title.setStyleSheet(
-            "font-size: 15px; font-weight: bold; color: #cdd6f4;"
-            "background: transparent; border: none;"
-        )
-        lay.addWidget(lbl_title)
-
-        lbl_name = QLabel("Название канала:")
-        lbl_name.setStyleSheet("font-size: 12px; color: #8899bb;")
-        lay.addWidget(lbl_name)
-
-        self._inp_name = QLineEdit()
-        self._inp_name.setPlaceholderText("Например: Игровой чат")
-        self._inp_name.setMaxLength(32)
-        lay.addWidget(self._inp_name)
-
-        self._cb_pass = QCheckBox("Защитить паролем")
-        self._cb_pass.setChecked(False)
-        self._cb_pass.toggled.connect(self._on_pass_toggle)
-        lay.addWidget(self._cb_pass)
-
-        self._inp_pass = QLineEdit()
-        self._inp_pass.setPlaceholderText("Пароль для входа")
-        self._inp_pass.setMaxLength(64)
-        self._inp_pass.setEchoMode(QLineEdit.EchoMode.Password)
-        self._inp_pass.setVisible(False)
-        lay.addWidget(self._inp_pass)
-
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(8)
-
-        btn_ok = QPushButton("✔  Создать")
-        btn_ok.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_ok.setStyleSheet(
-            "QPushButton { background: rgba(39,174,96,0.28); color: #82e0aa;"
-            " border: 1px solid rgba(46,204,113,0.55); border-radius: 8px;"
-            " font-size: 14px; font-weight: bold; padding: 9px 0; }"
-            "QPushButton:hover { background: rgba(39,174,96,0.48); border-color: rgba(46,204,113,0.85); color: #fff; }"
-        )
-        btn_ok.clicked.connect(self._on_ok)
-
-        btn_cancel = QPushButton("Отмена")
-        btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_cancel.setStyleSheet(
-            "QPushButton { background: rgba(127,140,141,0.22); color: #8899aa;"
-            " border: 1px solid rgba(127,140,141,0.40); border-radius: 8px;"
-            " font-size: 13px; padding: 9px 0; }"
-            "QPushButton:hover { background: rgba(149,165,166,0.35); color: #c8d0e0; }"
-        )
-        btn_cancel.clicked.connect(self.reject)
-
-        btn_row.addWidget(btn_ok)
-        btn_row.addWidget(btn_cancel)
-        lay.addLayout(btn_row)
-
-        self._inp_name.returnPressed.connect(self._on_ok)
-
-    def _on_pass_toggle(self, checked: bool):
-        self._inp_pass.setVisible(checked)
-        if checked:
-            self._inp_pass.setFocus()
-        self.setFixedHeight(260 if checked else 230)
-
-    def _on_ok(self):
-        name = self._inp_name.text().strip()
-        if not name:
-            self._inp_name.setPlaceholderText("⚠ Введите название!")
-            self._inp_name.setFocus()
-            return
-        self.accept()
-
-    def get_channel_name(self) -> str:
-        return self._inp_name.text().strip()
-
-    def get_password(self):
-        if self._cb_pass.isChecked():
-            p = self._inp_pass.text().strip()
-            return p if p else None
-        return None
-
-
-class _ChannelPasswordDialog(QDialog):
-    """Запрашивает пароль для входа в защищённый канал."""
-
-    def __init__(self, channel_name: str, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Пароль канала")
-        self.setModal(True)
-        self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setFixedSize(300, 165)
-
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(0, 0, 0, 0)
-
-        card = QWidget()
-        card.setObjectName("dlgCard")
-        card.setStyleSheet(_DIALOG_CHANNEL_SS)
-        outer.addWidget(card)
-
-        lay = QVBoxLayout(card)
-        lay.setContentsMargins(22, 18, 22, 18)
-        lay.setSpacing(10)
-
-        lbl = QLabel(f"🔒  Канал «{channel_name}» защищён")
-        lbl.setStyleSheet(
-            "font-size: 14px; font-weight: bold; color: #cdd6f4;"
-            "background: transparent; border: none;"
-        )
-        lbl.setWordWrap(True)
-        lay.addWidget(lbl)
-
-        self._inp = QLineEdit()
-        self._inp.setPlaceholderText("Введите пароль...")
-        self._inp.setEchoMode(QLineEdit.EchoMode.Password)
-        lay.addWidget(self._inp)
-
-        btn_row = QHBoxLayout()
-        btn_row.setSpacing(8)
-
-        btn_ok = QPushButton("Войти")
-        btn_ok.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_ok.setStyleSheet(
-            "QPushButton { background: rgba(39,174,96,0.28); color: #82e0aa;"
-            " border: 1px solid rgba(46,204,113,0.55); border-radius: 8px;"
-            " font-size: 14px; font-weight: bold; padding: 8px 0; }"
-            "QPushButton:hover { background: rgba(39,174,96,0.48); color: #fff; }"
-        )
-        btn_ok.clicked.connect(self.accept)
-
-        btn_cancel = QPushButton("Отмена")
-        btn_cancel.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_cancel.setStyleSheet(
-            "QPushButton { background: rgba(127,140,141,0.22); color: #8899aa;"
-            " border: 1px solid rgba(127,140,141,0.40); border-radius: 8px;"
-            " font-size: 13px; padding: 8px 0; }"
-            "QPushButton:hover { background: rgba(149,165,166,0.35); color: #c8d0e0; }"
-        )
-        btn_cancel.clicked.connect(self.reject)
-
-        btn_row.addWidget(btn_ok)
-        btn_row.addWidget(btn_cancel)
-        lay.addLayout(btn_row)
-
-        self._inp.returnPressed.connect(self.accept)
-
-    def get_password(self) -> str:
-        return self._inp.text().strip()
 
 
 class MainWindow(QMainWindow):
@@ -453,6 +56,11 @@ class MainWindow(QMainWindow):
         self.ip, self.nick, self.avatar = ip, nick, avatar
         self.app_settings = QSettings("MyVoiceChat", "GlobalSettings")
         self.known_uids = {}
+        self._icon_size = 24  # Мы уже выяснили, что она нужна
+        self._my_status_icon = None  # Для фикса ошибки в on_connected
+        from PyQt6.QtGui import QFont
+        self._font_room = QFont()  # Базовый шрифт для комнат
+        self._font_user = QFont()
         self.current_room = "General"
         self.default_rooms = ["General"]
         # Актуальный список каналов (обновляется из sync_users → channel_list)
@@ -641,6 +249,7 @@ class MainWindow(QMainWindow):
         self._br_stream = QBrush(self._c_stream)
         self._br_def    = QBrush(self._c_def)
         self._br_gray   = QBrush(QColor("#888888"))   # для заголовков комнат и watchers
+        self._br_host   = QBrush(QColor("#f5c518"))   # жёлтый для хоста
 
         # ── Кэш иконок для refresh_ui() ────────────────────────────────────────
         # refresh_ui() вызывается каждые 100 мс и раньше создавал QIcon().pixmap()
@@ -966,10 +575,10 @@ class MainWindow(QMainWindow):
 
         try:
             from server import EmbeddedServerManager
-            from client_main import _load_server_name
+            from client_main.ui_login import load_server_name
             from server_discovery import get_local_radmin_ip
             host_ip     = get_local_radmin_ip()
-            server_name = _load_server_name()
+            server_name = load_server_name()
             EmbeddedServerManager.get().start(host_ip, self.nick, server_name=server_name)
         except Exception as e:
             print(f"[UI] _on_become_host error: {e}")
@@ -1091,17 +700,6 @@ class MainWindow(QMainWindow):
         """
         Приложение-уровневый фильтр: перехватывает MouseMove у ЛЮБОГО дочернего
         виджета и пересчитывает курсор относительно границ главного окна.
-
-        Проблема без этого фильтра:
-          MainWindow.mouseMoveEvent вызывается только когда курсор находится
-          прямо над главным окном (не над дочерними виджетами). Как только
-          мышь попадает на QTreeWidget или кнопки — события уходят им, а
-          setCursor(SizeXxx), выставленный у края рамки, «застревает» навсегда.
-
-        Решение:
-          При каждом MouseMove в любом виджете вычисляем pos относительно
-          MainWindow (через QCursor.pos() → mapFromGlobal). Если ресайз не активен
-          и не у края — вызываем unsetCursor().
         """
         if (event.type() == QEvent.Type.MouseMove
                 and not self._resize_direction
@@ -1465,6 +1063,7 @@ class MainWindow(QMainWindow):
         self._br_stream = QBrush(self._c_stream)
         self._br_def    = QBrush(self._c_def)
         self._br_gray   = QBrush(QColor("#6e7a96") if is_dark else QColor("#8090a8"))
+        self._br_host   = QBrush(QColor("#f5c518"))   # хост — всегда жёлтый, независимо от темы
 
     def setup_hotkeys(self):
         """
@@ -1606,8 +1205,6 @@ class MainWindow(QMainWindow):
                 def _make_sound_hk(path: str, name: str):
                     def _play():
                         try:
-                            import os, base64
-                            from config import CMD_SOUNDBOARD
                             fsize = os.path.getsize(path)
                             if fsize > 1 * 1024 * 1024:
                                 return
@@ -1984,17 +1581,6 @@ class MainWindow(QMainWindow):
             if stopped_streams:
                 self.play_notification("stream_off")
                 for uid in stopped_streams:
-                    # FIX MEM: раньше здесь был deleteLater() + del stream_windows[uid].
-                    # Это НЕ вызывало _on_stream_window_closed() → decode_worker
-                    # для этого uid продолжал работать, держа H264-декодер в памяти
-                    # (~10–40 МБ) до своего 2-секундного тайм-аута. Сигнал
-                    # audio.status_changed тоже не отключался.
-                    #
-                    # Теперь: _on_stream_window_closed() обрабатывает ВСЁ:
-                    #   — disconnect audio.status_changed
-                    #   — stop_viewer_for_uid (немедленно сигнализирует воркеру)
-                    #   — deleteLater() окна
-                    #   — deferred GC + Windows heap trim через 2.5 сек
                     if uid in self.stream_windows:
                         self._on_stream_window_closed(uid)
 
@@ -2006,16 +1592,8 @@ class MainWindow(QMainWindow):
         self.prev_streaming_uids = current_streaming_uids
 
         # ── Звук подключения друга к серверу ──────────────────────────────────
-        # Сравниваем всех пользователей на сервере (без себя) с предыдущим снимком.
-        # Первый вызов после (пере)подключения только засевает prev_all_uids —
-        # звука нет, чтобы не «приветствовать» тех, кто уже был на сервере.
-        #
-        # Один звук на весь «пакет» новых подключений — не плодим N звуков если
-        # несколько людей подключились между двумя sync_users (раз в ~1–2 сек).
-        # Этого достаточно: пользователь видит обновлённый список и слышит сигнал.
         all_server_uids = all_active_uids - {self.audio.my_uid}
         if not self._server_users_initialized:
-            # Первый sync после входа — просто засеваем, без звука
             self.prev_all_uids = all_server_uids
             self._server_users_initialized = True
         else:
@@ -2023,6 +1601,24 @@ class MainWindow(QMainWindow):
             if new_arrivals:
                 self.play_notification("friend_connect")
             self.prev_all_uids = all_server_uids
+
+        # FIX #18: пропускаем полную перестройку дерева если состав и
+        # размещение пользователей не изменились.
+        # Раньше tree.clear() + полный rebuild выполнялись при КАЖДОМ sync_users
+        # (update_status → отправляется ~1 раз/сек с каждого клиента при неизменном
+        # mute/deaf). При 20 юзерах = до 20 full rebuild/сек на UI-потоке.
+        # Сигнатура: tuple отсортированных (room, uid, nick, mute, deaf, is_streaming,
+        # avatar, status_icon, status_text) — учитывает всё что рисует дерево.
+        _new_sig = tuple(
+            (r, u['uid'], u['nick'], u.get('mute'), u.get('deaf'),
+             u.get('is_streaming'), u.get('avatar'), u.get('status_icon'),
+             u.get('status_text'))
+            for r, u_list in sorted(users_map.items())
+            for u in sorted(u_list, key=lambda x: x['uid'])
+        )
+        if hasattr(self, '_users_map_sig') and self._users_map_sig == _new_sig:
+            return  # ничего не изменилось — не трогаем дерево
+        self._users_map_sig = _new_sig
 
         self.tree.clear()
         self.known_uids.clear()
@@ -2057,10 +1653,9 @@ class MainWindow(QMainWindow):
                 if is_host:
                     _font_host = QFont(font_u)
                     _font_host.setBold(True)
-                    _font_host.setUnderline(True)
                     item_u.setFont(0, _font_host)
-                    # Убираем ведущие пробелы — подчёркивание начинается с первой буквы
-                    item_u.setText(0, u['nick'])
+                    item_u.setForeground(0, self._br_host)   # жёлтый цвет хоста
+                    item_u.setText(0, u['nick'])              # без ведущих пробелов
                 else:
                     item_u.setFont(0, font_u)
                 item_u.setData(0, Qt.ItemDataRole.UserRole, uid)
@@ -2114,34 +1709,47 @@ class MainWindow(QMainWindow):
     def refresh_ui(self):
         try:
             ping = self.net.current_ping
-            if ping < 60:
-                col    = "#2ecc71"
-                bg     = "rgba(46,204,113,0.25)"
-                border = "rgba(46,204,113,0.60)"
-            elif ping < 150:
-                col    = "#f1c40f"
-                bg     = "rgba(241,196,15,0.25)"
-                border = "rgba(241,196,15,0.60)"
-            else:
-                col    = "#e74c3c"
-                bg     = "rgba(231,76,60,0.25)"
-                border = "rgba(231,76,60,0.60)"
-            self._latency_btn.setToolTip(
-                f"<span style='color:{col}; font-weight:bold; font-size:13px;'>"
-                f"Пинг: {ping} мс</span>"
-            )
-            self._latency_btn.setStyleSheet(
-                f"QPushButton#barBtn {{"
-                f"  background-color: {bg};"
-                f"  border: 1px solid {border};"
-                f"  border-radius: 10px;"
-                f"  padding: 4px;"
-                f"}}"
-                f"QPushButton#barBtn:hover {{"
-                f"  background-color: {bg.replace('0.25','0.40')};"
-                f"  border-color: {col};"
-                f"}}"
-            )
+
+            # FIX #16: кэшируем «зону» пинга и пересоздаём stylesheet только при
+            # переходе между зонами (зелёная < 60 < жёлтая < 150 < красная).
+            # setStyleSheet() и setToolTip() с f-строками каждые 100 мс — лишняя
+            # работа Qt-стека (CSS парсинг + repaint) даже когда ничего не изменилось.
+            ping_tier = 0 if ping < 60 else (1 if ping < 150 else 2)
+            if not hasattr(self, '_ping_tier_cache'):
+                self._ping_tier_cache = -1   # форсируем первый рендер
+            tier_changed = (ping_tier != self._ping_tier_cache)
+            self._ping_tier_cache = ping_tier
+
+            if tier_changed:
+                if ping_tier == 0:
+                    col    = "#2ecc71"
+                    bg     = "rgba(46,204,113,0.25)"
+                    border = "rgba(46,204,113,0.60)"
+                elif ping_tier == 1:
+                    col    = "#f1c40f"
+                    bg     = "rgba(241,196,15,0.25)"
+                    border = "rgba(241,196,15,0.60)"
+                else:
+                    col    = "#e74c3c"
+                    bg     = "rgba(231,76,60,0.25)"
+                    border = "rgba(231,76,60,0.60)"
+                self._latency_btn.setStyleSheet(
+                    f"QPushButton#barBtn {{"
+                    f"  background-color: {bg};"
+                    f"  border: 1px solid {border};"
+                    f"  border-radius: 10px;"
+                    f"  padding: 4px;"
+                    f"}}"
+                    f"QPushButton#barBtn:hover {{"
+                    f"  background-color: {bg.replace('0.25','0.40')};"
+                    f"  border-color: {col};"
+                    f"}}"
+                )
+                # tooltip тоже обновляем только при смене зоны (не каждые 100 мс!)
+                self._latency_btn.setToolTip(
+                    f"<span style='color:{col}; font-weight:bold; font-size:13px;'>"
+                    f"Пинг: {ping} мс</span>"
+                )
 
             # FIX: perf_counter() — синхронизируем с last_packet_time и last_voice_time
             # в audio_engine (тоже переведены на perf_counter). time.time() и
@@ -2225,7 +1833,12 @@ class MainWindow(QMainWindow):
                 elif curr_d or is_m or (uid != my_uid and u_vals and (is_locally_muted or is_vol_zero)):
                     item.setForeground(0, self._br_mute)
                 else:
-                    item.setForeground(0, self._br_def)
+                    # Хост — жёлтый, остальные — дефолтный цвет темы
+                    _host_uid = getattr(self.net, '_server_host_uid', 0)
+                    if uid == _host_uid and _host_uid != 0:
+                        item.setForeground(0, self._br_host)
+                    else:
+                        item.setForeground(0, self._br_def)
         except Exception as _e:
             import traceback
             print(f"[DEBUG] refresh_ui: EXCEPTION:\n{traceback.format_exc()}", flush=True)
@@ -2268,7 +1881,6 @@ class MainWindow(QMainWindow):
 
         # ── Правый клик по СЕБЕ → оверлей выбора статуса ─────────────────────
         if uid == self.audio.my_uid:
-            from ui_dialogs import SelfStatusOverlayPanel
             item_rect = self.tree.visualItemRect(item)
             global_pos = self.tree.viewport().mapToGlobal(item_rect.bottomLeft())
 
@@ -2487,7 +2099,7 @@ class MainWindow(QMainWindow):
             self.net.send_presence_update(icon, text)
 
     def open_soundboard(self):
-        from ui_dialogs import SoundboardPanel
+        from ui_dialogs.ui_soundboard import SoundboardPanel
 
         # Проверяем состояние существующей панели с защитой от RuntimeError
         # (возникает если C++ объект уже уничтожен Qt — крайний случай)
@@ -2827,7 +2439,12 @@ class MainWindow(QMainWindow):
         if not GITHUB_REPO:
             return  # репо не настроено — молча пропускаем
 
-        from updater import check_for_updates_async
+        try:
+            from updater import check_for_updates_async
+        except ImportError:
+            # updater.py не в sys.path (dev-режим без сборки PyInstaller) — пропускаем.
+            print("[Update] updater module не найден — автопроверка отключена")
+            return
 
         def _on_found(version: str, url: str):
             # Используем QTimer чтобы обновление UI произошло в главном потоке
@@ -2946,8 +2563,9 @@ class MainWindow(QMainWindow):
                 self._lobby_screen = None
 
         try:
-            from client_main import MultiServerScreen, _load_server_name
-            server_name = _load_server_name()
+            from client_main.ui_server_select import MultiServerScreen
+            from client_main.ui_login import load_server_name
+            server_name = load_server_name()
             screen = MultiServerScreen(self.nick, self.avatar, server_name=server_name)
             screen.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
 
@@ -3067,30 +2685,97 @@ class MainWindow(QMainWindow):
         self.net.fast_switch_to(new_ip)
 
     def closeEvent(self, e):
-        """При нажатии ✕ — корректно завершаем приложение."""
-        # Скрываем лобби если открыто
+        """При нажатии ✕ — корректно завершаем приложение.
+
+        Порядок завершения критичен:
+          1. Останавливаем UI-таймеры — прекращаем refresh_ui во время teardown.
+          2. Снимаем keyboard-хуки — убираем глобальные перехватчики клавиш.
+          3. Закрываем вспомогательные UI-элементы (лобби, оверлеи).
+          4. Останавливаем AudioHandler — закрывает PortAudio поток и pkt-поток.
+          5. VideoEngine.shutdown() — DXCamTrack + все VideoReceiver.
+          6. NetworkClient.stop() — сокеты, WebRTC PC, asyncio loop.
+          7. EmbeddedServerManager.stop() — broadcast server_migrate → close.
+          8. QApplication.quit() — завершаем event loop Qt.
+        """
+        print("[UI] closeEvent: начинаем shutdown...")
+
+        # ── 1. Останавливаем UI-таймеры ПЕРВЫМИ ──────────────────────────────
+        # ui_timer (100ms) продолжает дёргать refresh_ui во время teardown —
+        # может обращаться к уже закрытым объектам → RuntimeError / краш.
+        try:
+            self.ui_timer.stop()
+        except Exception:
+            pass
+
+        # ── 2. Снимаем keyboard-хуки ──────────────────────────────────────────
+        # Без unhook_all() глобальные хуки продолжают перехватывать ввод даже
+        # после закрытия окна — до полного завершения процесса. На Windows это
+        # приводит к тому что другие приложения не получают определённые клавиши.
+        try:
+            import keyboard as _kb
+            _kb.unhook_all()
+        except Exception:
+            pass
+
+        # ── 3. Закрываем вспомогательные UI-элементы ─────────────────────────
         if hasattr(self, '_lobby_screen') and self._lobby_screen is not None:
             try:
                 self._lobby_screen.close()
             except Exception:
                 pass
             self._lobby_screen = None
-        # Скрываем системный оверлей (поверх всех окон — должен исчезнуть первым)
+
         try:
             self._whisper_overlay.hide_overlay()
             self._whisper_overlay.deleteLater()
         except Exception:
             pass
-        self.audio.stop()
-        self.net.running = False
-        # Если мы хост встроенного сервера — корректная передача хостинга
+
+        # Закрываем все открытые VideoWindow (стримы зрителей)
+        for uid, w in list(self.stream_windows.items()):
+            try:
+                w.close()
+            except Exception:
+                pass
+        self.stream_windows.clear()
+
+        # ── 4. AudioHandler.stop() ────────────────────────────────────────────
+        # Закрывает PortAudio поток (stream.stop/close) и _pkt_thread.
+        # Должен идти до net.stop() — audio использует send_queue сети.
+        try:
+            self.audio.stop()
+        except Exception as ex:
+            print(f"[UI] closeEvent audio.stop() error: {ex}")
+
+        # ── 5. VideoEngine.shutdown() ─────────────────────────────────────────
+        # Останавливает DXCamTrack и все VideoReceiver.
+        # После net.stop() WebRTC треки будут закрыты, поэтому делаем ДО.
+        try:
+            self.video.shutdown()
+        except Exception as ex:
+            print(f"[UI] closeEvent video.shutdown() error: {ex}")
+
+        # ── 6. NetworkClient.stop() ───────────────────────────────────────────
+        # Закрывает RTCPeerConnection, asyncio loop, TCP/UDP сокеты.
+        # После этого все сетевые потоки выйдут из блокирующих recv().
+        try:
+            self.net.stop()
+        except Exception as ex:
+            print(f"[UI] closeEvent net.stop() error: {ex}")
+
+        # ── 7. EmbeddedServerManager — корректная передача хостинга ──────────
+        # stop_gracefully(): broadcast CMD_SERVER_MIGRATE → 350мс → close сокеты.
+        # Другие клиенты успевают получить команду и переподключиться.
         try:
             from server import EmbeddedServerManager
             mgr = EmbeddedServerManager.get()
             if mgr.is_running():
-                mgr.stop()   # stop_gracefully: broadcast server_migrate → 600 мс → close
+                mgr.stop()
         except Exception as ex:
             print(f"[UI] closeEvent EmbeddedServer stop error: {ex}")
+
+        # ── 8. Завершаем Qt ───────────────────────────────────────────────────
+        print("[UI] closeEvent: shutdown завершён")
         from PyQt6.QtWidgets import QApplication
         QApplication.quit()
         e.accept()
@@ -3123,7 +2808,7 @@ class MainWindow(QMainWindow):
         pass
 
     def toggle_stream(self):
-        from ui_dialogs import StreamSettingsDialog
+        from ui_dialogs.ui_stream_settings import StreamSettingsDialog
         if not self.is_streaming:
             dialog = StreamSettingsDialog(self)
             if dialog.exec():
