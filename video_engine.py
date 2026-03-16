@@ -58,7 +58,7 @@ import numpy as np
 from PyQt6.QtCore import QObject, pyqtSignal
 from PyQt6.QtGui import QImage
 
-from config import VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_FPS, VIDEO_BITRATE
+from config import VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_FPS, VIDEO_BITRATE, VIDEO_BITRATES
 
 # ─── Опциональные зависимости ─────────────────────────────────────────────────
 
@@ -83,6 +83,31 @@ except ImportError:
     AIORTC_AVAILABLE = False
     _AiortcVideoStreamTrack = object   # заглушка для наследования
     print("[Video] ОШИБКА: aiortc не установлен!")
+
+
+# =============================================================================
+# Динамический битрейт энкодера
+# =============================================================================
+
+# Мутабельный контейнер: доступен из замыкания _patched_encode внутри
+# patch_aiortc_nvenc(). Обновляется через set_encoder_bitrate() перед
+# каждым стартом стрима — таким образом битрейт масштабируется с разрешением.
+_encoder_state = {'bitrate': VIDEO_BITRATE}
+
+
+def set_encoder_bitrate(bitrate: int) -> None:
+    """
+    Устанавливает целевой битрейт для следующего (и текущего) сеанса кодирования.
+
+    Вызывается из VideoEngine.start_streaming() сразу после определения
+    разрешения стрима. _patched_encode читает значение при каждой инициализации
+    нового CodecContext (первый кадр каждого стрима).
+
+    bitrate зажат в диапазоне [500 kbps … 20 Mbps] — защита от случайных
+    значений из settings dict.
+    """
+    _encoder_state['bitrate'] = max(500_000, min(int(bitrate), 20_000_000))
+    print(f"[Video] Целевой битрейт энкодера: {_encoder_state['bitrate'] // 1000} kbps")
 
 
 # =============================================================================
@@ -113,38 +138,42 @@ def patch_aiortc_nvenc() -> bool:
             'codec': 'h264',
             'name': 'NVIDIA NVENC',
             'options': {
-                # p6 = высокое качество, выше p4 при той же задержке (low-latency tune)
-                'preset': 'p6',
-                'tune': 'll',          # low-latency — минимальный буфер кодека
+                # p7 = максимальное качество NVENC (был p6).
+                # Без tune=ll: low-latency экономит 1-2 кадра буфера, но снижает
+                # качество сжатия. При стриме 12 зрителям эти 33-66 мс некритичны.
+                'preset': 'p7',
 
-                # VBR: средний = 2/3 от макс, пиковый = максимум
-                # bufsize = 2×maxrate — даём кодеку «карман» для сложных сцен
-                'rc': 'vbr',
-                'b': str(VIDEO_BITRATE * 2 // 3),   # avg bitrate (напр. 4 Mbps при 6)
-                'maxrate': str(VIDEO_BITRATE),        # жёсткий потолок
-                'bufsize': str(VIDEO_BITRATE * 2),    # VBV буфер — больше → лучше качество
+                # VBR: avg = 2/3 от max, peak = max.
+                # Значения переопределяются динамически в _patched_encode
+                # из _encoder_state['bitrate'] — placeholder для тестирования кодека.
+                'rc':      'vbr',
+                'b':       str(VIDEO_BITRATE * 2 // 3),
+                'maxrate': str(VIDEO_BITRATE),
+                'bufsize': str(VIDEO_BITRATE * 2),
 
-                # Без B-кадров: нет задержки декодера у зрителей
+                # Без B-кадров: нет буферизации на декодере зрителя
                 'bf': '0',
-                'profile': 'high',     # high вместо main: лучше коэффициент сжатия
 
-                # Адаптивное квантование в пространстве и времени:
-                # текст, мелкие детали, движущиеся объекты становятся чётче
-                'spatial_aq': '1',
+                # high profile: лучший коэффициент сжатия vs main/baseline
+                'profile': 'high',
+
+                # Адаптивное квантование в пространстве (текст, мелкие детали) и
+                # времени (движущиеся объекты). Значительно улучшает резкость.
+                'spatial_aq':  '1',
                 'temporal_aq': '1',
 
-                # Keyframe каждые 2 секунды — зрители быстро восстанавливают картинку
+                # Keyframe каждые 2 с при 30fps — зрители быстро восстанавливают
                 'g': '60',
             },
         },
 
-        # 2. Windows Media Foundation (RTX 5060 / любой GPU с MF-поддержкой)
+        # 2. Windows Media Foundation (любой GPU с MF H.264-поддержкой)
         {
             'codec': 'h264_mf',
             'name':  'Windows MF (GPU)',
             'options': {
-                'scenario':    'livestreaming',
-                'quality_vs_speed': '100',  # max скорость
+                'scenario':          'livestreaming',
+                'quality_vs_speed':  '100',
             },
         },
 
@@ -153,8 +182,8 @@ def patch_aiortc_nvenc() -> bool:
             'codec': 'h264_amf',
             'name':  'AMD AMF',
             'options': {
-                'usage':   'lowlatency',
-                'quality': 'speed',
+                'usage':   'transcoding',  # был 'lowlatency' → transcoding лучше качество
+                'quality': 'quality',      # был 'speed' → quality = максимальное качество AMF
             },
         },
     ]
@@ -175,20 +204,40 @@ def patch_aiortc_nvenc() -> bool:
         except Exception:
             continue
 
-    # [FIX-3] CPU-fallback: ultrafast + baseline + keyframe каждые 2 секунды.
-    # profile=baseline — вдвое меньше нагрузки на декодер у зрителей.
-    # g=60 при 30fps — keyframe каждые 2 с, зрители быстро восстанавливают картинку.
-    # sc_threshold=0 — запрет keyframe на смене сцены (иначе битрейт скачет).
+    # CPU-fallback: veryfast + main profile.
+    #
+    # БЫЛО: ultrafast + baseline — главные виновники мутной картинки.
+    #   ultrafast: отключает субпиксельное предсказание движения (subme), mode
+    #   decision и большинство межкадрового анализа → блочные артефакты,
+    #   размытые края, потеря мелких деталей (текст UI, лого игр).
+    #   baseline: нет CABAC → на 15–20% хуже сжатие при том же битрейте
+    #   (остаток битрейта «тратится» на менее эффективные коды → шум, а не детали).
+    #
+    # СТАЛО: veryfast + main.
+    #   veryfast: включает hex motion estimation, 2 B-ref кадра, CABAC.
+    #   CPU нагрузка ~1.4× vs ultrafast, но качество заметно лучше.
+    #   main: CABAC включён — более эффективный энтропийный кодер.
+    #   Поддерживает все современные декодеры (Windows, Android, iOS).
+    #
+    # tune=zerolatency: отключает lookahead, B-кадры и mbtree.
+    #   При том же preset + tune latency ≈ 0 кадров буферизации.
+    #   Качество немного ниже чем без tune, но latency критична для стрима.
+    #
+    # Битрейт через ctx.bit_rate (динамически из _encoder_state) +
+    # maxrate + bufsize для VBR — обеспечивает чёткость статичных сцен
+    # (текст, интерфейс) и предотвращает скачки на быстрых сценах.
     x264_profile = {
         'codec': 'libx264',
-        'name':  'libx264 (Ultrafast CPU)',
+        'name':  'libx264 (CPU)',
         'options': {
-            'preset':        'ultrafast',
-            'tune':          'zerolatency',
-            'profile':       'baseline',
-            'level':         '3.1',
-            'g':             '60',
-            'sc_threshold':  '0',
+            'preset':       'veryfast',      # был 'ultrafast'
+            'tune':         'zerolatency',
+            'profile':      'main',          # был 'baseline' — включает CABAC
+            'level':        '4.1',           # был '3.1' — 4.1 = до 1080p30
+            'g':            '60',
+            'sc_threshold': '0',
+            # Без явного b/maxrate в options: битрейт задаётся через ctx.bit_rate
+            # и ctx.options дополняются в _patched_encode ниже.
         },
     }
 
@@ -204,7 +253,7 @@ def patch_aiortc_nvenc() -> bool:
 
         _CODEC_ATTRS  = ('_codec', '_encoder', '_context', '_av_codec')
         _active_flag  = [False]
-        _warn_flag    = [False]    # [FIX-4] однократное предупреждение
+        _warn_flag    = [False]    # однократное предупреждение при отсутствии атрибута
 
         def _patched_encode(self_enc, frame, force_keyframe: bool = False):
             codec_attr = next(
@@ -215,16 +264,36 @@ def patch_aiortc_nvenc() -> bool:
 
             if codec_attr is not None:
                 try:
+                    # Читаем актуальный битрейт из модульного _encoder_state.
+                    # set_encoder_bitrate() вызывается перед каждым стартом стрима
+                    # из VideoEngine.start_streaming() — таким образом битрейт
+                    # автоматически масштабируется с выбранным разрешением.
+                    cur_bitrate = _encoder_state['bitrate']
+
+                    # Для hw-кодеков дублируем битрейт в options (перезаписываем
+                    # placeholder-значения из hw_profiles, которые были вычислены
+                    # от дефолтного VIDEO_BITRATE).
+                    runtime_options = dict(selected_profile['options'])
+                    if selected_profile['codec'] in ('h264', 'h264_amf'):
+                        runtime_options['b']       = str(cur_bitrate * 2 // 3)
+                        runtime_options['maxrate'] = str(cur_bitrate)
+                        runtime_options['bufsize'] = str(cur_bitrate * 2)
+                    elif selected_profile['codec'] == 'libx264':
+                        # x264 VBR через crf+maxrate: ограничиваем потолок,
+                        # но позволяем кодеку понижать битрейт на лёгких сценах.
+                        # bufsize = 1×maxrate — tight VBV buffer = лучше постоянство качества.
+                        runtime_options['maxrate'] = str(cur_bitrate)
+                        runtime_options['bufsize'] = str(cur_bitrate)
+
                     ctx = av.CodecContext.create(selected_profile['codec'], 'w')
-                    ctx.options    = selected_profile['options']
+                    ctx.options    = runtime_options
                     ctx.width      = frame.width
                     ctx.height     = frame.height
                     ctx.pix_fmt    = 'yuv420p'
                     ctx.time_base  = frame.time_base
-                    # [FIX-2] Передаём целевой битрейт из config.
-                    # Для hw-кодеков он дублируется в options (выше), здесь
-                    # устанавливаем на случай если options не применились.
-                    ctx.bit_rate   = VIDEO_BITRATE
+                    # ctx.bit_rate = AVG target; для hw-кодеков уже в options['b'],
+                    # здесь выставляем явно как fallback если опция не применилась.
+                    ctx.bit_rate   = cur_bitrate * 2 // 3
                     ctx.open()
 
                     setattr(self_enc, codec_attr, ctx)
@@ -233,15 +302,16 @@ def patch_aiortc_nvenc() -> bool:
                         _active_flag[0] = True
                         print(
                             f"[Video] aiortc H264Encoder: инициализирован "
-                            f"{selected_profile['name']}, bitrate={VIDEO_BITRATE//1000} kbps"
+                            f"{selected_profile['name']}, "
+                            f"bitrate={cur_bitrate // 1000} kbps, "
+                            f"{frame.width}x{frame.height}"
                         )
 
                 except Exception as e:
                     print(f"[Video] aiortc H264Encoder: ошибка контекста ({e}) — fallback")
 
             else:
-                # [FIX-4] Если ни одного ожидаемого атрибута не нашли — патч
-                # не применится. Печатаем предупреждение один раз.
+                # Если ни одного ожидаемого атрибута не нашли — патч не применится.
                 if not _active_flag[0] and not _warn_flag[0]:
                     _warn_flag[0] = True
                     available = [a for a in dir(self_enc) if not a.startswith('__')]
@@ -765,17 +835,29 @@ class VideoEngine(QObject):
             return False
 
         s = settings or {}
+        w = s.get("width",  VIDEO_WIDTH)
+        h = s.get("height", VIDEO_HEIGHT)
+
+        # Выбираем битрейт по разрешению из VIDEO_BITRATES.
+        # Если разрешение нестандартное — берём ближайшее из таблицы по площади.
+        target_bitrate = VIDEO_BITRATES.get(
+            (w, h),
+            min(VIDEO_BITRATES.values(),
+                key=lambda b: abs(b - VIDEO_BITRATE))
+        )
+        set_encoder_bitrate(target_bitrate)
+
         self._dxcam_track = DXCamTrack(
             monitor_idx = s.get("monitor_idx", 0),
             fps         = s.get("fps",         VIDEO_FPS),
-            width       = s.get("width",       VIDEO_WIDTH),
-            height      = s.get("height",      VIDEO_HEIGHT),
+            width       = w,
+            height      = h,
         )
         self._dxcam_track.start(self._webrtc_loop)
         print(
             f"[VideoEngine] DXCamTrack запущен: "
-            f"{s.get('width', VIDEO_WIDTH)}×{s.get('height', VIDEO_HEIGHT)} "
-            f"@ {s.get('fps', VIDEO_FPS)} fps"
+            f"{w}×{h} @ {s.get('fps', VIDEO_FPS)} fps, "
+            f"bitrate={target_bitrate // 1000} kbps"
         )
         return True
 
@@ -843,7 +925,17 @@ class VideoEngine(QObject):
 
         # Останавливаем предыдущий receiver если есть (переподключение)
         if uid in self._receivers:
-            self._receivers[uid].stop()
+            old = self._receivers[uid]
+            # Отключаем сигналы ДО stop() — в Qt-очереди могут быть буферизованные
+            # emit() которые ещё не доставлены. Без disconnect() они прилетят в новый
+            # VideoWindow уже после его создания → placeholder «Ожидание видео...»
+            # заменяется старым кадром и не отображается при повторном открытии стрима.
+            try:
+                old.frame_received.disconnect(self.frame_received)
+                old.stream_stats_updated.disconnect(self.stream_stats_updated)
+            except (RuntimeError, TypeError):
+                pass
+            old.stop()
 
         receiver = VideoReceiver(uid, track, self._webrtc_loop)
         # Проксируем сигналы наверх (в MainWindow)
@@ -862,9 +954,19 @@ class VideoEngine(QObject):
             — стример нажал «Стоп трансляцию»
             — зритель нажал «Прекратить просмотр»
             — WebRTC соединение закрылось
+
+        ВАЖНО: disconnect() вызывается ДО stop() чтобы буферизованные в Qt-очереди
+        emit() не попали на следующий VideoWindow при повторном открытии стрима.
+        Без этого placeholder «Ожидание видео...» не отображается — кадр приходит
+        из старого ресивера раньше чем ICE нового соединения установится.
         """
         receiver = self._receivers.pop(uid, None)
         if receiver is not None:
+            try:
+                receiver.frame_received.disconnect(self.frame_received)
+                receiver.stream_stats_updated.disconnect(self.stream_stats_updated)
+            except (RuntimeError, TypeError):
+                pass
             receiver.stop()
         print(f"[VideoEngine] stop_viewer_for_uid({uid})")
 

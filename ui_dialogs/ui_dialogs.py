@@ -6,8 +6,9 @@ import socket
 import secrets
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QScrollArea,
                              QWidget, QGridLayout, QLabel, QSlider, QFrame,
-                             QSizePolicy, QProgressBar, QLineEdit)
-from PyQt6.QtCore import (Qt, QSize, QPoint, QTimer, pyqtSignal, QThread)
+                             QSizePolicy, QProgressBar, QLineEdit,
+                             QFileDialog, QMessageBox)
+from PyQt6.QtCore import (Qt, QSize, QPoint, QTimer, pyqtSignal, QThread, QSettings)
 from PyQt6.QtGui import QIcon, QGuiApplication, QPainter, QColor, QPen, QPainterPath, QBrush
 from config import (resource_path, FILE_CHUNK_SIZE, FILE_TRANSFER_TIMEOUT)
 
@@ -573,21 +574,10 @@ class UserOverlayPanel(QFrame):
                 border-radius: 12px;
             }
             QLabel {
-                color: #c8d0e0;
+                color: #d0d0d8;
+                font-size: 12px;
                 background: transparent;
                 border: none;
-            }
-            QPushButton {
-                background-color: rgba(255,255,255,0.07);
-                color: #c8d0e0;
-                border: 1px solid rgba(255,255,255,0.12);
-                border-radius: 7px;
-                padding: 6px 14px;
-                font-size: 13px;
-            }
-            QPushButton:hover {
-                background-color: rgba(255,255,255,0.14);
-                border-color: rgba(255,255,255,0.22);
             }
             QSlider::groove:horizontal {
                 height: 5px;
@@ -608,124 +598,287 @@ class UserOverlayPanel(QFrame):
         outer.addWidget(self._card)
 
         card_lay = QVBoxLayout(self._card)
-        card_lay.setContentsMargins(14, 12, 14, 12)
-        card_lay.setSpacing(8)
+        card_lay.setContentsMargins(14, 10, 14, 12)
+        card_lay.setSpacing(7)
 
-        # ── Никнейм (заголовок) ───────────────────────────────────────────────
-        nick_lbl = QLabel(self._nick)
-        nick_lbl.setStyleSheet(
-            "font-size: 14px; font-weight: bold; color: #cdd6f4; "
-            "background: transparent; border: none;"
-        )
-        card_lay.addWidget(nick_lbl)
+        # ── Громкость ─────────────────────────────────────────────────────────
+        lbl_vol_title = QLabel("🔊  Громкость")
+        lbl_vol_title.setStyleSheet("font-size: 11px; color: rgba(200,200,210,0.7); background:transparent; border:none;")
+        card_lay.addWidget(lbl_vol_title)
 
-        # Тонкий разделитель
+        vol_row = QHBoxLayout()
+        vol_row.setSpacing(8)
+        self.sl_vol = QSlider(Qt.Orientation.Horizontal)
+        self.sl_vol.setRange(0, 200)
+        self.sl_vol.setValue(_vol_to_slider(current_vol))
+        # Хороший шаг: стрелки ±5%, клик по треку ±25%
+        self.sl_vol.setSingleStep(5)
+        self.sl_vol.setPageStep(25)
+        self.lbl_vol = QLabel(f"{self.sl_vol.value()}%")
+        self.lbl_vol.setFixedWidth(38)
+        self.lbl_vol.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.sl_vol.valueChanged.connect(self._on_vol_changed)
+        vol_row.addWidget(self.sl_vol)
+        vol_row.addWidget(self.lbl_vol)
+        card_lay.addLayout(vol_row)
+
+        # ── Загружаем состояние буста (персистентное между сессиями) ─────────
+        _s_boost = QSettings("MyVoiceChat", "GlobalSettings")
+        self._is_boosted: bool = _s_boost.value(f"vol_boost_{uid}", "false") == "true"
+        if self._is_boosted:
+            self.sl_vol.blockSignals(True)
+            self.sl_vol.setValue(200)
+            self.sl_vol.blockSignals(False)
+            self.sl_vol.setEnabled(False)
+            self.lbl_vol.setText("⚡")
+
+        # ── Разделитель ───────────────────────────────────────────────────────
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
         sep.setStyleSheet("background: rgba(255,255,255,0.08); border: none; max-height: 1px;")
         sep.setMaximumHeight(1)
         card_lay.addWidget(sep)
 
-        # ── Блок громкости ────────────────────────────────────────────────────
-        vol_lbl = QLabel("🔊  Громкость")
-        vol_lbl.setStyleSheet("font-size: 12px; font-weight: bold; color: #a0b0cc;")
-        card_lay.addWidget(vol_lbl)
-
-        self.sl_vol = QSlider(Qt.Orientation.Horizontal)
-        self.sl_vol.setRange(0, 200)
-        self.sl_vol.setValue(_vol_to_slider(current_vol))
-        self.sl_vol.setMinimumWidth(200)
-        # slider 0 → 0.0 (полная тишина, _slider_to_vol гарантирует это).
-        self.sl_vol.valueChanged.connect(
-            lambda v: self.audio.set_user_volume(self.uid, _slider_to_vol(v))
+        # ── Кнопка: заглушить ─────────────────────────────────────────────────
+        is_m = audio_handler.remote_users[uid].is_locally_muted \
+               if uid in audio_handler.remote_users else False
+        self.btn_mute = self._make_btn(
+            "🔇  Заглушить" if not is_m else "🔊  Разглушить",
+            checkable=True, checked=is_m
         )
-        card_lay.addWidget(self.sl_vol)
+        self.btn_mute.clicked.connect(self._on_toggle_mute)
+        card_lay.addWidget(self.btn_mute)
 
-        # Метки под слайдером
-        marks_row = QHBoxLayout()
-        marks_row.setContentsMargins(0, 0, 0, 0)
-        for txt in ["0", "50", "100 (норм)", "150", "200"]:
-            lbl = QLabel(txt)
-            lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            lbl.setStyleSheet("font-size: 9px; color: rgba(180,190,210,0.45); background:transparent; border:none;")
-            marks_row.addWidget(lbl)
-        card_lay.addLayout(marks_row)
-
-        # ── Кнопка буста ─────────────────────────────────────────────────────
-        # slider 0 → 0.0 (полная тишина, _slider_to_vol гарантирует это).
-        # ставим флаг vol_boost_{uid}="true", применяем _BOOST_VOL (15x).
-        is_boosted = self.audio.app_settings.value(f"vol_boost_{uid}", "") == "true" \
-            if hasattr(self.audio, 'app_settings') else False
-
-        self._btn_boost = QPushButton(
-            "🔊  Усилить ×15 (OFF)" if not is_boosted else "🔊  Усилить ×15 (ON)"
-        )
-        self._btn_boost.setCheckable(True)
-        self._btn_boost.setChecked(is_boosted)
-        self._btn_boost.setStyleSheet("""
-            QPushButton {
-                background-color: rgba(255,255,255,0.07);
-                color: #c8d0e0;
-                border: 1px solid rgba(255,255,255,0.12);
-                border-radius: 7px;
-                padding: 6px 14px;
-            }
-            QPushButton:checked {
-                background-color: rgba(46,204,113,0.25);
-                color: #82e0aa;
-                border-color: rgba(46,204,113,0.50);
+        # ── Кнопка: шёпот (удерживать) ───────────────────────────────────────
+        self.btn_whisper = self._make_btn("🤫  Шепнуть  (удерживай)", checkable=False)
+        self.btn_whisper.setStyleSheet(self.btn_whisper.styleSheet() + """
+            QPushButton { border-color: rgba(130,100,220,0.5); color: #c8b0ff; }
+            QPushButton:pressed {
+                background-color: rgba(100,60,200,0.55);
+                border-color: #7b52d4;
+                color: #ffffff;
             }
         """)
-        self._btn_boost.toggled.connect(self._on_boost_toggled)
-        card_lay.addWidget(self._btn_boost)
+        # press/release — не click, иначе сработает только при отпускании
+        self.btn_whisper.pressed.connect(self._on_whisper_press)
+        self.btn_whisper.released.connect(self._on_whisper_release)
+        card_lay.addWidget(self.btn_whisper)
 
-        # ── Кнопки действий ───────────────────────────────────────────────────
-        # Шёпот (hold)
-        self.btn_nudge = NudgeHoldButton("👟  Пнуть  (держи 3с)")
-        self.btn_nudge.hold_complete.connect(self._on_nudge)
-        card_lay.addWidget(self.btn_nudge)
+        # ── Кнопка: смотреть стрим (только если пользователь стримит) ────────
+        if is_streaming and on_watch_stream is not None:
+            sep2 = QFrame()
+            sep2.setFrameShape(QFrame.Shape.HLine)
+            sep2.setStyleSheet("background: rgba(255,255,255,0.08); border: none; max-height: 1px;")
+            sep2.setMaximumHeight(1)
+            card_lay.addWidget(sep2)
 
-        if net is not None:
-            btn_whisper = QPushButton("🤫  Шепнуть (Push-to-Talk)")
-            btn_whisper.setCheckable(True)
-            btn_whisper.toggled.connect(self._on_whisper_toggled)
-            card_lay.addWidget(btn_whisper)
-
-        # Смотреть стрим
-        if is_streaming and on_watch_stream:
-            btn_watch = QPushButton("📺  Смотреть стрим")
-            btn_watch.setStyleSheet("""
-                QPushButton {
-                    background-color: rgba(91,142,245,0.25);
-                    color: #a0c0ff;
-                    border: 1px solid rgba(91,142,245,0.50);
-                    border-radius: 7px;
-                    padding: 6px 14px;
-                    font-weight: bold;
-                }
+            self.btn_watch = self._make_btn("📺  Смотреть стрим", checkable=False)
+            self.btn_watch.setStyleSheet(self.btn_watch.styleSheet() + """
+                QPushButton { border-color: rgba(46,204,113,0.45); color: #82e0aa; }
                 QPushButton:hover {
-                    background-color: rgba(91,142,245,0.40);
+                    background-color: rgba(39,174,96,0.25);
+                    border-color: rgba(46,204,113,0.8);
+                }
+                QPushButton:pressed {
+                    background-color: rgba(39,174,96,0.45);
                     color: #ffffff;
                 }
             """)
-            btn_watch.clicked.connect(lambda: (on_watch_stream(), self.close()))
-            card_lay.addWidget(btn_watch)
+            self.btn_watch.clicked.connect(self._on_watch_clicked)
+            card_lay.addWidget(self.btn_watch)
 
-        # Передача сервера (только для хоста)
-        if on_transfer_server:
-            btn_transfer = QPushButton("👑  Сделать хостом")
-            btn_transfer.clicked.connect(lambda: (on_transfer_server(uid), self.close()))
-            card_lay.addWidget(btn_transfer)
+        # ── Подсказка под кнопкой шёпота ─────────────────────────────────────
+        # Всегда занимает место в layout (нет Layout Shift при появлении).
+        # Видимость управляется только цветом текста: прозрачный ↔ фиолетовый.
+        self._lbl_whisper_hint = QLabel("Остальные тебя не слышат пока держишь")
+        self._lbl_whisper_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._lbl_whisper_hint.setWordWrap(False)
+        self._lbl_whisper_hint_active_style = (
+            "font-size: 10px; color: rgba(180,150,255,0.80); "
+            "background:transparent; border:none;"
+        )
+        self._lbl_whisper_hint_idle_style = (
+            "font-size: 10px; color: transparent; "
+            "background:transparent; border:none;"
+        )
+        self._lbl_whisper_hint.setStyleSheet(self._lbl_whisper_hint_idle_style)
+        card_lay.addWidget(self._lbl_whisper_hint)
 
-        # Заглушить на сервере (только для хоста)
-        if on_host_mute:
-            btn_hmute = QPushButton("🔇  Заглушить (сервер)")
-            btn_hmute.clicked.connect(lambda: (on_host_mute(uid), self.close()))
-            card_lay.addWidget(btn_hmute)
+        # ── Кнопка: Буст звука ────────────────────────────────────────────────
+        sep_b = QFrame()
+        sep_b.setFrameShape(QFrame.Shape.HLine)
+        sep_b.setStyleSheet(
+            "background: rgba(255,255,255,0.08); border: none; max-height: 1px;"
+        )
+        sep_b.setMaximumHeight(1)
+        card_lay.addWidget(sep_b)
 
-        # ── Позиционирование ──────────────────────────────────────────────────
+        self.btn_boost = self._make_btn("⚡  Буст звука", checkable=True, checked=self._is_boosted)
+        self.btn_boost.setStyleSheet(self.btn_boost.styleSheet() + """
+            QPushButton:checked {
+                background-color: rgba(255, 200, 0, 0.25);
+                border-color: rgba(255, 190, 0, 0.70);
+                color: #ffe066;
+            }
+            QPushButton:not(:checked):hover {
+                background-color: rgba(255, 200, 0, 0.10);
+                border-color: rgba(255, 190, 0, 0.40);
+            }
+        """)
+        self.btn_boost.clicked.connect(self._on_toggle_boost)
+        card_lay.addWidget(self.btn_boost)
+
+        # ── Кнопка: Пнуть (Nudge) — удержание 3 секунды ─────────────────────
+        # NudgeHoldButton: заполняется оранжевым за 3 с, только тогда отправляет.
+        # Защита от случайного нажатия — нельзя задеть мимоходом.
+        if net is not None:
+            sep_n = QFrame()
+            sep_n.setFrameShape(QFrame.Shape.HLine)
+            sep_n.setStyleSheet(
+                "background: rgba(255,255,255,0.08); border: none; max-height: 1px;"
+            )
+            sep_n.setMaximumHeight(1)
+            card_lay.addWidget(sep_n)
+
+            self.btn_nudge = NudgeHoldButton("👟  Пнуть  (держи 3с)")
+            self.btn_nudge.setStyleSheet("""
+                QPushButton {
+                    background-color: rgba(255,255,255,0.06);
+                    color: #f0a060;
+                    border: 1px solid rgba(230, 126, 34, 0.5);
+                    border-radius: 7px;
+                    padding: 5px 10px;
+                    font-size: 12px;
+                    text-align: left;
+                }
+                QPushButton:hover {
+                    background-color: rgba(230, 126, 34, 0.14);
+                    border-color: rgba(230, 126, 34, 0.85);
+                }
+                QPushButton:disabled {
+                    color: rgba(150, 100, 50, 0.55);
+                    border-color: rgba(150, 100, 50, 0.25);
+                    background-color: rgba(255,255,255,0.03);
+                }
+            """)
+
+            # Проверяем кулдаун из QSettings — показываем «через Xм» если ещё активен
+            import time as _nudge_time
+            _s = QSettings("MyVoiceChat", "GlobalSettings")
+            _last = float(_s.value(f"nudge_ts_{uid}", 0))
+            _remaining = int(600 - (_nudge_time.time() - _last))
+            if _remaining > 0:
+                _mins = (_remaining + 59) // 60
+                self.btn_nudge.setEnabled(False)
+                self.btn_nudge.setText(f"👟  Пнуть  (через {_mins}м)")
+
+            self.btn_nudge.hold_complete.connect(self._on_nudge_clicked)
+            card_lay.addWidget(self.btn_nudge)
+
+            # Подсказка под кнопкой — занимает место всегда, видна только при удержании
+            self._lbl_nudge_hint = QLabel("Держи, чтобы отправить голос «Пнуть»")
+            self._lbl_nudge_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._lbl_nudge_hint.setWordWrap(False)
+            self._lbl_nudge_hint_active_style = (
+                "font-size: 10px; color: rgba(240,160,80,0.85); "
+                "background:transparent; border:none;"
+            )
+            self._lbl_nudge_hint_idle_style = (
+                "font-size: 10px; color: transparent; "
+                "background:transparent; border:none;"
+            )
+            self._lbl_nudge_hint.setStyleSheet(self._lbl_nudge_hint_idle_style)
+            card_lay.addWidget(self._lbl_nudge_hint)
+
+            # Показываем / скрываем hint через сигналы таймера кнопки
+            self.btn_nudge._tick_timer.timeout.connect(self._on_nudge_tick_hint)
+
+        # ── Кнопка: Передать файл ─────────────────────────────────────────────
+        # Доступна только если net задан (есть активное соединение)
+        if net is not None:
+            sep_f = QFrame()
+            sep_f.setFrameShape(QFrame.Shape.HLine)
+            sep_f.setStyleSheet(
+                "background: rgba(255,255,255,0.08); border: none; max-height: 1px;"
+            )
+            sep_f.setMaximumHeight(1)
+            card_lay.addWidget(sep_f)
+
+            self.btn_file = self._make_btn("📁  Передать файл")
+            self.btn_file.setStyleSheet(self.btn_file.styleSheet() + """
+                QPushButton { border-color: rgba(91,142,245,0.4); color: #8ab4f8; }
+                QPushButton:hover {
+                    background-color: rgba(74,127,219,0.20);
+                    border-color: rgba(91,142,245,0.80);
+                }
+                QPushButton:pressed {
+                    background-color: rgba(74,127,219,0.40);
+                    color: #ffffff;
+                }
+            """)
+            self.btn_file.clicked.connect(self._on_send_file_clicked)
+            card_lay.addWidget(self.btn_file)
+
+        # ── Кнопка: Передать сервер (только если on_transfer_server задан) ────
+        # Видна исключительно хосту встроенного сервера в его контекстном меню.
+        if self._on_transfer_server is not None:
+            sep_ts = QFrame()
+            sep_ts.setFrameShape(QFrame.Shape.HLine)
+            sep_ts.setStyleSheet(
+                "background: rgba(255,255,255,0.08); border: none; max-height: 1px;"
+            )
+            sep_ts.setMaximumHeight(1)
+            card_lay.addWidget(sep_ts)
+
+            self.btn_transfer_server = self._make_btn("🔀  Передать сервер")
+            self.btn_transfer_server.setStyleSheet(
+                self.btn_transfer_server.styleSheet() + """
+                QPushButton { border-color: rgba(200,160,50,0.45); color: #f0c060; }
+                QPushButton:hover {
+                    background-color: rgba(200,160,50,0.18);
+                    border-color: rgba(220,180,60,0.85);
+                }
+                QPushButton:pressed {
+                    background-color: rgba(200,160,50,0.35);
+                    color: #ffffff;
+                }
+            """)
+            self.btn_transfer_server.clicked.connect(self._on_transfer_server_clicked)
+            card_lay.addWidget(self.btn_transfer_server)
+
+        # ── Кнопка: Выключить микрофон (только хост) ─────────────────────────
+        # Только mic off — уши не трогаются.
+        # Участник может включить mic обратно сам в любой момент.
+        if self._on_host_mute is not None:
+            sep_hm = QFrame()
+            sep_hm.setFrameShape(QFrame.Shape.HLine)
+            sep_hm.setStyleSheet(
+                "background: rgba(255,255,255,0.08); border: none; max-height: 1px;"
+            )
+            sep_hm.setMaximumHeight(1)
+            card_lay.addWidget(sep_hm)
+
+            self.btn_host_mute = self._make_btn("🎤  Выключить микрофон")
+            self.btn_host_mute.setStyleSheet(self.btn_host_mute.styleSheet() + """
+                QPushButton { border-color: rgba(220,60,60,0.45); color: #ff9090; }
+                QPushButton:hover {
+                    background-color: rgba(220,60,60,0.18);
+                    border-color: rgba(220,60,60,0.80);
+                }
+                QPushButton:pressed {
+                    background-color: rgba(220,60,60,0.35);
+                    color: #ffffff;
+                }
+            """)
+            self.btn_host_mute.clicked.connect(self._on_host_mute_clicked)
+            card_lay.addWidget(self.btn_host_mute)
+
+        # Это гарантирует, что место под hint уже учтено и панель
+        # не будет прыгать при появлении текста.
         self.adjustSize()
+        self.setFixedSize(self.sizeHint())
 
+        # ── Позиционирование прямо под элементом дерева ───────────────────────
         screen = QGuiApplication.screenAt(global_pos)
         if screen is None:
             screen = QGuiApplication.primaryScreen()
@@ -733,47 +886,248 @@ class UserOverlayPanel(QFrame):
 
         x = global_pos.x()
         y = global_pos.y()
-        if x + self.width()  > avail.right():
-            x = avail.right()  - self.width()  - 4
+
+        if x + self.width() > avail.right():
+            x = avail.right() - self.width() - 4
         if y + self.height() > avail.bottom():
             y = global_pos.y() - self.height()
+
         x = max(avail.left() + 4, x)
-        y = max(avail.top()  + 4, y)
+        y = max(avail.top() + 4, y)
+
         self.move(x, y)
 
-    def _on_boost_toggled(self, checked: bool):
-        """Включает/выключает буст ×15 для пользователя."""
-        pre_slider = self.sl_vol.value()
-        if checked:
-            self._btn_boost.setText("🔊  Усилить ×15 (ON)")
-            self.audio.set_user_volume(self.uid, _BOOST_VOL)
-            if hasattr(self.audio, 'app_settings'):
-                self.audio.app_settings.setValue(f"vol_boost_{self.uid}", "true")
+    # ── Фабрика кнопок ────────────────────────────────────────────────────────
+
+    def _make_btn(self, text: str, checkable=False, checked=False) -> QPushButton:
+        btn = QPushButton(text)
+        btn.setCheckable(checkable)
+        btn.setChecked(checked)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(255,255,255,0.06);
+                color: #d0d0d8;
+                border: 1px solid rgba(255,255,255,0.10);
+                border-radius: 7px;
+                padding: 5px 10px;
+                font-size: 12px;
+                text-align: left;
+            }
+            QPushButton:hover {
+                background-color: rgba(255,255,255,0.11);
+                border-color: rgba(255,255,255,0.18);
+            }
+            QPushButton:checked {
+                background-color: rgba(220,60,60,0.35);
+                border-color: rgba(220,60,60,0.6);
+                color: #ff9090;
+            }
+        """)
+        return btn
+
+    # ── Слоты ─────────────────────────────────────────────────────────────────
+
+    def _on_vol_changed(self, v: int):
+        # При v=0 показываем "Mute" вместо "0%" — понятнее пользователю
+        if v == 0:
+            self.lbl_vol.setText("🔇")
         else:
-            self._btn_boost.setText("🔊  Усилить ×15 (OFF)")
+            self.lbl_vol.setText(f"{v}%")
+        # Экспоненциальная кривая: slider 100 = 1.0x (нейтрально),
+        # slider 200 = 10.0x (+20 дБ) — позволяет поднять тихие микрофоны.
+        # slider 0 → 0.0 (полная тишина, _slider_to_vol гарантирует это).
+        self.audio.set_user_volume(self.uid, _slider_to_vol(v))
+
+    def _on_toggle_mute(self):
+        state = self.audio.toggle_user_mute(self.uid)
+        self.btn_mute.setText("🔊  Разглушить" if state else "🔇  Заглушить")
+
+    def _on_toggle_boost(self, checked: bool):
+        """
+        Активирует / деактивирует буст громкости пользователя (15x ≈ +23.5 дБ).
+
+        ВКЛ: сохраняем текущий слайдер в QSettings (vol_pre_boost_{uid}),
+             ставим флаг vol_boost_{uid}="true", применяем _BOOST_VOL (15x).
+             Слайдер блокируется — случайное движение не сбросит буст.
+        ВЫКЛ: восстанавливаем сохранённый слайдер, снимаем флаги,
+              разблокируем слайдер, применяем восстановленную громкость.
+
+        Громкость сохраняется через audio.set_user_volume() в vol_ip_{ip} —
+        совместимость с register_ip_mapping() при переподключении.
+        """
+        _s = QSettings("MyVoiceChat", "GlobalSettings")
+        self._is_boosted = checked
+        if checked:
+            _s.setValue(f"vol_pre_boost_{self.uid}", self.sl_vol.value())
+            _s.setValue(f"vol_boost_{self.uid}", "true")
+            self.sl_vol.blockSignals(True)
+            self.sl_vol.setValue(200)
+            self.sl_vol.blockSignals(False)
+            self.sl_vol.setEnabled(False)
+            self.lbl_vol.setText("⚡")
+            self.audio.set_user_volume(self.uid, _BOOST_VOL)
+        else:
+            pre_slider = int(_s.value(f"vol_pre_boost_{self.uid}", 100))
+            _s.setValue(f"vol_boost_{self.uid}", "false")
+            _s.remove(f"vol_pre_boost_{self.uid}")
+            self.sl_vol.setEnabled(True)
+            self.sl_vol.blockSignals(True)
+            self.sl_vol.setValue(pre_slider)
+            self.sl_vol.blockSignals(False)
+            self.lbl_vol.setText("🔇" if pre_slider == 0 else f"{pre_slider}%")
             self.audio.set_user_volume(self.uid, _slider_to_vol(pre_slider))
-            if hasattr(self.audio, 'app_settings'):
-                self.audio.app_settings.setValue(f"vol_boost_{self.uid}", "")
 
-    def _on_nudge(self):
-        """Отправляет «пнуть» через сеть."""
-        if self._net is not None:
-            try:
-                self._net.send_nudge_vote(self.uid)
-            except Exception as e:
-                print(f"[UserOverlay] nudge error: {e}")
+    def _on_whisper_press(self):
+        """Начинаем шёпот при нажатии."""
+        if not self._whisper_active:
+            self._whisper_active = True
+            self.audio.start_whisper(self.uid)
+            self.btn_whisper.setText("🤫  Шепчу...")
+            # Показываем подсказку только цветом — размер панели не меняется
+            self._lbl_whisper_hint.setStyleSheet(self._lbl_whisper_hint_active_style)
+
+    def _on_whisper_release(self):
+        """Останавливаем шёпот при отпускании."""
+        if self._whisper_active:
+            self._whisper_active = False
+            self.audio.stop_whisper()
+            self.btn_whisper.setText("🤫  Шепнуть  (удерживай)")
+            self._lbl_whisper_hint.setStyleSheet(self._lbl_whisper_hint_idle_style)
+
+    def _on_watch_clicked(self):
+        """Открываем окно стрима и закрываем оверлей."""
         self.close()
+        if self._on_watch_stream is not None:
+            self._on_watch_stream()
 
-    def _on_whisper_toggled(self, checked: bool):
-        """PTT-шёпот: включает/выключает режим шёпота к этому пользователю."""
-        self._whisper_active = checked
-        try:
-            if checked:
-                self.audio.start_whisper(self.uid)
-            else:
-                self.audio.stop_whisper()
-        except Exception as e:
-            print(f"[UserOverlay] whisper error: {e}")
+    def _on_nudge_tick_hint(self):
+        """
+        Вызывается каждые 20 мс пока кнопка удерживается.
+        Показывает подсказку при старте удержания (первый тик),
+        скрывает при сбросе (holding=False).
+        """
+        if not hasattr(self, '_lbl_nudge_hint'):
+            return
+        if self.btn_nudge._holding:
+            self._lbl_nudge_hint.setStyleSheet(self._lbl_nudge_hint_active_style)
+            # Динамический текст с прогрессом
+            pct = int(self.btn_nudge._progress * 100)
+            self._lbl_nudge_hint.setText(f"Держи… {pct}%")
+        else:
+            self._lbl_nudge_hint.setStyleSheet(self._lbl_nudge_hint_idle_style)
+            self._lbl_nudge_hint.setText("Держи, чтобы отправить голос «Пнуть»")
+
+    def _on_nudge_clicked(self):
+        """
+        Вызывается после успешного 3-секундного удержания (hold_complete).
+
+        Двойная защита от спама:
+          1. QSettings 'nudge_ts_<uid>' — кулдаун хранится между сессиями.
+          2. NudgeHoldButton._fired = True — повторный hold невозможен.
+
+        Кулдаун совпадает с серверным (NUDGE_COOLDOWN_SEC = 600 с).
+        """
+        if self._net is None:
+            return
+        import time as _t
+        _s   = QSettings("MyVoiceChat", "GlobalSettings")
+        _key = f"nudge_ts_{self.uid}"
+        _now = _t.time()
+        # guard: проверяем кулдаун ещё раз
+        if _now - float(_s.value(_key, 0)) < 600:
+            return
+        # Сохраняем оптимистично — до ответа сервера
+        _s.setValue(_key, _now)
+        self._net.send_nudge_vote(self.uid)
+        self.btn_nudge.setEnabled(False)
+        self.btn_nudge.setText("👟  Проголосовал ✓")
+        # Скрываем hint
+        if hasattr(self, '_lbl_nudge_hint'):
+            self._lbl_nudge_hint.setStyleSheet(self._lbl_nudge_hint_idle_style)
+        print(f"[UI] Nudge vote → uid={self.uid} nick={self._nick!r}")
+
+    def _on_send_file_clicked(self):
+        """
+        Пользователь нажал «📁 Передать файл».
+
+        Открываем стандартный диалог выбора файла.
+        Закрываем оверлей до старта QFileDialog — иначе popup-тип
+        перехватывает события и диалог может не отобразиться.
+        Запуск FileSenderWorker делегируется родительскому окну
+        через специальный сигнал, чтобы не тащить логику workers
+        внутрь оверлея.
+        """
+        if self._net is None:
+            return
+
+        self.close()    # закрываем popup ДО открытия QFileDialog
+
+        filepath, _ = QFileDialog.getOpenFileName(
+            None,
+            "Выберите файл для передачи",
+            os.path.expanduser("~"),
+            "Все файлы (*)",
+        )
+        if not filepath:
+            return
+
+        filename = os.path.basename(filepath)
+        filesize = os.path.getsize(filepath)
+
+        # Создаём и запускаем worker-отправитель
+        worker = FileSenderWorker(filepath)
+
+        # Создаём прогресс-виджет.
+        # Родитель None — он будет показан MainWindow отдельно.
+        prog = FileTransferProgressWidget(filename, filesize, is_sender=True)
+        prog.set_worker(worker)
+
+        def on_ready(port: int, token: str):
+            # Сигнал из рабочего потока — нужен переход в GUI-поток
+            # используем QTimer.singleShot(0, ...) для безопасного вызова
+            def _send():
+                self._net.send_file_offer(
+                    self.uid, filename, filesize, port, token
+                )
+            QTimer.singleShot(0, _send)
+
+        worker.ready.connect(on_ready)
+        worker.progress.connect(lambda s, t: prog.update_progress(s, t))
+        worker.finished.connect(lambda: prog.set_done())
+        worker.error.connect(lambda msg: prog.set_error(msg))
+        worker.cancelled.connect(lambda: prog.hide())
+
+        # Показываем прогресс-виджет в правом нижнем углу экрана
+        _show_float_widget(prog)
+        worker.start()
+
+    def _on_transfer_server_clicked(self):
+        """
+        Пользователь нажал «🔀 Передать сервер».
+        Закрываем popup и вызываем callback из MainWindow
+        (он покажет QMessageBox с подтверждением).
+        """
+        self.close()
+        if self._on_transfer_server is not None:
+            self._on_transfer_server()
+
+    def _on_host_mute_clicked(self):
+        """
+        Хост нажал «🎤 Выключить микрофон».
+        Закрываем popup до callback — Popup-тип перехватывает события мыши.
+        Участник может включить mic обратно сам в любой момент.
+        """
+        self.close()
+        if self._on_host_mute is not None:
+            self._on_host_mute()
+
+    def hideEvent(self, event):
+        """Если панель закрылась пока шептали — останавливаем шёпот."""
+        if self._whisper_active:
+            self._whisper_active = False
+            self.audio.stop_whisper()
+        super().hideEvent(event)
 
     def paintEvent(self, event):
         """Рисуем лёгкую тень вокруг карточки."""

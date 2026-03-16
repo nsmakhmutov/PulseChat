@@ -165,10 +165,11 @@ class WebRTCSFU:
 
         relay = MediaRelay()
         entry = {
-            'pc':     pc,
-            'relay':  relay,
-            'tracks': {},
-            'conn':   conn,
+            'pc':            pc,
+            'relay':         relay,
+            'tracks':        {},   # kind → последний relayed_track (для проверки готовности)
+            'source_tracks': {},   # kind → оригинальный трек стримера (для re-subscribe)
+            'conn':          conn,
         }
         self._streamer_entries[streamer_uid] = entry
 
@@ -177,7 +178,8 @@ class WebRTCSFU:
             # MediaRelay.subscribe(buffered=False): нет буферизации → минимальная задержка.
             # Несколько зрителей подпишутся на один и тот же физический трек.
             relayed = relay.subscribe(track, buffered=False)
-            entry['tracks'][track.kind] = relayed
+            entry['tracks'][track.kind]        = relayed  # для проверки готовности
+            entry['source_tracks'][track.kind] = track    # оригинал для re-subscribe
             print(
                 f"[SFU] Стример uid={streamer_uid}: трек получен kind={track.kind}"
             )
@@ -289,9 +291,25 @@ class WebRTCSFU:
         cfg = RTCConfiguration(iceServers=[])
         pc  = RTCPeerConnection(cfg)
 
-        # Добавляем relay-треки стримера
-        for kind, relayed_track in entry['tracks'].items():
-            pc.addTrack(relayed_track)
+        # Добавляем СВЕЖУЮ relay-подписку для нового зрителя.
+        #
+        # КРИТИЧНО: нельзя переиспользовать relayed_track из entry['tracks'].
+        # Когда предыдущий viewer PC закрывается (old['pc'].close()), aiortc
+        # вызывает track.stop() на каждом отправителе → relayed_track.readyState
+        # становится "ended". Добавление ended-трека в новый PC даёт подключение
+        # (ICE state → connected) но нулевой поток RTP → бесконечный timeout 5s.
+        #
+        # Решение: для каждого нового зрителя делаем relay.subscribe() заново —
+        # это создаёт новый RelayedTrack с readyState="live" от того же источника.
+        source_tracks = entry.get('source_tracks', {})
+        if source_tracks:
+            for kind, source_track in source_tracks.items():
+                fresh_relayed = entry['relay'].subscribe(source_track, buffered=False)
+                pc.addTrack(fresh_relayed)
+        else:
+            # Фолбэк для старых entry без source_tracks (не должно происходить)
+            for kind, relayed_track in entry['tracks'].items():
+                pc.addTrack(relayed_track)
 
         self._viewer_entries[viewer_uid] = {
             'pc':           pc,

@@ -35,9 +35,22 @@ CHUNK_SIZE      = int(SAMPLE_RATE * (FRAME_DURATION / 1000))  # 960 сэмпло
 VIDEO_WIDTH   = 1280
 VIDEO_HEIGHT  = 720
 VIDEO_FPS     = 30
-# VIDEO_BITRATE: начальный целевой битрейт для WebRTC.
-# aiortc + TWCC будут адаптировать его динамически.
-VIDEO_BITRATE = 3_000_000   # 3 Mbps
+
+# VIDEO_BITRATE: дефолтный битрейт (для 720p).
+# Реальное значение при старте стрима берётся из VIDEO_BITRATES по разрешению
+# и записывается через video_engine.set_encoder_bitrate().
+VIDEO_BITRATE = 4_500_000   # 4.5 Mbps (720p default)
+
+# Целевые битрейты по разрешению (ширина, высота) → бит/сек.
+# Подобраны для RadminVPN (20+ Мбит/с):
+#   720p — 4.5 Mbps: чёткий текст, мелкие детали UI игр.
+#   480p — 2.2 Mbps — хорошее качество для небольших окон зрителей.
+#   360p — 1.0 Mbps — для слабых каналов или медленных ПК.
+VIDEO_BITRATES: dict = {
+    (1280, 720):  4_500_000,
+    (854,  480):  2_200_000,
+    (640,  360):  1_000_000,
+}
 
 # ── Opus (голос комнаты — без изменений) ─────────────────────────────────────
 OPUS_APPLICATION = 2048   # opuslib.APPLICATION_VOIP

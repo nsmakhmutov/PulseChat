@@ -112,9 +112,9 @@ class StreamSettingsDialog(QDialog):
         layout.addWidget(QLabel("Разрешение:"))
         self.res_combo = QComboBox()
         self.res_options = {
-            "720p (HD)": (1280, 720),
-            "480p (SD)": (854, 480),
-            "360p": (640, 360)
+            "720p (HD) — 4.5 Mbps": (1280, 720),
+            "480p (SD) — 2.2 Mbps": (854,  480),
+            "360p      — 1.0 Mbps": (640,  360),
         }
         for text in self.res_options.keys():
             self.res_combo.addItem(text)

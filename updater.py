@@ -17,6 +17,13 @@
 # Зависимости:
 #   - py7zr      (для .7z архивов)  pip install py7zr
 #   - packaging  (для SemVer)       pip install packaging
+#
+# ⚠ ВАЖНО ДЛЯ РАЗРАБОТЧИКОВ:
+#   Этот файл ДОЛЖЕН лежать в КОРНЕ проекта (рядом с run.py, config.py).
+#   Все точки вызова используют плоский импорт:  from updater import ...
+#   Корень проекта всегда добавляется в sys.path через run.py (_base).
+#   Если перенести updater.py в пакет — нужно обновить импорты во ВСЕХ файлах:
+#     ui_main/ui_main.py, ui_dialogs/ui_settings.py, client_main/ui_connecting.py
 # ──────────────────────────────────────────────────────────────────────────────
 
 import threading
@@ -414,7 +421,22 @@ def download_and_install(download_url: str, on_progress=None, on_done=None, on_e
                 "@echo off",
                 f"taskkill /PID {current_pid} /F >nul 2>&1",
                 "ping -n 6 127.0.0.1 >nul",
-                f'xcopy /E /Y /I /Q "{new_files_dir}\\*" "{install_dir}\\" >nul 2>&1',
+                # robocopy /E  — копировать подпапки включая пустые
+                # robocopy /PURGE — удалять файлы в install_dir которых нет в new_files_dir
+                #   Это критично при смене структуры проекта (flat → packages):
+                #   старые _internal/ .pyd/.dll файлы удаляются, иначе возможны конфликты.
+                # /R:2 /W:1   — 2 повтора при ошибке, 1 сек ожидание (быстрее дефолтных 1M/30s)
+                # /NP /NJH /NJS — без прогресса, без заголовка, без итогов (тихий режим)
+                # Коды выхода robocopy 0..7 — успех, 8+ — ошибка.
+                # xcopy был заменён: он НЕ удаляет устаревшие файлы (/E /Y только добавляет).
+                f'robocopy /E /PURGE /R:2 /W:1 /NP /NJH /NJS "{new_files_dir}" "{install_dir}" >nul 2>&1',
+                # robocopy возвращает 1 при успешном копировании (файлы скопированы).
+                # Сбрасываем ERRORLEVEL чтобы start "" не думал что что-то пошло не так.
+                "if %ERRORLEVEL% LEQ 7 set ERRORLEVEL=0",
+                # Stamp-файл создаём ПОСЛЕ robocopy /PURGE — иначе он будет удалён
+                # как «лишний» файл которого нет в new_files_dir.
+                # Новый exe найдёт stamp, удалит его и пропустит проверку обновлений.
+                f'echo. > "{os.path.join(install_dir, _STAMP_FILENAME)}"',
                 f'start "" "{target_exe}"',
                 "ping -n 2 127.0.0.1 >nul",
                 'del "%~f0"',
@@ -426,19 +448,11 @@ def download_and_install(download_url: str, on_progress=None, on_done=None, on_e
             print(f"[Updater] install_dir  : {install_dir}")
             print(f"[Updater] new_files_dir: {new_files_dir}")
             print(f"[Updater] target_exe   : {target_exe}")
-
             print(f"[Updater] Лончер: {bat_path}")
 
-            # Записываем stamp ДО запуска батника.
-            # Новый exe при старте найдёт его, удалит и пропустит GitHub-запрос.
-            # Stamp пишем именно сейчас: если bat по какой-то причине не запустится,
-            # stamp не появится — следующий запуск старого exe проверит обновления штатно.
-            try:
-                _stamp = os.path.join(install_dir, _STAMP_FILENAME)
-                open(_stamp, "w").close()
-                print(f"[Updater] Stamp записан: {_stamp}")
-            except Exception as _se:
-                print(f"[Updater] Не удалось записать stamp (не критично): {_se}")
+            # Stamp-файл создаётся батником ПОСЛЕ robocopy /PURGE.
+            # Если бы мы записали его здесь (из Python), robocopy /PURGE удалил бы его
+            # как «лишний» файл которого нет в new_files_dir.
 
             subprocess.Popen(
                 ["cmd", "/c", bat_path],

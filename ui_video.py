@@ -91,7 +91,14 @@ class VideoSurface(QOpenGLWidget):
     def paintGL(self):
         """Главный рендер-цикл на GPU."""
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        # SmoothPixmapTransform: билинейная интерполяция при масштабировании.
+        # Antialiasing: сглаживание краёв при subpixel-позиционировании.
+        # Оба хинта применяются аппаратно через OpenGL (QOpenGLWidget),
+        # поэтому накладные расходы ≈ 0 мс на типичном GPU.
+        painter.setRenderHints(
+            QPainter.RenderHint.SmoothPixmapTransform
+            | QPainter.RenderHint.Antialiasing
+        )
         w, h = self.width(), self.height()
         painter.fillRect(0, 0, w, h, QColor(0, 0, 0))
         if self._current_image and not self._current_image.isNull():
@@ -110,14 +117,24 @@ class VideoSurface(QOpenGLWidget):
     # Приватные методы рисования
     # ------------------------------------------------------------------
     def _draw_frame(self, painter: QPainter, w: int, h: int):
-        """Рисует кадр с сохранением пропорций (letterbox / pillarbox)."""
+        """
+        Рисует кадр с сохранением пропорций (letterbox / pillarbox).
+
+        Масштабирование всегда билинейное (SmoothPixmapTransform установлен
+        в paintGL). Qt использует GPU-path при рендере в QOpenGLWidget,
+        поэтому quality ≈ бесплатна.
+
+        dest_w/dest_h округляются до чётных пикселей: YUV420p нативно
+        чётный субдискрет, нечётные размеры вызывают субпиксельный сдвиг
+        при drawImage → лёгкое размытие горизонтальных линий.
+        """
         img = self._current_image
         img_w, img_h = img.width(), img.height()
         if img_w <= 0 or img_h <= 0:
             return
-        scale = min(w / img_w, h / img_h)
-        dest_w = int(img_w * scale)
-        dest_h = int(img_h * scale)
+        scale  = min(w / img_w, h / img_h)
+        dest_w = (int(img_w * scale) // 2) * 2   # чётный
+        dest_h = (int(img_h * scale) // 2) * 2   # чётный
         dest_x = (w - dest_w) // 2
         dest_y = (h - dest_h) // 2
         painter.drawImage(QRect(dest_x, dest_y, dest_w, dest_h), img)

@@ -249,7 +249,7 @@ class MainWindow(QMainWindow):
         self._br_stream = QBrush(self._c_stream)
         self._br_def    = QBrush(self._c_def)
         self._br_gray   = QBrush(QColor("#888888"))   # для заголовков комнат и watchers
-        self._br_host   = QBrush(QColor("#f5c518"))   # жёлтый для хоста
+        self._br_gold   = QBrush(QColor("#f5c518"))   # золотой — для ника хоста
 
         # ── Кэш иконок для refresh_ui() ────────────────────────────────────────
         # refresh_ui() вызывается каждые 100 мс и раньше создавал QIcon().pixmap()
@@ -1063,7 +1063,6 @@ class MainWindow(QMainWindow):
         self._br_stream = QBrush(self._c_stream)
         self._br_def    = QBrush(self._c_def)
         self._br_gray   = QBrush(QColor("#6e7a96") if is_dark else QColor("#8090a8"))
-        self._br_host   = QBrush(QColor("#f5c518"))   # хост — всегда жёлтый, независимо от темы
 
     def setup_hotkeys(self):
         """
@@ -1645,7 +1644,7 @@ class MainWindow(QMainWindow):
                 if hasattr(self.audio, 'register_ip_mapping'):
                     self.audio.register_ip_mapping(uid, ip_addr)
 
-                item_u = QTreeWidgetItem(item_r, [f"  {u['nick']}", "", "", "", ""])
+                item_u = QTreeWidgetItem(item_r, [u['nick'], "", "", "", ""])
                 avatar_name = u.get('avatar', '1.svg')
                 host_uid    = getattr(self.net, '_server_host_uid', 0)
                 is_host     = (uid == host_uid and host_uid != 0)
@@ -1653,9 +1652,9 @@ class MainWindow(QMainWindow):
                 if is_host:
                     _font_host = QFont(font_u)
                     _font_host.setBold(True)
+                    _font_host.setUnderline(True)
                     item_u.setFont(0, _font_host)
-                    item_u.setForeground(0, self._br_host)   # жёлтый цвет хоста
-                    item_u.setText(0, u['nick'])              # без ведущих пробелов
+                    item_u.setForeground(0, self._br_gold)
                 else:
                     item_u.setFont(0, font_u)
                 item_u.setData(0, Qt.ItemDataRole.UserRole, uid)
@@ -1787,6 +1786,10 @@ class MainWindow(QMainWindow):
                 is_muted     = self.audio.is_muted
                 is_deafened  = self.audio.is_deafened
 
+            # Снимок host_uid вне лока — getattr безопасен без блокировки.
+            # Кэшируем здесь раз на итерацию (не вызываем getattr N раз в цикле).
+            host_uid = getattr(self.net, '_server_host_uid', 0)
+
             # Обновляем Qt-дерево БЕЗ лока
             for uid, data in self.known_uids.items():
                 item = data['item']
@@ -1833,10 +1836,10 @@ class MainWindow(QMainWindow):
                 elif curr_d or is_m or (uid != my_uid and u_vals and (is_locally_muted or is_vol_zero)):
                     item.setForeground(0, self._br_mute)
                 else:
-                    # Хост — жёлтый, остальные — дефолтный цвет темы
-                    _host_uid = getattr(self.net, '_server_host_uid', 0)
-                    if uid == _host_uid and _host_uid != 0:
-                        item.setForeground(0, self._br_host)
+                    # Хост выделяется золотым даже в «дефолтном» состоянии.
+                    # Проверка выполняется O(1) — host_uid снят до цикла.
+                    if host_uid and uid == host_uid:
+                        item.setForeground(0, self._br_gold)
                     else:
                         item.setForeground(0, self._br_def)
         except Exception as _e:
@@ -2008,7 +2011,7 @@ class MainWindow(QMainWindow):
 
             w.show()
             self.stream_windows[uid] = w
-            self.net.send_json({"action": "stream_watch_start", "streamer_uid": uid})
+            self.net.start_watching(uid)
         else:
             self.stream_windows[uid].raise_()
             self.stream_windows[uid].activateWindow()
@@ -2021,20 +2024,14 @@ class MainWindow(QMainWindow):
             except (RuntimeError, TypeError):
                 pass
         self.stream_windows.pop(uid, None)
-        self.net.send_json({"action": "stream_watch_stop", "streamer_uid": uid})
-        # ABR stop_watching() удалён: WebRTC управляет битрейтом через TWCC автоматически.
 
-        # FIX MEM: Останавливаем decode_worker для этого uid.
-        #
-        # Без этого вызова после закрытия окна decode_worker продолжал работать:
-        #   — При сценарии 3 (зритель закрыл вручную): воркер работает ВЕЧНО пока
-        #     стример не остановит трансляцию, всё это время держа FFmpeg декодер
-        #     (FRAME×2 потока = ~10 МБ, ранее AUTO = ~40 МБ).
-        #   — При сценарии 4 (стример остановил): воркер ждёт 2 сек тайм-аут,
-        #     всё это время память не освобождается.
-        # stop_viewer_for_uid() — non-blocking: кладёт None в очередь и уходит.
-        # Воркер завершится сам и вызовет decoder.close() + gc.collect() в finally.
-        self.video.stop_viewer_for_uid(uid)
+        # stop_watching() закрывает _viewer_pc (WebRTC) в asyncio-потоке,
+        # сбрасывает _watching_streamer_uid, отправляет stream_watch_stop серверу
+        # и вызывает video.stop_viewer_for_uid() — всё в одном методе.
+        # Нельзя использовать send_json напрямую: _viewer_pc остаётся открытым
+        # на клиенте → повторное открытие стрима не получает новый on("track")
+        # и показывает «Ожидание видео...» вместо картинки.
+        self.net.stop_watching()
 
         if w is not None:
             try:
