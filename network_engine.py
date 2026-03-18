@@ -58,6 +58,9 @@ from config import (
     CMD_SERVER_MIGRATE,
     CMD_QUICK_MSG, QUICK_MSG_MAX_LEN,
     CMD_HOST_MUTE, CMD_FORCE_MUTED,
+    CMD_CHAT_MSG, CMD_CHAT_HISTORY, CMD_CHAT_HISTORY_REQ,
+    CHAT_MSG_MAX_LEN, CHAT_HISTORY_MAX,
+    CMD_CHAT_MEDIA, CHAT_MEDIA_MAX_B64,
 )
 
 MAX_SILENT_RECONNECT_ATTEMPTS = 2    # было 4: 4×3с=12с → 2×1с=2с до auto_host_check
@@ -113,6 +116,11 @@ class NetworkClient(QObject):
     # Быстрый чат: (uid, from_nick, text)
     quick_msg_received  = pyqtSignal(int, str, str)
 
+    # Постоянный чат: одно сообщение (dict) или список (history)
+    chat_msg_received     = pyqtSignal(dict)   # новое сообщение
+    chat_history_received = pyqtSignal(list)   # история при подключении
+    chat_media_received   = pyqtSignal(dict)   # медиа-вложение (фото/файл)
+
     # ── Встроенный сервер: сигналы миграции хоста ────────────────────────────
     # become_host      — нам нужно стать новым хостом (запустить embedded server).
     #                    Эмитируется при получении CMD_SERVER_MIGRATE с нашим uid
@@ -158,8 +166,12 @@ class NetworkClient(QObject):
         # Флаг воспроизведения soundboard (anti-spam)
         self._sb_playing = threading.Event()
 
-        # ── Встроенный сервер: состояние хост-очереди и миграции ─────────────
-        # _host_order      — UID участников в порядке входа на сервер.
+        # История чата: список dict {uid, nick, avatar, text, ts, room}.
+        # Хранится в памяти, не персистентна. Максимум CHAT_HISTORY_MAX записей.
+        # Обновляется при каждом входящем CMD_CHAT_MSG и CMD_CHAT_HISTORY.
+        self._chat_history: list[dict] = []
+
+        # ── Встроенный сервер: состояние хост-очереди и миграции ─────────────        # _host_order      — UID участников в порядке входа на сервер.
         # _server_host_uid — UID текущего хоста (host_order[0]).
         # _migration_pending — получен CMD_SERVER_MIGRATE, ждём нового хоста.
         # _host_order_ips  — UID → RadminVPN IP всех участников группы.
@@ -1191,6 +1203,9 @@ class NetworkClient(QObject):
         if act == 'login_success':
             self.connected.emit(msg)
             print(f"[Net] Login success, UID: {msg.get('uid')}")
+            # Запрашиваем историю чата у хоста (тот кто первый в host_order).
+            # Если мы единственный клиент — сервер промолчит, история останется пустой.
+            self.send_json({'action': CMD_CHAT_HISTORY_REQ})
 
         elif act == 'sync_users':
             self._host_order      = msg.get('host_order', [])
@@ -1302,6 +1317,76 @@ class NetworkClient(QObject):
             text        = str(msg.get('text', ''))
             if text:
                 self.quick_msg_received.emit(sender_uid, from_nick, text)
+
+        # ── Постоянный чат: входящее сообщение ────────────────────────────
+        elif act == CMD_CHAT_MSG:
+            sender_uid = int(msg.get('uid', 0))
+            from_nick  = str(msg.get('from_nick', '?'))
+            text       = str(msg.get('text', ''))
+            avatar     = msg.get('avatar', '')
+            ts         = float(msg.get('ts', time.time()))
+            room       = str(msg.get('room', ''))
+            if text:
+                entry = {
+                    'uid':    sender_uid,
+                    'nick':   from_nick,
+                    'avatar': avatar,
+                    'text':   text,
+                    'ts':     ts,
+                    'room':   room,
+                }
+                self._chat_history.append(entry)
+                if len(self._chat_history) > CHAT_HISTORY_MAX:
+                    del self._chat_history[0]
+                self.chat_msg_received.emit(entry)
+
+        # ── Постоянный чат: история при подключении ───────────────────────
+        elif act == CMD_CHAT_HISTORY:
+            messages = msg.get('messages', [])
+            if isinstance(messages, list) and messages:
+                existing = {(m.get('uid', 0), m.get('ts', 0))
+                            for m in self._chat_history}
+                for m in messages:
+                    key = (m.get('uid', 0), m.get('ts', 0))
+                    if key not in existing:
+                        self._chat_history.append(m)
+                        existing.add(key)
+                self._chat_history.sort(key=lambda m: m.get('ts', 0))
+                if len(self._chat_history) > CHAT_HISTORY_MAX:
+                    self._chat_history = self._chat_history[-CHAT_HISTORY_MAX:]
+                self.chat_history_received.emit(list(self._chat_history))
+
+        # ── Постоянный чат: медиа-вложение ────────────────────────────────────
+        elif act == CMD_CHAT_MEDIA:
+            entry = {
+                'uid':          int(msg.get('uid', 0)),
+                'nick':         str(msg.get('from_nick', '?')),
+                'avatar':       msg.get('avatar', ''),
+                'ts':           float(msg.get('ts', time.time())),
+                'room':         str(msg.get('room', '')),
+                'text':         '',
+                'file_name':    msg.get('file_name', 'file'),
+                'file_type':    msg.get('file_type', 'file'),
+                'file_data_b64': msg.get('file_data_b64', ''),
+            }
+            if entry['file_data_b64']:
+                self._chat_history.append(entry)
+                if len(self._chat_history) > CHAT_HISTORY_MAX:
+                    del self._chat_history[0]
+                self.chat_media_received.emit(entry)
+
+        # ── Постоянный чат: запрос истории (relay от сервера к хосту) ─────
+        elif act == CMD_CHAT_HISTORY_REQ:
+            requester_uid = int(msg.get('requester_uid', 0))
+            if requester_uid and self._chat_history:
+                history_slice = self._chat_history[-100:]
+                self.send_json({
+                    'action':     CMD_CHAT_HISTORY,
+                    'target_uid': requester_uid,
+                    'messages':   history_slice,
+                })
+                print(f"[Net] chat_history → uid={requester_uid}: "
+                      f"{len(history_slice)} сообщений")
 
         # ── Хост выключил наш микрофон ─────────────────────────────────────
         elif act == CMD_FORCE_MUTED:
@@ -1429,6 +1514,37 @@ class NetworkClient(QObject):
         if not text:
             return
         self.send_json({'action': CMD_QUICK_MSG, 'text': text})
+
+    def send_chat_msg(self, text: str) -> None:
+        """
+        Отправить сообщение в постоянный чат комнаты (≤ CHAT_MSG_MAX_LEN символов).
+
+        Сервер добавляет nick/uid/avatar/ts и рассылает всем в комнате.
+        Отправитель тоже получает своё сообщение обратно от сервера —
+        это гарантирует одинаковый порядок сообщений у всех участников.
+        """
+        text = text.strip()[:CHAT_MSG_MAX_LEN]
+        if not text:
+            return
+        self.send_json({'action': CMD_CHAT_MSG, 'text': text})
+
+    def send_chat_media(
+        self, file_name: str, file_type: str, file_data_b64: str
+    ) -> None:
+        """
+        Отправить медиа-вложение (фото, GIF, файл) в чат комнаты.
+        file_type: 'image', 'gif', 'video', 'file'
+        file_data_b64: содержимое файла в base64 (≤ CHAT_MEDIA_MAX_B64 символов)
+        """
+        if not file_data_b64 or len(file_data_b64) > CHAT_MEDIA_MAX_B64:
+            print(f"[Net] send_chat_media: файл слишком большой или пустой")
+            return
+        self.send_json({
+            'action':       CMD_CHAT_MEDIA,
+            'file_name':    file_name,
+            'file_type':    file_type,
+            'file_data_b64': file_data_b64,
+        })
 
     def send_host_mute(self, target_uid: int) -> None:
         """Хост выключает микрофон участника. Уши не трогаются. Участник может включить сам."""

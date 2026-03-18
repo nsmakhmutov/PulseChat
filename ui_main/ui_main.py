@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QFrame, QSizeGrip, QFileDialog, QLineEdit,
                              QScrollArea, QDialog, QCheckBox,
                              QMenu, QApplication)
-from PyQt6.QtCore import Qt, QTimer, QSize, QSettings, QRect, QPoint, QEvent, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QSize, QSettings, QRect, QPoint, QEvent, QThread, pyqtSignal, QPropertyAnimation, QEasingCurve
 from PyQt6.QtGui import QIcon, QFont, QFontDatabase, QBrush, QColor, QCursor, QFontMetrics
 
 from config import (
@@ -25,6 +25,7 @@ from config import (
     CMD_JOIN_ROOM, CMD_STREAM_START, CMD_STREAM_STOP,
     CMD_SOUNDBOARD, CMD_SERVER_TRANSFER, CMD_SERVER_MIGRATE,
     CMD_FORCE_MUTED,
+    CHAT_MSG_MAX_LEN,
 )
 from audio_engine import AudioHandler
 from network_engine import NetworkClient
@@ -33,7 +34,7 @@ from ui_dialogs import (UserOverlayPanel, WhisperSystemOverlay, SelfStatusOverla
                         _show_float_widget, _format_size)
 from ui_dialogs.ui_settings import SettingsDialog
 from ui_dialogs.ui_soundboard import SoundboardPanel, SoundboardDialog
-from .ui_widgets import QuickMsgBubble, CustomTitleBar
+from .ui_widgets import QuickMsgBubble, CustomTitleBar, ChatPanel
 from .ui_channel import _CreateChannelDialog, _ChannelPasswordDialog
 from version import APP_VERSION, APP_NAME, GITHUB_REPO
 
@@ -83,6 +84,9 @@ class MainWindow(QMainWindow):
             # file_received.wav  — воспроизводится при входящем предложении файла.
             "friend_connect": resource_path("assets/music/friend_connect.wav"),
             "file_received":  resource_path("assets/music/file.wav"),
+            # Чат: входящее сообщение / исходящее
+            "chat_msg_in":    resource_path("assets/music/message.wav"),
+            "chat_msg_out":   resource_path("assets/music/message_send.wav"),
         }
         self.prev_room_uids: set = set()
         self.prev_streaming_uids: set = set()
@@ -131,6 +135,16 @@ class MainWindow(QMainWindow):
 
         self.setup_ui()
         self.apply_theme(self.app_settings.value("theme", "Светлая"))
+
+        # ── ChatPanel: встроена в _main_row (окно расширяется при открытии) ───
+        # ChatPanel добавлена в QHBoxLayout рядом с main_page в setup_ui().
+        # При открытии: setVisible(True) + resize(w + PANEL_WIDTH, h).
+        # При закрытии: setVisible(False) + resize(w - PANEL_WIDTH, h).
+        self._chat_panel.set_my_uid(0)     # обновится в on_connected
+        self._chat_panel.message_sent.connect(self._on_chat_panel_send)
+        self._chat_panel.media_send_requested.connect(self._on_chat_media_requested)
+        self._title_bar.chat_toggled.connect(self._toggle_chat_panel)
+
         self.net.connected.connect(self.on_connected)
         self.net.global_state_update.connect(self.update_user_tree)
         self.net.error_occurred.connect(self.on_connection_error)
@@ -169,6 +183,11 @@ class MainWindow(QMainWindow):
         # Словарь активных пузырей: uid → (QLabel, QTimer)
         # Хранение предотвращает создание нескольких пузырей для одного юзера.
         self._quick_bubbles: dict[int, tuple] = {}
+
+        # Постоянный чат
+        self.net.chat_msg_received.connect(self._on_chat_msg_received)
+        self.net.chat_history_received.connect(self._on_chat_history_received)
+        self.net.chat_media_received.connect(self._on_chat_media_received)
 
         # ── Встроенный сервер: миграция хоста ────────────────────────────────
         # become_host      — нам нужно стать новым хостом сервера.
@@ -365,33 +384,6 @@ class MainWindow(QMainWindow):
         self._whisper_banner.setFixedHeight(40)
         layout.addWidget(self._whisper_banner)
 
-        # ── Быстрый чат: строка ввода ─────────────────────────────────────
-        # Прозрачная стеклянная панель над панелью управления.
-        # Ограничение QUICK_MSG_MAX_LEN символов — проставляется и на QLineEdit.
-        self._quick_chat_bar = QFrame()
-        self._quick_chat_bar.setObjectName("quickChatBar")
-        self._quick_chat_bar.setFixedHeight(44)
-        qc_lay = QHBoxLayout(self._quick_chat_bar)
-        qc_lay.setContentsMargins(10, 0, 10, 0)
-        qc_lay.setSpacing(6)
-
-        self._quick_chat_input = QLineEdit()
-        self._quick_chat_input.setObjectName("quickChatInput")
-        self._quick_chat_input.setPlaceholderText("Быстрое сообщение…")
-        self._quick_chat_input.setMaxLength(QUICK_MSG_MAX_LEN)
-        self._quick_chat_input.setFixedHeight(32)
-        self._quick_chat_input.returnPressed.connect(self._send_quick_msg)
-        qc_lay.addWidget(self._quick_chat_input, stretch=1)
-
-        self._quick_chat_send_btn = QPushButton("➤")
-        self._quick_chat_send_btn.setObjectName("quickChatSendBtn")
-        self._quick_chat_send_btn.setFixedSize(32, 32)
-        self._quick_chat_send_btn.setToolTip("Отправить (Enter)")
-        self._quick_chat_send_btn.clicked.connect(self._send_quick_msg)
-        qc_lay.addWidget(self._quick_chat_send_btn)
-
-        layout.addWidget(self._quick_chat_bar)
-
         # ── Нижняя панель кнопок управления ─────────────────────────────────
         # Отдельный QFrame с собственным фоном — визуальная иерархия:
         # область чата (дерево) vs панель управления (кнопки), как в Discord.
@@ -493,7 +485,25 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(self._bottom_bar)
 
-        self._stack.addWidget(main_page)
+        # ── ChatPanel + горизонтальный контейнер (Discord-стиль) ─────────────
+        # ChatPanel скрыта по умолчанию — при hidden QHBoxLayout не выделяет
+        # ей место, окно остаётся компактным.
+        # При toggle: setVisible(True/False) + window resize(+/- PANEL_WIDTH).
+        self._chat_panel = ChatPanel(
+            my_uid=0,
+            current_room_fn=lambda: self.current_room,
+        )
+        self._chat_panel.setVisible(False)
+
+        _main_row = QWidget()
+        _main_row.setObjectName("mainRow")
+        _mr_lay = QHBoxLayout(_main_row)
+        _mr_lay.setContentsMargins(0, 0, 0, 0)
+        _mr_lay.setSpacing(0)
+        _mr_lay.addWidget(main_page, stretch=1)
+        _mr_lay.addWidget(self._chat_panel)
+
+        self._stack.addWidget(_main_row)
 
         lost_page = QWidget()
         lost_page.setObjectName("centralWidget")
@@ -647,18 +657,21 @@ class MainWindow(QMainWindow):
 
     # ── Edge-resize для безрамочного окна ────────────────────────────────────
     _EDGE_CURSORS = {
+        "right":        Qt.CursorShape.SizeHorCursor,
+        "bottom":       Qt.CursorShape.SizeVerCursor,
         "bottom-left":  Qt.CursorShape.SizeBDiagCursor,
         "bottom-right": Qt.CursorShape.SizeFDiagCursor,
-        "bottom":       Qt.CursorShape.SizeVerCursor,
     }
 
     def _edge_at(self, pos: QPoint) -> str | None:
         m = self._resize_margin
         x, y, w, h = pos.x(), pos.y(), self.width(), self.height()
-        b = y >= h - m
-        if b and x <= m:      return "bottom-left"
-        if b and x >= w - m:  return "bottom-right"
-        if b:                 return "bottom"
+        on_right  = x >= w - m
+        on_bottom = y >= h - m
+        if on_bottom and x <= m:       return "bottom-left"
+        if on_bottom and on_right:     return "bottom-right"
+        if on_bottom:                  return "bottom"
+        if on_right:                   return "right"
         return None
 
     def mousePressEvent(self, e):
@@ -681,11 +694,19 @@ class MainWindow(QMainWindow):
             delta = e.globalPosition().toPoint() - self._resize_start_pos
             orig  = self._resize_start_geom
             g     = QRect(orig)
+            min_w = self.minimumWidth()
             min_h = self.minimumHeight()
+            d     = self._resize_direction
 
-            # Только нижняя граница, ширина не меняется
-            new_bottom = orig.bottom() + delta.y()
-            g.setBottom(max(new_bottom, orig.top() + min_h))
+            # Нижняя граница
+            if d in ("bottom", "bottom-left", "bottom-right"):
+                new_bottom = orig.bottom() + delta.y()
+                g.setBottom(max(new_bottom, orig.top() + min_h))
+
+            # Правая граница
+            if d in ("right", "bottom-right"):
+                new_right = orig.right() + delta.x()
+                g.setRight(max(new_right, orig.left() + min_w))
 
             self.setGeometry(g)
             e.accept()
@@ -731,7 +752,7 @@ class MainWindow(QMainWindow):
             self._reposition_quick_bubbles()
 
     def resizeEvent(self, e):
-        """При изменении размера окна тоже пересчитываем позиции пузырей."""
+        """При изменении размера окна пересчитываем позиции пузырей."""
         super().resizeEvent(e)
         if hasattr(self, '_quick_bubbles') and self._quick_bubbles:
             self._reposition_quick_bubbles()
@@ -746,70 +767,77 @@ class MainWindow(QMainWindow):
         # Светлая тема: молочно-синяя, сохраняет читаемость, чуть прозрачнее.
         # ────────────────────────────────────────────────────────────────────────
         if is_dark:
-            win_bg       = "rgba(28, 32, 50, 255)"      # основной фон окна (было 18,20,30 — слишком тёмно)
-            surface      = "rgba(255,255,255,0.10)"      # фон дерева (было 0.04 — иконки не видны)
-            surface_solid= "#252840"                     # для QComboBox dropdown (нет rgba)
-            text         = "#eaeef8"                     # ярче (было #d4d8e8)
-            text_dim     = "#8898bb"                     # ярче (было #7888a8)
-            border       = "rgba(255,255,255,0.13)"
-            border_solid = "#3d4260"
-            hover        = "rgba(255,255,255,0.12)"
-            hover_solid  = "#363a58"                     # был #2a2d40 — почти не отличался от фона
+            # ── Glassmorphism dark palette ────────────────────────────────────
+            win_bg       = "rgba(22, 25, 40, 255)"      # единый фон — и главное окно и чат
+            surface      = "rgba(255,255,255,0.07)"      # дерево чуть светлее фона
+            surface_solid= "#1e2240"
+            text         = "#e8edf8"
+            text_dim     = "#7888aa"
+            border       = "rgba(255,255,255,0.11)"
+            border_solid = "#2e3458"
+            hover        = "rgba(255,255,255,0.09)"
+            hover_solid  = "#2a2f50"                     # hover чуть светлее win_bg
             accent       = "#5b8ef5"
             accent_red   = "#e74c3c"
-            title_bg     = "rgba(16, 18, 32, 255)"
-            title_text   = "#cdd6f4"
-            title_sep    = "rgba(255,255,255,0.09)"
-            win_border   = "rgba(255,255,255,0.13)"
-            bottom_bg    = "rgba(0,0,0,0.28)"
-            bottom_sep   = "rgba(255,255,255,0.09)"
-            btn_bg       = "rgba(255,255,255,0.16)"
-            btn_hover    = "rgba(255,255,255,0.26)"
-            btn_border   = "rgba(255,255,255,0.24)"
-            scrollbar    = "rgba(255,255,255,0.22)"
-            sb_track     = "rgba(255,255,255,0.07)"
-            tree_room_bg = "rgba(255,255,255,0.07)"
+            title_bg     = "rgba(10, 12, 22, 255)"       # header темнее фона
+            title_text   = "#c8d4f0"
+            title_sep    = "rgba(255,255,255,0.08)"
+            win_border   = "rgba(91,142,245,0.22)"
+            bottom_bg    = "rgba(10, 12, 22, 255)"       # нижняя панель = title_bg
+            bottom_sep   = "rgba(255,255,255,0.08)"
+            # Кнопки — достаточно светлые чтобы иконки читались
+            btn_bg       = "rgba(255,255,255,0.14)"      # было 0.08 — иконки сливались
+            btn_hover    = "rgba(255,255,255,0.24)"
+            btn_border   = "rgba(255,255,255,0.20)"
+            scrollbar    = "rgba(255,255,255,0.20)"
+            sb_track     = "rgba(255,255,255,0.05)"
+            tree_room_bg = "rgba(255,255,255,0.05)"
         else:
-            win_bg       = "rgba(210, 215, 225, 255)"
-            surface      = "rgba(0,0,0,0.04)"
-            surface_solid= "#e8eaee"
-            text         = "#1a1e2a"
-            text_dim     = "#667088"
-            border       = "rgba(0,0,0,0.12)"
-            border_solid = "#b8bcc8"
-            hover        = "rgba(0,0,0,0.07)"
-            hover_solid  = "#c8cad4"
+            # ── Glassmorphism light palette ───────────────────────────────────
+            win_bg       = "rgba(225, 230, 245, 255)"
+            surface      = "rgba(255,255,255,0.55)"
+            surface_solid= "#dde2f0"
+            text         = "#1a1e2e"
+            text_dim     = "#5a6480"
+            border       = "rgba(91,142,245,0.20)"
+            border_solid = "#b0b8d4"
+            hover        = "rgba(91,142,245,0.10)"
+            hover_solid  = "#d4daf0"
             accent       = "#3a6fd8"
             accent_red   = "#d32f2f"
-            title_bg     = "rgba(30, 42, 55, 255)"
-            title_text   = "#dce6f0"
-            title_sep    = "rgba(0,0,0,0.15)"
-            win_border   = "rgba(0,0,0,0.20)"
-            bottom_bg    = "rgba(0,0,0,0.10)"
-            bottom_sep   = "rgba(0,0,0,0.12)"
-            btn_bg       = "rgba(255,255,255,0.45)"
-            btn_hover    = "rgba(255,255,255,0.70)"
-            btn_border   = "rgba(0,0,0,0.15)"
-            scrollbar    = "rgba(0,0,0,0.25)"
-            sb_track     = "rgba(0,0,0,0.06)"
-            tree_room_bg = "rgba(0,0,0,0.05)"
+            title_bg     = "rgba(20, 28, 50, 255)"
+            title_text   = "#d8e4f8"
+            title_sep    = "rgba(0,0,0,0.12)"
+            win_border   = "rgba(91,142,245,0.30)"
+            bottom_bg    = "rgba(255,255,255,0.40)"
+            bottom_sep   = "rgba(91,142,245,0.15)"
+            btn_bg       = "rgba(255,255,255,0.60)"
+            btn_hover    = "rgba(255,255,255,0.85)"
+            btn_border   = "rgba(91,142,245,0.22)"
+            scrollbar    = "rgba(91,142,245,0.30)"
+            sb_track     = "rgba(0,0,0,0.05)"
+            tree_room_bg = "rgba(0,0,0,0.04)"
 
         self.setStyleSheet(f"""
             * {{ font-family: '{font_f}'; font-size: 15px; color: {text}; }}
 
-            /* ── Корневой контейнер окна ─────────────────────────────────────── */
+            /* ════════════════════════════════════════════════════════════════
+               Корневой контейнер окна — матовое стекло
+            ════════════════════════════════════════════════════════════════ */
             #windowRoot {{
                 background-color: {win_bg};
                 border: 1px solid {win_border};
-                border-radius: 10px;
+                border-radius: 12px;
             }}
 
-            /* ── Кастомный title bar ─────────────────────────────────────────── */
+            /* ════════════════════════════════════════════════════════════════
+               Кастомный title bar — тёмная подложка, тонкий сепаратор
+            ════════════════════════════════════════════════════════════════ */
             #customTitleBar {{
                 background-color: {title_bg};
                 border: none;
-                border-top-left-radius: 10px;
-                border-top-right-radius: 10px;
+                border-top-left-radius: 12px;
+                border-top-right-radius: 12px;
             }}
             #customTitleBar QLabel {{
                 background: transparent;
@@ -819,78 +847,100 @@ class MainWindow(QMainWindow):
                 color: {title_text};
                 font-size: 13px;
                 font-weight: bold;
-                letter-spacing: 0.5px;
+                letter-spacing: 0.8px;
                 background: transparent;
                 border: none;
             }}
             #titleBtnMin, #titleBtnMax {{
                 background: transparent;
                 border: none;
-                border-radius: 5px;
+                border-radius: 6px;
                 color: {title_text};
-                font-size: 15px;
+                font-size: 14px;
             }}
             #titleBtnMin:hover, #titleBtnMax:hover {{
-                background: rgba(255,255,255,0.12);
+                background: rgba(255,255,255,0.10);
+                color: #ffffff;
             }}
             #titleBtnClose {{
                 background: transparent;
                 border: none;
-                border-radius: 5px;
+                border-radius: 6px;
                 color: {title_text};
-                font-size: 15px;
+                font-size: 14px;
             }}
             #titleBtnClose:hover {{
-                background: #e74c3c;
+                background: rgba(231,76,60,0.85);
                 color: white;
             }}
             #titleSeparator {{
                 background-color: {title_sep};
                 border: none;
             }}
+            /* ── Кнопка 💬 в title bar ──────────────────────────────────── */
+            #titleBtnChat {{
+                background: transparent;
+                border: none;
+                border-radius: 6px;
+                color: {title_text};
+                font-size: 14px;
+                padding: 0;
+            }}
+            #titleBtnChat:hover {{
+                background: rgba(91,142,245,0.16);
+                color: #7eaaff;
+            }}
+            #titleBtnChat:checked {{
+                background: rgba(91,142,245,0.28);
+                color: #7eaaff;
+                border: 1px solid rgba(91,142,245,0.45);
+            }}
+            #titleBtnSep {{
+                background-color: {title_sep};
+                border: none;
+            }}
 
-            /* ── Главная область контента ───────────────────────────────────── */
+            /* ════════════════════════════════════════════════════════════════
+               Главная область
+            ════════════════════════════════════════════════════════════════ */
             QMainWindow, #centralWidget {{
                 background-color: transparent;
             }}
 
-            /* ── Дерево пользователей ───────────────────────────────────────── */
+            /* ════════════════════════════════════════════════════════════════
+               Дерево пользователей — «стеклянная» панель
+            ════════════════════════════════════════════════════════════════ */
             QTreeWidget {{
                 background-color: {surface};
                 color: {text};
                 border: 1px solid {border};
-                border-radius: 8px;
+                border-radius: 10px;
                 outline: none;
-                padding: 0px;
+                padding: 2px 0;
             }}
             QTreeWidget::item {{
                 outline: none;
                 border: none;
                 border-radius: 0px;
                 padding-left: 4px;
-                /* Нет border-radius — иначе Qt рисует закруглённый клип поверх
-                   прозрачного фона и при hover видны «просветы» по углам. */
             }}
             QTreeWidget::item:!has-children {{
                 height: 44px;
             }}
             QTreeWidget::item:has-children {{
-                height: 30px;
+                height: 28px;
                 background-color: transparent;
                 border-radius: 0px;
                 color: {text_dim};
-                font-size: 12px;
+                font-size: 11px;
                 font-weight: bold;
-                letter-spacing: 0.5px;
+                letter-spacing: 1.2px;
+                text-transform: uppercase;
             }}
             QTreeWidget::item:selected {{
                 background-color: transparent;
                 color: {text};
             }}
-            /* Hover — сплошная полоса на всю ширину, без border-radius.
-               Убираем rgba-прозрачность: при быстром движении мыши Qt не успевает
-               перерисовать соседние итемы → между ними мерцает тонкая серая линия.
-               Используем чуть более непрозрачный цвет чтобы перекрывать фон дерева. */
             QTreeWidget::item:hover {{
                 background-color: {hover_solid};
                 border-radius: 0px;
@@ -903,18 +953,17 @@ class MainWindow(QMainWindow):
                 background: transparent;
                 border-radius: 0px;
             }}
-            /* Tooltip иконок статусов — «парящий» текст */
             QTreeWidget QToolTip {{
-                background-color: transparent;
-                border: none;
+                background-color: rgba(14,16,28,230);
+                border: 1px solid rgba(91,142,245,0.35);
+                border-radius: 6px;
                 color: {text};
                 font-size: 12px;
-                padding: 0px;
+                padding: 4px 8px;
             }}
-            /* Скроллбар в дереве */
             QTreeWidget QScrollBar:vertical {{
                 background: {sb_track};
-                width: 5px;
+                width: 4px;
                 border-radius: 2px;
                 margin: 0;
             }}
@@ -925,21 +974,21 @@ class MainWindow(QMainWindow):
             QTreeWidget QScrollBar::add-line:vertical,
             QTreeWidget QScrollBar::sub-line:vertical {{ height: 0; }}
 
-            /* ── Нижняя панель кнопок ───────────────────────────────────────── */
+            /* ════════════════════════════════════════════════════════════════
+               Нижняя панель — «матовая» подложка
+            ════════════════════════════════════════════════════════════════ */
             #bottomBar {{
                 background-color: {bottom_bg};
                 border: 1px solid {bottom_sep};
-                border-radius: 12px;
+                border-radius: 14px;
             }}
-
-            /* ── Быстрый чат ────────────────────────────────────────────────── */
             #quickChatBar {{
                 background-color: {bottom_bg};
                 border: 1px solid {bottom_sep};
-                border-radius: 12px;
+                border-radius: 14px;
             }}
 
-            /* Все кнопки в bottomBar */
+            /* ── Кнопки в bottomBar ────────────────────────────────────── */
             #barBtn {{
                 background-color: {btn_bg};
                 border: 1px solid {btn_border};
@@ -948,14 +997,12 @@ class MainWindow(QMainWindow):
             }}
             #barBtn:hover {{
                 background-color: {btn_hover};
-                border-color: {accent};
+                border-color: rgba(91,142,245,0.55);
             }}
             #barBtn:checked {{
-                background-color: rgba(231,76,60,0.45);
-                border-color: rgba(231,76,60,0.75);
+                background-color: rgba(231,76,60,0.35);
+                border-color: rgba(231,76,60,0.65);
             }}
-
-            /* Кнопка трансляции — отдельный objectName (управляется из toggle_stream) */
             #btnStream {{
                 background-color: {btn_bg};
                 border: 1px solid {btn_border};
@@ -964,26 +1011,29 @@ class MainWindow(QMainWindow):
             }}
             #btnStream:hover {{
                 background-color: {btn_hover};
-                border-color: {accent};
+                border-color: rgba(91,142,245,0.55);
             }}
 
-
-
-            /* ── Баннер обновления ──────────────────────────────────────────── */
+            /* ════════════════════════════════════════════════════════════════
+               Баннер обновления
+            ════════════════════════════════════════════════════════════════ */
             QPushButton#updateBanner {{
-                background-color: rgba(46,204,113,0.20);
+                background-color: rgba(46,204,113,0.18);
                 color: #82e0aa;
                 font-weight: bold;
-                border: 1px solid rgba(46,204,113,0.45);
-                border-radius: 7px;
+                border: 1px solid rgba(46,204,113,0.40);
+                border-radius: 8px;
                 padding: 6px;
                 text-align: center;
             }}
             QPushButton#updateBanner:hover {{
-                background-color: rgba(46,204,113,0.35);
+                background-color: rgba(46,204,113,0.30);
+                border-color: rgba(46,204,113,0.65);
             }}
 
-            /* ── Fallback: обычные QPushButton вне bottomBar (reconnect и т.п.) */
+            /* ════════════════════════════════════════════════════════════════
+               Fallback QPushButton
+            ════════════════════════════════════════════════════════════════ */
             QPushButton {{
                 background-color: {btn_bg};
                 border: 1px solid {btn_border};
@@ -993,41 +1043,43 @@ class MainWindow(QMainWindow):
             }}
             QPushButton:hover {{
                 background-color: {btn_hover};
-                border-color: {accent};
+                border-color: rgba(91,142,245,0.55);
             }}
             QPushButton:checked {{
-                background-color: rgba(231,76,60,0.30);
+                background-color: rgba(231,76,60,0.28);
                 border-color: rgba(231,76,60,0.55);
                 color: #ff9090;
             }}
 
-            /* Кнопка переподключения на экране ошибки */
+            /* Кнопка переподключения */
             #btn_reconnect_green {{
-                background-color: rgba(46,204,113,0.25);
+                background-color: rgba(46,204,113,0.22);
                 color: #82e0aa;
                 font-size: 16px;
                 font-weight: bold;
-                border-radius: 8px;
-                border: 1px solid rgba(46,204,113,0.50);
+                border-radius: 10px;
+                border: 1px solid rgba(46,204,113,0.45);
             }}
             #btn_reconnect_green:hover {{
-                background-color: rgba(46,204,113,0.40);
+                background-color: rgba(46,204,113,0.38);
             }}
 
-            /* QDialog / QScrollArea / etc. — не трогаем стиль диалогов отсюда */
             QDialog {{ background: transparent; }}
 
+            /* ════════════════════════════════════════════════════════════════
+               Быстрый чат
+            ════════════════════════════════════════════════════════════════ */
             #quickChatInput {{
                 background-color: {btn_bg};
                 border: 1px solid {btn_border};
-                border-radius: 8px;
-                padding: 0 10px;
+                border-radius: 10px;
+                padding: 0 12px;
                 color: {text};
                 font-size: 13px;
-                selection-background-color: {accent};
+                selection-background-color: rgba(91,142,245,0.40);
             }}
             #quickChatInput:focus {{
-                border-color: {accent};
+                border-color: rgba(91,142,245,0.60);
                 background-color: {btn_hover};
             }}
             #quickChatInput::placeholder {{
@@ -1036,18 +1088,120 @@ class MainWindow(QMainWindow):
             #quickChatSendBtn {{
                 background-color: {btn_bg};
                 border: 1px solid {btn_border};
-                border-radius: 8px;
+                border-radius: 10px;
                 color: {accent};
                 font-size: 16px;
                 font-weight: bold;
                 padding: 0;
             }}
             #quickChatSendBtn:hover {{
-                background-color: {btn_hover};
-                border-color: {accent};
+                background-color: rgba(91,142,245,0.22);
+                border-color: rgba(91,142,245,0.55);
             }}
             #quickChatSendBtn:pressed {{
-                background-color: {hover_solid};
+                background-color: rgba(91,142,245,0.35);
+            }}
+
+            /* ════════════════════════════════════════════════════════════════
+               ChatPanel — стеклянная боковая панель
+            ════════════════════════════════════════════════════════════════ */
+            #chatPanel {{
+                background-color: {win_bg};
+                border-left: 1px solid {border};
+                border-radius: 0 12px 12px 0;
+            }}
+            #chatPanelHeader {{
+                background-color: {title_bg};
+                border-bottom: 1px solid {title_sep};
+                border-top-right-radius: 12px;
+            }}
+            #chatPanelTitle {{
+                color: {title_text};
+                font-size: 13px;
+                font-weight: bold;
+                letter-spacing: 0.5px;
+                background: transparent;
+                border: none;
+            }}
+            #chatPanelClose {{
+                background: transparent;
+                border: none;
+                border-radius: 5px;
+                color: {text_dim};
+                font-size: 12px;
+                padding: 0;
+            }}
+            #chatPanelClose:hover {{
+                background: rgba(231,76,60,0.75);
+                color: white;
+            }}
+            #chatPanelSep {{
+                background-color: {title_sep};
+                border: none;
+            }}
+            #chatScrollArea {{
+                background: transparent;
+                border: none;
+            }}
+            #chatScrollArea QScrollBar:vertical {{
+                background: {sb_track};
+                width: 4px;
+                border-radius: 2px;
+                margin: 0;
+            }}
+            #chatScrollArea QScrollBar::handle:vertical {{
+                background: {scrollbar};
+                border-radius: 2px;
+                min-height: 20px;
+            }}
+            #chatScrollArea QScrollBar::add-line:vertical,
+            #chatScrollArea QScrollBar::sub-line:vertical {{ height: 0; }}
+            #chatMsgContainer, #chatMsgWidget {{
+                background: transparent;
+            }}
+            /* Чужие и свои пузыри — base-стиль (border-radius переопределяется
+               напрямую на каждом QFrame в ChatMessageWidget по позиции в группе) */
+            #chatBubbleOther {{
+                background-color: rgba(255,255,255,0.07);
+                border: 1px solid rgba(255,255,255,0.10);
+                border-radius: 12px;
+            }}
+            #chatBubbleOwn {{
+                background-color: rgba(91,142,245,0.16);
+                border: 1px solid rgba(91,142,245,0.28);
+                border-radius: 12px;
+            }}
+            #chatInputBar {{
+                background-color: {bottom_bg};
+                border: none;
+                border-bottom-right-radius: 12px;
+            }}
+            #chatInput {{
+                background-color: {btn_bg};
+                border: 1px solid {btn_border};
+                border-radius: 10px;
+                padding: 0 10px;
+                color: {text};
+                font-size: 13px;
+                selection-background-color: rgba(91,142,245,0.40);
+            }}
+            #chatInput:focus {{
+                border-color: rgba(91,142,245,0.60);
+                background-color: {btn_hover};
+            }}
+            #chatSendBtn, #chatAttachBtn {{
+                background: transparent;
+                border: none;
+                border-radius: 8px;
+                color: {accent};
+                font-size: 15px;
+                padding: 0;
+            }}
+            #chatSendBtn:hover, #chatAttachBtn:hover {{
+                background: rgba(91,142,245,0.18);
+            }}
+            #chatSendBtn:pressed, #chatAttachBtn:pressed {{
+                background: rgba(91,142,245,0.32);
             }}
         """)
 
@@ -1101,6 +1255,12 @@ class MainWindow(QMainWindow):
                     keyboard.add_hotkey(d, lambda: self.btn_deafen.click())
                 except Exception as e:
                     print(f"[HK] deafen hotkey error: {e}")
+
+            # Ctrl+T — открыть/закрыть чат
+            try:
+                keyboard.add_hotkey("ctrl+t", lambda: self._toggle_chat_panel())
+            except Exception as e:
+                print(f"[HK] chat hotkey error: {e}")
 
             # ── PTT-хоткеи шёпота (слоты 0–4) ────────────────────────────────
             for i in range(5):
@@ -1306,12 +1466,76 @@ class MainWindow(QMainWindow):
     # ── Быстрый чат ────────────────────────────────────────────────────────────
 
     def _send_quick_msg(self):
-        """Отправить сообщение из строки ввода быстрого чата."""
-        text = self._quick_chat_input.text().strip()
-        if not text:
+        """Быстрый чат отключён — строка ввода убрана. Метод-заглушка."""
+        pass
+
+    # ── Постоянный чат (ChatPanel) ─────────────────────────────────────────────
+
+    def _toggle_chat_panel(self, checked: bool = None) -> None:
+        """
+        Открыть/закрыть ChatPanel. Окно расширяется/сжимается на PANEL_WIDTH.
+        checked: True = открыть, False = закрыть, None = переключить.
+        """
+        if checked is None:
+            checked = not self._chat_panel.isVisible()
+
+        panel_w = ChatPanel.PANEL_WIDTH
+        if checked:
+            if self._chat_panel.isVisible():
+                return  # уже открыт
+            self._chat_panel.update_room_label(self.current_room)
+            self._chat_panel.setVisible(True)
+            if not self.isMaximized():
+                self.resize(self.width() + panel_w, self.height())
+            self._chat_panel.focus_input()
+        else:
+            if not self._chat_panel.isVisible():
+                return  # уже закрыт
+            self._chat_panel.setVisible(False)
+            if not self.isMaximized():
+                self.resize(max(400, self.width() - panel_w), self.height())
+
+        self._title_bar.set_chat_checked(checked)
+
+    def _on_chat_panel_send(self, text: str) -> None:
+        """Пользователь отправил сообщение из ChatPanel."""
+        self.net.send_chat_msg(text)
+        self.play_notification("chat_msg_out")
+
+    def _on_chat_msg_received(self, entry: dict) -> None:
+        """Входящее сообщение чата — добавляем в панель."""
+        self._chat_panel.add_message(entry)
+        is_own = (entry.get('uid', 0) == self.audio.my_uid)
+        if is_own:
+            # Собственное сообщение подтверждено сервером — звук отправки
+            self.play_notification("chat_msg_out")
+        else:
+            # Чужое сообщение
+            self.play_notification("chat_msg_in")
+
+    def _on_chat_history_received(self, messages: list) -> None:
+        """История чата получена (при подключении) — загружаем в панель."""
+        if messages:
+            self._chat_panel.load_history(messages)
+
+    def _on_chat_media_requested(self) -> None:
+        """ChatPanel выбрала файл — берём данные и отправляем через network."""
+        media = self._chat_panel.take_pending_media()
+        if not media:
             return
-        self.net.send_quick_msg(text)
-        self._quick_chat_input.clear()
+        file_name, file_type, file_data_b64 = media
+        from config import CHAT_MEDIA_MAX_B64
+        if len(file_data_b64) > CHAT_MEDIA_MAX_B64:
+            print(f"[UI] chat media: слишком большой (>{CHAT_MEDIA_MAX_B64} символов b64)")
+            return
+        self.net.send_chat_media(file_name, file_type, file_data_b64)
+        self.play_notification("chat_msg_out")
+
+    def _on_chat_media_received(self, entry: dict) -> None:
+        """Входящее медиа-вложение — добавляем в ChatPanel."""
+        self._chat_panel.add_message(entry)
+        if entry.get('uid', 0) != self.audio.my_uid:
+            self.play_notification("chat_msg_in")
 
     def _on_quick_msg_received(self, sender_uid: int, from_nick: str, text: str):
         """
@@ -1509,6 +1733,10 @@ class MainWindow(QMainWindow):
                 self.app_settings.value("device_out_name")
             )
 
+            # Обновляем UID в ChatPanel (был 0 до первого подключения)
+            self._chat_panel.set_my_uid(self.audio.my_uid)
+            self._chat_panel.update_room_label(self.current_room)
+
             self.play_notification("self_move")
 
             # Сброс состояния «подключение друга» при каждом (пере)подключении.
@@ -1557,6 +1785,7 @@ class MainWindow(QMainWindow):
         if room_changed:
             self.current_room = my_new_room
             self.play_notification("self_move")
+            self._chat_panel.update_room_label(self.current_room)
 
         current_room_uids = {
             u['uid']
@@ -2695,6 +2924,13 @@ class MainWindow(QMainWindow):
           8. QApplication.quit() — завершаем event loop Qt.
         """
         print("[UI] closeEvent: начинаем shutdown...")
+
+        # Очищаем кэш медиафайлов чата (конвертированные GIF→MP4, temp-видео)
+        try:
+            from .ui_widgets import clear_media_cache
+            clear_media_cache()
+        except Exception:
+            pass
 
         # ── 1. Останавливаем UI-таймеры ПЕРВЫМИ ──────────────────────────────
         # ui_timer (100ms) продолжает дёргать refresh_ui во время teardown —

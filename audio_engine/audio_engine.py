@@ -587,18 +587,19 @@ class AudioHandler(QObject):
         elif _nr == 1 and self.denoiser:
             try:
                 # FIX 6: reuse _pcm_int16_buf — нет heap-аллокации каждые 20 мс.
-                # Прямое приведение через view невозможно (float32 != int16 size-wise).
-                # Используем np.multiply с truncation: безопасно т.к. pre-encode
-                # normalization ниже уже зажимает пики в ±0.98 < 1.0.
                 np.multiply(denoised_float, 32767.0,
                             out=self._pcm_int16_buf, casting='unsafe')
-                processed = [f for p, f in self.denoiser.denoise_chunk(self._pcm_int16_buf)]
+
+                # CRITICAL FIX: denoise_chunk возвращает кадры формы (channels, frame_size)
+                # например (1, 480) для моно. Без .flatten() np.concatenate даёт (2, 480)
+                # вместо (960,) → np.multiply ниже падает с ValueError → Exception молча
+                # проглатывается → Opus кодирует мусор → собеседник не слышит отправителя.
+                processed = [f.flatten() for p, f in
+                             self.denoiser.denoise_chunk(self._pcm_int16_buf)]
                 if processed:
-                    denoised_float = (
-                        processed[0].astype(np.float32) / 32767.0
-                        if len(processed) == 1
-                        else np.concatenate(processed).astype(np.float32) / 32767.0
-                    )
+                    # np.concatenate(list_of_1D) → всегда 1D (960,) — безопасно
+                    combined = np.concatenate(processed) if len(processed) > 1 else processed[0]
+                    denoised_float = combined.astype(np.float32) / 32767.0
             except Exception:
                 pass
 

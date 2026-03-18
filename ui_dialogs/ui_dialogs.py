@@ -415,15 +415,15 @@ class FileTransferProgressWidget(QFrame):
         card.setObjectName("ftCard")
         card.setStyleSheet("""
             QFrame#ftCard {
-                background-color: rgba(20, 22, 30, 230);
-                border: 1px solid rgba(91, 142, 245, 0.35);
-                border-radius: 10px;
+                background-color: rgba(10, 12, 22, 240);
+                border: 1px solid rgba(91, 142, 245, 0.28);
+                border-radius: 12px;
             }
-            QLabel { color: #c8ccd8; font-size: 12px;
+            QLabel { color: #c8d4e8; font-size: 12px;
                      background: transparent; border: none; }
             QProgressBar {
-                background: rgba(255,255,255,0.10);
-                border: none; border-radius: 4px; height: 7px;
+                background: rgba(255,255,255,0.08);
+                border: none; border-radius: 4px; height: 6px;
                 text-align: center; color: transparent;
             }
             QProgressBar::chunk {
@@ -569,19 +569,19 @@ class UserOverlayPanel(QFrame):
         self._card.setObjectName("card")
         self._card.setStyleSheet("""
             QFrame#card {
-                background-color: rgba(22, 22, 28, 215);
-                border: 1px solid rgba(255,255,255,0.10);
-                border-radius: 12px;
+                background-color: rgba(10, 12, 22, 230);
+                border: 1px solid rgba(91,142,245,0.18);
+                border-radius: 14px;
             }
             QLabel {
-                color: #d0d0d8;
+                color: #d0d8f0;
                 font-size: 12px;
                 background: transparent;
                 border: none;
             }
             QSlider::groove:horizontal {
-                height: 5px;
-                background: rgba(255,255,255,0.12);
+                height: 4px;
+                background: rgba(255,255,255,0.10);
                 border-radius: 2px;
             }
             QSlider::handle:horizontal {
@@ -591,7 +591,8 @@ class UserOverlayPanel(QFrame):
                 border-radius: 7px;
             }
             QSlider::sub-page:horizontal {
-                background: #5b8ef5;
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 #4a7fdb, stop:1 #7b52d4);
                 border-radius: 2px;
             }
         """)
@@ -1176,31 +1177,31 @@ class AvatarSelector(QDialog):
         self._card.setObjectName("avatarCard")
         self._card.setStyleSheet("""
             QFrame#avatarCard {
-                background-color: rgba(26, 28, 38, 252);
-                border: 1px solid rgba(255,255,255,0.10);
-                border-radius: 12px;
+                background-color: rgba(10, 12, 22, 252);
+                border: 1px solid rgba(91,142,245,0.18);
+                border-radius: 14px;
             }
             QLabel {
-                color: #c8d0e0;
+                color: #c8d4e8;
                 background: transparent;
                 border: none;
             }
             QPushButton.avatarBtn {
-                background-color: rgba(255,255,255,0.05);
+                background-color: rgba(255,255,255,0.04);
                 border: 1px solid rgba(255,255,255,0.08);
                 border-radius: 10px;
             }
             QPushButton.avatarBtn:hover {
                 background-color: rgba(91,142,245,0.18);
-                border: 1px solid rgba(91,142,245,0.55);
+                border: 1px solid rgba(91,142,245,0.50);
             }
             QScrollBar:vertical {
-                background: rgba(255,255,255,0.04);
-                width: 6px; border-radius: 3px; margin: 0;
+                background: rgba(255,255,255,0.03);
+                width: 5px; border-radius: 2px; margin: 0;
             }
             QScrollBar::handle:vertical {
-                background: rgba(255,255,255,0.18);
-                border-radius: 3px;
+                background: rgba(255,255,255,0.16);
+                border-radius: 2px;
             }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
             QScrollArea { background: transparent; border: none; }
@@ -1423,13 +1424,18 @@ class WhisperSystemOverlay(QWidget):
         """Полноширинная полупрозрачная плашка — рисуем вручную (WA_TranslucentBackground)."""
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        # Фон — тёмная полоса на всю ширину
-        p.setBrush(QBrush(QColor(15, 17, 32, 220)))
+        # Тёмно-синий glassmorphism фон
+        p.setBrush(QBrush(QColor(8, 10, 24, 235)))
         p.setPen(Qt.PenStyle.NoPen)
         p.drawRect(self.rect())
-        # Тонкая акцентная линия снизу
-        p.setPen(QPen(QColor(93, 173, 226, 180), 2))
-        p.drawLine(0, self.height() - 1, self.width(), self.height() - 1)
+        # Градиентная акцентная линия снизу (синий → фиолетовый)
+        from PyQt6.QtGui import QLinearGradient
+        grad = QLinearGradient(0, 0, self.width(), 0)
+        grad.setColorAt(0.0, QColor(91, 142, 245, 200))
+        grad.setColorAt(0.5, QColor(123, 82, 212, 220))
+        grad.setColorAt(1.0, QColor(91, 142, 245, 200))
+        p.setBrush(QBrush(grad))
+        p.drawRect(0, self.height() - 2, self.width(), 2)
         p.end()
 
 
@@ -1452,15 +1458,16 @@ class _DialogTitleBar(QWidget):
 
         self.setStyleSheet("""
             QWidget#dlgTitleBar {
-                background-color: rgba(18, 20, 30, 245);
+                background-color: rgba(6, 8, 18, 250);
                 border-top-left-radius: 12px;
                 border-top-right-radius: 12px;
                 border: none;
             }
             QLabel#dlgTitleText {
-                color: #cdd6f4;
+                color: #c8d4f0;
                 font-size: 13px;
                 font-weight: bold;
+                letter-spacing: 0.5px;
                 background: transparent;
                 border: none;
                 padding-left: 6px;
@@ -1468,16 +1475,16 @@ class _DialogTitleBar(QWidget):
             QPushButton {
                 background: transparent;
                 border: none;
-                border-radius: 5px;
-                color: #8890a0;
-                font-size: 14px;
+                border-radius: 6px;
+                color: #7888aa;
+                font-size: 13px;
                 min-width: 28px;
                 max-width: 28px;
                 min-height: 26px;
                 max-height: 26px;
             }
-            QPushButton:hover { background: rgba(255,255,255,0.10); color: #cdd6f4; }
-            QPushButton#dlgBtnClose:hover { background: #e74c3c; color: white; }
+            QPushButton:hover { background: rgba(255,255,255,0.10); color: #c8d4f0; }
+            QPushButton#dlgBtnClose:hover { background: rgba(231,76,60,0.85); color: white; }
         """)
 
         lay = QHBoxLayout(self)
@@ -1572,12 +1579,12 @@ class SelfStatusOverlayPanel(QFrame):
         self._card.setObjectName("statusCard")
         self._card.setStyleSheet("""
             QFrame#statusCard {
-                background-color: rgba(18, 20, 28, 225);
-                border: 1px solid rgba(255,255,255,0.12);
-                border-radius: 14px;
+                background-color: rgba(10, 12, 22, 235);
+                border: 1px solid rgba(91,142,245,0.18);
+                border-radius: 16px;
             }
             QLabel {
-                color: #d0d0d8;
+                color: #d0d8f0;
                 font-size: 12px;
                 background: transparent;
                 border: none;

@@ -24,6 +24,8 @@ from config import (
     CMD_JOIN_CHANNEL_AUTH, CHANNEL_NAME_MAX_LEN, CHANNEL_PASS_MAX_LEN,
     SERVER_NAME_DEFAULT,
     CMD_HOST_MUTE, CMD_FORCE_MUTED,
+    CMD_CHAT_MSG, CMD_CHAT_HISTORY, CMD_CHAT_HISTORY_REQ, CHAT_MSG_MAX_LEN,
+    CMD_CHAT_MEDIA, CHAT_MEDIA_MAX_B64,
 )
 from .server_webrtc import WebRTCSFU, AIORTC_AVAILABLE
 
@@ -976,6 +978,136 @@ class SFUServer:
                                         bc.sendall(broadcast_qm)
                                     except Exception:
                                         pass
+
+                        # ── Постоянный чат: новое сообщение ───────────────────
+                        # Сервер добавляет nick/uid/avatar/ts и рассылает всем
+                        # в комнате включая отправителя (единый порядок у всех).
+                        elif action == CMD_CHAT_MSG:
+                            text_cm = str(msg.get('text', '')).strip()[:CHAT_MSG_MAX_LEN]
+                            if text_cm:
+                                with self.clients_lock:
+                                    if conn in self.clients:
+                                        c = self.clients[conn]
+                                        sender_nick_cm   = c['nick']
+                                        sender_uid_cm    = c['uid']
+                                        sender_avatar_cm = c.get('avatar', '')
+                                        sender_room_cm   = c.get('room')
+                                    else:
+                                        sender_nick_cm = sender_uid_cm = sender_room_cm = None
+                                        sender_avatar_cm = ''
+                                    if sender_room_cm:
+                                        room_conns_cm = [
+                                            c_conn
+                                            for c_conn, c_data in self.clients.items()
+                                            if c_data.get('room') == sender_room_cm
+                                        ]
+                                    else:
+                                        room_conns_cm = []
+                                if sender_uid_cm:
+                                    broadcast_cm = json.dumps({
+                                        'action':    CMD_CHAT_MSG,
+                                        'uid':       sender_uid_cm,
+                                        'from_nick': sender_nick_cm,
+                                        'avatar':    sender_avatar_cm,
+                                        'text':      text_cm,
+                                        'ts':        time.time(),
+                                        'room':      sender_room_cm or '',
+                                    }).encode('utf-8')
+                                    for bc in room_conns_cm:
+                                        try:
+                                            bc.sendall(broadcast_cm)
+                                        except Exception:
+                                            pass
+
+                        # ── Постоянный чат: запрос истории от нового клиента ──
+                        # Сервер пересылает запрос хосту (host_order[0]).
+                        # Хост ответит CMD_CHAT_HISTORY с target_uid=requester.
+                        elif action == CMD_CHAT_HISTORY_REQ:
+                            with self._host_order_lock:
+                                host_uid_ch = (
+                                    self._host_order[0]
+                                    if self._host_order else 0
+                                )
+                            requester_uid_ch = uid
+                            if host_uid_ch and host_uid_ch != requester_uid_ch:
+                                with self.clients_lock:
+                                    host_conn_ch = next(
+                                        (c for c, d in self.clients.items()
+                                         if d.get('uid') == host_uid_ch),
+                                        None
+                                    )
+                                if host_conn_ch:
+                                    try:
+                                        host_conn_ch.sendall(json.dumps({
+                                            'action':        CMD_CHAT_HISTORY_REQ,
+                                            'requester_uid': requester_uid_ch,
+                                        }).encode('utf-8'))
+                                    except Exception:
+                                        pass
+
+                        # ── Постоянный чат: хост отвечает историей ────────────
+                        # Сервер пересылает пакет конкретному target_uid.
+                        elif action == CMD_CHAT_HISTORY:
+                            target_uid_ch = int(msg.get('target_uid', 0))
+                            messages_ch   = msg.get('messages', [])
+                            if target_uid_ch and isinstance(messages_ch, list):
+                                with self.clients_lock:
+                                    target_conn_ch = next(
+                                        (c for c, d in self.clients.items()
+                                         if d.get('uid') == target_uid_ch),
+                                        None
+                                    )
+                                if target_conn_ch:
+                                    try:
+                                        target_conn_ch.sendall(json.dumps({
+                                            'action':   CMD_CHAT_HISTORY,
+                                            'messages': messages_ch,
+                                        }).encode('utf-8'))
+                                    except Exception:
+                                        pass
+
+                        # ── Постоянный чат: медиа-вложение (фото/файл) ────────
+                        # Сервер добавляет nick/uid/avatar/ts и ретранслирует.
+                        # Размер не обрезается — клиент сам ограничивает CHAT_MEDIA_MAX_B64.
+                        elif action == CMD_CHAT_MEDIA:
+                            file_data_b64 = msg.get('file_data_b64', '')
+                            if (file_data_b64
+                                    and len(file_data_b64) <= CHAT_MEDIA_MAX_B64):
+                                with self.clients_lock:
+                                    if conn in self.clients:
+                                        c = self.clients[conn]
+                                        s_nick_md   = c['nick']
+                                        s_uid_md    = c['uid']
+                                        s_avatar_md = c.get('avatar', '')
+                                        s_room_md   = c.get('room')
+                                    else:
+                                        s_nick_md = s_uid_md = s_room_md = None
+                                        s_avatar_md = ''
+                                    if s_room_md:
+                                        room_conns_md = [
+                                            c_conn
+                                            for c_conn, c_data in self.clients.items()
+                                            if c_data.get('room') == s_room_md
+                                        ]
+                                    else:
+                                        room_conns_md = []
+                                if s_uid_md:
+                                    broadcast_md = json.dumps({
+                                        'action':       CMD_CHAT_MEDIA,
+                                        'uid':          s_uid_md,
+                                        'from_nick':    s_nick_md,
+                                        'avatar':       s_avatar_md,
+                                        'ts':           time.time(),
+                                        'room':         s_room_md or '',
+                                        'file_name':    msg.get('file_name', 'file'),
+                                        'file_type':    msg.get('file_type', ''),
+                                        'file_data_b64': file_data_b64,
+                                    }).encode('utf-8')
+                                    for bc in room_conns_md:
+                                        try:
+                                            bc.sendall(broadcast_md)
+                                        except Exception:
+                                            pass
 
                         # ── Хост выключает микрофон участника ─────────────────
                         # Только mic off — уши не трогаются.

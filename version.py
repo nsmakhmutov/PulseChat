@@ -6,10 +6,9 @@
 # ──────────────────────────────────────────────────────────────────────────────
 
 APP_NAME    = "InPulse"
-APP_VERSION = "1.0.40"           # SemVer: MAJOR.MINOR.PATCH
-APP_AUTHOR  = "skanike"     # ← замените на своё имя/псевдоним
+APP_VERSION = "1.0.42"           # SemVer: MAJOR.MINOR.PATCH
+APP_AUTHOR  = "Impulse Company"     # ← замените на своё имя/псевдоним
 APP_YEAR    = "2026"
-QA_TESTERS = "skarex · Rapoch · Arex · Zolotoy · Kronos"
 # GitHub репозиторий для проверки обновлений.
 # Формат: "владелец/репозиторий"  (без https://github.com/)
 # Пример: "john/voicechat-app"
@@ -27,8 +26,7 @@ ABOUT_TEXT = f"""\
 видео-трансляций, soundboard и шумоподавлением.
 
 Автор: {APP_AUTHOR}
-QA : {QA_TESTERS}
 Год:   {APP_YEAR}
 
-Стек: Python · PyQt6 · Opus · OpenGL · WASAPI · RRnoise 
+Стек: Python · PyQt6 · Opus · OpenGL · WASAPI · RRnoise ·DeepFilterNet
 """
