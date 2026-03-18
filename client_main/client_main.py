@@ -74,6 +74,7 @@ def main():
         print(f"[DEBUG] query_devices() упал: {_ex}", flush=True)
 
     # ── Перехват исключений в дочерних потоках ────────────────────────────────
+    import logging as _logging
     import threading as _threading
     import traceback as _tb
 
@@ -81,14 +82,12 @@ def main():
 
     def _thread_excepthook(args):
         msg = "".join(_tb.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
-        print(f"[CRASH] Исключение в потоке '{args.thread.name}':\n{msg}", flush=True)
-        with open("crash_python.log", "a", encoding="utf-8") as _f:
-            _f.write(f"Thread '{args.thread.name}':\n{msg}")
+        _logging.critical("CRASH (thread '%s'):\n%s", args.thread.name, msg)
         if _orig_thread_excepthook:
             _orig_thread_excepthook(args)
 
     _threading.excepthook = _thread_excepthook
-    print("[DEBUG] threading.excepthook установлен", flush=True)
+    _logging.debug("threading.excepthook установлен")
 
     # ── QSurfaceFormat ДО создания QApplication ───────────────────────────────
     _gl_fmt = QSurfaceFormat()

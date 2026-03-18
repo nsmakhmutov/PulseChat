@@ -794,7 +794,13 @@ class NetworkClient(QObject):
             print("[Net] _start_streaming_coro: DXCamTrack недоступен")
             return
 
-        pc.addTrack(dxcam_track)
+        pc.addTrack(dxcam_track)   # HQ: первый видеотрек
+
+        # Simulcast: добавляем LQ трек вторым (SFU идентифицирует по порядку)
+        lq_track = self.video.get_lq_track() if self.video else None
+        if lq_track is not None:
+            pc.addTrack(lq_track)
+            print("[Net] Simulcast LQ трек добавлен в RTCPeerConnection")
 
         @pc.on("icecandidate")
         def on_ice(candidate):
@@ -867,20 +873,23 @@ class NetworkClient(QObject):
     # ------------------------------------------------------------------
     # Просмотр стрима — WebRTC
     # ------------------------------------------------------------------
-    def start_watching(self, streamer_uid: int):
+    def start_watching(self, streamer_uid: int, quality: str = 'hq'):
         """
         Регистрируем начало просмотра стрима.
 
-        Отправляет TCP stream_watch_start.
-        Сервер создаёт viewer PC через WebRTCSFU и присылает WebRTC offer.
-        Offer обрабатывается в process_message → _handle_viewer_offer_coro.
+        quality='hq' — запросить HQ поток (default, для быстрых ПК/каналов).
+        quality='lq' — запросить LQ поток (слабый ПК или медленный RadminVPN).
+
+        Сервер передаёт quality в SFU.handle_viewer_connect() →
+        зрителю маршрутизируется нужный simulcast-поток.
         """
         self._watching_streamer_uid = streamer_uid
         self.send_json({
-            'action':      'stream_watch_start',
-            'streamer_uid': streamer_uid,
+            'action':       'stream_watch_start',
+            'streamer_uid':  streamer_uid,
+            'quality':       quality,
         })
-        print(f"[Net] start_watching → streamer_uid={streamer_uid}")
+        print(f"[Net] start_watching → streamer_uid={streamer_uid}, quality={quality}")
 
     def stop_watching(self):
         """
@@ -1016,7 +1025,7 @@ class NetworkClient(QObject):
         Ждёт завершения ICE gathering с таймаутом.
         На RadminVPN (host-only ICE) завершается за ~50–200 мс.
         """
-        loop    = asyncio.get_event_loop()
+        loop     = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         while pc.iceGatheringState != "complete":
             if loop.time() >= deadline:
@@ -1233,6 +1242,20 @@ class NetworkClient(QObject):
             ch_name = msg.get('channel_name', '')
             if ch_name:
                 self.channel_created.emit(ch_name)
+
+        # FIX #4: сервер отвечает 'create_channel_result' после CMD_CREATE_CHANNEL.
+        # Ранее network_engine не обрабатывал этот action → канал создавался на сервере,
+        # но клиент-хост не получал уведомления → send_global_state присылал обновлённый
+        # channel_list, но только если STATE DIRTY — что работало только косвенно.
+        # Прямое решение: при ok=True эмитируем channel_created, чтобы UI обновился сразу.
+        elif act == 'create_channel_result':
+            if msg.get('ok'):
+                ch_name = msg.get('channel_name', '')
+                if ch_name:
+                    self.channel_created.emit(ch_name)
+            # ok=False — ошибки (not_host, invalid_name, already_exists) молча игнорируем:
+            # сервер ничего не создал, UI ничего не обновляет. При необходимости
+            # можно добавить сигнал create_channel_error в будущем.
 
         elif act == 'channel_deleted':
             ch_name = msg.get('channel_name', '')

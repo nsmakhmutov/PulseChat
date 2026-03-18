@@ -112,12 +112,17 @@ class ServerAnnouncer:
         host_nick:       str,
         server_name:     str = '',
         get_user_count = None,
+        get_user_nicks = None,
     ):
         self.server_ip      = server_ip
         self.server_port    = server_port
         self.host_nick      = host_nick
         self.server_name    = server_name or 'InPulse Server'
         self._get_count     = get_user_count or (lambda: 0)
+        # FIX #5: callable() → список никнеймов текущих участников сервера.
+        # Используется для hover-попапа в MultiServerScreen.
+        # Макс 30 юзеров × ~20 байт/ник = ~600 байт — безопасно для UDP.
+        self._get_nicks     = get_user_nicks or (lambda: [])
         self._running       = False
         self._thread: threading.Thread | None = None
         self._sock: socket.socket | None      = None
@@ -149,7 +154,8 @@ class ServerAnnouncer:
             self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
             while self._running:
-                # user_count запрашиваем каждый цикл — он меняется динамически
+                # user_count и user_nicks запрашиваем каждый цикл — они меняются динамически
+                _nicks = self._get_nicks()
                 msg = json.dumps({
                     "action":      "server_announce",
                     "ip":          self.server_ip,
@@ -157,6 +163,7 @@ class ServerAnnouncer:
                     "host_nick":   self.host_nick,
                     "server_name": self.server_name,
                     "user_count":  self._get_count(),
+                    "user_nicks":  _nicks[:30],  # макс 30 ников, безопасный размер UDP
                 }).encode('utf-8')
 
                 for target in self._BROADCAST_TARGETS:
@@ -284,7 +291,8 @@ class ServerDiscovery:
                         ip = msg.get('ip', '')
                         if not ip:
                             continue
-                        cnt  = msg.get('user_count', 0)
+                        cnt   = msg.get('user_count', 0)
+                        nicks = msg.get('user_nicks', [])
                         if ip not in found:
                             found[ip] = {
                                 'ip':          ip,
@@ -292,6 +300,7 @@ class ServerDiscovery:
                                 'host_nick':   msg.get('host_nick', '?'),
                                 'server_name': msg.get('server_name', 'InPulse Server'),
                                 'user_count':  cnt,
+                                'user_nicks':  nicks,
                             }
                             print(f"[Discovery] Найден сервер: {ip} "
                                   f"({msg.get('server_name', '?')}, "
@@ -299,6 +308,7 @@ class ServerDiscovery:
                         else:
                             # Обновляем живой счётчик без пересоздания записи
                             found[ip]['user_count'] = cnt
+                            found[ip]['user_nicks']  = nicks
                 except socket.timeout:
                     pass   # нормально — ждём следующий пакет
                 except json.JSONDecodeError:

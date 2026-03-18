@@ -1,5 +1,5 @@
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QComboBox, QCheckBox,
-                             QFrame, QWidget, QPushButton, QMessageBox)
+                             QFrame, QWidget, QPushButton)
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QGuiApplication
 
@@ -12,11 +12,10 @@ from .ui_dialogs import _DialogTitleBar
 class StreamSettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        # ── Безрамочный стеклянный дизайн ────────────────────────────────────
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setWindowTitle("Настройки трансляции")
-        self.setMinimumWidth(360)
+        self.setMinimumWidth(380)
 
         root_lay = QVBoxLayout(self)
         root_lay.setContentsMargins(0, 0, 0, 0)
@@ -73,7 +72,6 @@ class StreamSettingsDialog(QDialog):
         card_lay.setContentsMargins(0, 0, 0, 0)
         card_lay.setSpacing(0)
 
-        # Title bar
         self._title_bar = _DialogTitleBar(self, "📺  Настройки трансляции")
         card_lay.addWidget(self._title_bar)
 
@@ -83,7 +81,6 @@ class StreamSettingsDialog(QDialog):
         _sep.setStyleSheet("background: rgba(255,255,255,0.08); border: none;")
         card_lay.addWidget(_sep)
 
-        # Контент
         content_w = QWidget()
         content_w.setStyleSheet("background: transparent;")
         layout = QVBoxLayout(content_w)
@@ -91,15 +88,19 @@ class StreamSettingsDialog(QDialog):
         layout.setSpacing(8)
         card_lay.addWidget(content_w)
 
+        # ── Монитор ───────────────────────────────────────────────────────────
         layout.addWidget(QLabel("Выберите монитор:"))
         self.monitor_combo = QComboBox()
 
         try:
             screens = QGuiApplication.screens()
             for i, screen in enumerate(screens):
-                geometry = screen.geometry()
+                geometry    = screen.geometry()
                 screen_name = screen.name()
-                display_text = f"Монитор {i} [{screen_name}] ({geometry.width()}x{geometry.height()})"
+                display_text = (
+                    f"Монитор {i} [{screen_name}] "
+                    f"({geometry.width()}×{geometry.height()})"
+                )
                 self.monitor_combo.addItem(display_text, i)
             if not screens:
                 self.monitor_combo.addItem("Основной монитор", 0)
@@ -109,26 +110,48 @@ class StreamSettingsDialog(QDialog):
 
         layout.addWidget(self.monitor_combo)
 
+        # ── Разрешение ────────────────────────────────────────────────────────
         layout.addWidget(QLabel("Разрешение:"))
         self.res_combo = QComboBox()
-        self.res_options = {
-            "720p (HD) — 4.5 Mbps": (1280, 720),
-            "480p (SD) — 2.2 Mbps": (854,  480),
-            "360p      — 1.0 Mbps": (640,  360),
+
+        # Фиксированные пресеты — битрейт указан в актуальных значениях из config.py
+        # (был неверный: 720p=4.5 Mbps, 480p=2.2 Mbps, 360p=1.0 Mbps)
+        self._fixed_res_options: dict[str, tuple[int, int]] = {
+            "720p  (HD)  — 6 Mbps":   (1280, 720),
+            "480p  (SD)  — 3 Mbps":   ( 854, 480),
+            "360p        — 1.5 Mbps": ( 640, 360),
         }
-        for text in self.res_options.keys():
-            self.res_combo.addItem(text)
+
+        # Динамическая запись «Источник» добавляется первой и обновляется
+        # при смене монитора. Хранится как userData='source'.
+        self.res_combo.addItem("Источник (нативное разрешение)", "source")
+        for text, res in self._fixed_res_options.items():
+            self.res_combo.addItem(text, res)
+
+        # По умолчанию выбираем 720p
+        self.res_combo.setCurrentIndex(1)
         layout.addWidget(self.res_combo)
 
+        # Примечание о simulcast
+        self._simulcast_lbl = QLabel(
+            "ℹ️ Simulcast: параллельно транслируется LQ-поток (половинное\n"
+            "разрешение) для зрителей с медленным каналом или слабым ПК."
+        )
+        self._simulcast_lbl.setStyleSheet(
+            "background-color: rgba(35,60,100,0.45); color: #a8c8e8; "
+            "border-radius: 6px; padding: 7px; font-size: 11px;"
+        )
+        self._simulcast_lbl.setWordWrap(True)
+        layout.addWidget(self._simulcast_lbl)
+
+        # ── FPS ───────────────────────────────────────────────────────────────
         layout.addWidget(QLabel("Частота кадров (FPS):"))
         self.fps_combo = QComboBox()
         self.fps_combo.addItems(["15", "30", "60"])
         self.fps_combo.setCurrentText("30")
         layout.addWidget(self.fps_combo)
 
-        # ── Фикс прозрачного popup у всех трёх комбобоксов ───────────────────
-        # QComboBox popup — отдельный top-level виджет: при WA_TranslucentBackground
-        # родителя он рендерится прозрачным. Задаём solid-фон напрямую на view().
+        # ── Фикс прозрачного popup ────────────────────────────────────────────
         def _fix_stream_combo(combo):
             try:
                 v = combo.view()
@@ -147,12 +170,19 @@ class StreamSettingsDialog(QDialog):
                 win.setStyleSheet("background-color: #1e2130;")
             except Exception:
                 pass
+
         QTimer.singleShot(0, lambda: _fix_stream_combo(self.monitor_combo))
         QTimer.singleShot(0, lambda: _fix_stream_combo(self.res_combo))
         QTimer.singleShot(0, lambda: _fix_stream_combo(self.fps_combo))
 
+        # Обновляем надпись «Источник» при смене монитора
+        self.monitor_combo.currentIndexChanged.connect(self._update_source_label)
+        # Первичное обновление после построения
+        QTimer.singleShot(0, self._update_source_label)
+
         layout.addSpacing(10)
 
+        # ── Аудио ─────────────────────────────────────────────────────────────
         sep = QLabel("── Аудио трансляции ──────────────────")
         sep.setStyleSheet("color: gray; font-size: 11px;")
         layout.addWidget(sep)
@@ -161,35 +191,25 @@ class StreamSettingsDialog(QDialog):
         self.cb_stream_audio.setChecked(False)
         layout.addWidget(self.cb_stream_audio)
 
-        self._vbc_banner = QLabel()
-        self._vbc_banner.setWordWrap(True)
-        self._vbc_banner.setStyleSheet("border-radius: 6px; padding: 8px; font-size: 12px;")
-        layout.addWidget(self._vbc_banner)
-
-        self._btn_vbc_install = QPushButton("⬇  Установить VB-CABLE")
-        self._btn_vbc_install.setStyleSheet(
-            "background-color: #e67e22; color: white; font-weight: bold; height: 34px;"
-        )
-        self._btn_vbc_install.clicked.connect(self._on_install_vbcable)
-        layout.addWidget(self._btn_vbc_install)
-
         self._hint_lbl = QLabel(
-            "💡 Направьте вывод игры/плеера на «CABLE Input»\n"
-            "    (Настройки Windows → Звук → Приложения)\n"
-            "    Ваши наушники оставьте основным устройством."
+            "ℹ️  Захват системного звука через WASAPI Loopback.\n"
+            "Зрители будут слышать то, что играет на вашем ПК."
         )
         self._hint_lbl.setStyleSheet(
-            "background-color: #1a5276; color: #aed6f1; "
+            "background-color: rgba(22,75,107,0.55); color: #aed6f1; "
             "border-radius: 6px; padding: 8px; font-size: 11px;"
         )
         self._hint_lbl.setWordWrap(True)
+        self._hint_lbl.setVisible(False)
         layout.addWidget(self._hint_lbl)
 
-        self._refresh_vbc_ui()
-        self.cb_stream_audio.toggled.connect(self._on_audio_toggled)
+        self.cb_stream_audio.toggled.connect(
+            lambda checked: self._hint_lbl.setVisible(checked)
+        )
 
         layout.addSpacing(8)
 
+        # ── Кнопки ────────────────────────────────────────────────────────────
         btn_start = QPushButton("▶  Запустить трансляцию")
         btn_start.setStyleSheet("""
             QPushButton {
@@ -228,93 +248,71 @@ class StreamSettingsDialog(QDialog):
 
         self.adjustSize()
 
-    def _refresh_vbc_ui(self):
+    # ------------------------------------------------------------------
+    # Динамическое обновление надписи «Источник»
+    # ------------------------------------------------------------------
+
+    def _update_source_label(self) -> None:
+        """
+        Обновляет текст пункта «Источник» при смене монитора.
+        Показывает реальное разрешение выбранного монитора.
+        """
+        monitor_idx = self.monitor_combo.currentData()
         try:
-            from vbcable_installer import is_vbcable_installed, find_zip
-            installed = is_vbcable_installed()
-        except ImportError:
-            installed = False
-            find_zip = lambda: None
-
-        audio_on = self.cb_stream_audio.isChecked()
-
-        if installed:
-            self._vbc_banner.setText("✅  VB-CABLE установлен — захват без эха активен")
-            self._vbc_banner.setStyleSheet(
-                "background-color: #1e8449; color: #a9dfbf; "
-                "border-radius: 6px; padding: 8px; font-size: 12px;"
-            )
-            self._btn_vbc_install.setVisible(False)
-            self._hint_lbl.setVisible(audio_on)
-        else:
-            try:
-                from vbcable_installer import find_zip
-                zip_found = find_zip() is not None
-            except ImportError:
-                zip_found = False
-
-            if zip_found:
-                self._vbc_banner.setText(
-                    "⚠  VB-CABLE не установлен.\n"
-                    "Архив найден в папке проекта — нажмите кнопку ниже."
-                )
-                self._btn_vbc_install.setEnabled(True)
+            screens = QGuiApplication.screens()
+            if monitor_idx is not None and int(monitor_idx) < len(screens):
+                screen = screens[int(monitor_idx)]
+                geo    = screen.geometry()
+                w, h   = geo.width(), geo.height()
+                text   = f"Источник  ({w}×{h})  — нативное"
             else:
-                self._vbc_banner.setText(
-                    "⚠  VB-CABLE не установлен.\n"
-                    "Без него звук стрима будет захватываться через WASAPI Loopback\n"
-                    "и зрители могут слышать эхо своего голоса.\n\n"
-                    "Скачайте VBCABLE_Driver_Pack45.zip с vb-audio.com\n"
-                    "и положите его в папку с программой."
-                )
-                self._btn_vbc_install.setEnabled(False)
+                text = "Источник  (нативное разрешение)"
+        except Exception:
+            text = "Источник  (нативное разрешение)"
 
-            self._vbc_banner.setStyleSheet(
-                "background-color: #7d6608; color: #fef9e7; "
-                "border-radius: 6px; padding: 8px; font-size: 12px;"
-            )
-            self._btn_vbc_install.setVisible(True)
-            self._hint_lbl.setVisible(False)
+        # Пункт «Источник» всегда имеет index=0
+        if self.res_combo.itemData(0) == "source":
+            self.res_combo.setItemText(0, text)
 
-        self._vbc_banner.setVisible(audio_on)
-        self._btn_vbc_install.setVisible(
-            audio_on and not installed and self._btn_vbc_install.isVisible()
-        )
-        self._hint_lbl.setVisible(audio_on and installed)
-        self.adjustSize()
+    # ------------------------------------------------------------------
+    # Получение настроек
+    # ------------------------------------------------------------------
 
-    def _on_audio_toggled(self, checked):
-        self._refresh_vbc_ui()
+    def get_settings(self) -> dict:
+        """
+        Возвращает dict настроек для VideoEngine.start_streaming() и
+        network_engine.start_streaming_webrtc().
 
-    def _on_install_vbcable(self):
-        try:
-            from vbcable_installer import install_vbcable, find_zip
-        except ImportError:
-            QMessageBox.critical(self, "VB-CABLE",
-                "Модуль vbcable_installer.py не найден рядом с программой.")
-            return
+        quality='hq' зритель выбирает сам при stream_watch_start.
+        Здесь возвращаем только параметры стримера.
+        """
+        monitor_idx  = self.monitor_combo.currentData()
+        fps          = int(self.fps_combo.currentText())
+        audio_on     = self.cb_stream_audio.isChecked()
 
-        self._btn_vbc_install.setEnabled(False)
-        self._btn_vbc_install.setText("Устанавливаю…")
-        success, msg = install_vbcable()
-        if success:
-            QMessageBox.information(self, "VB-CABLE", msg)
+        res_data = self.res_combo.currentData()
+        if res_data == "source":
+            # Нативное разрешение выбранного монитора
+            try:
+                screens = QGuiApplication.screens()
+                idx     = int(monitor_idx) if monitor_idx is not None else 0
+                if idx < len(screens):
+                    geo    = screens[idx].geometry()
+                    width  = geo.width()
+                    height = geo.height()
+                else:
+                    width, height = 1920, 1080
+            except Exception:
+                width, height = 1920, 1080
         else:
-            QMessageBox.warning(self, "VB-CABLE — ошибка", msg)
-        self._btn_vbc_install.setEnabled(True)
-        self._btn_vbc_install.setText("⬇  Установить VB-CABLE")
-        self._refresh_vbc_ui()
+            width, height = res_data
 
-    def get_settings(self):
-        res_text = self.res_combo.currentText()
-        width, height = self.res_options[res_text]
-        audio_enabled = self.cb_stream_audio.isChecked()
         return {
-            "monitor_idx":         self.monitor_combo.currentData(),
+            "monitor_idx":         monitor_idx,
             "width":               width,
             "height":              height,
-            "fps":                 int(self.fps_combo.currentText()),
-            "stream_audio":        audio_enabled,
-            "system_audio":        audio_enabled,
+            "fps":                 fps,
+            "stream_audio":        audio_on,
+            "system_audio":        audio_on,
             "system_audio_device": None,
         }

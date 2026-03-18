@@ -55,17 +55,6 @@ class StreamAudioCapture:
         self._pcm_buf = np.empty(CHUNK_SIZE * 8, dtype=np.float32)
         self._pcm_len = 0
         self._buffer_lock = threading.Lock()
-        # True когда захват идёт из CABLE Output (VB-CABLE).
-        # В этом режиме AEC полностью отключён — голосов в CABLE Output нет физически.
-        self._using_vbcable: bool = False
-
-        # Локальный мониторинг VB-CABLE: очередь сырых PCM-фреймов,
-        # которые параллельно с отправкой зрителям воспроизводятся
-        # в реальные наушники стримера.  None — мониторинг не запущен.
-        self._vbcable_monitor_queue: "queue.Queue | None" = None
-        # Громкость локального мониторинга: 1.0 = оригинал.
-        # Можно снизить если стример хочет слышать игру тише чем зрители.
-        self.monitor_volume: float = 1.0
 
     @staticmethod
     def list_wasapi_output_devices():
@@ -310,171 +299,11 @@ class StreamAudioCapture:
         return False
 
     # ------------------------------------------------------------------
-    # Стратегия 0: VB-CABLE — приоритет над всеми остальными методами
+    # Аудио-колбэк: принимает фреймы от sounddevice, собирает 20ms чанки
     # ------------------------------------------------------------------
-    def _try_vbcable(self) -> bool:
-        """
-        Захватывает звук из «CABLE Output» как обычное INPUT-устройство.
-
-        Архитектура VB-CABLE:
-          «CABLE Input»  — виртуальный ВЫВОД (куда игра выводит звук)
-          «CABLE Output» — виртуальный ВВОД  (откуда мы читаем)
-
-        Связь между ними: всё что подаётся на CABLE Input,
-        сразу появляется на CABLE Output. Голоса зрителей НЕ подаются
-        на CABLE Input никогда → CABLE Output математически чист → AEC не нужен,
-        ducking не нужен, эхо невозможно как явление.
-
-        device_idx игнорируется — устройство находится по имени автоматически.
-        Возвращает True если поток открыт и проработал до stop().
-        """
-        cable_idx = None
-        cable_ch  = 2
-        cable_sr  = SAMPLE_RATE
-
-        try:
-            devs = sd.query_devices()
-            for i, d in enumerate(devs):
-                if 'cable output' in d['name'].lower() and d['max_input_channels'] > 0:
-                    cable_idx = i
-                    cable_ch  = max(1, int(d['max_input_channels']))
-                    cable_sr  = int(d.get('default_samplerate', SAMPLE_RATE))
-                    print(f"[StreamAudio] [VB-CABLE] Найден: «{d['name']}» "
-                          f"idx={i} ch={cable_ch} sr={cable_sr}")
-                    break
-
-            if cable_idx is None:
-                print("[StreamAudio] [VB-CABLE] Устройство 'CABLE Output' не найдено — "
-                      "пробуем WASAPI Loopback")
-                return False
-
-            self._native_sr     = cable_sr
-            self._using_vbcable = True
-
-            # ── Локальный мониторинг: стример слышит игру в наушниках ──────────
-            # Открываем OutputStream на устройство вывода по умолчанию.
-            # Callback читает сырые фреймы из _vbcable_monitor_queue (заполняется
-            # в _audio_cb) и прокидывает их в наушники. Если очередь пуста —
-            # тишина (не блокируемся). cable_ch и cable_sr совпадают с InputStream,
-            # поэтому ресемплинг не нужен.
-            monitor_q: "queue.Queue" = queue.Queue(maxsize=80)
-            self._vbcable_monitor_queue = monitor_q
-            _mon_vol_ref = [self.monitor_volume]  # mutable ref для closure
-
-            def _monitor_out_cb(outdata, frames, time_info, status):
-                try:
-                    raw = monitor_q.get_nowait()  # shape: (frames, cable_ch)
-                    vol = self.monitor_volume
-                    if raw.shape == outdata.shape:
-                        np.multiply(raw, vol, out=outdata)
-                    else:
-                        # Разное кол-во каналов: микшируем в mono и раскладываем
-                        mono = np.mean(raw, axis=1, keepdims=True) if raw.ndim > 1 else raw.reshape(-1, 1)
-                        outdata[:] = np.repeat(mono, outdata.shape[1], axis=1) * vol
-                except Exception:
-                    outdata.fill(0)  # очередь пуста или ошибка — тишина
-
-            # Определяем кол-во каналов дефолтного вывода
-            try:
-                _out_ch = max(1, int(sd.query_devices(kind='output')['max_output_channels']))
-                _out_ch = min(_out_ch, cable_ch)  # не больше чем захватываем
-            except Exception:
-                _out_ch = cable_ch
-
-            with sd.InputStream(
-                device=cable_idx,
-                samplerate=cable_sr,
-                channels=cable_ch,
-                dtype='float32',
-                blocksize=CHUNK_SIZE,
-                callback=self._audio_cb,
-            ):
-                print("[StreamAudio] ✔ [VB-CABLE] Захват запущен — "
-                      "чистый звук без AEC и ducking")
-                try:
-                    with sd.OutputStream(
-                        samplerate=cable_sr,
-                        channels=_out_ch,
-                        dtype='float32',
-                        blocksize=CHUNK_SIZE,
-                        callback=_monitor_out_cb,
-                    ):
-                        print(f"[StreamAudio] ✔ [VB-CABLE] Локальный мониторинг запущен "
-                              f"(ch={_out_ch} sr={cable_sr}) — стример слышит игру в наушниках")
-                        while self._running.is_set():
-                            time.sleep(0.05)
-                except Exception as e_mon:
-                    # Мониторинг не удался (редкий случай) — стрим продолжается без него
-                    print(f"[StreamAudio] [VB-CABLE] Мониторинг недоступен: {e_mon}\n"
-                          f"  Захват зрителям продолжается, но стример не слышит игру локально.")
-                    while self._running.is_set():
-                        time.sleep(0.05)
-            return True
-
-        except Exception as e:
-            print(f"[StreamAudio] [VB-CABLE] Ошибка открытия потока: {e}")
-            return False
-        finally:
-            self._using_vbcable = False
-            self._vbcable_monitor_queue = None  # сбрасываем ссылку на очередь
-
-    def _capture_loop(self, device_idx):
-        # ── Стратегия 0: VB-CABLE (ПРИОРИТЕТ) ─────────────────────────────────
-        # CABLE Output = чистый игровой звук, голосов зрителей там нет → эхо невозможно.
-        if self._try_vbcable():
-            print("[StreamAudio] Захват остановлен [0/VB-CABLE]")
-            return
-
-        # ── Стратегии A/B: WASAPI Loopback (запасной путь) ────────────────────
-        resolved = self._resolve_device(device_idx)
-        if resolved is None:
-            print("[StreamAudio] Подходящее WASAPI OUTPUT-устройство не найдено")
-            return
-
-        dev_info = sd.query_devices(resolved)
-        native_ch = max(1, int(dev_info.get('max_output_channels', 2)))
-        self._native_sr = int(dev_info.get('default_samplerate', SAMPLE_RATE))
-        output_name = dev_info['name']
-
-        print(f"[StreamAudio] Целевое устройство: «{output_name}» "
-              f"(sd_idx={resolved}, ch={native_ch}, sr={self._native_sr})")
-
-        # ── Стратегия A: pyaudiowpatch ─────────────────────────────────────
-        # Единственный надёжный метод: использует isLoopbackDevice,
-        # не захватывает микрофоны случайно.
-        if self._try_pyaudiowpatch(output_name):
-            print("[StreamAudio] Loopback поток остановлен [A/pyaudiowpatch]")
-            return
-
-        # ── Стратегия B: sounddevice WasapiSettings(loopback=True) ─────────
-        # Работает на части конфигураций, падает с -9998 на Sound Blaster и др.
-        if self._try_sounddevice_loopback(resolved, native_ch):
-            print("[StreamAudio] Loopback поток остановлен [B/sounddevice]")
-            return
-
-        # ── Ничего не сработало ─────────────────────────────────────────────
-        print(
-            "[StreamAudio] ✖ WASAPI Loopback захватить не удалось.\n"
-            "  Решение: pip install pyaudiowpatch\n"
-            "  Подробнее: https://github.com/s0d3s/PyAudioWPatch"
-        )
-        print("[StreamAudio] Loopback поток остановлен")
-
     def _audio_cb(self, indata, frames, time_info, status):
         if not self._running.is_set():
             return
-
-        # ── Локальный мониторинг VB-CABLE ──────────────────────────────────────
-        # Сырой фрейм (до любой обработки) кладём в очередь мониторинга.
-        # Параллельный sd.OutputStream в _try_vbcable читает её и воспроизводит
-        # в реальные наушники стримера — он слышит игру так же как и зрители,
-        # но через отдельный путь без задержки encode/decode.
-        # Блок работает ТОЛЬКО когда _using_vbcable=True и очередь создана.
-        if self._using_vbcable and self._vbcable_monitor_queue is not None:
-            try:
-                self._vbcable_monitor_queue.put_nowait(indata.copy())
-            except Exception:
-                pass  # очередь полна — дроп, не критично (20ms потери)
 
         try:
             if indata.ndim > 1 and indata.shape[1] > 1:
@@ -629,22 +458,18 @@ class MicrophoneTrack(AudioStreamTrack):
 
 class SystemAudioTrack(AudioStreamTrack):
     """
-    Захват системного звука (WASAPI Loopback / VB-CABLE) → WebRTC.
+    Захват системного звука (WASAPI Loopback) → WebRTC.
 
     Используется стримером для передачи игрового звука зрителям через WebRTC SFU.
 
     Повторно использует всю логику захвата из StreamAudioCapture без дублирования:
-      VB-CABLE (приоритет) → pyaudiowpatch WASAPI Loopback → sounddevice loopback.
+      pyaudiowpatch WASAPI Loopback → sounddevice loopback (запасной путь).
     Разница: вместо Opus-encode + UDP-отправки StreamAudioCapture вызывает
     pcm_callback(chunk: float32 mono), а SystemAudioTrack кладёт chunk в asyncio.Queue.
-
-    Локальный мониторинг VB-CABLE (стример слышит игру в наушниках) полностью
-    сохранён — он живёт внутри StreamAudioCapture и не затрагивает WebRTC.
 
     Ленивая инициализация: захват стартует при первом recv() из WebRTC asyncio-цикла.
     Формат вывода: s16, 48 000 Гц, моно, CHUNK_SIZE=960 сэмплов (20 мс).
     """
-
     kind = "audio"
 
     def __init__(self, device_idx: int = None):

@@ -1,6 +1,7 @@
 # server.py — SFUServer + EmbeddedServerManager
 import asyncio
 import json
+import hashlib
 import secrets
 import socket
 import threading
@@ -138,6 +139,21 @@ class SFUServer:
         self._channel_auth: dict = {}
         self._channel_auth_lock = threading.Lock()
 
+        # ── Кэш медиа-пейлоадов (FIX #1) ────────────────────────────────────
+        # json.dumps({'file_data_b64': <10MB>}) занимает ~50 мс на CPython.
+        # При пересылке одного файла 10 получателям = 500 мс задержки в TCP-потоке.
+        # Решение: кэшируем готовые bytes-пейлоады по MD5(file_data_b64).
+        # Ключ: md5_hex строки. Значение: (expire_ts, payload_bytes_without_ts).
+        # TTL = 300 сек, макс 30 записей — при 20 юзерах этого с запасом хватит.
+        # ts подставляется при каждой отправке, поэтому кэш хранит payload без ts,
+        # а финальные bytes строятся за O(len(ts_str)) вместо O(len(10MB)).
+        self._media_cache: dict[str, tuple[float, bytes, bytes]] = {}
+        # (expire_ts, prefix_bytes, suffix_bytes)
+        # prefix = всё до "ts": в JSON, suffix = всё после значения ts
+        self._media_cache_lock = threading.Lock()
+        self._media_cache_max  = 30
+        self._media_cache_ttl  = 300.0  # секунд
+
     # ------------------------------------------------------------------
     # Управление каналами
     # ------------------------------------------------------------------
@@ -145,6 +161,12 @@ class SFUServer:
         """Возвращает текущее число подключённых клиентов. Используется ServerAnnouncer."""
         with self.clients_lock:
             return len(self.clients)
+
+    def _get_user_nicks_list(self) -> list:
+        """Возвращает список никнеймов подключённых клиентов. Используется ServerAnnouncer
+        для включения в UDP-broadcast, чтобы клиенты показывали hover-попап с участниками."""
+        with self.clients_lock:
+            return [c.get('nick', '') for c in self.clients.values() if c.get('nick')]
 
     def _pick_best_host(self, exclude_uid: int = 0) -> tuple[int, str]:
         """
@@ -661,9 +683,10 @@ class SFUServer:
                                 )
                                 # WebRTC: создаём offer для зрителя через SFU
                                 if self.sfu:
+                                    quality = msg.get('quality', 'hq')
                                     self.sfu.call_async(
                                         self.sfu.handle_viewer_connect(
-                                            w_uid, streamer_uid, conn
+                                            w_uid, streamer_uid, conn, quality
                                         )
                                     )
                             self._mark_dirty()
@@ -1067,8 +1090,15 @@ class SFUServer:
                                         pass
 
                         # ── Постоянный чат: медиа-вложение (фото/файл) ────────
-                        # Сервер добавляет nick/uid/avatar/ts и ретранслирует.
-                        # Размер не обрезается — клиент сам ограничивает CHAT_MEDIA_MAX_B64.
+                        # FIX #1: кэш пейлоадов по MD5(file_data_b64).
+                        # json.dumps 10 MB base64 = ~50 мс на CPython.
+                        # Тот же файл, пересланный снова (или при ретрансляции),
+                        # отдаётся из кэша за ~0.1 мс.
+                        # Кэш хранит (prefix_bytes, suffix_bytes):
+                        #   prefix = JSON до поля "ts"
+                        #   suffix = JSON после значения "ts"
+                        # При отправке: prefix + str(ts).encode() + suffix
+                        # → аллокация O(len(ts)) вместо O(10 MB).
                         elif action == CMD_CHAT_MEDIA:
                             file_data_b64 = msg.get('file_data_b64', '')
                             if (file_data_b64
@@ -1092,17 +1122,64 @@ class SFUServer:
                                     else:
                                         room_conns_md = []
                                 if s_uid_md:
-                                    broadcast_md = json.dumps({
-                                        'action':       CMD_CHAT_MEDIA,
-                                        'uid':          s_uid_md,
-                                        'from_nick':    s_nick_md,
-                                        'avatar':       s_avatar_md,
-                                        'ts':           time.time(),
-                                        'room':         s_room_md or '',
-                                        'file_name':    msg.get('file_name', 'file'),
-                                        'file_type':    msg.get('file_type', ''),
-                                        'file_data_b64': file_data_b64,
-                                    }).encode('utf-8')
+                                    now_ts = time.time()
+                                    # ── Кэш: строим или берём готовый пейлоад ──
+                                    md5_key = hashlib.md5(
+                                        file_data_b64.encode('utf-8'), usedforsecurity=False
+                                    ).hexdigest()
+                                    with self._media_cache_lock:
+                                        cached = self._media_cache.get(md5_key)
+                                        hit = (cached is not None
+                                               and cached[0] > now_ts
+                                               and cached[3] == s_uid_md
+                                               and cached[4] == s_nick_md)
+                                    if hit:
+                                        _, prefix_b, suffix_b, _, _ = cached
+                                        broadcast_md = (
+                                            prefix_b
+                                            + f'{now_ts}'.encode('ascii')
+                                            + suffix_b
+                                        )
+                                    else:
+                                        # Полная сборка: строим payload и кэшируем части
+                                        full_dict = {
+                                            'action':        CMD_CHAT_MEDIA,
+                                            'uid':           s_uid_md,
+                                            'from_nick':     s_nick_md,
+                                            'avatar':        s_avatar_md,
+                                            'ts':            now_ts,
+                                            'room':          s_room_md or '',
+                                            'file_name':     msg.get('file_name', 'file'),
+                                            'file_type':     msg.get('file_type', ''),
+                                            'file_data_b64': file_data_b64,
+                                        }
+                                        broadcast_md = json.dumps(full_dict).encode('utf-8')
+                                        # Разбиваем на prefix/suffix по полю "ts"
+                                        # Формат json.dumps гарантирован: "ts": <float>
+                                        try:
+                                            ts_marker = f'"ts": {now_ts}'.encode('ascii')
+                                            split_idx = broadcast_md.index(ts_marker)
+                                            prefix_b = broadcast_md[:split_idx + 6]  # до числа
+                                            suffix_b = broadcast_md[split_idx + 6 + len(f'{now_ts}'.encode('ascii')):]
+                                            with self._media_cache_lock:
+                                                # Вытесняем истёкшие записи если кэш полный
+                                                if len(self._media_cache) >= self._media_cache_max:
+                                                    expired = [k for k, v in self._media_cache.items()
+                                                               if v[0] <= now_ts]
+                                                    for k in expired:
+                                                        del self._media_cache[k]
+                                                    # Если всё ещё полный — удаляем самый старый
+                                                    if len(self._media_cache) >= self._media_cache_max:
+                                                        oldest = min(self._media_cache,
+                                                                     key=lambda k: self._media_cache[k][0])
+                                                        del self._media_cache[oldest]
+                                                self._media_cache[md5_key] = (
+                                                    now_ts + self._media_cache_ttl,
+                                                    prefix_b, suffix_b,
+                                                    s_uid_md, s_nick_md,
+                                                )
+                                        except (ValueError, Exception):
+                                            pass  # кэш не удался — broadcast_md уже готов
                                     for bc in room_conns_md:
                                         try:
                                             bc.sendall(broadcast_md)
@@ -1374,6 +1451,7 @@ class SFUServer:
                 host_nick      = host_nick,
                 server_name    = self._server_name,
                 get_user_count = self.get_client_count,
+                get_user_nicks = self._get_user_nicks_list,
             )
             self._announcer.start()
         except Exception as e:

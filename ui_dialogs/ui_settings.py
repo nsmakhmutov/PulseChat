@@ -1239,6 +1239,37 @@ class SettingsDialog(QDialog):
             self._btn_check_update.setEnabled(False)
             self._ver_status_lbl.setText("⚠ GITHUB_REPO не задан в version.py")
 
+        # ── Разделитель ───────────────────────────────────────────────────────
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.Shape.HLine)
+        sep2.setFrameShadow(QFrame.Shadow.Sunken)
+        lay.addWidget(sep2)
+
+        # ── Кнопка «Открыть папку с логами» ──────────────────────────────────
+        # Открывает %APPDATA%\InPulse\logs в проводнике Windows.
+        # Пользователи-тестировщики прикладывают логи к баг-репортам.
+        btn_logs = QPushButton("📂  Открыть папку с логами")
+        btn_logs.setFixedHeight(34)
+        btn_logs.setToolTip("Открывает папку с файлами логов в Проводнике")
+        btn_logs.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_logs.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(91,142,245,0.18);
+                color: #a0c0ff;
+                border: 1px solid rgba(91,142,245,0.45);
+                border-radius: 7px;
+                font-size: 13px;
+                padding: 0 14px;
+            }
+            QPushButton:hover {
+                background-color: rgba(91,142,245,0.32);
+                border-color: rgba(91,142,245,0.70);
+                color: #ffffff;
+            }
+        """)
+        btn_logs.clicked.connect(self._on_open_logs_folder)
+        lay.addWidget(btn_logs)
+
         lay.addStretch()
         self.tabs.addTab(tab, "Версия")
 
@@ -1269,6 +1300,26 @@ class SettingsDialog(QDialog):
         self._ver_status_lbl.setText(
             "✅ Загрузка завершена. Приложение сейчас перезапустится..."
         )
+
+    def _on_open_logs_folder(self):
+        """Открывает папку с логами в Проводнике Windows (или файловом менеджере ОС)."""
+        import subprocess
+        _appdata = os.environ.get('APPDATA') or os.path.expanduser('~')
+        logs_dir = os.path.join(_appdata, 'InPulse', 'logs')
+        os.makedirs(logs_dir, exist_ok=True)
+        try:
+            if os.name == 'nt':
+                # Windows: открываем проводник с фокусом на папке
+                os.startfile(logs_dir)
+            else:
+                # macOS / Linux fallback
+                subprocess.Popen(['xdg-open', logs_dir])
+        except Exception as e:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, "Ошибка",
+                f"Не удалось открыть папку логов:\n{logs_dir}\n\n{e}"
+            )
 
     def _on_check_update_clicked(self):
         from updater import check_for_updates_async

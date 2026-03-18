@@ -114,8 +114,12 @@ class _PingWorker(QThread):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class _ServerItemWidget(QFrame):
-    """Кликабельная карточка сервера: имя, хост, IP, пинг, кол-во участников."""
-    clicked = pyqtSignal()
+    """Кликабельная карточка сервера: имя, хост, IP, пинг, кол-во участников.
+    FIX #5: одиночный клик = выбор + подключение (как кнопка «Подключиться»).
+            hover = стеклянный попап со списком участников.
+    """
+    clicked        = pyqtSignal()
+    double_clicked = pyqtSignal()   # зарезервировано; клик уже подключает
 
     def __init__(self, info: dict, parent=None):
         super().__init__(parent)
@@ -125,6 +129,7 @@ class _ServerItemWidget(QFrame):
         self._apply_style()
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFixedHeight(56)
+        self.setMouseTracking(True)
 
         lay = QHBoxLayout(self)
         lay.setContentsMargins(12, 8, 12, 8)
@@ -179,6 +184,9 @@ class _ServerItemWidget(QFrame):
             self._ping_worker.result.connect(self._on_ping)
             self._ping_worker.start()
 
+        # ── Hover-попап с участниками (стеклянный стиль) ──────────────────────
+        self._hover_popup: QLabel | None = None
+
     def _on_ping(self, ms: int):
         if ms < 0:
             self._lbl_ping.setText("—")
@@ -202,6 +210,61 @@ class _ServerItemWidget(QFrame):
     def set_selected(self, selected: bool):
         self._selected = selected
         self._apply_style()
+
+    # ── Hover-попап ───────────────────────────────────────────────────────────
+    def _show_hover_popup(self):
+        """Создаёт стеклянный попап со списком участников сервера."""
+        nicks = self.info.get('user_nicks', [])
+        if not nicks:
+            return
+
+        # Строим текст участников
+        lines = [f"  👤  {n}" for n in nicks[:30]]
+        body  = "\n".join(lines) if lines else "  (нет участников)"
+
+        self._hover_popup = QLabel(
+            f"<b>Участники сервера:</b><br>" +
+            "<br>".join(f"👤 {n}" for n in nicks[:30]),
+            self.window(),
+        )
+        self._hover_popup.setTextFormat(Qt.TextFormat.RichText)
+        self._hover_popup.setWordWrap(False)
+        self._hover_popup.setStyleSheet("""
+            QLabel {
+                background-color: rgba(18, 20, 32, 235);
+                border: 1px solid rgba(91,142,245,0.40);
+                border-radius: 10px;
+                color: #c8d0e0;
+                font-size: 12px;
+                padding: 10px 14px;
+            }
+        """)
+        self._hover_popup.adjustSize()
+
+        # Позиция: справа от карточки, прижата к правому краю окна
+        pos = self.mapTo(self.window(), self.rect().topRight())
+        popup_w = self._hover_popup.width()
+        popup_h = self._hover_popup.height()
+        win_w   = self.window().width()
+        x = min(pos.x() + 8, win_w - popup_w - 8)
+        y = max(4, pos.y() - popup_h // 4)
+        self._hover_popup.move(x, y)
+        self._hover_popup.raise_()
+        self._hover_popup.show()
+
+    def _hide_hover_popup(self):
+        if self._hover_popup is not None:
+            self._hover_popup.hide()
+            self._hover_popup.deleteLater()
+            self._hover_popup = None
+
+    def enterEvent(self, event):
+        self._show_hover_popup()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hide_hover_popup()
+        super().leaveEvent(event)
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
@@ -497,6 +560,8 @@ class MultiServerScreen(QWidget):
             self._item_widgets.append(w)
 
     def _on_item_selected(self, info: dict, widget: _ServerItemWidget):
+        # FIX #5: одиночный клик = выбор + немедленное подключение.
+        # Кнопка «Подключиться» остаётся для доступности с клавиатуры.
         for w in self._item_widgets:
             try:
                 w.set_selected(False)
@@ -508,6 +573,10 @@ class MultiServerScreen(QWidget):
             pass
         self._selected_info = info
         self.btn_connect.setEnabled(True)
+        # Подключаемся сразу при клике
+        ip = info.get('ip', '')
+        if ip:
+            self._open_connecting(ip)
 
     # ── Действия ──────────────────────────────────────────────────────────────
 

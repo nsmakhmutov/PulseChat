@@ -134,7 +134,7 @@ class MainWindow(QMainWindow):
         self.stream_windows = {}
 
         self.setup_ui()
-        self.apply_theme(self.app_settings.value("theme", "Светлая"))
+        self.apply_theme(self.app_settings.value("theme", "Темная"))
 
         # ── ChatPanel: встроена в _main_row (окно расширяется при открытии) ───
         # ChatPanel добавлена в QHBoxLayout рядом с main_page в setup_ui().
@@ -251,12 +251,13 @@ class MainWindow(QMainWindow):
         # refresh_ui() вызывается каждые 100 мс. Создание QColor/QSize/QSettings
         # внутри метода = 10 аллокаций/сек × N_users без необходимости.
         # Кэшируем один раз здесь, обновляем только при смене темы.
-        self._cache_theme = self.app_settings.value("theme", "Светлая")
+        # FIX #7: только тёмная тема — _cache_theme всегда "Темная".
+        self._cache_theme = "Темная"
         self._theme_dirty = False  # ВАЖН-6: флаг вместо QSettings.value() каждые 100 мс
         self._c_talk   = QColor("#2ecc71")
         self._c_mute   = QColor("#e74c3c")
         self._c_stream = QColor("#3498db")
-        self._c_def    = QColor("#ecf0f1") if self._cache_theme == "Темная" else QColor("#444444")
+        self._c_def    = QColor("#ecf0f1")
         self._icon_size = QSize(26, 26)
 
         # ── Кэш QBrush для refresh_ui() ────────────────────────────────────────
@@ -759,64 +760,34 @@ class MainWindow(QMainWindow):
 
     def apply_theme(self, theme_name):
         font_f = self.custom_font_family
-        is_dark = (theme_name == "Темная")
+        # FIX #7: светлая тема удалена — единственная тема «Темная» (glassmorphism dark).
+        # Параметр theme_name сохранён для обратной совместимости вызовов,
+        # но значение игнорируется — используется всегда тёмная палитра.
 
-        # ────────────────────────────────────────────────────────────────────────
-        # Палитра — единый «стеклянный» язык дизайна.
-        # Тёмная тема: глубокий navy-dark, rgba-слои, как в SoundboardPanel.
-        # Светлая тема: молочно-синяя, сохраняет читаемость, чуть прозрачнее.
-        # ────────────────────────────────────────────────────────────────────────
-        if is_dark:
-            # ── Glassmorphism dark palette ────────────────────────────────────
-            win_bg       = "rgba(22, 25, 40, 255)"      # единый фон — и главное окно и чат
-            surface      = "rgba(255,255,255,0.07)"      # дерево чуть светлее фона
-            surface_solid= "#1e2240"
-            text         = "#e8edf8"
-            text_dim     = "#7888aa"
-            border       = "rgba(255,255,255,0.11)"
-            border_solid = "#2e3458"
-            hover        = "rgba(255,255,255,0.09)"
-            hover_solid  = "#2a2f50"                     # hover чуть светлее win_bg
-            accent       = "#5b8ef5"
-            accent_red   = "#e74c3c"
-            title_bg     = "rgba(10, 12, 22, 255)"       # header темнее фона
-            title_text   = "#c8d4f0"
-            title_sep    = "rgba(255,255,255,0.08)"
-            win_border   = "rgba(91,142,245,0.22)"
-            bottom_bg    = "rgba(10, 12, 22, 255)"       # нижняя панель = title_bg
-            bottom_sep   = "rgba(255,255,255,0.08)"
-            # Кнопки — достаточно светлые чтобы иконки читались
-            btn_bg       = "rgba(255,255,255,0.14)"      # было 0.08 — иконки сливались
-            btn_hover    = "rgba(255,255,255,0.24)"
-            btn_border   = "rgba(255,255,255,0.20)"
-            scrollbar    = "rgba(255,255,255,0.20)"
-            sb_track     = "rgba(255,255,255,0.05)"
-            tree_room_bg = "rgba(255,255,255,0.05)"
-        else:
-            # ── Glassmorphism light palette ───────────────────────────────────
-            win_bg       = "rgba(225, 230, 245, 255)"
-            surface      = "rgba(255,255,255,0.55)"
-            surface_solid= "#dde2f0"
-            text         = "#1a1e2e"
-            text_dim     = "#5a6480"
-            border       = "rgba(91,142,245,0.20)"
-            border_solid = "#b0b8d4"
-            hover        = "rgba(91,142,245,0.10)"
-            hover_solid  = "#d4daf0"
-            accent       = "#3a6fd8"
-            accent_red   = "#d32f2f"
-            title_bg     = "rgba(20, 28, 50, 255)"
-            title_text   = "#d8e4f8"
-            title_sep    = "rgba(0,0,0,0.12)"
-            win_border   = "rgba(91,142,245,0.30)"
-            bottom_bg    = "rgba(255,255,255,0.40)"
-            bottom_sep   = "rgba(91,142,245,0.15)"
-            btn_bg       = "rgba(255,255,255,0.60)"
-            btn_hover    = "rgba(255,255,255,0.85)"
-            btn_border   = "rgba(91,142,245,0.22)"
-            scrollbar    = "rgba(91,142,245,0.30)"
-            sb_track     = "rgba(0,0,0,0.05)"
-            tree_room_bg = "rgba(0,0,0,0.04)"
+        # ── Glassmorphism dark palette ────────────────────────────────────────
+        win_bg       = "rgba(22, 25, 40, 255)"
+        surface      = "rgba(255,255,255,0.07)"
+        surface_solid= "#1e2240"
+        text         = "#e8edf8"
+        text_dim     = "#7888aa"
+        border       = "rgba(255,255,255,0.11)"
+        border_solid = "#2e3458"
+        hover        = "rgba(255,255,255,0.09)"
+        hover_solid  = "#2a2f50"
+        accent       = "#5b8ef5"
+        accent_red   = "#e74c3c"
+        title_bg     = "rgba(10, 12, 22, 255)"
+        title_text   = "#c8d4f0"
+        title_sep    = "rgba(255,255,255,0.08)"
+        win_border   = "rgba(91,142,245,0.22)"
+        bottom_bg    = "rgba(10, 12, 22, 255)"
+        bottom_sep   = "rgba(255,255,255,0.08)"
+        btn_bg       = "rgba(255,255,255,0.14)"
+        btn_hover    = "rgba(255,255,255,0.24)"
+        btn_border   = "rgba(255,255,255,0.20)"
+        scrollbar    = "rgba(255,255,255,0.20)"
+        sb_track     = "rgba(255,255,255,0.05)"
+        tree_room_bg = "rgba(255,255,255,0.05)"
 
         self.setStyleSheet(f"""
             * {{ font-family: '{font_f}'; font-size: 15px; color: {text}; }}
@@ -1206,17 +1177,18 @@ class MainWindow(QMainWindow):
         """)
 
         # ── Кэш цветов для refresh_ui: пересоздаём при смене темы ────────────
-        self._cache_theme = theme_name
+        # FIX #7: только тёмная палитра — is_dark всегда True.
+        self._cache_theme = "Темная"
         self._theme_dirty = True   # сигнал refresh_ui: обновить _c_def / _br_def
         self._c_talk   = QColor("#2ecc71")
         self._c_mute   = QColor("#e74c3c")
         self._c_stream = QColor("#3498db")
-        self._c_def    = QColor("#d4d8e8") if is_dark else QColor("#1a1e2a")
+        self._c_def    = QColor("#d4d8e8")
         self._br_talk   = QBrush(self._c_talk)
         self._br_mute   = QBrush(self._c_mute)
         self._br_stream = QBrush(self._c_stream)
         self._br_def    = QBrush(self._c_def)
-        self._br_gray   = QBrush(QColor("#6e7a96") if is_dark else QColor("#8090a8"))
+        self._br_gray   = QBrush(QColor("#6e7a96"))
 
     def setup_hotkeys(self):
         """
@@ -1836,13 +1808,25 @@ class MainWindow(QMainWindow):
         # (update_status → отправляется ~1 раз/сек с каждого клиента при неизменном
         # mute/deaf). При 20 юзерах = до 20 full rebuild/сек на UI-потоке.
         # Сигнатура: tuple отсортированных (room, uid, nick, mute, deaf, is_streaming,
-        # avatar, status_icon, status_text) — учитывает всё что рисует дерево.
-        _new_sig = tuple(
-            (r, u['uid'], u['nick'], u.get('mute'), u.get('deaf'),
-             u.get('is_streaming'), u.get('avatar'), u.get('status_icon'),
-             u.get('status_text'))
-            for r, u_list in sorted(users_map.items())
-            for u in sorted(u_list, key=lambda x: x['uid'])
+        # avatar, status_icon, status_text) + СПИСОК КАНАЛОВ.
+        #
+        # FIX CHANNELS: default_rooms включён в подпись.
+        # Проблема: при создании/удалении пустого временного канала users_map
+        # не меняется (в канале нет пользователей) → подпись была идентична →
+        # ранний return → дерево не перерисовывалось → канал не появлялся/исчезал
+        # пока не происходило любое другое событие (mute, подключение юзера и т.п.).
+        # Решение: добавляем tuple(self.default_rooms) в подпись — как только
+        # _on_channel_list_updated или _on_channel_created/deleted изменят список
+        # каналов, следующий вызов refresh_ui немедленно перестроит дерево.
+        _new_sig = (
+            tuple(self.default_rooms),   # ← изменение списка каналов = rebuild
+            tuple(
+                (r, u['uid'], u['nick'], u.get('mute'), u.get('deaf'),
+                 u.get('is_streaming'), u.get('avatar'), u.get('status_icon'),
+                 u.get('status_text'))
+                for r, u_list in sorted(users_map.items())
+                for u in sorted(u_list, key=lambda x: x['uid'])
+            ),
         )
         if hasattr(self, '_users_map_sig') and self._users_map_sig == _new_sig:
             return  # ничего не изменилось — не трогаем дерево
@@ -1987,9 +1971,10 @@ class MainWindow(QMainWindow):
 
             # ВАЖН-6: тема меняется только через apply_theme() → флаг _theme_dirty.
             # Избегаем QSettings.value() (обращение к реестру) 10 раз/сек.
+            # FIX #7: только тёмная тема — цвета фиксированные.
             if self._theme_dirty:
                 self._theme_dirty = False
-                self._c_def  = QColor("#ecf0f1") if self._cache_theme == "Темная" else QColor("#444444")
+                self._c_def  = QColor("#ecf0f1")
                 self._br_def = QBrush(self._c_def)
 
             c_talk   = self._c_talk
@@ -2704,7 +2689,7 @@ class MainWindow(QMainWindow):
         print(f"[UI] Запрос создания канала: '{name}' (пароль: {'да' if password else 'нет'})")
 
     def _on_channel_created(self, channel_name: str):
-        """Сервер создал новый канал."""
+        """Сервер создал новый канал — обновляем список и сразу перестраиваем дерево."""
         names = [ch['name'] for ch in self._channel_list]
         if channel_name not in names:
             self._channel_list.append({
@@ -2712,17 +2697,30 @@ class MainWindow(QMainWindow):
                 'has_password': False,
                 'permanent':    False,
             })
+        # FIX CHANNELS: немедленно обновляем default_rooms чтобы следующий
+        # вызов refresh_ui (через ≤100 мс) увидел изменение в подписи дерева
+        # и перерисовал его. Без этого новый канал появлялся только после
+        # следующего события (mute/connect другого пользователя).
+        self._sync_default_rooms_from_channel_list()
         print(f"[UI] Канал создан: '{channel_name}'")
 
     def _on_channel_deleted(self, channel_name: str):
-        """Сервер удалил временный канал (он опустел)."""
+        """Сервер удалил временный канал (он опустел) — немедленно убираем из дерева."""
         self._channel_list = [
             ch for ch in self._channel_list
             if ch['name'] != channel_name
         ]
+        # FIX CHANNELS: то же — немедленный sync default_rooms → rebuild дерева
+        self._sync_default_rooms_from_channel_list()
         print(f"[UI] Канал удалён: '{channel_name}'")
         if self.current_room == channel_name:
             self.net.send_json({'action': 'join_room', 'room': 'General'})
+
+    def _sync_default_rooms_from_channel_list(self):
+        """Синхронизирует default_rooms из _channel_list без ожидания sync_users."""
+        permanent = [ch['name'] for ch in self._channel_list if ch.get('permanent', False)]
+        temporary = [ch['name'] for ch in self._channel_list if not ch.get('permanent', False)]
+        self.default_rooms = (permanent or ['General']) + sorted(temporary)
 
     def _on_join_room_denied(self, room: str, reason: str):
         """Вход в канал отклонён — запрашиваем пароль или показываем ошибку."""

@@ -7,7 +7,6 @@ from config import (
     WEBRTC_ICE_TIMEOUT,
 )
 
-# ── Опциональный импорт aiortc ────────────────────────────────────────────────
 try:
     from aiortc import (
         RTCPeerConnection, RTCSessionDescription,
@@ -21,42 +20,29 @@ except ImportError:
 
 
 # =============================================================================
-# WebRTCSFU — asyncio SFU для видео/аудио стримов
+# WebRTCSFU — asyncio SFU с поддержкой simulcast (HQ + LQ)
 # =============================================================================
 
 class WebRTCSFU:
     """
     asyncio-based SFU (Selective Forwarding Unit) для WebRTC видео/аудио.
 
-    Запускается в отдельном daemon-потоке с собственным asyncio event loop.
-    tcp_handler вызывает методы через asyncio.run_coroutine_threadsafe().
+    ─── Simulcast (HQ + LQ) ────────────────────────────────────────────────
+    Стример отправляет ДВА видеотрека в одном RTCPeerConnection:
+        1-й video track = HQ (добавлен первым через pc.addTrack в network_engine)
+        2-й video track = LQ (DXCamTrackLQ, добавлен вторым)
 
-    ─── Жизненный цикл стримера ────────────────────────────────────────────
-    1. tcp_handler получает CMD_WEBRTC_OFFER (role="streamer") → вызывает
-       handle_streamer_offer(uid, sdp, conn)
-    2. SFU создаёт RTCPeerConnection, принимает video/audio треки,
-       оборачивает их в MediaRelay
-    3. Ждёт завершения ICE-gathering (host-only на RadminVPN = ~50 мс)
-    4. Отправляет CMD_WEBRTC_ANSWER стримеру через conn.sendall()
+    SFU определяет порядок по счётчику on_track:
+        source_tracks = {'video_hq': ..., 'video_lq': ..., 'audio': ...}
 
-    ─── Жизненный цикл зрителя ─────────────────────────────────────────────
-    1. tcp_handler получает stream_watch_start → регистрирует в watchers,
-       вызывает handle_viewer_connect(viewer_uid, streamer_uid, viewer_conn)
-    2. SFU создаёт RTCPeerConnection для зрителя, добавляет реле-треки стримера
-    3. Создаёт offer, ждёт ICE-gathering, отправляет CMD_WEBRTC_OFFER зрителю
-    4. Зритель отвечает CMD_WEBRTC_ANSWER → handle_viewer_answer(uid, sdp)
+    Зритель выбирает качество в stream_watch_start:
+        {'action': 'stream_watch_start', 'streamer_uid': X, 'quality': 'lq'}
+    По умолчанию quality='hq'. Если LQ трек не пришёл от стримера —
+    fallback на HQ для всех зрителей.
 
     ─── ICE стратегия ──────────────────────────────────────────────────────
-    В RadminVPN все клиенты в одной виртуальной сети (26.x.x.x).
-    Host ICE кандидаты достаточны — STUN не нужен.
-    Используем "gather-and-send" вместо trickle ICE для простоты:
-    ждём завершения gathering, затем отправляем SDP со всеми кандидатами.
-    CMD_WEBRTC_ICE поддерживается для будущей совместимости с STUN.
-
-    ─── MediaRelay ──────────────────────────────────────────────────────────
-    Треки от одного RTCPeerConnection нельзя напрямую добавить в другой.
-    MediaRelay создаёт прокси-треки с общим буфером — один входящий трек
-    может быть подписан несколькими зрителями без копирования данных.
+    Host-only ICE (RadminVPN 26.x.x.x). STUN не нужен.
+    Gather-and-send: ждём завершения gathering, отправляем SDP целиком.
     """
 
     def __init__(self):
@@ -66,20 +52,22 @@ class WebRTCSFU:
         )
         self._thread.start()
 
-        # streamer_uid → {'pc': RTCPeerConnection, 'relay': MediaRelay,
-        #                  'tracks': {kind: relayed_track}, 'conn': conn}
+        # streamer_uid → {
+        #   'pc':           RTCPeerConnection,
+        #   'relay':        MediaRelay,
+        #   'tracks':       {key: relayed_track},     # для совместимости
+        #   'source_tracks':{key: original_track},    # video_hq/video_lq/audio
+        #   'conn':         socket,
+        # }
         self._streamer_entries: dict = {}
 
-        # viewer_uid → {'pc': RTCPeerConnection, 'conn': conn,
-        #                'streamer_uid': int}
+        # viewer_uid → {'pc': RTCPeerConnection, 'conn': conn, 'streamer_uid': int}
         self._viewer_entries: dict = {}
 
-        # Буфер ожидающих зрителей: streamer_uid → [(viewer_uid, conn)]
-        # Используется если зритель подключился до завершения offer стримера.
+        # Буфер ожидающих зрителей: streamer_uid → [(viewer_uid, conn, quality)]
         self._pending_viewers: dict[int, list] = {}
 
-        # Входящие ICE-кандидаты до момента создания PC:
-        # uid → [candidate_dict]
+        # Входящие ICE-кандидаты до создания PC
         self._pending_ice: dict[int, list] = {}
 
     # ------------------------------------------------------------------
@@ -91,10 +79,6 @@ class WebRTCSFU:
         self._loop.run_forever()
 
     def call_async(self, coro):
-        """
-        Отправляет корутину в asyncio loop из threading-контекста (tcp_handler).
-        Возвращает concurrent.futures.Future — можно игнорировать для fire-and-forget.
-        """
         return asyncio.run_coroutine_threadsafe(coro, self._loop)
 
     # ------------------------------------------------------------------
@@ -102,14 +86,6 @@ class WebRTCSFU:
     # ------------------------------------------------------------------
 
     async def _send_async(self, conn, msg: dict) -> None:
-        """
-        Отправляет JSON-пакет клиенту из asyncio-контекста.
-        run_in_executor: conn.sendall() блокирующий → не блокируем asyncio loop.
-
-        [FIX-4] asyncio.get_event_loop() → asyncio.get_running_loop().
-        get_running_loop() — правильный способ получить loop из coroutine.
-        get_event_loop() устарел в Python 3.10+ в уже запущенном loop.
-        """
         payload = json.dumps(msg).encode('utf-8')
         loop = asyncio.get_running_loop()
         try:
@@ -119,13 +95,6 @@ class WebRTCSFU:
 
     @staticmethod
     async def _wait_ice_gathering(pc, timeout: float = WEBRTC_ICE_TIMEOUT) -> None:
-        """
-        Ждёт завершения ICE gathering с таймаутом.
-        На RadminVPN (host-only ICE) gathering завершается за ~50–200 мс.
-
-        [FIX-4] asyncio.get_event_loop() → asyncio.get_running_loop().
-        Оба вызова заменены — метод вызывается только из async-контекста.
-        """
         loop     = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         while pc.iceGatheringState != "complete":
@@ -144,15 +113,13 @@ class WebRTCSFU:
         """
         Принимает WebRTC offer от стримера.
 
-        1. Закрывает старый PC стримера (переподключение).
-        2. Создаёт новый RTCPeerConnection.
-        3. on("track") → оборачивает трек в MediaRelay, сохраняет.
-        4. setRemoteDescription(offer) → createAnswer → setLocalDescription.
-        5. Ждёт завершения ICE gathering.
-        6. Отправляет answer стримеру.
-        7. Обрабатывает ожидающих зрителей.
+        Порядок video треков в on_track:
+          1-й video → video_hq (DXCamTrack)
+          2-й video → video_lq (DXCamTrackLQ)
+        Аудио → 'audio'.
+
+        Счётчик _video_count[] отслеживает порядок в замыкании.
         """
-        # Закрываем предыдущую сессию если была
         old = self._streamer_entries.pop(streamer_uid, None)
         if old:
             try:
@@ -167,34 +134,42 @@ class WebRTCSFU:
         entry = {
             'pc':            pc,
             'relay':         relay,
-            'tracks':        {},   # kind → последний relayed_track (для проверки готовности)
-            'source_tracks': {},   # kind → оригинальный трек стримера (для re-subscribe)
+            'tracks':        {},
+            'source_tracks': {},
             'conn':          conn,
         }
         self._streamer_entries[streamer_uid] = entry
 
+        # Счётчик video-треков в замыкании: 0=HQ, 1=LQ
+        _video_count = [0]
+
         @pc.on("track")
         def on_track(track):
-            # MediaRelay.subscribe(buffered=False): нет буферизации → минимальная задержка.
-            # Несколько зрителей подпишутся на один и тот же физический трек.
-            relayed = relay.subscribe(track, buffered=False)
-            entry['tracks'][track.kind]        = relayed  # для проверки готовности
-            entry['source_tracks'][track.kind] = track    # оригинал для re-subscribe
-            print(
-                f"[SFU] Стример uid={streamer_uid}: трек получен kind={track.kind}"
-            )
-            # Обрабатываем ожидавших зрителей (подключились до стримера).
-            # ensure_future — не блокируем on_track callback.
-            pending = self._pending_viewers.pop(streamer_uid, [])
-            for v_uid, v_conn in pending:
-                asyncio.ensure_future(
-                    self.handle_viewer_connect(v_uid, streamer_uid, v_conn)
+            if track.kind == 'video':
+                key = 'video_hq' if _video_count[0] == 0 else 'video_lq'
+                _video_count[0] += 1
+                print(
+                    f"[SFU] Стример uid={streamer_uid}: "
+                    f"video трек #{_video_count[0]-1} → {key}"
                 )
+            else:
+                key = track.kind   # 'audio'
+
+            relayed = relay.subscribe(track, buffered=False)
+            entry['tracks'][key]        = relayed
+            entry['source_tracks'][key] = track
+
+            # Обрабатываем зрителей, ожидавших этого трека
+            # (pending зрители добавляются при watch_start до готовности стримера)
+            if key in ('video_hq', 'audio'):
+                pending = self._pending_viewers.pop(streamer_uid, [])
+                for v_uid, v_conn, v_quality in pending:
+                    asyncio.ensure_future(
+                        self.handle_viewer_connect(v_uid, streamer_uid, v_conn, v_quality)
+                    )
 
         @pc.on("icecandidate")
         def on_ice(candidate):
-            # Trickle ICE (для будущей поддержки STUN).
-            # При host-only ICE кандидаты уже в SDP после gathering → эта ветка редка.
             if candidate:
                 asyncio.ensure_future(self._send_async(conn, {
                     'action':     CMD_WEBRTC_ICE,
@@ -213,12 +188,10 @@ class WebRTCSFU:
             if state in ("failed", "closed", "disconnected"):
                 await self.close_streamer(streamer_uid)
 
-        # Принимаем offer, создаём answer
         try:
             await pc.setRemoteDescription(
                 RTCSessionDescription(sdp=sdp, type=sdp_type)
             )
-            # Добавляем буферизованные ICE-кандидаты (если клиент использует trickle)
             for ice in self._pending_ice.pop(streamer_uid, []):
                 try:
                     from aiortc import RTCIceCandidate
@@ -233,8 +206,6 @@ class WebRTCSFU:
 
             answer = await pc.createAnswer()
             await pc.setLocalDescription(answer)
-
-            # Ждём завершения ICE gathering (host-only = быстро)
             await self._wait_ice_gathering(pc)
 
             await self._send_async(conn, {
@@ -249,38 +220,46 @@ class WebRTCSFU:
             self._streamer_entries.pop(streamer_uid, None)
 
     # ------------------------------------------------------------------
-    # Зритель: создание offer и подключение
+    # Зритель: создание offer с нужным качеством (HQ или LQ)
     # ------------------------------------------------------------------
 
     async def handle_viewer_connect(
-        self, viewer_uid: int, streamer_uid: int, viewer_conn
+        self,
+        viewer_uid:   int,
+        streamer_uid: int,
+        viewer_conn,
+        quality:      str = 'hq',
     ) -> None:
         """
-        Создаёт WebRTC соединение для нового зрителя.
+        Создаёт WebRTC соединение для зрителя.
 
-        Если треки стримера ещё не готовы — кладём зрителя в pending_viewers.
-        Как только on("track") от стримера сработает — pending обработается автоматически.
+        quality='hq' → маршрутизируем video_hq трек (default).
+        quality='lq' → маршрутизируем video_lq трек (слабый зритель).
 
-        Порядок:
-        1. Проверяем наличие relay-треков стримера.
-        2. Создаём RTCPeerConnection для зрителя.
-        3. Добавляем relay-треки: viewer_pc.addTrack(relayed_track).
-        4. on("track") → video_engine.add_receiver() (на клиентской стороне).
-        5. createOffer → setLocalDescription → wait ICE → send offer зрителю.
+        Fallback: если LQ трек не пришёл от стримера (старая версия клиента
+        без simulcast) → всем зрителям отдаём video_hq.
+
+        Аудиотрек общий для всех зрителей — не зависит от quality.
+
+        КРИТИЧНО: relay.subscribe() заново для каждого зрителя.
+        Нельзя переиспользовать relayed_track из entry['tracks'] —
+        при закрытии старого viewer PC aiortc вызывает track.stop() →
+        relayed_track.readyState = 'ended' → нулевой RTP поток.
         """
         entry = self._streamer_entries.get(streamer_uid)
-        if entry is None or not entry['tracks']:
-            # Стример ещё не прислал offer или треки не готовы
+
+        # Проверяем, что нужный трек уже готов
+        hq_ready = entry is not None and 'video_hq' in entry.get('source_tracks', {})
+        if not hq_ready:
             self._pending_viewers.setdefault(streamer_uid, []).append(
-                (viewer_uid, viewer_conn)
+                (viewer_uid, viewer_conn, quality)
             )
             print(
                 f"[SFU] Зритель uid={viewer_uid}: стример uid={streamer_uid} "
-                f"ещё не готов — помещён в pending"
+                f"ещё не готов — помещён в pending (quality={quality})"
             )
             return
 
-        # Закрываем предыдущий PC зрителя (переподключение)
         old = self._viewer_entries.pop(viewer_uid, None)
         if old:
             try:
@@ -291,30 +270,29 @@ class WebRTCSFU:
         cfg = RTCConfiguration(iceServers=[])
         pc  = RTCPeerConnection(cfg)
 
-        # Добавляем СВЕЖУЮ relay-подписку для нового зрителя.
-        #
-        # КРИТИЧНО: нельзя переиспользовать relayed_track из entry['tracks'].
-        # Когда предыдущий viewer PC закрывается (old['pc'].close()), aiortc
-        # вызывает track.stop() на каждом отправителе → relayed_track.readyState
-        # становится "ended". Добавление ended-трека в новый PC даёт подключение
-        # (ICE state → connected) но нулевой поток RTP → бесконечный timeout 5s.
-        #
-        # Решение: для каждого нового зрителя делаем relay.subscribe() заново —
-        # это создаёт новый RelayedTrack с readyState="live" от того же источника.
         source_tracks = entry.get('source_tracks', {})
-        if source_tracks:
-            for kind, source_track in source_tracks.items():
-                fresh_relayed = entry['relay'].subscribe(source_track, buffered=False)
-                pc.addTrack(fresh_relayed)
-        else:
-            # Фолбэк для старых entry без source_tracks (не должно происходить)
-            for kind, relayed_track in entry['tracks'].items():
-                pc.addTrack(relayed_track)
+        relay         = entry['relay']
+
+        # Выбираем video ключ по quality; fallback на video_hq
+        video_key = 'video_lq' if quality == 'lq' else 'video_hq'
+        if video_key not in source_tracks:
+            video_key = 'video_hq'   # LQ не пришёл → даём HQ
+            if quality == 'lq':
+                print(
+                    f"[SFU] Зритель uid={viewer_uid}: LQ трек недоступен "
+                    f"(стример без simulcast) — используем HQ"
+                )
+
+        for key, source_track in source_tracks.items():
+            if key == video_key or key == 'audio':
+                fresh = relay.subscribe(source_track, buffered=False)
+                pc.addTrack(fresh)
 
         self._viewer_entries[viewer_uid] = {
             'pc':           pc,
             'conn':         viewer_conn,
             'streamer_uid': streamer_uid,
+            'quality':      video_key,
         }
 
         @pc.on("icecandidate")
@@ -350,8 +328,8 @@ class WebRTCSFU:
                 'type':         pc.localDescription.type,
             })
             print(
-                f"[SFU] Offer отправлен зрителю uid={viewer_uid} "
-                f"(стример uid={streamer_uid})"
+                f"[SFU] Offer → зритель uid={viewer_uid} "
+                f"(стример uid={streamer_uid}, quality={video_key})"
             )
         except Exception as e:
             print(f"[SFU] handle_viewer_connect error uid={viewer_uid}: {e}")
@@ -364,10 +342,6 @@ class WebRTCSFU:
     async def handle_viewer_answer(
         self, viewer_uid: int, sdp: str, sdp_type: str
     ) -> None:
-        """
-        Принимает WebRTC answer от зрителя.
-        Завершает ICE negotiation на стороне сервера.
-        """
         entry = self._viewer_entries.get(viewer_uid)
         if entry is None:
             print(f"[SFU] handle_viewer_answer: нет PC для uid={viewer_uid}")
@@ -376,7 +350,6 @@ class WebRTCSFU:
             await entry['pc'].setRemoteDescription(
                 RTCSessionDescription(sdp=sdp, type=sdp_type)
             )
-            # Добавляем буферизованные ICE-кандидаты
             for ice in self._pending_ice.pop(viewer_uid, []):
                 try:
                     from aiortc import RTCIceCandidate
@@ -399,10 +372,6 @@ class WebRTCSFU:
     async def handle_ice_candidate(
         self, uid: int, candidate_dict: dict
     ) -> None:
-        """
-        Добавляет ICE-кандидат к нужному PC.
-        Буферизует если PC ещё не создан (гонка: ICE пришёл до offer/answer).
-        """
         pc = None
         if uid in self._streamer_entries:
             pc = self._streamer_entries[uid]['pc']
@@ -410,7 +379,6 @@ class WebRTCSFU:
             pc = self._viewer_entries[uid]['pc']
 
         if pc is None:
-            # PC ещё не создан — буферизуем
             self._pending_ice.setdefault(uid, []).append(candidate_dict)
             return
 
@@ -430,10 +398,6 @@ class WebRTCSFU:
     # ------------------------------------------------------------------
 
     async def close_streamer(self, streamer_uid: int) -> None:
-        """
-        Закрывает PC стримера и все PC его зрителей.
-        Вызывается при CMD_STREAM_STOP или потере соединения.
-        """
         entry = self._streamer_entries.pop(streamer_uid, None)
         if entry:
             try:
@@ -442,7 +406,6 @@ class WebRTCSFU:
                 pass
             print(f"[SFU] Стример uid={streamer_uid}: PC закрыт")
 
-        # Закрываем всех зрителей этого стримера
         victims = [
             v_uid for v_uid, ve in list(self._viewer_entries.items())
             if ve['streamer_uid'] == streamer_uid
@@ -453,10 +416,6 @@ class WebRTCSFU:
         self._pending_viewers.pop(streamer_uid, None)
 
     async def close_viewer(self, viewer_uid: int) -> None:
-        """
-        Закрывает PC зрителя.
-        Вызывается при stream_watch_stop или потере соединения.
-        """
         entry = self._viewer_entries.pop(viewer_uid, None)
         if entry:
             try:
@@ -466,21 +425,10 @@ class WebRTCSFU:
             print(f"[SFU] Зритель uid={viewer_uid}: PC закрыт")
 
     # ------------------------------------------------------------------
-    # Остановка SFU (при закрытии сервера)
+    # Остановка SFU
     # ------------------------------------------------------------------
 
     def shutdown(self) -> None:
-        """
-        Полная остановка SFU: закрывает все RTCPeerConnection и event loop.
-
-        Вызывается из SFUServer.stop_gracefully() / stop_silent() при
-        завершении работы встроенного сервера.
-
-        Порядок:
-          1. Запускаем coroutine _close_all() — закрывает все PC (стримеры + зрители).
-          2. Ждём завершения (max 1 сек) чтобы aiortc успел отправить BYE.
-          3. Останавливаем asyncio loop → run_forever() завершается → поток выходит.
-        """
         if self._loop is None or self._loop.is_closed():
             return
 
@@ -489,7 +437,6 @@ class WebRTCSFU:
                 await self.close_streamer(uid)
             for uid in list(self._viewer_entries.keys()):
                 await self.close_viewer(uid)
-            # Очищаем pending буферы
             self._pending_viewers.clear()
             self._pending_ice.clear()
 
