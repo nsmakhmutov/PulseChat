@@ -501,9 +501,6 @@ except ImportError:
 try:
     import pyaudiowpatch as _pyaudio
     PYAUDIOWPATCH_AVAILABLE = True
-    print("[StreamAudio] pyaudiowpatch доступен — будет использован для WASAPI Loopback")
 except ImportError:
     _pyaudio = None
     PYAUDIOWPATCH_AVAILABLE = False
-    print("[StreamAudio] pyaudiowpatch не найден. "
-          "Для надёжного захвата системного звука: pip install pyaudiowpatch")

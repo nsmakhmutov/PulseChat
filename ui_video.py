@@ -463,6 +463,14 @@ class VideoOverlay(QFrame):
         self.btn_deafen.setIcon(QIcon(resource_path(icon)))
         self.btn_deafen.blockSignals(False)
 
+    def set_stream_volume_value(self, vol: float):
+        """
+        Синхронизирует ползунок попапа с текущей громкостью AudioHandler.
+        Вызывается из MainWindow.open_video_window() после подключения сигнала.
+        Не эмитит stream_volume_changed — только обновляет визуальное состояние.
+        """
+        self._vol_popup.set_value(vol)
+
     def set_fullscreen_icon(self, is_fullscreen: bool):
         """Переключить иконку кнопки fullscreen."""
         self.btn_fs.setText("❐" if is_fullscreen else "⛶")

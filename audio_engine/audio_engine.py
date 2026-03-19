@@ -237,6 +237,23 @@ class AudioHandler(QObject):
         self._local_sounds: list = []
         self._local_sounds_lock = threading.Lock()
 
+        # ── Стриминговый аудио-буфер (WebRTC стрим-аудио зрителя) ────────────
+        # Архитектура: pre-allocated flat numpy ring buffer.
+        # Полностью исключает np.concatenate и np.empty в RT audio_callback:
+        #   - Запись (asyncio thread): copy в конец _stream_buf
+        #   - Чтение (PortAudio callback): memmove хвоста в начало (одна операция)
+        #
+        # Размер: CHUNK_SIZE * 30 = ~600мс @ 48кГц — покрывает RadminVPN-джиттер.
+        # При переполнении пишем поверх старых данных (overwrite oldest).
+        _STREAM_BUF_CHUNKS = 30
+        self._STREAM_BUF_SIZE: int  = CHUNK_SIZE * _STREAM_BUF_CHUNKS
+        self._stream_buf:  np.ndarray = np.zeros(self._STREAM_BUF_SIZE + CHUNK_SIZE,
+                                                  dtype=np.float32)
+        self._stream_fill: int = 0          # сколько семплов в буфере
+        self._stream_lock  = threading.Lock()
+        self._stream_vol:   float = 1.0
+        self._stream_active: bool = False
+
         # --- Стрим-аудио (WebRTC) ---
         # Воспроизведение стрим-аудио на стороне зрителя теперь обрабатывается
         # через WebRTC (RTCPeerConnection + AudioStreamTrack).
@@ -387,6 +404,76 @@ class AudioHandler(QObject):
                 self._local_sounds.append({'data': data, 'pos': 0, 'vol': float(vol)})
         except Exception as e:
             print(f"[Audio] play_internal_sound error: {e}")
+
+    def add_stream_audio(self, data: np.ndarray, sr: int, vol: float = 1.0) -> None:
+        """
+        Пишет PCM-чанк стрим-аудио (WebRTC) в pre-allocated кольцевой буфер.
+        Нет np.concatenate, нет np.empty — нет аллокаций на горячем пути.
+
+        data: aiortc frame.to_ndarray() — (channels, samples) или (1, samples*ch)
+        sr  : частота дискретизации источника
+        vol : громкость (применяется здесь, не в callback)
+        """
+        try:
+            data = np.asarray(data, dtype=np.float32)
+
+            # Нормализация формы: любой 2D → плоский float32 моно
+            if data.ndim == 2:
+                # aiortc s16 interleaved: (1, samples*channels)
+                if data.shape[0] == 1 and data.shape[1] >= 4:
+                    ch = 2   # Opus всегда стерео
+                    data = data.reshape(-1, ch)
+                # Теперь (samples, channels) или (channels, samples)
+                # Определяем: если строк > 2, то это (samples, channels)
+                if data.shape[0] > 2 and data.shape[1] <= 2:
+                    mono = np.mean(data, axis=1).astype(np.float32)
+                else:
+                    # (channels, samples) — транспонируем
+                    mono = np.mean(data, axis=0).astype(np.float32)
+            elif data.ndim == 1:
+                mono = data
+            else:
+                return
+
+            # Ресемплинг при необходимости
+            if sr != SAMPLE_RATE:
+                target_len = int(round(len(mono) * SAMPLE_RATE / sr))
+                if target_len > 0:
+                    x_old = np.linspace(0.0, 1.0, len(mono), dtype=np.float64)
+                    x_new = np.linspace(0.0, 1.0, target_len, dtype=np.float64)
+                    mono  = np.interp(x_new, x_old, mono).astype(np.float32)
+
+            if vol != 1.0:
+                mono = mono * vol
+
+            n = len(mono)
+            with self._stream_lock:
+                # Если переполнение — отбрасываем старые данные
+                if self._stream_fill + n > self._STREAM_BUF_SIZE:
+                    drop = self._stream_fill + n - self._STREAM_BUF_SIZE
+                    # Сдвигаем буфер влево, убирая самые старые семплы
+                    remain = self._stream_fill - drop
+                    if remain > 0:
+                        self._stream_buf[:remain] = self._stream_buf[drop:self._stream_fill]
+                    self._stream_fill = remain
+
+                # Копируем без аллокации
+                self._stream_buf[self._stream_fill:self._stream_fill + n] = mono
+                self._stream_fill += n
+                self._stream_active = True
+
+        except Exception as e:
+            print(f"[Audio] add_stream_audio error: {e}")
+
+    def stop_stream_playback(self) -> None:
+        """Останавливает стрим-аудио и сбрасывает буфер. Вызывать при stop_watching()."""
+        self._stream_active = False
+        with self._stream_lock:
+            self._stream_fill = 0
+
+    def set_stream_volume(self, vol: float) -> None:
+        """Устанавливает громкость стрим-аудио (0.0–2.0)."""
+        self._stream_vol = max(0.0, min(float(vol), 2.0))
 
     def set_nr_mode(self, mode: int):
         """
@@ -696,6 +783,12 @@ class AudioHandler(QObject):
                 pass
 
         self.mix_buffer.fill(0)
+        # BUG-FIX: _n_active инициализируем до блока deafened.
+        # Без этого при is_deafened=True переменная не создаётся, но используется
+        # ниже в блоке _stream_active → UnboundLocalError в CFFI callback.
+        # При deafen активных голосовых спикеров нет (зритель не слышит комнату),
+        # поэтому 0 — корректное значение: auto-ducking стрима отключается (factor=1.0).
+        _n_active = 0
         if not self._is_deafened.is_set():
             # ── N-speaker headroom ────────────────────────────────────────────
             # Проблема: 3+ участников говорят одновременно → сумма амплитуд
@@ -835,6 +928,36 @@ class AudioHandler(QObject):
                     if snd['pos'] < len(snd['data']):
                         active.append(snd)
             self._local_sounds = active
+
+        # ── Стриминговое аудио зрителя (WebRTC) ─────────────────────────────
+        # Читаем CHUNK_SIZE семплов из кольцевого буфера.
+        # Lock — только на стороне записи (asyncio thread) и здесь при мemmove.
+        # Нет np.concatenate, нет np.empty — нет аллокаций в RT-path.
+        # Auto-ducking: при активных голосах приглушаем игру до 40%.
+        if self._stream_active:
+            with self._stream_lock:
+                avail = self._stream_fill
+
+                if avail >= CHUNK_SIZE:
+                    # Нормальный путь: читаем CHUNK_SIZE семплов
+                    _current_vol = self._stream_vol * (0.4 if _n_active > 0 else 1.0)
+                    self.mix_buffer += self._stream_buf[:CHUNK_SIZE] * _current_vol
+                    # Сдвигаем остаток без аллокации
+                    remaining = avail - CHUNK_SIZE
+                    if remaining > 0:
+                        self._stream_buf[:remaining] = self._stream_buf[CHUNK_SIZE:avail]
+                    self._stream_fill = remaining
+
+                elif avail > 0:
+                    # Underrun: есть данные, но меньше CHUNK_SIZE.
+                    # Fade-out по убывающей — плавный переход в тишину без щелчка.
+                    _current_vol = self._stream_vol * (0.4 if _n_active > 0 else 1.0)
+                    _fade = np.linspace(1.0, 0.0, avail, dtype=np.float32)
+                    self.mix_buffer[:avail] += (
+                        self._stream_buf[:avail] * _fade * _current_vol
+                    )
+                    self._stream_fill = 0
+                # else: полный underrun — тишина, не трогаем mix_buffer
 
         # ── Математически чистый tanh soft-clipper ───────────────────────────
         # Заменяет старый пропорциональный лимитер (self.mix_buffer *= k).

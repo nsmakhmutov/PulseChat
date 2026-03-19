@@ -154,19 +154,50 @@ class WebRTCSFU:
                 )
             else:
                 key = track.kind   # 'audio'
+                print(
+                    f"[SFU] Стример uid={streamer_uid}: "
+                    f"✔ audio трек получен"
+                )
 
             relayed = relay.subscribe(track, buffered=False)
             entry['tracks'][key]        = relayed
             entry['source_tracks'][key] = track
 
-            # Обрабатываем зрителей, ожидавших этого трека
-            # (pending зрители добавляются при watch_start до готовности стримера)
-            if key in ('video_hq', 'audio'):
+            # ── Флаш pending-зрителей ────────────────────────────────────────
+            #
+            # Аудио трек пришёл → все треки готовы → флашим немедленно.
+            # video_hq пришёл → ставим отложенный флаш через 500 мс:
+            #   RadminVPN может давать задержку между треками до 300мс.
+            #   Если аудио придёт за это время — флаш выше отработает раньше.
+            #   Если нет (stream_audio=False) — флашим без аудио через 500мс.
+            #
+            if key == 'audio':
                 pending = self._pending_viewers.pop(streamer_uid, [])
                 for v_uid, v_conn, v_quality in pending:
                     asyncio.ensure_future(
                         self.handle_viewer_connect(v_uid, streamer_uid, v_conn, v_quality)
                     )
+                if pending:
+                    print(
+                        f"[SFU] Стример uid={streamer_uid}: аудио готов — "
+                        f"флаш {len(pending)} pending-зрителей"
+                    )
+
+            elif key == 'video_hq':
+                # Отложенный флаш: 500 мс на приход LQ + аудио-трека
+                async def _fallback_flush(s_uid=streamer_uid):
+                    await asyncio.sleep(0.50)
+                    pending = self._pending_viewers.pop(s_uid, [])
+                    if pending:
+                        print(
+                            f"[SFU] Стример uid={s_uid}: отложенный флаш "
+                            f"(аудио не пришло за 500мс) — {len(pending)} зрителей"
+                        )
+                        for v_uid, v_conn, v_quality in pending:
+                            asyncio.ensure_future(
+                                self.handle_viewer_connect(v_uid, s_uid, v_conn, v_quality)
+                            )
+                asyncio.ensure_future(_fallback_flush())
 
         @pc.on("icecandidate")
         def on_ice(candidate):

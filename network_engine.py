@@ -89,6 +89,16 @@ except ImportError:
     RTCConfiguration = None
     print("[Net] WARNING: aiortc не установлен — WebRTC функции недоступны")
 
+# SystemAudioTrack: захват системного звука для трансляции зрителям.
+# Импортируем лениво чтобы не падать если audio_engine недоступен.
+try:
+    from audio_engine.audio_capture import SystemAudioTrack
+    SYSTEM_AUDIO_AVAILABLE = True
+except ImportError:
+    SystemAudioTrack = None
+    SYSTEM_AUDIO_AVAILABLE = False
+    print("[Net] WARNING: SystemAudioTrack недоступен — системный звук в стриме отключён")
+
 
 class NetworkClient(QObject):
     connected           = pyqtSignal(dict)
@@ -193,6 +203,11 @@ class NetworkClient(QObject):
 
         # RTCPeerConnection зрителя (если текущий клиент смотрит)
         self._viewer_pc   = None
+
+        # SystemAudioTrack — захват системного звука для трансляции.
+        # Создаётся в _start_streaming_coro, останавливается в stop_streaming_webrtc.
+        # Ссылка нужна чтобы корректно вызвать .stop() и освободить DLL-захват.
+        self._system_audio_track: "SystemAudioTrack | None" = None
 
         self._init_sockets()
 
@@ -768,9 +783,9 @@ class NetworkClient(QObject):
             print("[Net] start_streaming_webrtc: VideoEngine.start_streaming() вернул False")
             return
 
-        self._run_in_webrtc_loop(self._start_streaming_coro())
+        self._run_in_webrtc_loop(self._start_streaming_coro(settings))
 
-    async def _start_streaming_coro(self) -> None:
+    async def _start_streaming_coro(self, settings: dict | None = None) -> None:
         """
         Корутина создания WebRTC PC стримера.
 
@@ -801,6 +816,24 @@ class NetworkClient(QObject):
         if lq_track is not None:
             pc.addTrack(lq_track)
             print("[Net] Simulcast LQ трек добавлен в RTCPeerConnection")
+
+        # Системный звук: захват через WASAPI Process Loopback DLL.
+        # Добавляется ТОЛЬКО если пользователь включил "Транслировать звук" в настройках.
+        # DLL исключает звук самого InPulse → зрители не слышат голосовой чат стримера.
+        _stream_audio = (settings or {}).get('stream_audio', False)
+        if _stream_audio and SYSTEM_AUDIO_AVAILABLE and SystemAudioTrack is not None:
+            try:
+                audio_device_idx = (settings or {}).get('audio_device_idx', None)
+                self._system_audio_track = SystemAudioTrack(device_idx=audio_device_idx)
+                pc.addTrack(self._system_audio_track)
+                print("[Net] SystemAudioTrack добавлен в RTCPeerConnection")
+            except Exception as e:
+                print(f"[Net] SystemAudioTrack ошибка инициализации: {e}")
+                self._system_audio_track = None
+        elif _stream_audio and not SYSTEM_AUDIO_AVAILABLE:
+            print("[Net] SystemAudioTrack недоступен — стрим без системного звука (DLL не найдена?)")
+        else:
+            print("[Net] Системный звук отключён в настройках трансляции")
 
         @pc.on("icecandidate")
         def on_ice(candidate):
@@ -860,12 +893,20 @@ class NetworkClient(QObject):
     def stop_streaming_webrtc(self) -> None:
         """
         Останавливает WebRTC-стрим.
-        Закрывает PC стримера и останавливает DXCamTrack.
+        Закрывает PC стримера, останавливает DXCamTrack и SystemAudioTrack.
         Должен вызываться вместе с (или после) CMD_STREAM_STOP.
         """
         if self._streamer_pc is not None:
             self._run_in_webrtc_loop(self._close_pc_coro(self._streamer_pc))
             self._streamer_pc = None
+
+        # Останавливаем захват системного звука — DLL::StopCapture()
+        if self._system_audio_track is not None:
+            try:
+                self._system_audio_track.stop()
+            except Exception as e:
+                print(f"[Net] SystemAudioTrack stop error: {e}")
+            self._system_audio_track = None
 
         if self.video:
             self.video.stop_streaming()
@@ -922,7 +963,7 @@ class NetworkClient(QObject):
 
         1. Закрывает старый viewer PC (если был).
         2. Создаёт новый RTCPeerConnection.
-        3. on("track") → VideoEngine.add_receiver(streamer_uid, track).
+        3. on("track"): видео → VideoEngine.add_receiver; аудио → _recv_stream_audio_coro.
         4. setRemoteDescription(offer) → createAnswer → setLocalDescription.
         5. Ждёт ICE gathering → отправляет answer серверу.
         """
@@ -945,6 +986,12 @@ class NetworkClient(QObject):
             )
             if track.kind == "video" and self.video:
                 self.video.add_receiver(streamer_uid, track)
+            elif track.kind == "audio":
+                # Запускаем recv-цикл в WebRTC loop.
+                # Без этого aiortc переполняет jitter-buffer → тишина.
+                asyncio.ensure_future(
+                    self._recv_stream_audio_coro(track, streamer_uid)
+                )
 
         @pc.on("icecandidate")
         def on_ice(candidate):
@@ -986,6 +1033,68 @@ class NetworkClient(QObject):
             print(f"[Net] _handle_viewer_offer_coro error: {e}")
             if self._viewer_pc is pc:
                 self._viewer_pc = None
+
+    async def _recv_stream_audio_coro(self, track, streamer_uid: int) -> None:
+        """
+        Вычитывает аудио-фреймы от стримера и направляет в
+        AudioHandler.add_stream_audio() — pre-allocated ring buffer.
+        Нет перекрытия фреймов, нет аллокаций в RT-path → нет щелчков.
+        """
+        print(f"[Net] StreamAudio receiver запущен для стримера uid={streamer_uid}")
+        _first = True
+        _frame_count = 0
+
+        try:
+            while True:
+                try:
+                    frame = await asyncio.wait_for(track.recv(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    continue
+                except Exception as e:
+                    print(f"[Net] StreamAudio recv error (uid={streamer_uid}): {e}")
+                    break
+
+                try:
+                    arr = frame.to_ndarray()
+
+                    if arr.dtype != np.float32:
+                        arr = arr.astype(np.float32) / 32768.0
+
+                    # add_stream_audio сам разбирает формат (interleaved/planar)
+                    # и делает усреднение каналов → моно
+
+                    sr = frame.sample_rate or 48000
+
+                    if _first:
+                        _first = False
+                        peak = float(np.abs(arr).max())
+                        print(
+                            f"[Net] StreamAudio: первый фрейм uid={streamer_uid} "
+                            f"sr={sr} shape={arr.shape} peak={peak:.4f}"
+                        )
+
+                    _frame_count += 1
+                    if _frame_count % 500 == 0:
+                        print(
+                            f"[Net] StreamAudio: {_frame_count} фреймов "
+                            f"от uid={streamer_uid}"
+                        )
+
+                    # ГЛАВНЫЙ ФИХ: add_stream_audio, НЕ play_internal_sound
+                    if self.audio is not None and hasattr(self.audio, 'add_stream_audio'):
+                        self.audio.add_stream_audio(arr, sr, vol=1.0)
+
+                except Exception as e:
+                    print(
+                        f"[Net] StreamAudio frame decode error "
+                        f"(uid={streamer_uid}): {e}"
+                    )
+
+        finally:
+            print(
+                f"[Net] StreamAudio receiver завершён (uid={streamer_uid}, "
+                f"фреймов={_frame_count})"
+            )
 
     async def _handle_ice_candidate_coro(
         self, role: str, candidate_dict: dict

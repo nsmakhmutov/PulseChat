@@ -2219,9 +2219,13 @@ class MainWindow(QMainWindow):
             # Установить актуальное состояние прямо сейчас
             w.sync_audio_state(self.audio.is_muted, self.audio.is_deafened)
 
-            # Громкость стрима — управляется VideoWindow через WebRTC (не через AudioHandler).
-            # overlay_stream_volume_changed подключается внутри VideoWindow к своему
-            # WebRTC AudioReceiver напрямую (будет реализовано в Шаге 7: ui_video.py).
+            # Громкость стрима: подключаем к AudioHandler.set_stream_volume().
+            # AudioHandler._stream_vol управляет усилением в audio_callback (0.0–2.0).
+            # При deafen auto-ducking (0.4×) применяется поверх этого коэффициента.
+            w.overlay_stream_volume_changed.connect(self.audio.set_stream_volume)
+            # Синхронизируем ползунок попапа с текущим значением движка,
+            # чтобы при повторном открытии окна ползунок не сбрасывался в 1.0.
+            w.overlay.set_stream_volume_value(self.audio._stream_vol)
 
             w.show()
             self.stream_windows[uid] = w
