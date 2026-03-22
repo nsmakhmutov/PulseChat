@@ -773,6 +773,17 @@ class ChatMessageWidget(QWidget):
                     if e.button() == Qt.MouseButton.LeftButton else None
                 )
                 layout.addWidget(img_lbl)
+                # FIX #6: кнопка сохранения изображения
+                _d_img, _n_img = file_data_b64, file_name
+                save_btn_img = QPushButton("💾  Сохранить")
+                save_btn_img.setFixedHeight(26)
+                save_btn_img.setStyleSheet(
+                    "font-size:11px;border-radius:5px;padding:0 8px;"
+                    "background:rgba(255,255,255,0.07);color:#a0b0c8;"
+                    "border:1px solid rgba(255,255,255,0.12);"
+                )
+                save_btn_img.clicked.connect(lambda: self._save_file(_d_img, _n_img))
+                layout.addWidget(save_btn_img)
                 return
             except Exception as ex:
                 print(f"[Chat] image: {ex}")
@@ -842,6 +853,17 @@ class ChatMessageWidget(QWidget):
                 thumb_lbl.mousePressEvent = _make_click_handler(_cache_path, file_name)
 
                 layout.addWidget(container)
+                # FIX #6: кнопка сохранения видео/GIF
+                _d_vid, _n_vid = file_data_b64, file_name
+                save_btn_vid = QPushButton("💾  Сохранить")
+                save_btn_vid.setFixedHeight(26)
+                save_btn_vid.setStyleSheet(
+                    "font-size:11px;border-radius:5px;padding:0 8px;"
+                    "background:rgba(255,255,255,0.07);color:#a0b0c8;"
+                    "border:1px solid rgba(255,255,255,0.12);"
+                )
+                save_btn_vid.clicked.connect(lambda: self._save_file(_d_vid, _n_vid))
+                layout.addWidget(save_btn_vid)
                 return
             except Exception as ex:
                 print(f"[Chat] video thumb: {ex}")

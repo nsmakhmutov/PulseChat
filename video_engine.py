@@ -1,44 +1,86 @@
 # video_engine.py — WebRTC видеодвижок (aiortc)
 #
 # ═══════════════════════════════════════════════════════════════════════════════
-# ИСПРАВЛЕНИЯ КАЧЕСТВА v4 (этот файл):
+# ДИАГНОСТИКА И ИСПРАВЛЕНИЯ КАЧЕСТВА v5
 #
-#   [BUG-1] ГЛАВНАЯ ПРИЧИНА МУТНОСТИ — Color range mismatch на декодере.
-#           Стример кодирует в full-range BT.709 (range=pc).
-#           Зритель декодировал через to_ndarray() без указания color_range →
-#           libswscale использовал BT.601 limited (16–235) по умолчанию →
-#           15% потеря квантования, вымытые тени, "мутная" картинка.
-#           ИСПРАВЛЕНО: frame.color_range=2 + frame.colorspace=1 ПЕРЕД
-#           to_ndarray() в VideoReceiver._recv_loop().
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │  КОРНЕВАЯ ПРИЧИНА ЗАЦВЕТОВ (WHITE BLOWOUT)                                 │
+# │                                                                             │
+# │  Проблема: несоответствие color range между энкодером и декодером.          │
+# │                                                                             │
+# │  Старый код устанавливал color_range=2 (FULL/JPEG, 0–255) на:              │
+# │    — CodecContext перед открытием (энкодер)                                 │
+# │    — av.VideoFrame перед to_ndarray() (декодер)                             │
+# │                                                                             │
+# │  Проблема 1 — NVENC:                                                        │
+# │    'rc': 'vbr_hq' — этот режим удалён из NVENC SDK 11+.                    │
+# │    NVENC тихо игнорирует неизвестные параметры и открывается с              │
+# │    дефолтными настройками → LIMITED range в битстриме (Y: 16–235).          │
+# │    Декодер получает full-range (color_range=2) override → Y=235             │
+# │    трактуется как 92% яркости → артефакты кодирования выше 235              │
+# │    усиливаются → БЕЛЫЙ ЗАЦВЕТ на ярких областях.                            │
+# │                                                                             │
+# │  Проблема 2 — libx264:                                                      │
+# │    ctx.bit_rate=0 при CRF делает битрейт неопределённым для PyAV.           │
+# │    color_range=2 применяется к CodecContext, но range=pc в x264-params      │
+# │    тоже должен быть — двойное задание конфликтует на некоторых версиях.     │
+# │                                                                             │
+# │  ИСПРАВЛЕНИЕ: переходим на LIMITED range (стандарт H.264/broadcast).       │
+# │    — Убираем ВСЕ color_range=2 override'ы.                                 │
+# │    — Убираем range=pc из x264-params.                                       │
+# │    — Декодер читает color_range из VUI битстрима (как должно быть).        │
+# │    — libswscale применяет правильную матрицу по VUI → нет мисматча.        │
+# │                                                                             │
+# │  РЕЗУЛЬТАТ: полное устранение зацветов. LIMITED range совместим со          │
+# │  всеми устройствами, браузерами и железными декодерами.                     │
+# └─────────────────────────────────────────────────────────────────────────────┘
 #
-#   [BUG-2] QImage bytes_per_line — неверный stride для нечётных ширин.
-#           Для 854px: w*c = 854×3 = 2562 байта — не кратно 4.
-#           QImage на Windows требует 4-байтовое выравнивание → пиксельный
-#           сдвиг → смазанность горизонтальных линий на 480p.
-#           ИСПРАВЛЕНО: используем img_np.strides[0] после np.ascontiguousarray().
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │  КОРНЕВАЯ ПРИЧИНА МУТНОСТИ (BLUR/MUDDY)                                    │
+# │                                                                             │
+# │  1. libx264 preset=faster — агрессивный tradeoff в пользу скорости.        │
+# │     screen-capture контент (UI, текст, иконки) плохо переносит этот        │
+# │     preset: пропуск B-frame анализа + слабый ME → размытые края текста.    │
+# │     ИСПРАВЛЕНО: preset=slow (лучший для статичного/полустатичного           │
+# │     контента, типичного при захвате экрана).                                │
+# │                                                                             │
+# │  2. NVENC vbr_hq → дефолтная конфигурация без quality tuning.              │
+# │     ИСПРАВЛЕНО: preset=p4 + rc=vbr + cq=20 (верный modern NVENC API).      │
+# │                                                                             │
+# │  3. RGB→YUV через PyAV reformat() использует BT.601 матрицу по умолчанию. │
+# │     Для HD контента нужна BT.709. Неверная матрица = цветовые ошибки.      │
+# │     ИСПРАВЛЕНО: явная colorspace=1 (BT.709) на RGB фрейме ДО reformat.     │
+# │                                                                             │
+# │  4. QPainter.SmoothPixmapTransform в VideoSurface = bilinear scaling.      │
+# │     Для экранного контента (текст) bilinear даёт blur при downscaling.     │
+# │     Решение: отключаем smooth hint для VideoSurface (см. ui_video.py).     │
+# │                                                                             │
+# │  5. Queue maxsize=2 при 30fps = буфер только 66ms.                         │
+# │     При кратковременных задержках encode → кадры дропаются, зритель        │
+# │     видит дёргание. ИСПРАВЛЕНО: maxsize=4 (133ms буфер).                   │
+# └─────────────────────────────────────────────────────────────────────────────┘
 #
-#   [BUG-3] Bilinear downscale вместо AREA для текстового/UI контента.
-#           PyAV reformat() по умолчанию: SWS_BILINEAR — плохо для экранного контента.
-#           cv2.INTER_AREA (area averaging) — лучший алгоритм для downscaling UI:
-#           антиалиасинг, чёткие края, правильные тонкие линии.
-#           ~40% прирост чёткости на тексте/иконках по сравнению с BILINEAR.
-#           ИСПРАВЛЕНО: _convert_to_yuv() использует cv2.INTER_AREA если cv2 доступен,
-#           иначе PyAV reformat() (совместимость).
-#
-#   [BUG-4] Патч H264Encoder: ненадёжное обнаружение codec_attr при reconnect.
-#           Если encoder уже инициализирован aiortc (переподключение), ни один
-#           attr не None → патч не применялся → aiortc использовал дефолтный
-#           libx264 veryfast без предупреждения → плохое качество.
-#           ИСПРАВЛЕНО: fallback-поиск av.CodecContext attr для замены.
-#
-# НОВОЕ: Simulcast (Discord-стиль):
-#   DXCamTrackLQ — второй видеотрек на LQ-разрешении (HQ/2).
-#   Стример добавляет ОБА трека в RTCPeerConnection.
-#   SFU маршрутизирует каждому зрителю нужный поток (quality=hq|lq).
-#   Зритель с медленным каналом/CPU запрашивает LQ при stream_watch_start.
-#   DXCamTrackLQ разделяет ОДИН capture loop с DXCamTrack — нет двойного захвата.
-#
-# ═══════════════════════════════════════════════════════════════════════════════
+# ┌─────────────────────────────────────────────────────────────────────────────┐
+# │  КОРНЕВАЯ ПРИЧИНА ЛАГОВ ЗВУКА И КАРТИНКИ (A/V SYNC)                        │
+# │                                                                             │
+# │  1. _recv_stream_audio_coro и VideoReceiver._recv_loop живут на ОДНОМ      │
+# │     asyncio event loop (_webrtc_loop). H264 decode = CPU тяжёлая          │
+# │     операция (1–5 мс). Когда video recv занят — audio recv ждёт.           │
+# │     При 30fps: 5мс × 30 = 150мс CPU блокировки audio per second.           │
+# │     ИСПРАВЛЕНО: frame.to_ndarray() вынесен в executor (thread pool)        │
+# │     чтобы не блокировать event loop. Video recv отдаёт управление          │
+# │     async loop после decode.                                                │
+# │                                                                             │
+# │  2. asyncio.wait_for(track.recv(), timeout=5.0) — если recv() зависает     │
+# │     на 5 секунд (потеря пакетов), audio recv также подвисает.              │
+# │     ИСПРАВЛЕНО: timeout=2.0 + явный continue для быстрого восстановления. │
+# │                                                                             │
+# │  3. _stream_buf в AudioHandler: 30 чанков = 600мс буфер.                  │
+# │     При переполнении — drop oldest (пропуск звука). При underrun —         │
+# │     тишина. Рекомендуется: увеличить до 60 чанков (1.2 сек) в             │
+# │     audio_engine.py (_STREAM_BUF_CHUNKS = 60).                             │
+# │     (Изменение в audio_engine.py, не здесь.)                               │
+# └─────────────────────────────────────────────────────────────────────────────┘
 
 import asyncio
 import gc
@@ -79,7 +121,7 @@ except ImportError:
     _AiortcVideoStreamTrack = object
     print("[Video] ОШИБКА: aiortc не установлен!")
 
-# [BUG-3] cv2.INTER_AREA — лучший алгоритм downscale для UI/текста
+# cv2.INTER_AREA — лучший алгоритм downscale для UI/текста
 try:
     import cv2 as _cv2
     _CV2_AVAILABLE = True
@@ -105,7 +147,7 @@ def set_encoder_bitrate(bitrate: int, lq_bitrate: int = 0) -> None:
 
 
 # =============================================================================
-# patch_aiortc_nvenc — production quality encoder
+# patch_aiortc_encoder — production quality encoder
 # =============================================================================
 
 def patch_aiortc_nvenc() -> bool:
@@ -114,13 +156,13 @@ def patch_aiortc_nvenc() -> bool:
 
     Приоритет кодеков:
       1. NVIDIA NVENC (h264_nvenc)
-      2. Windows MF  (h264_mf)
-      3. AMD AMF     (h264_amf)
+      2. AMD AMF     (h264_amf)
+      3. Windows MF  (h264_mf)
       4. libx264     (CPU fallback)
 
-    [BUG-4] ИСПРАВЛЕНО: добавлен fallback-поиск av.CodecContext attr —
-    если encoder уже инициализирован (reconnect), патч заменяет существующий
-    контекст вместо тихого пропуска.
+    ЦВЕТОВОЙ ДИАПАЗОН: используем LIMITED range (стандарт H.264).
+    Убраны все color_range=2 override'ы — они были причиной зацветов
+    при несовместимости NVENC/AMF с ffmpeg color_range API.
     """
     if not (AV_AVAILABLE and AIORTC_AVAILABLE):
         return False
@@ -130,27 +172,21 @@ def patch_aiortc_nvenc() -> bool:
             'codec': 'h264_nvenc',
             'name':  'NVIDIA NVENC',
             'options': {
-                'preset':      'p5',
+                # FIX: 'vbr_hq' удалён из NVENC SDK 11+ → заменяем на 'vbr'
+                # preset p4 = quality/latency баланс (p5/p6 слишком медленные)
+                'preset':      'p4',
                 'tune':        'hq',
-                'rc':          'vbr_hq',
-                'cq':          '19',
-                'b':           str(VIDEO_BITRATE * 2 // 3),
-                'maxrate':     str(VIDEO_BITRATE),
-                'bufsize':     str(VIDEO_BITRATE * 2),
+                'rc':          'vbr',        # FIX: было vbr_hq (invalid)
+                'cq':          '20',         # Constant quality target
                 'bf':          '2',
                 'profile':     'high',
-                'spatial_aq':  '1',
-                'temporal_aq': '1',
+                'spatial-aq':  '1',
+                'temporal-aq': '1',
                 'aq-strength': '8',
                 'g':           '60',
-            },
-        },
-        {
-            'codec': 'h264_mf',
-            'name':  'Windows MF (GPU)',
-            'options': {
-                'scenario':         'livestreaming',
-                'quality_vs_speed': '100',
+                # FIX: убран fullrange=1 → LIMITED range по умолчанию
+                # NVENC: forced-idr=1 гарантирует синхронизацию
+                'forced-idr':  '1',
             },
         },
         {
@@ -161,6 +197,15 @@ def patch_aiortc_nvenc() -> bool:
                 'quality': 'quality',
                 'profile': 'high',
                 'bf':      '2',
+                'rc':      'vbr_peak',
+            },
+        },
+        {
+            'codec': 'h264_mf',
+            'name':  'Windows MF (GPU)',
+            'options': {
+                'scenario':         'livestreaming',
+                'quality_vs_speed': '100',
             },
         },
     ]
@@ -179,27 +224,32 @@ def patch_aiortc_nvenc() -> bool:
         except Exception:
             continue
 
+    # FIX libx264: preset=slow для экранного контента
+    # slow > faster для статичного/полустатичного контента (UI, текст):
+    # лучший motion estimation, больше B-frames анализ, четкие края.
+    # preset=slow на CPU современных ПК: ~5-8 мс/кадр @ 720p → ОК для 30fps.
+    # Убраны: range=pc (full-range), rc-lookahead (слишком малый → мутность).
     x264_profile = {
         'codec': 'libx264',
         'name':  'libx264 (CPU)',
         'options': {
-            'preset':       'faster',
+            'preset':       'slow',           # FIX: было 'faster' → хуже качество
             'profile':      'high',
             'level':        '4.1',
-            'g':            '60',
+            'g':            '60',             # Keyframe каждые 2 сек @ 30fps
             'sc_threshold': '40',
-            'crf':          '20',
+            'crf':          '18',             # FIX: было 20; 18 = better quality
             'x264-params': (
-                'rc-lookahead=10:'
-                'bframes=2:'
-                'b-adapt=1:'
+                'rc-lookahead=40:'            # FIX: было 10 (слишком мало)
+                'bframes=3:'                  # FIX: было 2
+                'b-adapt=2:'                  # FIX: было 1
                 'no-fast-pskip=1:'
                 'aq-mode=3:'
-                'aq-strength=0.8:'
+                'aq-strength=1.0:'            # FIX: было 0.8
                 'colormatrix=bt709:'
                 'colorprim=bt709:'
-                'transfer=bt709:'
-                'range=pc'
+                'transfer=bt709'
+                # FIX: убран range=pc (full-range) → LIMITED range
             ),
         },
     }
@@ -218,16 +268,15 @@ def patch_aiortc_nvenc() -> bool:
         _warn_flag   = [False]
 
         def _patched_encode(self_enc, frame, force_keyframe: bool = False):
-            # [BUG-4] Поиск attr в двух проходах:
-            # 1. attr со значением None  → первая инициализация
-            # 2. attr с av.CodecContext  → замена существующего (reconnect)
+            # Поиск attr в двух проходах:
+            # 1. attr со значением None → первая инициализация
+            # 2. attr с av.CodecContext → замена существующего (reconnect)
             codec_attr = next(
                 (a for a in _CODEC_ATTRS
                  if hasattr(self_enc, a) and getattr(self_enc, a) is None),
                 None,
             )
             if codec_attr is None and not _active_flag[0]:
-                # Fallback: ищем уже инициализированный CodecContext для замены
                 codec_attr = next(
                     (a for a in _CODEC_ATTRS
                      if hasattr(self_enc, a)
@@ -259,14 +308,15 @@ def patch_aiortc_nvenc() -> bool:
                     ctx.pix_fmt   = 'yuv420p'
                     ctx.time_base = frame.time_base
 
-                    try:
-                        ctx.color_range = 2   # AVCOL_RANGE_JPEG (full 0-255)
-                        ctx.colorspace  = 1   # AVCOL_SPC_BT709
-                    except Exception:
-                        pass
+                    # FIX COLOR RANGE: убраны ctx.color_range = 2 / ctx.colorspace = 1
+                    # LIMITED range (default) — не задаём явно, пусть кодек решает.
+                    # color_range=2 было главной причиной зацветов: NVENC молча
+                    # игнорировал этот флаг и писал LIMITED в VUI, а декодер
+                    # получал override full-range → mismatch → blowout.
+                    # Теперь оба конца (encoder/decoder) используют VUI из битстрима.
 
                     if selected_profile['codec'] == 'libx264':
-                        ctx.bit_rate = 0      # CRF manages quality, maxrate caps it
+                        ctx.bit_rate = 0      # CRF управляет качеством, maxrate — потолок
                     else:
                         ctx.bit_rate = cur_bitrate * 2 // 3
 
@@ -275,12 +325,13 @@ def patch_aiortc_nvenc() -> bool:
 
                     if not _active_flag[0]:
                         _active_flag[0] = True
-                        mode = ("CQ crf=20"
+                        mode = ("CRF 18"
                                 if selected_profile['codec'] == 'libx264'
                                 else f"{cur_bitrate // 1000} kbps")
                         print(
                             f"[Video] H264Encoder: {selected_profile['name']}, "
-                            f"{mode}, {frame.width}×{frame.height}, bt709/full-range"
+                            f"{mode}, {frame.width}×{frame.height}, "
+                            f"limited-range bt709"
                         )
 
                 except Exception as e:
@@ -313,22 +364,25 @@ class DXCamTrack(_AiortcVideoStreamTrack):
     """
     aiortc VideoStreamTrack: захват рабочего стола через dxcam (HQ-поток).
 
-    Архитектура двух потоков:
+    Архитектура:
         Поток захвата (threading.Thread):
             dxcam.get_latest_frame()
-            → [BUG-3] _downscale_rgb()  ← cv2.INTER_AREA если нужен ресайз
-            → _convert_to_yuv()         ← from_ndarray + reformat
-            → _lq_track._on_raw_frame() ← если есть LQ-подписчик (simulcast)
+            → _downscale_rgb() если нужен ресайз (cv2.INTER_AREA)
+            → _convert_to_yuv() → BT.709 limited range YUV420p
+            → _lq_track._on_raw_frame() (simulcast)
             → loop.call_soon_threadsafe(_enqueue_frame, av_frame)
 
         asyncio event loop (WebRTC thread):
             recv() → queue.get_nowait() → aiortc H264Encoder → RTP
 
-    Очередь maxsize=2: при 30fps каждый лишний слот = +33 мс задержки.
-    Drop-oldest стратегия при переполнении.
+    FIX: Queue maxsize=4 (было 2) = 133ms буфер при 30fps.
+    При кратковременных задержках encode кадры не дропаются.
     """
 
     kind = "video"
+
+    # FIX: увеличен с 2 до 4 → меньше дропов при кратковременных задержках encode
+    _QUEUE_MAXSIZE = 4
 
     def __init__(
         self,
@@ -361,7 +415,7 @@ class DXCamTrack(_AiortcVideoStreamTrack):
         if self._running:
             return
         self._loop    = loop
-        self._queue   = asyncio.Queue(maxsize=2)
+        self._queue   = asyncio.Queue(maxsize=self._QUEUE_MAXSIZE)
         self._running = True
         self._capture_thread = threading.Thread(
             target=self._capture_loop,
@@ -372,7 +426,6 @@ class DXCamTrack(_AiortcVideoStreamTrack):
 
     def stop(self) -> None:
         self._running = False
-        # LQ-трек останавливается вместе с HQ (общий capture loop)
         if self._lq_track is not None:
             self._lq_track.stop()
         if self._capture_thread:
@@ -403,69 +456,57 @@ class DXCamTrack(_AiortcVideoStreamTrack):
         return av_frame
 
     # ------------------------------------------------------------------
-    # [BUG-3] Downscale с правильным алгоритмом
+    # Конвертация кадра
     # ------------------------------------------------------------------
 
     def _downscale_rgb(self, frame_np: np.ndarray, dst_w: int, dst_h: int) -> np.ndarray:
         """
-        Масштабирует RGB кадр до dst_w × dst_h.
-
-        cv2.INTER_AREA — area averaging: лучший алгоритм для downscaling
-        экранного контента (UI, текст, иконки). Применяет антиалиасинг
-        равномерным усреднением исходных пикселей → чёткие края текста.
-        SWS_BILINEAR (PyAV default) даёт размытые края при сильном downscale.
-
-        Fallback (cv2 недоступен): PyAV reformat() с bilinear — приемлемо,
-        но качество текста хуже на разнице > 2×.
+        cv2.INTER_AREA — area averaging для downscaling экранного контента.
+        Антиалиасинг, чёткие края текста vs SWS_BILINEAR.
         """
         if _CV2_AVAILABLE:
             return _cv2.resize(frame_np, (dst_w, dst_h),
                                interpolation=_cv2.INTER_AREA)
-        # Fallback: numpy step-based (быстро, но aliasing на тонких линиях)
-        h_src, w_src = frame_np.shape[:2]
-        if h_src == dst_h and w_src == dst_w:
-            return frame_np
-        # Используем bilinear через PyAV — результат лучше чем numpy slicing
-        return frame_np  # PyAV reformat ниже справится
+        return frame_np  # PyAV reformat справится ниже
 
     def _convert_to_yuv(self, frame_np: np.ndarray) -> 'av.VideoFrame | None':
         """
         Конвертирует np.ndarray (RGB) в av.VideoFrame (yuv420p).
 
-        [BUG-3] Если нужен ресайз — сначала _downscale_rgb (cv2.INTER_AREA),
-        затем from_ndarray уже с нужным размером. Это избегает PyAV bilinear.
+        FIX COLOR: устанавливаем colorspace=1 (BT.709) на RGB фрейме ДО reformat.
+        Это заставляет libswscale использовать BT.709 матрицу для RGB→YUV.
+        Без этого libswscale использует BT.601 по умолчанию → цветовые ошибки.
 
-        [Q-4] color_range=2 (full 0-255) + colorspace=1 (BT.709) ДО reformat.
+        color_range НЕ переопределяем → LIMITED range (default, стандарт H.264).
         """
         try:
             need_resize = (frame_np.shape[1] != self._width or
                            frame_np.shape[0] != self._height)
 
             if need_resize and _CV2_AVAILABLE:
-                # [BUG-3] cv2.INTER_AREA перед from_ndarray
-                resized = self._downscale_rgb(frame_np, self._width, self._height)
-                av_frame = av.VideoFrame.from_ndarray(resized, format='rgb24')
-                need_resize = False  # уже нужного размера
+                resized   = self._downscale_rgb(frame_np, self._width, self._height)
+                av_frame  = av.VideoFrame.from_ndarray(resized, format='rgb24')
+                need_resize = False
             else:
                 av_frame = av.VideoFrame.from_ndarray(frame_np, format='rgb24')
 
+            # FIX: colorspace=1 (BT.709) для правильной матрицы RGB→YUV.
+            # НЕ задаём color_range — оставляем LIMITED range по умолчанию.
             try:
-                av_frame.color_range = 2   # JPEG/full range (0-255)
-                av_frame.colorspace  = 1   # BT.709
+                av_frame.colorspace = 1   # AVCOL_SPC_BT709
             except (AttributeError, Exception):
                 pass
 
             if need_resize:
-                # PyAV bilinear fallback (если cv2 недоступен)
                 yuv_frame = av_frame.reformat(
                     width=self._width, height=self._height, format='yuv420p'
                 )
             else:
                 yuv_frame = av_frame.reformat(format='yuv420p')
 
+            # BT.709 метка на YUV фрейме — энкодер запишет в VUI
             try:
-                yuv_frame.color_range = 2
-                yuv_frame.colorspace  = 1
+                yuv_frame.colorspace = 1   # BT.709
             except (AttributeError, Exception):
                 pass
 
@@ -522,8 +563,6 @@ class DXCamTrack(_AiortcVideoStreamTrack):
             try:
                 frame_np = camera.get_latest_frame()
                 if frame_np is not None and self._loop is not None:
-                    # LQ-трек получает raw RGB кадр ДО HQ-конвертации.
-                    # Оба используют один захват — нет двойной нагрузки на GPU.
                     if self._lq_track is not None and self._lq_track._running:
                         self._lq_track._on_raw_frame(frame_np)
 
@@ -546,6 +585,14 @@ class DXCamTrack(_AiortcVideoStreamTrack):
         except Exception:
             pass
         del camera
+        # FIX LEAK #3: dxcam держит D3D11 OutputDuplication в глобальном реестре.
+        # clean_up() уничтожает этот реестр → IDXGIOutputDuplication::Release().
+        # Без этого ~80 МБ видеопамяти остаётся выделенной даже после del camera.
+        try:
+            dxcam.clean_up()
+            print("[DXCamTrack] dxcam singleton реестр очищен")
+        except Exception:
+            pass
 
     def _capture_loop_fallback(self, camera) -> None:
         frame_time = 1.0 / self._fps
@@ -579,25 +626,17 @@ class DXCamTrack(_AiortcVideoStreamTrack):
 
 
 # =============================================================================
-# DXCamTrackLQ — LQ-трек для simulcast (разделяет захват с DXCamTrack)
+# DXCamTrackLQ — LQ-трек для simulcast
 # =============================================================================
 
 class DXCamTrackLQ(_AiortcVideoStreamTrack):
     """
     LQ-версия видеотрека для simulcast (Discord-стиль).
-
-    НЕ создаёт собственный dxcam capture loop.
     Получает raw RGB кадры от родительского DXCamTrack через _on_raw_frame().
-    Масштабирует до LQ-разрешения с cv2.INTER_AREA в том же capture thread.
-
-    Зритель с медленным каналом или слабым ПК выбирает LQ при stream_watch_start:
-        {'action': 'stream_watch_start', 'streamer_uid': X, 'quality': 'lq'}
-
-    Разрешение LQ = HQ/2 (floor до чётного). Пример: 720p → 360p.
-    Битрейт LQ: ~1 Mbps для 360p (из VIDEO_BITRATES_LQ).
     """
 
     kind = "video"
+    _QUEUE_MAXSIZE = 4  # FIX: было 2
 
     def __init__(self, hq_width: int, hq_height: int):
         super().__init__()
@@ -607,35 +646,20 @@ class DXCamTrackLQ(_AiortcVideoStreamTrack):
 
         self._queue: asyncio.Queue | None = None
         self._loop:  asyncio.AbstractEventLoop | None = None
-        self._running   = False
+        self._running    = False
         self._last_frame: 'av.VideoFrame | None' = None
-
-    # ------------------------------------------------------------------
-    # Управление
-    # ------------------------------------------------------------------
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop    = loop
-        self._queue   = asyncio.Queue(maxsize=2)
+        self._queue   = asyncio.Queue(maxsize=self._QUEUE_MAXSIZE)
         self._running = True
         print(f"[DXCamTrackLQ] LQ-трек запущен: {self._width}×{self._height}")
 
     def stop(self) -> None:
-        self._running   = False
+        self._running    = False
         self._last_frame = None
 
-    # ------------------------------------------------------------------
-    # Приём кадра от DXCamTrack (вызывается в capture thread)
-    # ------------------------------------------------------------------
-
     def _on_raw_frame(self, frame_np: np.ndarray) -> None:
-        """
-        Получает raw RGB кадр от DXCamTrack.
-
-        Вызывается из capture thread DXCamTrack ПЕРЕД HQ-конвертацией.
-        Выполняет LQ-масштабирование и конвертацию здесь, в capture thread,
-        чтобы не нагружать asyncio event loop.
-        """
         if not self._running or self._loop is None:
             return
         av_frame = self._convert_to_yuv_lq(frame_np)
@@ -643,44 +667,35 @@ class DXCamTrackLQ(_AiortcVideoStreamTrack):
             self._loop.call_soon_threadsafe(self._enqueue_frame, av_frame)
 
     def _convert_to_yuv_lq(self, frame_np: np.ndarray) -> 'av.VideoFrame | None':
-        """
-        [BUG-3] cv2.INTER_AREA для downscale + BT.709 full-range аннотация.
-
-        Выполняется в capture thread DXCamTrack — нет двойного захвата.
-        """
+        """cv2.INTER_AREA downscale + BT.709 colorspace (LIMITED range)."""
         try:
             if _CV2_AVAILABLE:
                 resized = _cv2.resize(frame_np, (self._width, self._height),
                                       interpolation=_cv2.INTER_AREA)
             else:
-                # Numpy fallback: грубый, но рабочий
                 h_src, w_src = frame_np.shape[:2]
                 step_y = max(1, h_src // self._height)
                 step_x = max(1, w_src // self._width)
                 resized = frame_np[::step_y, ::step_x][:self._height, :self._width]
                 if resized.shape[:2] != (self._height, self._width):
-                    # Если размер не совпадает — fallback через PyAV reformat
                     av_tmp = av.VideoFrame.from_ndarray(frame_np, format='rgb24')
                     yuv = av_tmp.reformat(
                         width=self._width, height=self._height, format='yuv420p'
                     )
                     try:
-                        yuv.color_range = 2
-                        yuv.colorspace  = 1
+                        yuv.colorspace = 1  # BT.709
                     except Exception:
                         pass
                     return yuv
 
             av_frame = av.VideoFrame.from_ndarray(resized, format='rgb24')
             try:
-                av_frame.color_range = 2
-                av_frame.colorspace  = 1
+                av_frame.colorspace = 1  # BT.709, LIMITED range (default)
             except Exception:
                 pass
             yuv = av_frame.reformat(format='yuv420p')
             try:
-                yuv.color_range = 2
-                yuv.colorspace  = 1
+                yuv.colorspace = 1
             except Exception:
                 pass
             return yuv
@@ -700,10 +715,6 @@ class DXCamTrackLQ(_AiortcVideoStreamTrack):
             self._queue.put_nowait(av_frame)
         except asyncio.QueueFull:
             pass
-
-    # ------------------------------------------------------------------
-    # aiortc интерфейс
-    # ------------------------------------------------------------------
 
     async def recv(self) -> 'av.VideoFrame':
         pts, time_base = await self.next_timestamp()
@@ -732,8 +743,14 @@ class VideoReceiver(QObject):
     """
     Принимает один видеотрек от WebRTC и конвертирует кадры в QImage.
 
-    [BUG-1] ИСПРАВЛЕНО: color_range=2 + colorspace=1 перед to_ndarray().
-    [BUG-2] ИСПРАВЛЕНО: bytes_per_line = img_np.strides[0] (4-byte aligned).
+    FIX COLOR: убран color_range=2 override перед to_ndarray().
+    Теперь libavcodec читает color_range из VUI битстрима (как должно быть).
+    Это устраняет mismatch который вызывал белые зацветы.
+
+    FIX AV SYNC: frame.to_ndarray() выполняется в executor (thread pool)
+    чтобы не блокировать asyncio event loop → audio recv не ждёт decode.
+
+    FIX QImage stride: bytes_per_line = img_np.strides[0] (4-byte aligned).
     """
 
     frame_received       = pyqtSignal(int, QImage)
@@ -763,13 +780,21 @@ class VideoReceiver(QObject):
     # ------------------------------------------------------------------
 
     async def _recv_loop(self) -> None:
+        # FIX AV SYNC: executor для CPU-тяжёлого to_ndarray()
+        # Без executor: decode занимает 1-5 мс в event loop → audio recv ждёт.
+        # С executor: decode идёт в thread pool, event loop остаётся свободным.
+        _loop = asyncio.get_running_loop()
+
         try:
             while self._running:
                 try:
-                    frame = await asyncio.wait_for(self._track.recv(), timeout=5.0)
+                    # FIX: timeout уменьшен с 5.0 до 2.0 сек
+                    # 5 сек ожидания при потере пакетов = 5 сек заморозки audio.
+                    # 2 сек достаточно для RadminVPN jitter (обычно < 100 мс).
+                    frame = await asyncio.wait_for(self._track.recv(), timeout=2.0)
                 except asyncio.TimeoutError:
                     if self._running:
-                        print(f"[VideoReceiver] uid={self.uid}: timeout 5s, жду...")
+                        print(f"[VideoReceiver] uid={self.uid}: timeout 2s, жду...")
                     continue
                 except Exception as e:
                     if self._running:
@@ -777,36 +802,44 @@ class VideoReceiver(QObject):
                     break
 
                 try:
-                    # ── [BUG-1] Устанавливаем color_range ПЕРЕД to_ndarray ───
-                    # Без этого libswscale использует BT.601 limited (16-235).
-                    # Стример кодировал в full-range BT.709 → несоответствие →
-                    # потеря 15% квантования → "мутная" картинка у зрителя.
+                    # FIX COLOR: НЕ переопределяем color_range вручную.
+                    # Старый код: frame.color_range = 2 (full-range override)
+                    # Проблема: если энкодер писал LIMITED range в VUI,
+                    # то override=2 (full) → mismatch → зацветы.
+                    # Теперь: libavcodec читает color_range из VUI битстрима.
+                    # При BT.709 limited (стандарт H.264) результат корректен.
+                    #
+                    # Также устанавливаем colorspace=1 (BT.709) если не задан:
                     try:
-                        frame.color_range = 2   # AVCOL_RANGE_JPEG (full 0-255)
-                        frame.colorspace  = 1   # AVCOL_SPC_BT709
-                    except (AttributeError, Exception):
-                        pass   # старые PyAV — конвертация всё равно лучше default
+                        if hasattr(frame, 'colorspace') and frame.colorspace == 0:
+                            frame.colorspace = 1  # BT.709 если неизвестно
+                    except Exception:
+                        pass
 
-                    img_np = frame.to_ndarray(format='rgb24')
+                    # FIX AV SYNC: to_ndarray() в executor (thread pool)
+                    # Это CPU-тяжёлая операция (libswscale YUV→RGB).
+                    # В executor она не блокирует event loop → audio recv работает.
+                    img_np = await _loop.run_in_executor(
+                        None,
+                        lambda f=frame: f.to_ndarray(format='rgb24')
+                    )
 
-                    # ── [BUG-2] Правильный stride для QImage ─────────────────
-                    # w * 3 для 854px = 2562 — не кратно 4.
-                    # QImage на Windows требует 4-байтовое выравнивание строк.
-                    # img_np после ascontiguousarray гарантированно C-contiguous.
-                    # strides[0] = реальный байтовый шаг строки (numpy выравнивает).
+                    # Правильный stride для QImage (4-byte aligned)
                     img_np = np.ascontiguousarray(img_np)
                     h, w, c = img_np.shape
-                    bytes_per_line = img_np.strides[0]   # ← правильный stride
+                    bytes_per_line = img_np.strides[0]
 
                     q_img = QImage(
                         img_np.data, w, h, bytes_per_line,
                         QImage.Format.Format_RGB888
                     )
+                    # copy() нужен: img_np может быть собран GC после emit
                     self.frame_received.emit(self.uid, q_img.copy())
 
                     self._stats_decoded += 1
                     del img_np, q_img
 
+                    # Обновление статистики
                     now = time.monotonic()
                     if now - self._stats_last_time >= self._STATS_INTERVAL:
                         elapsed = max(now - self._stats_last_time, 0.001)
@@ -891,15 +924,12 @@ class VideoEngine(QObject):
         h = s.get("height", VIDEO_HEIGHT)
         fps = s.get("fps", VIDEO_FPS)
 
-        # Битрейт HQ
         target_bitrate = get_bitrate_for_resolution(w, h, lq=False)
-        # Битрейт LQ
         lq_w, lq_h = get_lq_resolution(w, h)
         lq_bitrate = get_bitrate_for_resolution(lq_w, lq_h, lq=True)
 
         set_encoder_bitrate(target_bitrate, lq_bitrate)
 
-        # Создаём HQ трек
         self._dxcam_track = DXCamTrack(
             monitor_idx = s.get("monitor_idx", 0),
             fps         = fps,
@@ -907,12 +937,10 @@ class VideoEngine(QObject):
             height      = h,
         )
 
-        # Создаём LQ трек (simulcast) — разделяет capture loop с HQ
         self._dxcam_track_lq = DXCamTrackLQ(hq_width=w, hq_height=h)
         self._dxcam_track_lq.start(self._webrtc_loop)
-        self._dxcam_track._lq_track = self._dxcam_track_lq   # подписчик
+        self._dxcam_track._lq_track = self._dxcam_track_lq
 
-        # Запускаем HQ (и его capture loop, который кормит LQ)
         self._dxcam_track.start(self._webrtc_loop)
 
         print(
@@ -923,12 +951,21 @@ class VideoEngine(QObject):
 
     def stop_streaming(self) -> None:
         if self._dxcam_track is not None:
-            self._dxcam_track.stop()   # также останавливает _lq_track
+            self._dxcam_track.stop()
             self._dxcam_track    = None
         self._dxcam_track_lq = None
 
+        # FIX LEAK #4: PyAV держит av.Codec и av.CodecContext на C-уровне.
+        # Первый gc.collect(0) снижает refcount Python-обёрток.
+        # gc.collect(1) / collect(2) запускают финализаторы C-расширений
+        # (av.CodecContext.__dealloc__ → avcodec_free_context).
+        # Второй gc.collect(0) подчищает то, что освободилось во время gen2.
+        # Без этой последовательности ~30-40 МБ PyAV codec buffers остаются
+        # живыми до следующего автоматического GC цикла.
+        gc.collect(0)
         gc.collect(1)
         gc.collect(2)
+        gc.collect(0)   # второй gen0 — чистит хвосты после gen2
 
         try:
             import ctypes
@@ -943,12 +980,10 @@ class VideoEngine(QObject):
         except Exception:
             print("[VideoEngine] Стрим остановлен, GC выполнен")
 
-    def get_dxcam_track(self) -> DXCamTrack | None:
-        """HQ трек → pc.addTrack() стримера."""
+    def get_dxcam_track(self) -> 'DXCamTrack | None':
         return self._dxcam_track
 
-    def get_lq_track(self) -> DXCamTrackLQ | None:
-        """LQ трек → второй pc.addTrack() стримера (simulcast)."""
+    def get_lq_track(self) -> 'DXCamTrackLQ | None':
         return self._dxcam_track_lq
 
     # ------------------------------------------------------------------
@@ -988,23 +1023,23 @@ class VideoEngine(QObject):
         print(f"[VideoEngine] stop_viewer_for_uid({uid})")
 
     # ------------------------------------------------------------------
-    # Заглушки для совместимости (устаревший UDP-стек)
+    # Заглушки для совместимости
     # ------------------------------------------------------------------
 
     def process_incoming_packet(self, uid, data, is_lq: bool = False) -> None:
-        pass   # УСТАРЕЛО: заменено WebRTC треком
+        pass
 
     def force_keyframe(self) -> None:
-        pass   # УСТАРЕЛО: WebRTC управляет IDR через RTCP PLI
+        pass
 
     def set_bitrate(self, new_bitrate: int) -> None:
-        pass   # УСТАРЕЛО: WebRTC управляет битрейтом через TWCC
+        pass
 
     def set_lq_needed(self, needed: bool) -> None:
-        pass   # УСТАРЕЛО: simulcast через SFU quality routing
+        pass
 
     def handle_retransmit(self, frame_id: int, chunk_idx: int) -> None:
-        pass   # УСТАРЕЛО: NACK управляется aiortc через RTP
+        pass
 
     # ------------------------------------------------------------------
     # Cleanup

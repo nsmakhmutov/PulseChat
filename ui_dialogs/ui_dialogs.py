@@ -1095,8 +1095,19 @@ class UserOverlayPanel(QFrame):
 
         worker.ready.connect(on_ready)
         worker.progress.connect(lambda s, t: prog.update_progress(s, t))
-        worker.finished.connect(lambda: prog.set_done())
-        worker.error.connect(lambda msg: prog.set_error(msg))
+
+        def _on_send_done():
+            prog.set_done()
+            # FIX MEM: автоматически скрываем через 3 сек — без этого виджет
+            # оставался в памяти навсегда (держит worker → его буферы файла)
+            QTimer.singleShot(3000, prog.hide)
+
+        def _on_send_error(msg_text):
+            prog.set_error(msg_text)
+            QTimer.singleShot(4000, prog.hide)
+
+        worker.finished.connect(_on_send_done)
+        worker.error.connect(_on_send_error)
         worker.cancelled.connect(lambda: prog.hide())
 
         # Показываем прогресс-виджет в правом нижнем углу экрана

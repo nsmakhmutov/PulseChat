@@ -181,6 +181,11 @@ class NetworkClient(QObject):
         # UID стримера, которого смотрит клиент (0 = не смотрит)
         self._watching_streamer_uid: int = 0
 
+        # FIX LEAK #2: ссылка на asyncio Task аудио-приёмника стрима.
+        # ensure_future() без сохранения задачи = задача живёт вечно в event loop.
+        # Сохраняем здесь → cancel() при stop_watching() → GC может собрать трек.
+        self._stream_audio_task: 'asyncio.Task | None' = None
+
         # Флаг воспроизведения soundboard (anti-spam)
         self._sb_playing = threading.Event()
 
@@ -954,6 +959,16 @@ class NetworkClient(QObject):
         streamer_uid = self._watching_streamer_uid
         self._watching_streamer_uid = 0
 
+        # FIX LEAK #2: отменяем аудио-таск до закрытия PC.
+        # Без cancel() задача продолжает ждать track.recv() вечно,
+        # удерживая ссылку на трек, его jitter-буфер и всю цепочку объектов.
+        if self._stream_audio_task is not None:
+            try:
+                self._stream_audio_task.cancel()
+            except Exception:
+                pass
+            self._stream_audio_task = None
+
         # Закрываем viewer PC
         if self._viewer_pc is not None:
             self._run_in_webrtc_loop(self._close_pc_coro(self._viewer_pc))
@@ -968,6 +983,12 @@ class NetworkClient(QObject):
         # Останавливаем VideoReceiver для этого стримера
         if self.video and streamer_uid:
             self.video.stop_viewer_for_uid(streamer_uid)
+
+        # FIX LEAK #5: сбрасываем и обнуляем стрим-аудио буфер AudioHandler.
+        # Без этого 60 чанков * 960 * 4 байта = ~230 КБ numpy-массив остаётся
+        # «горячим» → Windows heap trim не может вернуть страницы ОС.
+        if self.audio is not None and hasattr(self.audio, 'stop_stream_playback'):
+            self.audio.stop_stream_playback()
 
     async def _handle_viewer_offer_coro(
         self, streamer_uid: int, sdp: str, sdp_type: str
@@ -1001,9 +1022,10 @@ class NetworkClient(QObject):
             if track.kind == "video" and self.video:
                 self.video.add_receiver(streamer_uid, track)
             elif track.kind == "audio":
-                # Запускаем recv-цикл в WebRTC loop.
-                # Без этого aiortc переполняет jitter-buffer → тишина.
-                asyncio.ensure_future(
+                # FIX LEAK #2: сохраняем Task чтобы cancel() при stop_watching.
+                # ensure_future без сохранения = задача висит вечно в event loop
+                # и держит ссылку на трек + буферы.
+                self._stream_audio_task = asyncio.ensure_future(
                     self._recv_stream_audio_coro(track, streamer_uid)
                 )
 
@@ -1326,6 +1348,9 @@ class NetworkClient(QObject):
         raw_data = ""
         # JSONDecoder создаём ОДИН РАЗ — stateless, экономим аллокации.
         _decoder = json.JSONDecoder()
+        # FIX #5: ограничиваем размер буфера — защита от переполнения памяти
+        # при получении битого/огромного пакета от сервера.
+        _RAW_DATA_MAX = 32 * 1024 * 1024  # 32 MB — абсолютный потолок
         while self.running:
             try:
                 chunk_bytes = self.tcp_sock.recv(4096)
@@ -1333,11 +1358,27 @@ class NetworkClient(QObject):
                     print("[Net] Server closed connection (empty recv).")
                     break
                 raw_data += chunk_bytes.decode('utf-8', errors='ignore')
+                # FIX #5 MEM: если буфер вырос до предела — сбрасываем.
+                # Это возможно только при битом JSON стриме (атака / баг сервера).
+                if len(raw_data) > _RAW_DATA_MAX:
+                    print(f"[Net] WARN: raw_data overflow ({len(raw_data)} bytes) — clearing")
+                    raw_data = ""
                 while True:
                     try:
                         msg, idx = _decoder.raw_decode(raw_data)
                         raw_data = raw_data[idx:].lstrip()
-                        self.process_message(msg)
+                        # FIX #5: process_message НЕ должен роняться в tcp_listen.
+                        # Любое необработанное исключение внутри process_message
+                        # без этого try/except всплывало в outer except (OSError),
+                        # ломало TCP-цикл и вызывало _on_connection_lost — тихий
+                        # крах без очевидной причины. Теперь ошибки логируются и
+                        # цикл продолжается.
+                        try:
+                            self.process_message(msg)
+                        except Exception as pm_err:
+                            import traceback
+                            print(f"[Net] process_message error: {pm_err}\n"
+                                  f"{traceback.format_exc()}")
                     except json.JSONDecodeError:
                         break
             except (ConnectionResetError, ConnectionAbortedError, OSError) as e:

@@ -597,14 +597,15 @@ class VideoSurface(QOpenGLWidget):
     def paintGL(self):
         """Главный рендер-цикл на GPU."""
         painter = QPainter(self)
-        # SmoothPixmapTransform: билинейная интерполяция при масштабировании.
-        # Antialiasing: сглаживание краёв при subpixel-позиционировании.
-        # Оба хинта применяются аппаратно через OpenGL (QOpenGLWidget),
-        # поэтому накладные расходы ≈ 0 мс на типичном GPU.
-        painter.setRenderHints(
-            QPainter.RenderHint.SmoothPixmapTransform
-            | QPainter.RenderHint.Antialiasing
-        )
+        # FIX BLUR: убран SmoothPixmapTransform для экранного контента.
+        # SmoothPixmapTransform = bilinear interpolation при масштабировании.
+        # Для видео с экрана (UI, текст, иконки) bilinear добавляет размытость
+        # при downscaling (когда окно меньше исходника) — текст теряет чёткость.
+        # Qt на QOpenGLWidget использует GPU-accelerated drawImage в любом случае.
+        # Antialiasing оставляем для корректного subpixel-позиционирования рамок.
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        # НЕ устанавливаем SmoothPixmapTransform — Qt выберет nearest/linear
+        # автоматически в зависимости от scale factor (sharp для 1:1, linear для других).
         w, h = self.width(), self.height()
         painter.fillRect(0, 0, w, h, QColor(0, 0, 0))
         if self._current_image and not self._current_image.isNull():

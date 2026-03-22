@@ -130,8 +130,21 @@ class SFUServer:
 
         # ── Временные каналы ─────────────────────────────────────────────────
         # channel_name → {'password': str|None, 'permanent': bool}
+        # FIX #4: имя главного канала читается из USER_CONFIG_PATH.
+        # Хост может переименовать его через контекстное меню;
+        # имя сохраняется в конфиге и применяется при каждом старте сервера.
+        _general_name = 'General'
+        try:
+            import json as _json_cfg
+            from config import USER_CONFIG_PATH as _UCP
+            if os.path.exists(_UCP):
+                with open(_UCP, 'r', encoding='utf-8') as _f:
+                    _general_name = _json_cfg.load(_f).get('general_channel_name', 'General') or 'General'
+        except Exception:
+            pass
+        self._general_channel_name: str = _general_name
         self._channels: dict = {
-            'General': {'password': None, 'permanent': True},
+            _general_name: {'password': None, 'permanent': True},
         }
         self._channels_lock = threading.Lock()
 
@@ -451,10 +464,11 @@ class SFUServer:
                         if action == CMD_LOGIN:
                             client_nick   = msg.get('nick', 'User')
                             client_avatar = msg.get('avatar', '1.svg')
+                            _gcn = self._general_channel_name
                             with self.clients_lock:
                                 self.clients[conn] = {
                                     'nick':         client_nick,
-                                    'room':         'General',
+                                    'room':         _gcn,
                                     'uid':          uid,
                                     'avatar':       client_avatar,
                                     'ip':           client_ip,
@@ -462,7 +476,7 @@ class SFUServer:
                                     'status_text':  '',
                                 }
                             with self.udp_lock:
-                                self.uid_to_room[uid] = 'General'
+                                self.uid_to_room[uid] = _gcn
                             # Добавляем в очередь потенциальных хостов.
                             # FIX (Bug G): в embedded-режиме владелец сервера (_owner_ip)
                             # всегда вставляется в host_order[0], независимо от порядка
@@ -484,20 +498,21 @@ class SFUServer:
                                 remaining = len(self.clients)
                             print(
                                 f"[Server] ✔ {client_nick} подключился "
-                                f"(General, IP: {client_ip}) | Онлайн: {remaining}"
+                                f"({_gcn}, IP: {client_ip}) | Онлайн: {remaining}"
                             )
                             self._mark_dirty()
                             self.send_global_state()
 
                         # ── Join Room ─────────────────────────────────────────
                         elif action == CMD_JOIN_ROOM:
-                            new_room = msg.get('room', 'General')[:CHANNEL_NAME_MAX_LEN]
+                            _gcn_jr = self._general_channel_name
+                            new_room = msg.get('room', _gcn_jr)[:CHANNEL_NAME_MAX_LEN]
 
                             # Проверяем существование и пароль канала
                             with self._channels_lock:
                                 ch = self._channels.get(new_room)
 
-                            if new_room != 'General' and ch is None:
+                            if new_room != _gcn_jr and ch is None:
                                 conn.sendall(json.dumps({
                                     'action': 'join_room_denied',
                                     'reason': 'not_found',
@@ -580,6 +595,32 @@ class SFUServer:
                                         'action': 'create_channel_result',
                                         'ok': False, 'reason': 'already_exists',
                                     }).encode('utf-8'))
+
+                        # ── FIX #4: Переименование постоянного канала (только хост) ──
+                        elif action == 'rename_channel':
+                            with self._host_order_lock:
+                                is_host = bool(self._host_order and self._host_order[0] == uid)
+                            if is_host:
+                                old_nm = msg.get('old_name', '').strip()[:CHANNEL_NAME_MAX_LEN]
+                                new_nm = msg.get('new_name', '').strip()[:CHANNEL_NAME_MAX_LEN]
+                                if old_nm and new_nm and old_nm != new_nm:
+                                    with self._channels_lock:
+                                        ch_data = self._channels.pop(old_nm, None)
+                                        if ch_data is not None:
+                                            self._channels[new_nm] = ch_data
+                                            # Переводим всех клиентов из старого имени в новое
+                                            with self.clients_lock:
+                                                for cdata in self.clients.values():
+                                                    if cdata.get('room') == old_nm:
+                                                        cdata['room'] = new_nm
+                                            with self.udp_lock:
+                                                for k, v in self.uid_to_room.items():
+                                                    if v == old_nm:
+                                                        self.uid_to_room[k] = new_nm
+                                            self._general_channel_name = new_nm
+                                            print(f"[Server] Канал переименован: '{old_nm}' → '{new_nm}'")
+                                    self._mark_dirty()
+                                    self.send_global_state()
 
                         # ── Update User ───────────────────────────────────────
                         elif action == 'update_user':

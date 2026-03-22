@@ -238,14 +238,13 @@ class AudioHandler(QObject):
         self._local_sounds_lock = threading.Lock()
 
         # ── Стриминговый аудио-буфер (WebRTC стрим-аудио зрителя) ────────────
-        # Архитектура: pre-allocated flat numpy ring buffer.
-        # Полностью исключает np.concatenate и np.empty в RT audio_callback:
-        #   - Запись (asyncio thread): copy в конец _stream_buf
-        #   - Чтение (PortAudio callback): memmove хвоста в начало (одна операция)
-        #
-        # Размер: CHUNK_SIZE * 30 = ~600мс @ 48кГц — покрывает RadminVPN-джиттер.
-        # При переполнении пишем поверх старых данных (overwrite oldest).
-        _STREAM_BUF_CHUNKS = 30
+        # FIX AV SYNC: буфер увеличен с 30 до 60 чанков (600мс → 1.2 сек).
+        # RadminVPN jitter может достигать 300-500мс в играх.
+        # 30 чанков = 600мс слишком мало → underrun при нагрузке → аудио пропадает.
+        # 60 чанков = 1.2 сек с запасом покрывает пики jitter RadminVPN.
+        # Latency не увеличивается: при заполненном буфере drop-oldest
+        # гарантирует что слушатель получает свежий звук, не старый.
+        _STREAM_BUF_CHUNKS = 60   # FIX: было 30
         self._STREAM_BUF_SIZE: int  = CHUNK_SIZE * _STREAM_BUF_CHUNKS
         self._stream_buf:  np.ndarray = np.zeros(self._STREAM_BUF_SIZE + CHUNK_SIZE,
                                                   dtype=np.float32)
@@ -553,6 +552,11 @@ class AudioHandler(QObject):
         self._stream_active = False
         with self._stream_lock:
             self._stream_fill = 0
+            # FIX LEAK #5: явно обнуляем буфер.
+            # Без обнуления numpy-массив остаётся «горячим» в памяти процесса —
+            # Windows не отдаёт страницы обратно ОС даже после SetWorkingSetSize.
+            # Обнуление помечает страницы как «чистые» → heap trim возвращает их ОС.
+            self._stream_buf[:] = 0.0
 
     def set_stream_volume(self, vol: float) -> None:
         """Устанавливает громкость стрим-аудио (0.0–2.0)."""
@@ -1016,12 +1020,15 @@ class AudioHandler(QObject):
             self._local_sounds = active
 
         # ── Стриминговое аудио зрителя (WebRTC) ─────────────────────────────
-        # Auto-ducking: при активных голосах приглушаем стрим до 40%.
+        # FIX AV SYNC: убран auto-ducking (0.4 при активных голосах).
+        # Старое поведение: при разговоре кого-либо в чате громкость стрима
+        # прыгала с 100% до 40% и обратно → очень заметные скачки.
+        # Пользователь сам регулирует баланс через StreamVolumePopup.
         if self._stream_active:
             with self._stream_lock:
                 avail = self._stream_fill
                 if avail >= CHUNK_SIZE:
-                    _current_vol = self._stream_vol * (0.4 if _n_active > 0 else 1.0)
+                    _current_vol = self._stream_vol   # FIX: убрано * 0.4
                     self.mix_buffer += self._stream_buf[:CHUNK_SIZE] * _current_vol
                     # Диагностика: RMS стрим-аудио до масштабирования
                     _sb = self._stream_buf[:CHUNK_SIZE]
@@ -1031,7 +1038,7 @@ class AudioHandler(QObject):
                         self._stream_buf[:remaining] = self._stream_buf[CHUNK_SIZE:avail]
                     self._stream_fill = remaining
                 elif avail > 0:
-                    _current_vol = self._stream_vol * (0.4 if _n_active > 0 else 1.0)
+                    _current_vol = self._stream_vol   # FIX: убрано * 0.4
                     _fade = np.linspace(1.0, 0.0, avail, dtype=np.float32)
                     self.mix_buffer[:avail] += (
                         self._stream_buf[:avail] * _fade * _current_vol

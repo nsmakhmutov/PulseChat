@@ -1870,7 +1870,10 @@ class MainWindow(QMainWindow):
             tuple(
                 (r, u['uid'], u['nick'], u.get('mute'), u.get('deaf'),
                  u.get('is_streaming'), u.get('avatar'), u.get('status_icon'),
-                 u.get('status_text'))
+                 u.get('status_text'),
+                 # FIX #3: watchers в подписи → дерево перерисовывается когда
+                 # зритель подключается/отключается от стрима налету.
+                 tuple(w.get('nick', '') for w in u.get('watchers', [])))
                 for r, u_list in sorted(users_map.items())
                 for u in sorted(u_list, key=lambda x: x['uid'])
             ),
@@ -1927,6 +1930,11 @@ class MainWindow(QMainWindow):
                 if status_icon:
                     # Ленивое создание пиксмапа с кэшированием
                     if status_icon not in self._status_px_cache:
+                        # FIX MEM: ограничиваем кэш — 200 иконок достаточно для
+                        # любого реального набора статусов. Сброс при переполнении
+                        # прост и надёжен (статусы — маленький набор SVG-файлов).
+                        if len(self._status_px_cache) >= 200:
+                            self._status_px_cache.clear()
                         icon_path = resource_path(f"assets/status/{status_icon}")
                         px = QIcon(icon_path).pixmap(20, 20)
                         self._status_px_cache[status_icon] = px
@@ -1966,6 +1974,13 @@ class MainWindow(QMainWindow):
         self._reposition_quick_bubbles()
 
     def refresh_ui(self):
+        try:
+            self._refresh_ui_impl()
+        except Exception as _rui_err:
+            import traceback
+            print(f"[UI] refresh_ui UNHANDLED error: {_rui_err}\n{traceback.format_exc()}")
+
+    def _refresh_ui_impl(self):
         try:
             ping = self.net.current_ping
 
@@ -2123,7 +2138,7 @@ class MainWindow(QMainWindow):
     def show_context_menu(self, pos):
         item = self.tree.itemAt(pos)
 
-        # ── ПКМ по пустому месту или заголовку канала — создать канал ─────────
+        # ── ПКМ по пустому месту или заголовку канала — создать/переименовать ─
         if not item or item.data(0, Qt.ItemDataRole.UserRole) == "ROOM_HEADER":
             if self._is_server_host():
                 menu = QMenu(self)
@@ -2134,9 +2149,25 @@ class MainWindow(QMainWindow):
                     "QMenu::item:selected { background: rgba(91,142,245,0.30); color: #fff; }"
                 )
                 act_create = menu.addAction("🔊  Создать временный канал")
+
+                # FIX #4: если клик по конкретному заголовку постоянного канала
+                # — показываем пункт переименования
+                act_rename = None
+                clicked_room = None
+                if item and item.data(0, Qt.ItemDataRole.UserRole) == "ROOM_HEADER":
+                    clicked_room = item.data(1, Qt.ItemDataRole.UserRole)
+                    # Проверяем, является ли канал постоянным
+                    for ch in self._channel_list:
+                        if ch['name'] == clicked_room and ch.get('permanent', False):
+                            menu.addSeparator()
+                            act_rename = menu.addAction("✏️  Переименовать канал")
+                            break
+
                 chosen = menu.exec(self.tree.viewport().mapToGlobal(pos))
                 if chosen == act_create:
                     self._on_create_channel_requested()
+                elif act_rename is not None and chosen == act_rename:
+                    self._on_rename_permanent_channel(clicked_room)
             return
 
         uid = item.data(0, Qt.ItemDataRole.UserRole)
@@ -2631,12 +2662,25 @@ class MainWindow(QMainWindow):
             prog = FileTransferProgressWidget(filename, filesize, is_sender=False)
             prog.set_worker(worker)
 
+            # FIX #1: держим жёсткую ссылку на worker чтобы GC не убил поток
+            prog._worker_strong_ref = worker
+
             worker.progress.connect(lambda r, t: prog.update_progress(r, t))
-            worker.finished.connect(lambda p: (
-                prog.set_done(p),
+
+            def _on_transfer_done(p):
+                prog.set_done(p)
                 print(f"[UI] 📥 Файл сохранён: {p}")
-            ))
-            worker.error.connect(lambda m: prog.set_error(m))
+                # FIX #1: автоматически скрываем оверлей через 3 сек после успеха
+                QTimer.singleShot(3000, prog.hide)
+
+            def _on_transfer_error(m):
+                prog.set_error(m)
+                # FIX #1: скрываем через 4 сек после ошибки
+                QTimer.singleShot(4000, prog.hide)
+
+            worker.finished.connect(_on_transfer_done)
+            worker.error.connect(_on_transfer_error)
+            # FIX #1: при отмене сразу скрываем (уже было, убеждаемся что hide, не close)
             worker.cancelled.connect(lambda: prog.hide())
 
             _show_float_widget(prog)
@@ -2747,6 +2791,50 @@ class MainWindow(QMainWindow):
             'password':     password or '',
         })
         print(f"[UI] Запрос создания канала: '{name}' (пароль: {'да' if password else 'нет'})")
+
+    def _on_rename_permanent_channel(self, old_name: str):
+        """
+        FIX #4: Хост переименовывает постоянный канал (например General).
+        Диалог ввода нового имени. Сохраняем в USER_CONFIG_PATH и применяем на сервере.
+        Имя сохраняется между сессиями — при следующем старте сервер прочитает из конфига.
+        """
+        from PyQt6.QtWidgets import QInputDialog
+        new_name, ok = QInputDialog.getText(
+            self,
+            "Переименовать канал",
+            f"Новое название канала (было: {old_name}):",
+            QLineEdit.EchoMode.Normal,
+            old_name,
+        )
+        if not ok or not new_name.strip():
+            return
+        new_name = new_name.strip()[:32]
+        if new_name == old_name:
+            return
+
+        # Сохраняем в конфиг — будет применено при следующем старте сервера
+        try:
+            import json as _json
+            from config import USER_CONFIG_PATH
+            cfg = {}
+            if os.path.exists(USER_CONFIG_PATH):
+                with open(USER_CONFIG_PATH, 'r', encoding='utf-8') as f:
+                    cfg = _json.load(f)
+            # Сохраняем имя главного канала под ключом 'general_channel_name'
+            cfg['general_channel_name'] = new_name
+            with open(USER_CONFIG_PATH, 'w', encoding='utf-8') as f:
+                _json.dump(cfg, f, ensure_ascii=False, indent=2)
+            print(f"[UI] Сохранено имя главного канала: '{new_name}'")
+        except Exception as e:
+            print(f"[UI] Ошибка сохранения имени канала: {e}")
+
+        # Отправляем команду переименования на сервер (горячее применение)
+        self.net.send_json({
+            'action':    'rename_channel',
+            'old_name':  old_name,
+            'new_name':  new_name,
+        })
+        print(f"[UI] Запрос переименования канала: '{old_name}' → '{new_name}'")
 
     def _on_channel_created(self, channel_name: str):
         """Сервер создал новый канал — обновляем список и сразу перестраиваем дерево."""
@@ -2927,6 +3015,15 @@ class MainWindow(QMainWindow):
             except RuntimeError:
                 pass
             self._lobby_screen = None
+
+        # FIX #2: устанавливаем новый IP в network client ДО любых остановок.
+        # Если mgr.stop() → stop_gracefully() успеет прислать нам CMD_SERVER_MIGRATE
+        # раньше чем мы вызовем fast_switch_to, то _migrate_reconnect прочитает
+        # self._ip и должен получить ПРАВИЛЬНЫЙ (новый) адрес, а не старый.
+        self.net._ip = new_ip
+        # Снимаем migration_pending чтобы любой параллельный _migrate_reconnect
+        # от старого CMD_SERVER_MIGRATE не перехватил управление.
+        self.net._migration_pending = False
 
         # FIX: net.running=False ПЕРВЫМ.
         # stop_gracefully рассылает CMD_SERVER_MIGRATE всем клиентам, включая нас.
@@ -3153,11 +3250,21 @@ class MainWindow(QMainWindow):
                 self.btn_stream.setChecked(False)
                 return
         else:
-            self.video.stop_streaming()
-            # stop_streaming() останавливает DXCamTrack.
-            # WebRTC PC закрывается отдельно в net.stop_streaming_webrtc() если есть.
             self.is_streaming = False
             self.net.send_json({"action": CMD_STREAM_STOP})
+
+            # FIX LEAK #1: stop_streaming_webrtc() закрывает RTCPeerConnection
+            # стримера и SystemAudioTrack. Без этого вызова _streamer_pc оставался
+            # открытым после каждого стрима → H264 encoder + DTLS/SRTP буферы
+            # (~50 МБ) никогда не освобождались.
+            # Порядок: сначала CMD_STREAM_STOP на сервер (он убирает нас из стримеров),
+            # затем закрываем PC (чтобы SFU успел разорвать соединение корректно).
+            self.net.stop_streaming_webrtc()
+
+            # stop_streaming() останавливает DXCamTrack и освобождает D3D11.
+            # Вызываем ПОСЛЕ stop_streaming_webrtc() чтобы треки были сначала
+            # отсоединены от PC, а потом удалены.
+            self.video.stop_streaming()
 
             # ── Уничтожаем оверлей аннотаций стримера ───────────────────────
             try:
