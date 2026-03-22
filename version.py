@@ -6,7 +6,7 @@
 # ──────────────────────────────────────────────────────────────────────────────
 
 APP_NAME    = "InPulse"
-APP_VERSION = "1.0.42"           # SemVer: MAJOR.MINOR.PATCH
+APP_VERSION = "1.0.45"           # SemVer: MAJOR.MINOR.PATCH
 APP_AUTHOR  = "Impulse Company"     # ← замените на своё имя/псевдоним
 APP_YEAR    = "2026"
 # GitHub репозиторий для проверки обновлений.
@@ -28,5 +28,5 @@ ABOUT_TEXT = f"""\
 Автор: {APP_AUTHOR}
 Год:   {APP_YEAR}
 
-Стек: Python · PyQt6 · Opus · OpenGL · WASAPI · RRnoise ·DeepFilterNet
+Стек: Python · PyQt6 · Opus · OpenGL · WASAPI · RRnoise · DeepFilterNet
 """

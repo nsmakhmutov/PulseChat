@@ -16,7 +16,7 @@ import av
 from aiortc import AudioStreamTrack
 from PyQt6.QtCore import QObject, pyqtSignal, QSettings
 from config import (
-    SAMPLE_RATE, CHANNELS, CHUNK_SIZE,
+    SAMPLE_RATE, CHANNELS, CHUNK_SIZE, FRAME_DURATION,
     OPUS_APPLICATION, DEFAULT_BITRATE,
     UDP_HEADER_STRUCT, UDP_HEADER_SIZE,
     FLAG_STREAM_VOICES, FLAG_WHISPER,
@@ -27,7 +27,7 @@ from .audio_processing import (
     PYRNNOISE_AVAILABLE, PYAUDIOWPATCH_AVAILABLE, _pyaudio,
     butter, sosfilt, sosfilt_zi, _WLP_SOS, _ANON_LP_SOS,
 )
-from .audio_capture import StreamAudioCapture, MicrophoneTrack, SystemAudioTrack
+from .audio_capture import StreamAudioCapture, MicrophoneTrack, SystemAudioTrack, get_dll
 try:
     from pyrnnoise import RNNoise
 except ImportError:
@@ -267,6 +267,10 @@ class AudioHandler(QObject):
 
         self.mix_buffer = np.zeros(CHUNK_SIZE, dtype=np.float32)
 
+        # Mix-Minus удалён: программное вычитание reference из захвата DLL
+        # создавало обратный эффект — инвертированный голос суммировался со стримом.
+        # Исключение голоса InPulse целиком обеспечивает DLL (PROCESS_LOOPBACK_EXCLUDE).
+
         # ── Pre-allocated encode buffer (hot path, 50 Hz) ──────────────────
         # (denoised_float * 32767).astype(np.int16) создаёт новый массив каждые
         # 20 мс → GC давление ~94 KB/сек. Используем фиксированный буфер
@@ -339,7 +343,54 @@ class AudioHandler(QObject):
         # maxlen=5 заменяет ручную проверку `if len > 5: pop(0)`.
         self.vad_pre_buffer = deque(maxlen=5)
         self.was_talking = False
-        self.stream = None
+        # FIX -9993: разделены на два независимых потока PortAudio.
+        # sd.Stream (duplex) требует ОДИНАКОВЫЙ host API для input и output.
+        # После _remap_to_wasapi() output переходит на WASAPI, input остаётся
+        # на MME → PaErrorCode -9993 ("Illegal combination of I/O devices").
+        # Решение: sd.InputStream (MME, любой API) + sd.OutputStream (WASAPI).
+        # self.stream = OutputStream — backward compat для external checks (.stream is None).
+        self.stream = None        # sd.OutputStream (playback, WASAPI)
+        self._in_stream = None    # sd.InputStream  (mic capture, MME)
+        # Реальное число каналов открытых потоков — выставляется в start().
+        self._out_channels: int = 2
+        self._in_channels:  int = 1
+
+        # ── Нативная частота дискретизации устройств ──────────────────────────
+        # Выставляется в start() после query_devices().
+        # Если устройство не 48000 Гц — ресемплинг выполняется автоматически:
+        #   Вход:  native_sr → 48000  (перед NR и Opus encode)
+        #   Выход: 48000 → native_sr  (перед записью в outdata)
+        # CHUNK_SIZE и Opus всегда работают на 48000 — это не меняется.
+        self._in_sr:        int = SAMPLE_RATE   # частота микрофона
+        self._out_sr:       int = SAMPLE_RATE   # частота динамиков
+        self._in_blocksize: int = CHUNK_SIZE    # кол-во сэмплов на колбэк (вход)
+        self._out_blocksize: int = CHUNK_SIZE   # кол-во сэмплов на колбэк (выход)
+        # Pre-allocated буфер ресемплированного выхода (48000 → out_sr).
+        # Перевыделяется в start() если out_sr меняется.
+        self._out_resamp_buf: np.ndarray = np.zeros(CHUNK_SIZE, dtype=np.float32)
+        # Флаг первого вызова output-callback
+        self._cb_out_first_logged: bool = False
+
+        # PortAudio OutputStream всегда открыт — голоса воспроизводятся через него.
+        # Сессия WASAPI Shared python.exe PID → PROCESS_LOOPBACK_EXCLUDE в DLL
+        # исключает её из loopback захвата. Отдельный DLL Render не нужен.
+        # ctypes-указатель на mix_buffer (pre-allocated, никогда не перевыделяется).
+        self._mix_buffer_ptr: ctypes.POINTER(ctypes.c_float) = (
+            self.mix_buffer.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+        )
+
+        # ── Диагностика _output_callback (зритель видит раздельные уровни) ──
+        # Логируем раз в секунду:
+        #   [OUT-DIAG] voice_rms  = RMS декодированных голосов участников чата
+        #   [OUT-DIAG] stream_rms = RMS стрим-аудио, пришедшего по WebRTC
+        #   [OUT-DIAG] mix_rms    = RMS итогового mix_buffer (то что слышит зритель)
+        # Если voice_rms ≈ stream_rms → стрим содержит голосовой чат (DLL не работает).
+        # Если stream_rms > 0 при voice_rms ≈ 0 → только игровой звук (норма).
+        self._diag_voice_sum:  float = 0.0
+        self._diag_stream_sum: float = 0.0
+        self._diag_mix_sum:    float = 0.0
+        self._diag_cnt:        int   = 0
+        self._diag_next_ts:    float = 0.0
         # Ссылки на рабочие потоки — нужны для корректного join() в stop().
         # Без явного join() повторные вызовы start() (переподключение, смена
         # устройства) накапливают «зомби»-потоки.
@@ -362,6 +413,25 @@ class AudioHandler(QObject):
         #   - RemoteUser.volume / .is_locally_muted — простые примитивы, GIL-safe.
         # -------------------------------------------------------------------
         self._audio_users_snapshot: dict = {}
+
+
+    # ------------------------------------------------------------------
+    #  DLL RAW Render Engine — управление
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    #  Заглушка для обратной совместимости — DLL Render удалён
+    # ------------------------------------------------------------------
+
+    def enable_dll_render(self, active: bool, raw_mode: bool = False) -> None:
+        """
+        No-op. DLL Render удалён в v4.
+        Голоса воспроизводятся через PortAudio WASAPI Shared (python.exe PID).
+        PROCESS_LOOPBACK_EXCLUDE в DLL Capture исключает эту сессию по PID
+        через Session Manager — до hardware микшера — эхо не возникает.
+        Оставлен для совместимости на случай вызова из старого кода.
+        """
+        pass  # nothing to do
 
     def set_bitrate(self, bitrate_kbps):
         bitrate_bps = int(bitrate_kbps) * 1000
@@ -417,18 +487,31 @@ class AudioHandler(QObject):
         try:
             data = np.asarray(data, dtype=np.float32)
 
-            # Нормализация формы: любой 2D → плоский float32 моно
+            # Нормализация формы: любой 2D → плоский float32 моно.
+            #
+            # Возможные форматы на входе:
+            #   (1, 960)  — моно из SystemAudioTrack.recv() [layout='mono']
+            #   (1, 1920) — стерео interleaved Opus от aiortc (L,R,L,R,...)
+            #   (2, 960)  — планарное стерео (channels, samples)
+            #   (960, 2)  — интерливед (samples, channels)
+            #
+            # ВАЖНО: НЕ делаем слепое reshape(-1, 2) для shape (1, N) —
+            # при моно это режет буфер вдвое и звук тянется на полпитча.
             if data.ndim == 2:
-                # aiortc s16 interleaved: (1, samples*channels)
-                if data.shape[0] == 1 and data.shape[1] >= 4:
-                    ch = 2   # Opus всегда стерео
-                    data = data.reshape(-1, ch)
-                # Теперь (samples, channels) или (channels, samples)
-                # Определяем: если строк > 2, то это (samples, channels)
-                if data.shape[0] > 2 and data.shape[1] <= 2:
+                rows, cols = data.shape
+                if rows == 1:
+                    # Один ряд: моно или стерео interleaved
+                    # Стерео interleaved: cols кратен 2 И вдвое больше CHUNK_SIZE
+                    if cols % 2 == 0 and cols >= CHUNK_SIZE * 2:
+                        mono = data[0].reshape(-1, 2).mean(axis=1).astype(np.float32)
+                    else:
+                        # Чистое моно (960 сэмплов) — просто берём строку
+                        mono = data[0]
+                elif rows > 2 and cols <= 2:
+                    # (samples, channels): много строк, 1-2 канала
                     mono = np.mean(data, axis=1).astype(np.float32)
                 else:
-                    # (channels, samples) — транспонируем
+                    # (channels, samples): строки = каналы
                     mono = np.mean(data, axis=0).astype(np.float32)
             elif data.ndim == 1:
                 mono = data
@@ -542,20 +625,76 @@ class AudioHandler(QObject):
         print("[DEBUG] AudioHandler.start: поиск устройств...", flush=True)
         in_idx = self.find_device_index_by_name(input_name, True)
         out_idx = self.find_device_index_by_name(output_name, False)
+        out_idx = self._remap_to_wasapi(out_idx)
+
+        # ── Определяем нативную частоту дискретизации каждого устройства ────
+        # sounddevice/PortAudio в Shared WASAPI ОБЯЗАН открывать поток на нативной
+        # частоте устройства. Если передать 48000 а устройство настроено на 44100 —
+        # некоторые драйверы (Creative, старые Realtek) возвращают тишину или
+        # падают с PaError -9997 (Invalid sample rate).
+        # Решение: открываем на нативной частоте + ресемплируем в колбэках.
+        try:
+            _in_dev_info  = sd.query_devices(in_idx  if in_idx  is not None else sd.default.device[0])
+            self._in_sr   = int(_in_dev_info['default_samplerate'])
+        except Exception:
+            self._in_sr   = SAMPLE_RATE
+
+        try:
+            _out_dev_info  = sd.query_devices(out_idx if out_idx is not None else sd.default.device[1])
+            self._out_sr   = int(_out_dev_info['default_samplerate'])
+        except Exception:
+            self._out_sr   = SAMPLE_RATE
+
+        # Кол-во сэмплов для 20 мс фрейма на нативной частоте
+        self._in_blocksize  = int(round(self._in_sr  * FRAME_DURATION / 1000))
+        self._out_blocksize = int(round(self._out_sr * FRAME_DURATION / 1000))
+
+        # Pre-allocate буфер ресемплированного выхода нужного размера
+        self._out_resamp_buf = np.zeros(self._out_blocksize, dtype=np.float32)
+
+        if self._in_sr != SAMPLE_RATE:
+            print(
+                f"[Audio] ⚠ Микрофон: {self._in_sr} Гц ≠ 48000 — "
+                f"автоматический ресемплинг {self._in_sr}→48000 Гц",
+                flush=True,
+            )
+        if self._out_sr != SAMPLE_RATE:
+            print(
+                f"[Audio] ⚠ Динамики: {self._out_sr} Гц ≠ 48000 — "
+                f"автоматический ресемплинг 48000→{self._out_sr} Гц",
+                flush=True,
+            )
+
         print(f"[DEBUG] AudioHandler.start: in_idx={in_idx}, out_idx={out_idx}", flush=True)
 
         self._is_running.set()
         try:
-            print("[DEBUG] AudioHandler.start: создание sd.Stream...", flush=True)
-            self.stream = sd.Stream(
-                device=(in_idx, out_idx),
-                samplerate=SAMPLE_RATE, blocksize=CHUNK_SIZE,
+            # FIX -9993: два независимых потока вместо одного дуплексного.
+            # sd.Stream (duplex) требует одинаковый HostAPI для in и out.
+            # После _remap_to_wasapi() out = WASAPI, in = MME → PaErrorCode -9993.
+            # sd.InputStream + sd.OutputStream работают с разными HostAPI без ограничений.
+            # Дополнительный бонус: OutputStream на WASAPI атрибутируется нашему PID
+            # (не svchost.exe как MME) → DLL Process Loopback правильно исключает
+            # воспроизводимый нами звук → зрители больше НЕ слышат эхо своих голосов.
+            print("[DEBUG] AudioHandler.start: создание sd.InputStream (микрофон)...", flush=True)
+            self._in_stream = sd.InputStream(
+                device=in_idx,
+                samplerate=self._in_sr,       # нативная частота устройства
+                blocksize=self._in_blocksize, # 20 мс фрейм на нативной частоте
                 dtype='float32', channels=CHANNELS,
-                callback=self.audio_callback
+                callback=self._input_callback,
             )
-            print("[DEBUG] AudioHandler.start: sd.Stream создан, вызов stream.start()...", flush=True)
+            print("[DEBUG] AudioHandler.start: создание sd.OutputStream (динамики WASAPI)...", flush=True)
+            self.stream = sd.OutputStream(
+                device=out_idx,
+                samplerate=self._out_sr,       # нативная частота устройства
+                blocksize=self._out_blocksize, # 20 мс фрейм на нативной частоте
+                dtype='float32', channels=CHANNELS,
+                callback=self._output_callback,
+            )
+            self._in_stream.start()
             self.stream.start()
-            print("[DEBUG] AudioHandler.start: stream.start() выполнен", flush=True)
+            print("[DEBUG] AudioHandler.start: InputStream + OutputStream запущены", flush=True)
             self._pkt_thread = threading.Thread(target=self._packet_processor_loop, daemon=True)
             self._pkt_thread.start()
             print("[DEBUG] AudioHandler.start: рабочий поток запущен — DONE", flush=True)
@@ -572,12 +711,21 @@ class AudioHandler(QObject):
         if t is not None and t.is_alive():
             t.join(timeout=0.5)
         self._pkt_thread = None
+        # Закрываем InputStream (микрофон)
+        if getattr(self, '_in_stream', None) is not None:
+            try:
+                self._in_stream.stop()
+                self._in_stream.close()
+            except Exception:
+                pass
+            self._in_stream = None
+        # Закрываем OutputStream (динамики, WASAPI)
         if hasattr(self, 'stream') and self.stream:
             try:
                 self.stream.stop()
                 self.stream.close()
                 self.stream = None
-            except:
+            except Exception:
                 pass
 
     def cleanup_users(self, active_uids):
@@ -648,23 +796,36 @@ class AudioHandler(QObject):
             except Exception:
                 pass
 
-    def audio_callback(self, indata, outdata, frames, time_info, status):
-        # Логируем только первый вызов — подтверждает что callback запустился
+    # ===========================================================================
+    #  _input_callback  —  захват микрофона (sd.InputStream, любой HostAPI)
+    #  Вызывается PortAudio каждые 20 мс из нативного потока.
+    #  NR → VAD → Opus encode → send_queue.
+    #  Сигнатура InputStream callback: (indata, frames, time_info, status).
+    # ===========================================================================
+    def _input_callback(self, indata, frames, time_info, status):
         if not self._cb_first_logged:
             self._cb_first_logged = True
-            print("[DEBUG] audio_callback: ПЕРВЫЙ ВЫЗОВ — PortAudio callback работает", flush=True)
+            print("[DEBUG] _input_callback: ПЕРВЫЙ ВЫЗОВ — InputStream работает", flush=True)
         if status:
-            print(f"[DEBUG] audio_callback: status={status}", flush=True)
+            print(f"[DEBUG] _input_callback: status={status}", flush=True)
 
         if not self._is_running.is_set():
-            outdata.fill(0)
             return
 
-        curr_time = time.perf_counter()  # FIX: высокоточный таймер Windows (мкс вместо 15.6ms у time.time)
+        curr_time = time.perf_counter()
         raw_input = indata.flatten()
+
+        # ── Ресемплинг вход: native_sr → 48000 ──────────────────────────────
+        # Выполняется до NR и Opus — оба работают строго на 48000 Гц / CHUNK_SIZE.
+        # np.interp — линейная интерполяция, достаточна для голоса (< 4 кГц).
+        # При in_sr == 48000 блок пропускается без аллокаций (fast path).
+        if self._in_sr != SAMPLE_RATE:
+            x_old = np.linspace(0.0, 1.0, len(raw_input), dtype=np.float64)
+            x_new = np.linspace(0.0, 1.0, CHUNK_SIZE,     dtype=np.float64)
+            raw_input = np.interp(x_new, x_old, raw_input).astype(np.float32)
+
         denoised_float = raw_input
 
-        # nr_mode: 0=выкл, 1=RNNoise, 2=DFN — читаем self (не QSettings каждые 20мс)
         _nr = self.nr_mode
         if _nr == 2 and self.dfn_engine:
             try:
@@ -676,73 +837,47 @@ class AudioHandler(QObject):
                 # FIX 6: reuse _pcm_int16_buf — нет heap-аллокации каждые 20 мс.
                 np.multiply(denoised_float, 32767.0,
                             out=self._pcm_int16_buf, casting='unsafe')
-
-                # CRITICAL FIX: denoise_chunk возвращает кадры формы (channels, frame_size)
-                # например (1, 480) для моно. Без .flatten() np.concatenate даёт (2, 480)
-                # вместо (960,) → np.multiply ниже падает с ValueError → Exception молча
-                # проглатывается → Opus кодирует мусор → собеседник не слышит отправителя.
+                # CRITICAL FIX: denoise_chunk возвращает (channels, frame_size).
                 processed = [f.flatten() for p, f in
                              self.denoiser.denoise_chunk(self._pcm_int16_buf)]
                 if processed:
-                    # np.concatenate(list_of_1D) → всегда 1D (960,) — безопасно
                     combined = np.concatenate(processed) if len(processed) > 1 else processed[0]
                     denoised_float = combined.astype(np.float32) / 32767.0
             except Exception:
                 pass
 
-        # ── Pre-encode input normalization ──────────────────────────────────
-        # Если denoised_float содержит пики > 1.0 (микрофонный буст Windows,
-        # RNNoise иногда выходит за ±1.0, некоторые ASIO-драйверы) →
-        # умножение на 32767 даёт значения > INT16_MAX → wraparound в
-        # отрицательную зону → жёсткий треск именно при громком голосе
-        # («на пределе микрофона»). Soft-limit здесь — единственная защита.
-        # Используем in-place операцию: аллокаций нет.
+        # ── Pre-encode normalization: защита от wraparound при пиках > 1.0 ──
         _in_peak = np.max(np.abs(denoised_float))
         if _in_peak > 0.98:
-            # Нормализуем к 0.98 — оставляем 2% запас до INT16_MAX
             denoised_float = denoised_float * (0.98 / _in_peak)
 
         rms = np.sqrt(np.mean(denoised_float ** 2))
-        # FIX 9: throttle 50 Гц → 10 Гц. Эмитим каждый 5-й фрейм.
+        # FIX 9: throttle 50 Гц → 10 Гц.
         self._vol_emit_counter += 1
         if self._vol_emit_counter >= 5:
             self._vol_emit_counter = 0
             self.volume_level_signal.emit(int(min(rms * 1000, 100)))
 
         is_talking = rms > self.vad_threshold or (curr_time - self.last_voice_time < self.vad_hangover)
-        if rms > self.vad_threshold: self.last_voice_time = curr_time
+        if rms > self.vad_threshold:
+            self.last_voice_time = curr_time
 
         if self.my_uid != 0:
             mute_flag = 1 if self._is_muted.is_set() else 0
             deaf_flag = 2 if self._is_deafened.is_set() else 0
             flags = mute_flag | deaf_flag
-
-            # Читаем whisper_target_uid ДО проверки мута — шёпот обходит мут.
-            # Это атомарное чтение int (GIL-safe).
             whisper_uid = self.whisper_target_uid
 
             try:
                 if is_talking and whisper_uid != 0:
                     # ── РЕЖИМ ШЁПОТА ─────────────────────────────────────────
-                    # Шёпот отправляется НЕЗАВИСИМО от состояния мута.
-                    # Мут означает «не говорить в комнату» — шёпот приватный
-                    # и не нарушает намерение пользователя заглушить себя от
-                    # остальных. PTT-кнопка шёпота — явное действие отправить.
-                    #
-                    # Нормальный аудио-пакет в комнату НЕ кладём в очередь →
-                    # остальные участники не слышат отправителя в этот момент.
-                    # FIX 6: _pcm_int16_buf предаллоцирован в __init__ — нет GC-давления 50/сек
                     np.multiply(denoised_float, 32767, out=self._pcm_int16_buf,
                                 casting='unsafe')
                     encoded = self.encoder.encode(self._pcm_int16_buf.tobytes(), CHUNK_SIZE)
-                    # В режиме шёпота пакет в комнату НЕ отправляется — my_sequence
-                    # не должен расти. stop_whisper() синхронизирует его с
-                    # _whisper_sequence, так что разрыва seq при возврате не будет.
                     self._whisper_sequence += 1
                     w_flags = FLAG_WHISPER
                     w_header = UDP_HEADER_STRUCT.pack(self.my_uid, curr_time,
-                                           self._whisper_sequence, w_flags)
-                    # Payload: [target_uid: 4 байта] + [opus]
+                                                      self._whisper_sequence, w_flags)
                     w_payload = struct.pack('!I', whisper_uid) + encoded
                     try:
                         self.send_queue.put_nowait(w_header + w_payload)
@@ -751,95 +886,76 @@ class AudioHandler(QObject):
 
                 elif is_talking and not self._is_muted.is_set():
                     # ── ОБЫЧНЫЙ РЕЖИМ: пакет в комнату ───────────────────────
-                    # FIX 6: reuse pre-allocated buffer
                     np.multiply(denoised_float, 32767, out=self._pcm_int16_buf,
                                 casting='unsafe')
                     encoded = self.encoder.encode(self._pcm_int16_buf.tobytes(), CHUNK_SIZE)
                     self.my_sequence += 1
-                    packet = UDP_HEADER_STRUCT.pack(self.my_uid, curr_time, self.my_sequence, flags) + encoded
-
+                    packet = UDP_HEADER_STRUCT.pack(self.my_uid, curr_time,
+                                                    self.my_sequence, flags) + encoded
                     if not self.was_talking:
-                        # FIX #3: deque.popleft() — O(1) вместо list.pop(0) — O(n)
+                        # FIX #3: deque.popleft() — O(1)
                         while self.vad_pre_buffer:
                             try:
                                 self.send_queue.put_nowait(self.vad_pre_buffer.popleft())
-                            except:
+                            except Exception:
                                 pass
                         self.was_talking = True
                     self.send_queue.put_nowait(packet)
-                    # Стрим-аудио микрофона теперь передаётся через WebRTC (MicrophoneTrack).
-                    # UDP FLAG_STREAM_AUDIO для микрофона удалён.
 
                 else:
-                    # Не говорим (или мут без шёпота) — сбрасываем was_talking,
-                    # пополняем pre_buffer для следующего старта речи.
                     self.was_talking = False
                     if not is_talking and whisper_uid == 0:
                         empty_packet = UDP_HEADER_STRUCT.pack(self.my_uid, curr_time, 0, flags)
-                        # FIX #3: deque(maxlen=5) — автоматически вытесняет старые
-                        # элементы при переполнении, ручная проверка len > 5 не нужна.
                         self.vad_pre_buffer.append(empty_packet)
-            except:
+            except Exception:
                 pass
+
+    # ===========================================================================
+    #  _output_callback  —  воспроизведение (sd.OutputStream, WASAPI)
+    #  Вызывается PortAudio каждые 20 мс из нативного потока.
+    #  Декодирует голоса → подмешивает UI-звуки → стрим-аудио → tanh → outdata.
+    #  Сигнатура OutputStream callback: (outdata, frames, time_info, status).
+    #
+    #  КЛЮЧЕВОЕ: OutputStream на WASAPI атрибутируется PID нашего процесса
+    #  (не svchost.exe как MME) → DLL Process Loopback корректно исключает его →
+    #  зрители не слышат эхо своих голосов.
+    # ===========================================================================
+    def _output_callback(self, outdata, frames, time_info, status):
+        if not self._cb_out_first_logged:
+            self._cb_out_first_logged = True
+            print("[DEBUG] _output_callback: ПЕРВЫЙ ВЫЗОВ — OutputStream (WASAPI) работает", flush=True)
+        if status:
+            print(f"[DEBUG] _output_callback: status={status}", flush=True)
+
+        if not self._is_running.is_set():
+            outdata.fill(0)
+            return
+
+        curr_time = time.perf_counter()
+
+        # ── Диагностика: локальные аккумуляторы для этого фрейма ────────────
+        _diag_voice_frame:  float = 0.0   # сумма RMS^2 голосов чата за фрейм
+        _diag_stream_frame: float = 0.0   # RMS^2 стрим-аудио за фрейм
 
         self.mix_buffer.fill(0)
         # BUG-FIX: _n_active инициализируем до блока deafened.
-        # Без этого при is_deafened=True переменная не создаётся, но используется
-        # ниже в блоке _stream_active → UnboundLocalError в CFFI callback.
-        # При deafen активных голосовых спикеров нет (зритель не слышит комнату),
-        # поэтому 0 — корректное значение: auto-ducking стрима отключается (factor=1.0).
         _n_active = 0
         if not self._is_deafened.is_set():
-            # ── N-speaker headroom ────────────────────────────────────────────
-            # Проблема: 3+ участников говорят одновременно → сумма амплитуд
-            # до 3.0–4.0 → даже soft limiter давит сигнал в 3× → все тихие
-            # и «мутные». Это не дисторшн, но воспринимается как «плохое качество».
-            #
-            # Решение: заранее вычисляем gain для каждого активного спикера
-            # по формуле sqrt(2) / sqrt(N_active). При N=1: gain=1.0 (без изменений).
-            # При N=2: gain=1.0 (пара = норма). При N=3: gain=0.82. При N=4: gain=0.71.
-            # Это стандартный incoherent sources scaling — суммарная RMS остаётся
-            # постоянной независимо от числа говорящих.
-            #
-            # Считаем «активных»: last_packet < 1.5с AND не заглушен AND volume > 0.
-            # Не блокируемся — читаем уже готовый COW-снимок без лока.
-            # ── Подсчёт активных голосовых спикеров (окно 0.4с) ─────────────────
-            # Было 1.5с → «фантомные» спикеры: человек сказал одно слово и
-            # полторы секунды тянул gain вниз для всей комнаты. При плохом
-            # микрофоне 3-го клиента (постоянный шум = VAD открыт) — он вечно
-            # оставался в _n_active и давил громкость всем остальным.
-            # 0.4с = комфортный хвост VAD без долгих фантомов.
-            #
-            # ВАЖНО: порог для воспроизведения пакетов остаётся 1.5с ниже —
-            # не трогаем, чтобы не обрезать речь в конце фразы.
+            # ── Подсчёт активных голосовых спикеров (окно 0.4с) ─────────────
             _n_active = sum(
                 1 for u in self._audio_users_snapshot.values()
                 if (curr_time - u.last_packet_time < 0.4
                     and not u.is_locally_muted
                     and not u.volume_zero)
             )
-            # Loopback/stream аудио намеренно НЕ включаем в _n_active.
-            # Игровой звук — фоновый поток, а не «конкурирующий голос».
-            # Раньше активный стрим постоянно добавлял +1 к N → gain у всех
-            # зрителей падал на 18% даже когда никто не говорил.
-            # Soft limiter (ниже) надёжно защищает от перегруза при наложении
-            # голоса и игрового звука без ручного снижения gain.
 
             # ── Смягчённая формула headroom ──────────────────────────────────
-            # Было: sqrt(2)/sqrt(N) → при N=3 gain=0.816 (внезапные -18%
-            # в момент подключения 3-го собеседника — хорошо слышимый провал).
-            # Теперь: ≤2 источников → 100%, далее -10% за каждого, пол 0.75.
-            # Soft limiter обработает редкие случаи когда все кричат одновременно.
             if _n_active <= 2:
                 _speaker_gain = 1.0
             else:
                 _speaker_gain = max(0.75, 1.0 - 0.1 * (_n_active - 2))
 
             # FIX #1: читаем COW-снимок БЕЗ лока.
-            # _packet_processor_loop обновляет _audio_users_snapshot внутри
-            # users_lock после каждого изменения. Снимок «отстаёт» максимум
-            # на 1 пакет (~20 мс) — для аудиомикширования незаметно.
-            # JitterBuffer.get() имеет собственный внутренний лок — thread-safe.
             for uid, user in self._audio_users_snapshot.items():
                 if curr_time - user.last_packet_time < 1.5:
                     data = user.jitter_buffer.get()
@@ -849,25 +965,10 @@ class AudioHandler(QObject):
                                 decoded = user.decoder.decode(data, CHUNK_SIZE)
                                 s = np.frombuffer(decoded, dtype=np.int16).astype(np.float32) / 32767.0
 
-                                # ── Per-uid whisper effect ───────────────────────────────────
-                                # _active_whispers[uid] обновляется в add_incoming_whisper_packet
-                                # на каждый входящий пакет шёпота (~50 раз/сек).
-                                #
-                                # «Тёплый старт» при первом пакете (uid не в _whisper_states):
-                                # history заполняем текущим фреймом s (повторённым до 2048).
-                                # Обе читающие головки pitch-shifter'а сразу попадают в реальный
-                                # сигнал — переход ноль→сигнал отсутствует → нет треска/click.
-                                #
-                                # LP-фильтр: нулевые начальные условия оптимальны для голосового
-                                # сигнала (mean ≈ 0); sosfilt_zi(sos)*0 == zeros.
-                                #
-                                # Два шептуна одновременно: каждый uid имеет свой state dict →
-                                # независимые history/phase/lp_zi/buf → нет взаимных артефактов →
-                                # оба смешиваются в mix_buffer без потерь.
+                                # ── Per-uid whisper effect ───────────────────
                                 _w_ts = self._active_whispers.get(uid, 0.0)
                                 if _w_ts and (curr_time - _w_ts) < 2.0:
                                     if uid not in self._whisper_states:
-                                        # Ленивое создание: тёплый старт с реальным сигналом
                                         _warm_history = np.resize(
                                             s.astype(np.float32), 2048).copy()
                                         _N = CHUNK_SIZE
@@ -879,33 +980,20 @@ class AudioHandler(QObject):
                                                 dtype=np.float64),
                                             'buf':     np.zeros(
                                                 2048 + _N, dtype=np.float32),
-                                            # FIX 7: pre-alloc scratch arrays —
-                                            # np.arange(N) вызывался ДВАЖДЫ каждые 20 мс.
-                                            # Пересоздание 2 массивов по 960 float64 = ~15 KB/фрейм.
-                                            # Кэшируем: arange и base_idx неизменны пока N=CHUNK_SIZE.
                                             '_arange': np.arange(_N, dtype=np.float64),
                                             '_base':   np.arange(2048, 2048 + _N, dtype=np.float64),
                                         }
                                     s = self._apply_anonymous_voice_effect(
                                         s, self._whisper_states[uid])
                                 else:
-                                    # Шептун неактивен: освобождаем state (нет утечки памяти)
                                     self._active_whispers.pop(uid, None)
                                     self._whisper_states.pop(uid, None)
 
                                 self.mix_buffer += s * (user.volume * _speaker_gain)
-                                # Mix-Minus (FLAG_STREAM_VOICES) через UDP удалён.
-                                # Голоса участников комнаты для зрителей стрима будут
-                                # реализованы через WebRTC в следующей итерации.
+                                # Диагностика: накапливаем вклад этого голоса
+                                _diag_voice_frame += float(np.dot(s, s)) / CHUNK_SIZE
                             else:
-                                # FIX PLC: пакет не пришёл вовремя (jitter/потеря сети).
-                                # Вызываем Opus PLC (Packet Loss Concealment) с data=None.
-                                # Opus генерирует comfort noise и поддерживает внутреннее
-                                # LPC-состояние предсказателя синхронизированным.
-                                # Без этого вызова при следующем реальном пакете декодер
-                                # «не знает» что был пропуск → выдаёт discontinuity → треск.
-                                # Результат PLC в mix_buffer НЕ добавляем — тишина правильна
-                                # когда пакет потерян, PLC нужен только для состояния декодера.
+                                # FIX PLC: сохраняем состояние декодера при потере пакета.
                                 try:
                                     user.decoder.decode(None, CHUNK_SIZE)
                                 except Exception:
@@ -913,9 +1001,7 @@ class AudioHandler(QObject):
                         except Exception:
                             pass
 
-        # ── Внутренний микшер UI-звуков (уведомления, Soundboard, Nudge) ────────
-        # Подмешиваем в уже заполненный mix_buffer — никаких sd.play() и
-        # новых WASAPI-устройств. Lock гарантирует атомарность доступа к списку.
+        # ── Внутренний микшер UI-звуков (уведомления, Soundboard, Nudge) ────
         with self._local_sounds_lock:
             active = []
             for snd in self._local_sounds:
@@ -930,41 +1016,29 @@ class AudioHandler(QObject):
             self._local_sounds = active
 
         # ── Стриминговое аудио зрителя (WebRTC) ─────────────────────────────
-        # Читаем CHUNK_SIZE семплов из кольцевого буфера.
-        # Lock — только на стороне записи (asyncio thread) и здесь при мemmove.
-        # Нет np.concatenate, нет np.empty — нет аллокаций в RT-path.
-        # Auto-ducking: при активных голосах приглушаем игру до 40%.
+        # Auto-ducking: при активных голосах приглушаем стрим до 40%.
         if self._stream_active:
             with self._stream_lock:
                 avail = self._stream_fill
-
                 if avail >= CHUNK_SIZE:
-                    # Нормальный путь: читаем CHUNK_SIZE семплов
                     _current_vol = self._stream_vol * (0.4 if _n_active > 0 else 1.0)
                     self.mix_buffer += self._stream_buf[:CHUNK_SIZE] * _current_vol
-                    # Сдвигаем остаток без аллокации
+                    # Диагностика: RMS стрим-аудио до масштабирования
+                    _sb = self._stream_buf[:CHUNK_SIZE]
+                    _diag_stream_frame = float(np.dot(_sb, _sb)) / CHUNK_SIZE
                     remaining = avail - CHUNK_SIZE
                     if remaining > 0:
                         self._stream_buf[:remaining] = self._stream_buf[CHUNK_SIZE:avail]
                     self._stream_fill = remaining
-
                 elif avail > 0:
-                    # Underrun: есть данные, но меньше CHUNK_SIZE.
-                    # Fade-out по убывающей — плавный переход в тишину без щелчка.
                     _current_vol = self._stream_vol * (0.4 if _n_active > 0 else 1.0)
                     _fade = np.linspace(1.0, 0.0, avail, dtype=np.float32)
                     self.mix_buffer[:avail] += (
                         self._stream_buf[:avail] * _fade * _current_vol
                     )
                     self._stream_fill = 0
-                # else: полный underrun — тишина, не трогаем mix_buffer
 
         # ── Математически чистый tanh soft-clipper ───────────────────────────
-        # Заменяет старый пропорциональный лимитер (self.mix_buffer *= k).
-        # Старая схема: один gain на весь кадр → резкая «ступенька» gain между
-        # соседними кадрами → слышимый щелчок/треск при пиках.
-        # tanh обрабатывает каждый семпл независимо, плавно загибая только те,
-        # что вышли за limit. Результат — аналог лампового сатуратора без артефактов.
         _limit = 0.95
         _over  = np.abs(self.mix_buffer) > _limit
         if np.any(_over):
@@ -976,7 +1050,42 @@ class AudioHandler(QObject):
         # Safety-clip: float-погрешности после tanh
         np.clip(self.mix_buffer, -1.0, 1.0, out=self.mix_buffer)
 
-        outdata[:] = self.mix_buffer.reshape(-1, 1)
+        # ── Диагностика: накапливаем и логируем раз в секунду ──────────────
+        _mix_rms_sq = float(np.dot(self.mix_buffer, self.mix_buffer)) / CHUNK_SIZE
+        self._diag_voice_sum  += _diag_voice_frame
+        self._diag_stream_sum += _diag_stream_frame
+        self._diag_mix_sum    += _mix_rms_sq
+        self._diag_cnt        += 1
+
+        if curr_time >= self._diag_next_ts and self._diag_cnt > 0:
+            n = self._diag_cnt
+            v_rms = (self._diag_voice_sum  / n) ** 0.5
+            s_rms = (self._diag_stream_sum / n) ** 0.5
+            m_rms = (self._diag_mix_sum    / n) ** 0.5
+            _sa = "ДА" if self._stream_active else "нет"
+            print(
+                f"[OUT-DIAG] voice_rms={v_rms:.4f}  stream_rms={s_rms:.4f}  "
+                f"mix_rms={m_rms:.4f}  stream_active={_sa}  "
+                f"n_active={_n_active}  deafen={self._is_deafened.is_set()}",
+                flush=True,
+            )
+            self._diag_voice_sum  = 0.0
+            self._diag_stream_sum = 0.0
+            self._diag_mix_sum    = 0.0
+            self._diag_cnt        = 0
+            self._diag_next_ts    = curr_time + 1.0
+
+        # ── Вывод через PortAudio (всегда) ──────────────────────────────────
+        # PortAudio WASAPI Shared сессия python.exe атрибутируется нашему PID.
+        # DLL Capture PROCESS_LOOPBACK_EXCLUDE(python.exe) исключает её
+        # на уровне Session Manager до hardware микшера — эхо не возникает.
+        if self._out_sr != SAMPLE_RATE:
+            x_old = np.linspace(0.0, 1.0, CHUNK_SIZE,         dtype=np.float64)
+            x_new = np.linspace(0.0, 1.0, self._out_blocksize, dtype=np.float64)
+            resampled = np.interp(x_new, x_old, self.mix_buffer).astype(np.float32)
+            outdata[:] = resampled[:frames].reshape(-1, 1)
+        else:
+            outdata[:] = self.mix_buffer.reshape(-1, 1)
 
     def register_ip_mapping(self, uid, ip_addr):
         if not ip_addr: return
@@ -1104,6 +1213,75 @@ class AudioHandler(QObject):
         self.whisper_received.emit(uid)
 
         self.add_incoming_packet(uid, seq, data, 0)
+
+    def _remap_to_wasapi(self, mme_idx: int | None) -> int | None:
+        try:
+            apis = sd.query_hostapis()
+            devices = sd.query_devices()
+
+            wasapi_host_idx = next(
+                (i for i, a in enumerate(apis) if 'WASAPI' in a['name']), None
+            )
+
+            if mme_idx is None:
+                if wasapi_host_idx is not None:
+                    default_wasapi_out = apis[wasapi_host_idx]['default_output_device']
+                    print(f"[Audio] Дефолтное устройство → WASAPI (idx {default_wasapi_out})")
+                    return default_wasapi_out
+                return None
+
+            dev = devices[mme_idx]
+            host_api = apis[dev['hostapi']]
+
+            if 'MME' not in host_api['name']:
+                return mme_idx  # уже не MME
+
+            if wasapi_host_idx is None:
+                print("[Audio] WASAPI недоступен, остаёмся на MME (возможно эхо)")
+                return mme_idx
+
+            default_wasapi = apis[wasapi_host_idx]['default_output_device']
+            phys_name = dev['name']
+            best_idx = None
+            best_score = -1
+
+            for i, d in enumerate(devices):
+                if d['hostapi'] != wasapi_host_idx or d['max_output_channels'] <= 0:
+                    continue
+                wname = d['name']
+                if wname == phys_name:
+                    best_idx = i
+                    break
+                # MME обрезает имена до 31 символа — проверяем ОБА направления
+                match_len = min(len(phys_name), len(wname), 10)
+                if match_len >= 8 and (
+                        wname.startswith(phys_name[:match_len]) or
+                        phys_name.startswith(wname[:match_len])
+                ):
+                    score = match_len
+                    if score > best_score:
+                        best_score = score
+                        best_idx = i
+
+            if best_idx is not None:
+                print(
+                    f"[Audio] Output MME→WASAPI: "
+                    f"idx {mme_idx}→{best_idx} "
+                    f"'{phys_name}' → '{devices[best_idx]['name']}'"
+                )
+                return best_idx
+
+            # ── КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: нет совпадения → всё равно форсируем WASAPI ──
+            # Возврат mme_idx здесь = DLL не может исключить процесс = эхо гарантировано.
+            print(
+                f"[Audio] WASAPI-аналог для '{phys_name}' не найден. "
+                f"Форсируем дефолтный WASAPI (idx {default_wasapi})"
+            )
+            return default_wasapi  # ← единственная важная строка
+
+        except Exception as e:
+            print(f"[Audio] _remap_to_wasapi error: {e}")
+            return mme_idx
 
     @property
     def is_muted(self):

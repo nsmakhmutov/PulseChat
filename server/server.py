@@ -27,6 +27,7 @@ from config import (
     CMD_HOST_MUTE, CMD_FORCE_MUTED,
     CMD_CHAT_MSG, CMD_CHAT_HISTORY, CMD_CHAT_HISTORY_REQ, CHAT_MSG_MAX_LEN,
     CMD_CHAT_MEDIA, CHAT_MEDIA_MAX_B64,
+    CMD_DRAW_STROKE, DRAW_MAX_POINTS,
 )
 from .server_webrtc import WebRTCSFU, AIORTC_AVAILABLE
 
@@ -1213,10 +1214,71 @@ class SFUServer:
                                         except Exception:
                                             pass
 
+                        # ── Draw Stroke: ретрансляция зрителям + стримеру ────────
+                        # Зритель нарисовал мазок → сервер рассылает его всем
+                        # остальным зрителям этого стрима и самому стримеру.
+                        # points — нормализованные (0.0–1.0) координаты кадра.
+                        # width зажат в [1,8], число точек ограничено DRAW_MAX_POINTS.
+                        elif action == CMD_DRAW_STROKE:
+                            streamer_uid_dr = msg.get('streamer_uid')
+                            points_dr       = msg.get('points', [])
+                            color_dr        = str(msg.get('color', '#FF6B6B'))[:16]
+                            width_dr        = max(1, min(8, int(msg.get('width', 3))))
+                            nick_dr         = str(msg.get('nick', '?'))[:32]
+
+                            if streamer_uid_dr and isinstance(points_dr, list) and points_dr:
+                                if len(points_dr) > DRAW_MAX_POINTS:
+                                    points_dr = points_dr[:DRAW_MAX_POINTS]
+
+                                with self.clients_lock:
+                                    sender_uid_dr = (
+                                        self.clients[conn]['uid']
+                                        if conn in self.clients else 0
+                                    )
+
+                                relay_dr = json.dumps({
+                                    'action':       CMD_DRAW_STROKE,
+                                    'streamer_uid': streamer_uid_dr,
+                                    'sender_uid':   sender_uid_dr,
+                                    'nick':         nick_dr,
+                                    'color':        color_dr,
+                                    'points':       points_dr,
+                                    'width':        width_dr,
+                                }).encode('utf-8')
+
+                                # Все зрители данного стрима
+                                with self.watchers_lock:
+                                    watcher_uids_dr = set(
+                                        self.watchers.get(streamer_uid_dr, {}).keys()
+                                    )
+
+                                with self.clients_lock:
+                                    # Зрители (включая отправителя для эха)
+                                    target_conns_dr = [
+                                        c for c, d in self.clients.items()
+                                        if d.get('uid') in watcher_uids_dr
+                                    ]
+                                    # Стример — видит мазки у себя на экране
+                                    streamer_conn_dr = next(
+                                        (c for c, d in self.clients.items()
+                                         if d.get('uid') == streamer_uid_dr),
+                                        None,
+                                    )
+                                    if streamer_conn_dr:
+                                        target_conns_dr.append(streamer_conn_dr)
+
+                                for tc in target_conns_dr:
+                                    try:
+                                        tc.sendall(relay_dr)
+                                    except Exception:
+                                        pass
+
                     except json.JSONDecodeError:
                         break
 
         except Exception as e:
+            # OSError (10054/10053 — разрыв соединения) — штатно, не логируем.
+            # Остальные исключения логируем для диагностики.
             err_code = getattr(e, 'winerror', None) or getattr(e, 'errno', None)
             is_disconnect = err_code in (10054, 10053, 104, 32)
             if not is_disconnect:

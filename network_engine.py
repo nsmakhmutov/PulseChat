@@ -61,6 +61,7 @@ from config import (
     CMD_CHAT_MSG, CMD_CHAT_HISTORY, CMD_CHAT_HISTORY_REQ,
     CHAT_MSG_MAX_LEN, CHAT_HISTORY_MAX,
     CMD_CHAT_MEDIA, CHAT_MEDIA_MAX_B64,
+    CMD_DRAW_STROKE, DRAW_MAX_POINTS,
 )
 
 MAX_SILENT_RECONNECT_ATTEMPTS = 2    # было 4: 4×3с=12с → 2×1с=2с до auto_host_check
@@ -150,6 +151,13 @@ class NetworkClient(QObject):
     # Хост выключил наш микрофон (CMD_FORCE_MUTED).
     # MainWindow применяет mute. Кнопки НЕ блокируются — участник может включить сам.
     force_muted = pyqtSignal()
+
+    # ── Аннотации стрима (рисование зрителей) ──────────────────────────────
+    # Эмитируется при получении CMD_DRAW_STROKE от сервера.
+    # Аргументы: (sender_uid: int, nick: str, color: str, points: list, width: int)
+    # points — list of [x, y], значения нормализованы 0.0–1.0 относительно кадра.
+    # Эмитируется и у зрителей, и у стримера (сервер ретранслирует всем).
+    draw_stroke_received = pyqtSignal(int, str, str, list, int)
 
     def __init__(self, audio):
         super().__init__()
@@ -819,14 +827,20 @@ class NetworkClient(QObject):
 
         # Системный звук: захват через WASAPI Process Loopback DLL.
         # Добавляется ТОЛЬКО если пользователь включил "Транслировать звук" в настройках.
-        # DLL исключает звук самого InPulse → зрители не слышат голосовой чат стримера.
+        # DLL нативно исключает весь звук процесса InPulse из loopback:
+        #   StartRender() → RAW WASAPI → PID python.exe атрибутирован
+        #   StartCapture(exclude_pid) → PROCESS_LOOPBACK_EXCLUDE работает.
+        # Программный голосовой gate удалён — дропов стрима при голосе нет.
         _stream_audio = (settings or {}).get('stream_audio', False)
         if _stream_audio and SYSTEM_AUDIO_AVAILABLE and SystemAudioTrack is not None:
             try:
                 audio_device_idx = (settings or {}).get('audio_device_idx', None)
-                self._system_audio_track = SystemAudioTrack(device_idx=audio_device_idx)
+                self._system_audio_track = SystemAudioTrack(
+                    device_idx=audio_device_idx,
+                    audio_handler=self.audio,   # AudioHandler → enable_dll_render()
+                )
                 pc.addTrack(self._system_audio_track)
-                print("[Net] SystemAudioTrack добавлен в RTCPeerConnection")
+                print("[Net] SystemAudioTrack добавлен в RTCPeerConnection (DLL-режим, gate-free)")
             except Exception as e:
                 print(f"[Net] SystemAudioTrack ошибка инициализации: {e}")
                 self._system_audio_track = None
@@ -1044,6 +1058,19 @@ class NetworkClient(QObject):
         _first = True
         _frame_count = 0
 
+        # ── Диагностика стрим-аудио на стороне ЗРИТЕЛЯ ──────────────────────
+        # Логируем RMS входящего потока раз в секунду.
+        # ИНТЕРПРЕТАЦИЯ:
+        #   RMS ≈ 0 постоянно       → WebRTC трек пустой / не подключён
+        #   RMS > 0 когда люди говорят в комнате → DLL стримера НЕ исключает
+        #                             голосовой чат (основная причина эха!)
+        #   RMS > 0 при тишине в чате → идёт реальный звук игры/рабочего стола
+        import time as _time_mod
+        _diag_rms_sum: float = 0.0
+        _diag_rms_cnt: int   = 0
+        _diag_next_ts: float = _time_mod.perf_counter() + 1.0
+        _diag_frames_per_sec: int = 0
+
         try:
             while True:
                 try:
@@ -1069,16 +1096,33 @@ class NetworkClient(QObject):
                         _first = False
                         peak = float(np.abs(arr).max())
                         print(
-                            f"[Net] StreamAudio: первый фрейм uid={streamer_uid} "
-                            f"sr={sr} shape={arr.shape} peak={peak:.4f}"
+                            f"[VIEWER-DIAG] StreamAudio: ПЕРВЫЙ ФРЕЙМ uid={streamer_uid} "
+                            f"sr={sr} shape={arr.shape} dtype={arr.dtype} peak={peak:.4f}",
+                            flush=True,
                         )
 
                     _frame_count += 1
-                    if _frame_count % 500 == 0:
+                    _diag_frames_per_sec += 1
+
+                    # Накапливаем RMS для диагностического лога
+                    flat = arr.flatten().astype(np.float32)
+                    _diag_rms_sum += float(np.dot(flat, flat))
+                    _diag_rms_cnt += len(flat)
+
+                    _now = _time_mod.perf_counter()
+                    if _now >= _diag_next_ts and _diag_rms_cnt > 0:
+                        rms  = (_diag_rms_sum / _diag_rms_cnt) ** 0.5
+                        peak = float(np.abs(flat).max())
                         print(
-                            f"[Net] StreamAudio: {_frame_count} фреймов "
-                            f"от uid={streamer_uid}"
+                            f"[VIEWER-DIAG] StreamAudio uid={streamer_uid}: "
+                            f"RMS={rms:.4f}  peak={peak:.4f}  "
+                            f"fps={_diag_frames_per_sec}  total={_frame_count}",
+                            flush=True,
                         )
+                        _diag_rms_sum      = 0.0
+                        _diag_rms_cnt      = 0
+                        _diag_frames_per_sec = 0
+                        _diag_next_ts      = _now + 1.0
 
                     # ГЛАВНЫЙ ФИХ: add_stream_audio, НЕ play_internal_sound
                     if self.audio is not None and hasattr(self.audio, 'add_stream_audio'):
@@ -1524,6 +1568,18 @@ class NetworkClient(QObject):
         elif act == CMD_FORCE_MUTED:
             self.force_muted.emit()
 
+        # ── Draw Stroke: аннотация зрителя поверх стрима ──────────────────
+        elif act == CMD_DRAW_STROKE:
+            sender_uid_dr = int(msg.get('sender_uid', 0))
+            nick_dr       = str(msg.get('nick', '?'))
+            color_dr      = str(msg.get('color', '#FF6B6B'))
+            points_dr     = msg.get('points', [])
+            width_dr      = int(msg.get('width', 3))
+            if isinstance(points_dr, list) and points_dr:
+                self.draw_stroke_received.emit(
+                    sender_uid_dr, nick_dr, color_dr, points_dr, width_dr
+                )
+
         # ── Миграция сервера (встроенный режим) ────────────────────────────
         elif act == CMD_SERVER_MIGRATE:
             new_host_uid = msg.get('new_host_uid', 0)
@@ -1568,6 +1624,32 @@ class NetworkClient(QObject):
             self.tcp_sock.sendall(json.dumps(data).encode('utf-8'))
         except Exception as e:
             print(f"[Net] Send JSON error: {e}")
+
+    def send_draw_stroke(self, streamer_uid: int, nick: str,
+                         color: str, points: list, width: int) -> None:
+        """
+        Отправляет мазок рисования серверу.
+        Сервер ретранслирует всем зрителям + стримеру.
+
+        streamer_uid — uid стримера (чей стрим смотрим).
+        nick         — ник рисующего зрителя (отображается на оверлее стримера).
+        color        — hex-цвет '#RRGGBB'.
+        points       — list of [x, y], нормализованные 0.0–1.0 относительно кадра.
+        width        — толщина линии 1–8 px.
+        """
+        if not points:
+            return
+        # Ограничиваем на клиенте до отправки — не нагружаем сеть
+        if len(points) > DRAW_MAX_POINTS:
+            points = points[:DRAW_MAX_POINTS]
+        self.send_json({
+            'action':       CMD_DRAW_STROKE,
+            'streamer_uid': streamer_uid,
+            'nick':         nick[:32],
+            'color':        color[:16],
+            'points':       points,
+            'width':        max(1, min(8, width)),
+        })
 
     def update_user_info(self, nick, avatar):
         self.send_json({"action": "update_user", "nick": nick, "avatar": avatar})

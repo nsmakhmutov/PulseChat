@@ -1,35 +1,43 @@
 # ui_video.py — GPU-accelerated видеоплеер на QOpenGLWidget
 #
 # Архитектура:
-#   VideoSurface  — QOpenGLWidget, рендерит кадры через OpenGL текстуры (GPU)
-#   VideoOverlay  — QFrame-оверлей с панелью управления (авто-скрытие по мышке)
-#   VideoWindow   — QWidget-обёртка: склеивает VideoSurface + VideoOverlay
+#   VideoSurface             — QOpenGLWidget, рендерит кадры через OpenGL текстуры (GPU)
+#   VideoGlassTitleBar       — стеклянный кастомный тайтлбар (перетаскивание, мин/макс/закрыть)
+#   DrawCanvas               — прозрачный QWidget поверх video_container; рисование зрителем
+#   StreamerAnnotationOverlay— прозрачное топ-окно на экране стримера (видит чужие мазки)
+#   VideoOverlay             — QFrame-оверлей с панелью управления (авто-скрытие по мышке)
+#   VideoWindow              — QWidget-обёртка: склеивает всё вместе
 #
 # Публичный API (совместим со старым кодом):
 #   VideoWindow(nick)           — создать окно
 #   window.uid                  — UID стримера (устанавливается снаружи)
 #   window.update_frame(QImage) — слот для приёма нового кадра
+#   window.add_remote_stroke()  — принять мазок от сервера (зритель/стример)
 #
 # Новые сигналы VideoWindow (подключать в MainWindow при необходимости):
 #   overlay_mute_toggled   () — зритель нажал кнопку mic в оверлее
 #   overlay_deafen_toggled () — зритель нажал кнопку volume в оверлее
 #   overlay_stop_watch     () — зритель нажал «Прекратить просмотр»
+#   draw_stroke_ready(uid, nick, color, points, width) — зритель закончил мазок
 #
 # Полноэкранный режим:
 #   — Кнопка ⛶ в оверлее / двойной клик / F / F11 → переключить fullscreen
 #   — Escape → выйти из fullscreen
 
 import time
+import math
+import random
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QSizePolicy, QPushButton, QFrame, QSlider,
-                             QGraphicsOpacityEffect)
+                             QGraphicsOpacityEffect, QApplication)
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from PyQt6.QtCore import (Qt, pyqtSlot, QSize, QRect, pyqtSignal,
-                          QTimer, QEvent, QPoint, QPropertyAnimation,
+                          QTimer, QEvent, QPoint, QPointF, QPropertyAnimation,
                           QEasingCurve)
-from PyQt6.QtGui import QImage, QPainter, QColor, QFont, QIcon, QLinearGradient
+from PyQt6.QtGui import (QImage, QPainter, QColor, QFont, QIcon,
+                         QLinearGradient, QPen, QPainterPath, QCursor)
 
-from config import resource_path
+from config import resource_path, DRAW_FADE_SEC
 
 # ВАЖНО: QSurfaceFormat.setDefaultFormat() вызывается в client_main.py
 # ДО создания QApplication. Здесь его быть НЕ должно — иначе краш 0xC0000409.
@@ -39,6 +47,504 @@ _HIDE_TIMEOUT_MS = 3000
 
 # Высота оверлей-панели
 _OVERLAY_H = 60
+
+# Высота стеклянного тайтлбара плеера
+_TITLE_H = 36
+
+# Палитра цветов мазков — 12 хорошо различимых цветов (назначается случайно при старте)
+_STROKE_PALETTE = [
+    '#FF6B6B', '#FFD93D', '#6BCB77', '#4D96FF',
+    '#FF922B', '#CC5DE8', '#20C997', '#F06595',
+    '#74C0FC', '#A9E34B', '#FFA94D', '#E599F7',
+]
+
+# ---------------------------------------------------------------------------
+# VideoGlassTitleBar — стеклянный кастомный тайтлбар окна плеера
+# ---------------------------------------------------------------------------
+class VideoGlassTitleBar(QWidget):
+    """
+    Кастомный title bar в стиле стеклянного интерфейса приложения.
+    Заменяет стандартный системный заголовок окна.
+    Поддерживает перетаскивание, двойной клик → maximize/restore,
+    кнопки: свернуть, развернуть/восстановить, закрыть.
+    """
+    def __init__(self, parent_window: QWidget, title: str = ''):
+        super().__init__(parent_window)
+        self._win      = parent_window
+        self._drag_pos = None
+        self._title    = title
+
+        self.setFixedHeight(_TITLE_H)
+        self.setMouseTracking(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setObjectName('videoTitleBar')
+        self.setStyleSheet("""
+            QWidget#videoTitleBar {
+                background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                    stop:0 rgba(26, 28, 44, 235),
+                    stop:1 rgba(15, 16, 28, 245));
+                border-bottom: 1px solid rgba(255,255,255,0.08);
+            }
+        """)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(12, 0, 6, 0)
+        lay.setSpacing(4)
+
+        # Иконка приложения
+        self._ico = QLabel()
+        self._ico.setFixedSize(18, 18)
+        self._ico.setStyleSheet('background:transparent; border:none;')
+        try:
+            self._ico.setPixmap(
+                QIcon(resource_path('assets/icon/logo.ico')).pixmap(18, 18)
+            )
+        except Exception:
+            pass
+        lay.addWidget(self._ico)
+
+        # Заголовок
+        self._lbl = QLabel(title)
+        self._lbl.setStyleSheet(
+            'color:#cdd6f4; font-size:12px; font-weight:600;'
+            'background:transparent; border:none; padding-left:4px;'
+        )
+        lay.addWidget(self._lbl, stretch=1)
+
+        _btn_ss = (
+            'QPushButton{'
+            '  background:transparent; border:none; border-radius:5px;'
+            '  color:#8890a0; font-size:13px;'
+            '  min-width:28px; max-width:28px;'
+            '  min-height:26px; max-height:26px;'
+            '}'
+            'QPushButton:hover{background:rgba(255,255,255,0.10);color:#cdd6f4;}'
+        )
+        _close_ss = (
+            _btn_ss +
+            'QPushButton#closeTitleBtn:hover{background:#c0392b;color:white;}'
+        )
+
+        # Свернуть
+        self._btn_min = QPushButton('─')
+        self._btn_min.setStyleSheet(_btn_ss)
+        self._btn_min.clicked.connect(self._win.showMinimized)
+
+        # Максимизировать / восстановить
+        self._btn_max = QPushButton('□')
+        self._btn_max.setStyleSheet(_btn_ss)
+        self._btn_max.clicked.connect(self._toggle_max)
+
+        # Закрыть
+        self._btn_close = QPushButton('✕')
+        self._btn_close.setObjectName('closeTitleBtn')
+        self._btn_close.setStyleSheet(_close_ss)
+        self._btn_close.clicked.connect(self._win.close)
+
+        for b in (self._btn_min, self._btn_max, self._btn_close):
+            lay.addWidget(b)
+
+    def set_title(self, title: str):
+        self._title = title
+        self._lbl.setText(title)
+
+    def update_max_icon(self):
+        is_max = bool(self._win.windowState() & Qt.WindowState.WindowMaximized)
+        self._btn_max.setText('❐' if is_max else '□')
+
+    def _toggle_max(self):
+        if self._win.windowState() & Qt.WindowState.WindowMaximized:
+            self._win.showNormal()
+        else:
+            self._win.showMaximized()
+        self.update_max_icon()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._drag_pos = (
+                e.globalPosition().toPoint() - self._win.frameGeometry().topLeft()
+            )
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if e.buttons() == Qt.MouseButton.LeftButton and self._drag_pos is not None:
+            # В fullscreen перетаскивание не нужно
+            if not (self._win.windowState() & Qt.WindowState.WindowMaximized):
+                self._win.move(e.globalPosition().toPoint() - self._drag_pos)
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        self._drag_pos = None
+        super().mouseReleaseEvent(e)
+
+    def mouseDoubleClickEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._toggle_max()
+        super().mouseDoubleClickEvent(e)
+
+
+# ---------------------------------------------------------------------------
+# DrawCanvas — прозрачный QWidget для рисования поверх видео (зритель)
+# ---------------------------------------------------------------------------
+class DrawCanvas(QWidget):
+    """
+    Прозрачный виджет-«стекло» поверх video_container.
+    В режиме рисования (is_drawing=True) перехватывает мышь и рисует мазки.
+    В обычном режиме — полностью прозрачен для событий мыши.
+
+    Хранит до 64 мазков (локальных + удалённых).
+    Каждый мазок: {'points': [(x,y)...], 'color': str, 'width': int, 'born': float}
+    Координаты — пиксельные (абсолют. виджета). При рендере нормализуем к кадру.
+    Удалённые мазки хранятся нормализованными (0.0–1.0) и денормализуются при paint.
+
+    Сигнал stroke_ready испускается при отпускании кнопки мыши.
+    points в сигнале нормализованы 0.0–1.0 относительно области кадра.
+    """
+
+    stroke_ready = pyqtSignal(str, list, int)   # (color, norm_points, width)
+
+    _MAX_STROKES = 64
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setMouseTracking(True)
+
+        self._is_drawing_mode: bool = False
+        self._current_stroke: list  = []     # текущий мазок (пиксели)
+        self._strokes: list         = []     # все мазки (нормализованные, для render)
+        self._my_color: str         = random.choice(_STROKE_PALETTE)
+        self._my_width: int         = 3
+
+        # Таймер перерисовки для затухания
+        self._fade_timer = QTimer(self)
+        self._fade_timer.setInterval(50)      # 20 Гц — достаточно для fade
+        self._fade_timer.timeout.connect(self._on_fade_tick)
+
+        # Область кадра внутри виджета (letterbox rect) — обновляется из VideoSurface
+        self._frame_rect: QRect = QRect()
+
+    # ── Публичный API ────────────────────────────────────────────────────────
+
+    def set_drawing_mode(self, enabled: bool):
+        """Переключает режим рисования. True — захватываем мышь."""
+        self._is_drawing_mode = enabled
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, not enabled)
+        if enabled:
+            self.setCursor(Qt.CursorShape.CrossCursor)
+            if not self._fade_timer.isActive():
+                self._fade_timer.start()
+        else:
+            self.unsetCursor()
+            self._current_stroke.clear()
+
+    def set_color(self, color: str):
+        self._my_color = color
+
+    def set_width(self, w: int):
+        self._my_width = max(1, min(8, w))
+
+    def update_frame_rect(self, rect: QRect):
+        """Вызывается VideoWindow при каждом resize/paintGL чтобы знать где кадр."""
+        self._frame_rect = rect
+
+    def add_remote_stroke(self, color: str, norm_points: list, width: int):
+        """
+        Добавляет мазок от удалённого зрителя или ретранслированный сервером.
+        norm_points — нормализованные [[x,y], ...] 0.0–1.0 относительно кадра.
+        """
+        if not norm_points:
+            return
+        self._strokes.append({
+            'norm': norm_points,
+            'color': color,
+            'width': width,
+            'born': time.monotonic(),
+            'local': False,
+        })
+        if len(self._strokes) > self._MAX_STROKES:
+            self._strokes.pop(0)
+        if not self._fade_timer.isActive():
+            self._fade_timer.start()
+        self.update()
+
+    def clear_strokes(self):
+        self._strokes.clear()
+        self._current_stroke.clear()
+        self.update()
+
+    # ── Мышь ────────────────────────────────────────────────────────────────
+
+    def mousePressEvent(self, e):
+        if self._is_drawing_mode and e.button() == Qt.MouseButton.LeftButton:
+            self._current_stroke = [e.position().toPoint()]
+            if not self._fade_timer.isActive():
+                self._fade_timer.start()
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self._is_drawing_mode and e.buttons() & Qt.MouseButton.LeftButton:
+            p = e.position().toPoint()
+            if self._current_stroke:
+                last = self._current_stroke[-1]
+                # Сглаживание: не добавляем точку ближе 3px к предыдущей
+                dx, dy = p.x() - last.x(), p.y() - last.y()
+                if dx*dx + dy*dy >= 9:
+                    self._current_stroke.append(p)
+                    self.update()
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if self._is_drawing_mode and e.button() == Qt.MouseButton.LeftButton:
+            if len(self._current_stroke) >= 2:
+                norm = self._normalize_stroke(self._current_stroke)
+                if norm:
+                    # Добавляем локальный мазок
+                    self._strokes.append({
+                        'norm':  norm,
+                        'color': self._my_color,
+                        'width': self._my_width,
+                        'born':  time.monotonic(),
+                        'local': True,
+                    })
+                    if len(self._strokes) > self._MAX_STROKES:
+                        self._strokes.pop(0)
+                    self.stroke_ready.emit(self._my_color, norm, self._my_width)
+            self._current_stroke.clear()
+            self.update()
+        super().mouseReleaseEvent(e)
+
+    # ── Рендер ──────────────────────────────────────────────────────────────
+
+    def paintEvent(self, event):
+        if not self._strokes and not self._current_stroke:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        now = time.monotonic()
+        fade_start = DRAW_FADE_SEC - 1.0    # последняя 1 секунда — fade out
+
+        for stroke in self._strokes:
+            age     = now - stroke['born']
+            if age >= DRAW_FADE_SEC:
+                continue
+            # Прозрачность: полная до fade_start, потом линейное затухание
+            if age < fade_start:
+                alpha = 255
+            else:
+                alpha = int(255 * (1.0 - (age - fade_start) / 1.0))
+                alpha = max(0, min(255, alpha))
+
+            pts = self._denormalize(stroke['norm'])
+            if len(pts) < 2:
+                continue
+            color = QColor(stroke['color'])
+            color.setAlpha(alpha)
+            pen = QPen(color, stroke['width'],
+                       Qt.PenStyle.SolidLine,
+                       Qt.PenCapStyle.RoundCap,
+                       Qt.PenJoinStyle.RoundJoin)
+            p.setPen(pen)
+            path = QPainterPath()
+            path.moveTo(float(pts[0].x()), float(pts[0].y()))
+            for pt in pts[1:]:
+                path.lineTo(float(pt.x()), float(pt.y()))
+            p.drawPath(path)
+
+        # Текущий мазок (в процессе рисования) — всегда непрозрачен
+        if self._current_stroke and len(self._current_stroke) >= 2:
+            color = QColor(self._my_color)
+            color.setAlpha(255)
+            pen = QPen(color, self._my_width,
+                       Qt.PenStyle.SolidLine,
+                       Qt.PenCapStyle.RoundCap,
+                       Qt.PenJoinStyle.RoundJoin)
+            p.setPen(pen)
+            path = QPainterPath()
+            path.moveTo(float(self._current_stroke[0].x()),
+                        float(self._current_stroke[0].y()))
+            for pt in self._current_stroke[1:]:
+                path.lineTo(float(pt.x()), float(pt.y()))
+            p.drawPath(path)
+
+        p.end()
+
+    # ── Вспомогательное ──────────────────────────────────────────────────────
+
+    def _on_fade_tick(self):
+        now = time.monotonic()
+        # Убираем истёкшие мазки
+        self._strokes = [s for s in self._strokes if now - s['born'] < DRAW_FADE_SEC]
+        if not self._strokes and not self._current_stroke:
+            self._fade_timer.stop()
+        self.update()
+
+    def _normalize_stroke(self, pixels: list) -> list:
+        """Конвертирует пиксельные координаты виджета в нормализованные 0.0–1.0 кадра."""
+        r = self._frame_rect
+        if r.isEmpty():
+            # Fallback: весь виджет
+            w, h = max(self.width(), 1), max(self.height(), 1)
+            return [[p.x() / w, p.y() / h] for p in pixels]
+        fw, fh = max(r.width(), 1), max(r.height(), 1)
+        result = []
+        for p in pixels:
+            nx = (p.x() - r.x()) / fw
+            ny = (p.y() - r.y()) / fh
+            # Зажимаем в [0, 1] — рисование за пределами кадра бессмысленно
+            result.append([max(0.0, min(1.0, nx)), max(0.0, min(1.0, ny))])
+        return result
+
+    def _denormalize(self, norm_points: list) -> list:
+        """Конвертирует нормализованные 0.0–1.0 обратно в пиксели виджета."""
+        r = self._frame_rect
+        if r.isEmpty():
+            w, h = self.width(), self.height()
+            return [QPoint(int(p[0] * w), int(p[1] * h)) for p in norm_points]
+        return [
+            QPoint(int(r.x() + p[0] * r.width()),
+                   int(r.y() + p[1] * r.height()))
+            for p in norm_points
+        ]
+
+
+# ---------------------------------------------------------------------------
+# StreamerAnnotationOverlay — оверлей аннотаций на экране СТРИМЕРА
+# ---------------------------------------------------------------------------
+class StreamerAnnotationOverlay(QWidget):
+    """
+    Полностью прозрачное frameless top-level окно поверх всего экрана стримера.
+    Отображает мазки зрителей поверх захватываемого DXCam-контента.
+    Стример видит кто именно рисует (ник + цветная точка рядом с мазком).
+
+    Архитектура:
+      — WA_TranslucentBackground + WA_NoSystemBackground → прозрачный фон
+      — WindowType.Tool | FramelessWindowHint | WindowStaysOnTopHint →
+        поверх всех окон, не попадает в taskbar, не мешает DXCam capture
+        (DXCam захватывает рабочий стол под оверлеем, т.к. overlay — отдельное окно)
+      — setWindowFlag(X11BypassWindowManagerHint) — только если нужно
+
+    Вызывать show() при старте стрима, hide()/close() при остановке.
+    """
+
+    def __init__(self):
+        super().__init__(
+            None,
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+        # Растягиваем на весь primary screen
+        screen = QApplication.primaryScreen()
+        if screen:
+            self.setGeometry(screen.geometry())
+
+        self._strokes: list = []    # {'norm', 'color', 'width', 'born', 'nick'}
+        self._MAX     = 64
+
+        self._fade_timer = QTimer(self)
+        self._fade_timer.setInterval(50)
+        self._fade_timer.timeout.connect(self._on_fade_tick)
+
+        # Захват области стрима: если DXCam снимает не весь экран, а регион —
+        # нормализация происходит в VideoEngine. Здесь храним последний известный
+        # DXCam-регион для правильного отображения. По умолчанию — весь экран.
+        self._capture_rect: QRect = QRect()
+
+    def set_capture_region(self, x: int, y: int, w: int, h: int):
+        """Обновляет координаты захватываемой области DXCam на экране."""
+        self._capture_rect = QRect(x, y, w, h)
+
+    def add_stroke(self, nick: str, color: str, norm_points: list, width: int):
+        if not norm_points:
+            return
+        self._strokes.append({
+            'norm':  norm_points,
+            'color': color,
+            'width': width,
+            'born':  time.monotonic(),
+            'nick':  nick,
+        })
+        if len(self._strokes) > self._MAX:
+            self._strokes.pop(0)
+        if not self._fade_timer.isActive():
+            self._fade_timer.start()
+        self.update()
+
+    def clear(self):
+        self._strokes.clear()
+        self.update()
+
+    def _on_fade_tick(self):
+        now = time.monotonic()
+        self._strokes = [s for s in self._strokes if now - s['born'] < DRAW_FADE_SEC]
+        if not self._strokes:
+            self._fade_timer.stop()
+        self.update()
+
+    def paintEvent(self, event):
+        if not self._strokes:
+            return
+
+        # Определяем область на экране (capture rect или весь виджет)
+        r = self._capture_rect
+        if r.isEmpty():
+            r = self.rect()
+
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        now         = time.monotonic()
+        fade_start  = DRAW_FADE_SEC - 1.0
+        font        = QFont('Segoe UI', 9, QFont.Weight.Bold)
+        p.setFont(font)
+
+        for stroke in self._strokes:
+            age = now - stroke['born']
+            if age >= DRAW_FADE_SEC:
+                continue
+            alpha = 255 if age < fade_start else max(
+                0, int(255 * (1.0 - (age - fade_start)))
+            )
+
+            pts = [
+                QPoint(int(r.x() + pt[0] * r.width()),
+                       int(r.y() + pt[1] * r.height()))
+                for pt in stroke['norm']
+            ]
+            if len(pts) < 2:
+                continue
+
+            color = QColor(stroke['color'])
+            color.setAlpha(alpha)
+            pen = QPen(color, stroke['width'],
+                       Qt.PenStyle.SolidLine,
+                       Qt.PenCapStyle.RoundCap,
+                       Qt.PenJoinStyle.RoundJoin)
+            p.setPen(pen)
+            path = QPainterPath()
+            path.moveTo(float(pts[0].x()), float(pts[0].y()))
+            for pt in pts[1:]:
+                path.lineTo(float(pt.x()), float(pt.y()))
+            p.drawPath(path)
+
+            # Ник рядом с первой точкой мазка
+            if stroke.get('nick'):
+                lbl_color = QColor(stroke['color'])
+                lbl_color.setAlpha(min(200, alpha))
+                p.setPen(lbl_color)
+                p.drawText(pts[0].x() + 6, pts[0].y() - 6, stroke['nick'])
+
+        p.end()
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +798,8 @@ class VideoOverlay(QFrame):
     stream_volume_changed = pyqtSignal(float)   # 0.0–2.0
     # Клик по кнопке soundboard в оверлее стрима → VideoWindow.open_soundboard()
     soundboard_clicked = pyqtSignal()
+    # Кнопка Draw: зажата → режим рисования включён
+    draw_toggled = pyqtSignal(bool)   # True = рисование включено
 
     def __init__(self, parent: QWidget):
         super().__init__(parent)
@@ -344,6 +852,11 @@ class VideoOverlay(QFrame):
         self.btn_soundboard = self._make_btn("assets/icon/bells.svg", "Soundboard")
         self.btn_soundboard.clicked.connect(self.soundboard_clicked)
 
+        # --- Draw (рисование поверх стрима) ---
+        self.btn_draw = self._make_btn("assets/icon/draw.svg", "Рисовать на стриме (5 сек)")
+        self.btn_draw.setCheckable(True)
+        self.btn_draw.clicked.connect(self._on_draw_clicked)
+
         # --- Разделитель ---
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.VLine)
@@ -362,6 +875,7 @@ class VideoOverlay(QFrame):
         layout.addWidget(self.btn_stop)
         layout.addWidget(self.btn_vol_stream)
         layout.addWidget(self.btn_soundboard)
+        layout.addWidget(self.btn_draw)
         layout.addWidget(sep, alignment=Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(self.btn_fs)
 
@@ -432,6 +946,42 @@ class VideoOverlay(QFrame):
     # ------------------------------------------------------------------
     # Обработка кликов с обновлением иконок
     # ------------------------------------------------------------------
+    def _on_draw_clicked(self):
+        """
+        Переключает режим рисования.
+        Кнопка checkable: checked=True → рисование включено (карандаш подсвечен).
+        Цвет кнопки при active — Discord-синий вместо стандартного красного,
+        чтобы не путать с «заглушить».
+        """
+        is_drawing = self.btn_draw.isChecked()
+        if is_drawing:
+            self.btn_draw.setStyleSheet(
+                self.btn_draw.styleSheet() +
+                "QPushButton:checked {"
+                "  background-color: rgba(88, 101, 242, 210);"
+                "  border: 1px solid rgba(88, 101, 242, 255);"
+                "}"
+            )
+        else:
+            # Сбрасываем на дефолтный стиль (перестройкой не трогаем остальные кнопки)
+            self.btn_draw.setStyleSheet("")
+            self.btn_draw.setStyleSheet(self._make_btn_ss())
+        self.draw_toggled.emit(is_drawing)
+
+    def _make_btn_ss(self) -> str:
+        return (
+            "QPushButton {"
+            "  background-color: rgba(60, 63, 65, 190);"
+            "  border: 1px solid rgba(255, 255, 255, 35);"
+            "  border-radius: 8px; padding: 4px; color: #e0e0e0;"
+            "}"
+            "QPushButton:hover { background-color: rgba(95, 100, 108, 230); }"
+            "QPushButton:checked {"
+            "  background-color: rgba(88, 101, 242, 210);"
+            "  border: 1px solid rgba(88, 101, 242, 255);"
+            "}"
+        )
+
     def _on_mute_clicked(self):
         is_muted = self.btn_mute.isChecked()
         icon = "assets/icon/mic_off.svg" if is_muted else "assets/icon/mic_on.svg"
@@ -506,6 +1056,10 @@ class VideoWindow(QWidget):
     overlay_stop_watch     = pyqtSignal()
     overlay_stream_volume_changed = pyqtSignal(float)   # 0.0–2.0
 
+    # --- Рисование: зритель закончил мазок → MainWindow отправит на сервер ---
+    # (color: str, norm_points: list, width: int)
+    draw_stroke_ready = pyqtSignal(str, list, int)
+
     def __init__(self, nick: str):
         super().__init__()
         self.uid: int | None = None
@@ -516,6 +1070,9 @@ class VideoWindow(QWidget):
         self._closing = False        # флаг: окно в процессе закрытия
         self._net = None             # NetworkClient — устанавливается через set_net()
         self._sb_panel = None        # SoundboardPanel поверх стрима (toggle)
+
+        # DrawCanvas — инициализируется после _setup_ui (нужен _video_container)
+        self._draw_canvas: DrawCanvas | None = None
 
         self._setup_ui(nick)
         self._setup_hide_timer()
@@ -563,26 +1120,53 @@ class VideoWindow(QWidget):
     # Построение UI
     # ------------------------------------------------------------------
     def _setup_ui(self, nick: str):
-        self.setWindowTitle(f"Стрим: {nick}")
+        # ── Безрамочное окно со стеклянным тайтлбаром ───────────────────────
+        # WindowType.Window даёт полноценное окно (taskbar + Alt-Tab),
+        # FramelessWindowHint убирает системный заголовок и рамку.
+        # Стеклянный тайтлбар рисуется нами (VideoGlassTitleBar).
+        self.setWindowFlags(
+            Qt.WindowType.Window
+            | Qt.WindowType.FramelessWindowHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
         self.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
-        self.resize(1280, 720)
-        self.setMinimumSize(640, 360)
+        self.resize(1280, 720 + _TITLE_H + 28)
+        self.setMinimumSize(640, 360 + _TITLE_H + 28)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
+        # Стиль окна: тёмный фон + тонкая рамка как у других окон приложения
+        self.setStyleSheet("""
+            VideoWindow {
+                background-color: #0e1018;
+                border: 1px solid rgba(255,255,255,0.08);
+                border-radius: 0px;
+            }
+        """)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
+        # ── Стеклянный тайтлбар ──────────────────────────────────────────────
+        self._title_bar = VideoGlassTitleBar(self, f"Стрим: {nick}")
+        root.addWidget(self._title_bar)
+
         # --- Контейнер для видео + оверлея (нужен для абсолютного позиционирования) ---
         self._video_container = QWidget(self)
         self._video_container.setMouseTracking(True)
-        self._video_container.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._video_container.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
         root.addWidget(self._video_container, stretch=1)
 
         # OpenGL-поверхность заполняет весь контейнер
         self.surface = VideoSurface(self._video_container)
         self.surface.fullscreen_requested.connect(self.toggle_fullscreen)
+
+        # ── DrawCanvas поверх video_container ───────────────────────────────
+        # Создаём здесь, после video_container. Размер синхронизируем в resizeEvent.
+        self._draw_canvas = DrawCanvas(self._video_container)
+        self._draw_canvas.stroke_ready.connect(self.draw_stroke_ready)  # → MainWindow
 
         # Оверлей поверх видео (абсолютное позиционирование внутри контейнера)
         self.overlay = VideoOverlay(self._video_container)
@@ -592,12 +1176,14 @@ class VideoWindow(QWidget):
         self.overlay.fullscreen_clicked.connect(self.toggle_fullscreen)
         self.overlay.stream_volume_changed.connect(self.overlay_stream_volume_changed)
         self.overlay.soundboard_clicked.connect(self.open_soundboard)
+        # Кнопка Draw → включить/выключить режим рисования на DrawCanvas
+        self.overlay.draw_toggled.connect(self._on_draw_toggled)
         self.overlay.hide()  # скрыт по умолчанию
 
         # --- Тулбар статистики (снизу) ---
         self._bar = QWidget(self)
         self._bar.setFixedHeight(28)
-        self._bar.setStyleSheet("background: #1a1a2e;")
+        self._bar.setStyleSheet("background: #10111e; border-top: 1px solid rgba(255,255,255,0.06);")
         bar_layout = QHBoxLayout(self._bar)
         bar_layout.setContentsMargins(8, 0, 8, 0)
         bar_layout.setSpacing(0)
@@ -608,10 +1194,7 @@ class VideoWindow(QWidget):
         self._lbl_res      = QLabel("Res: —")
         self._lbl_frames   = QLabel("Frames: 0")
         self._lbl_renderer = QLabel("🟢 OpenGL GPU")
-        # WebRTC stats: RTT + jitter из pc.getStats() (будет подключено в следующей итерации).
-        # Заменяет «ABR: X kbps» — WebRTC управляет битрейтом через TWCC автоматически,
-        # ручной ABR-feedback больше не нужен.
-        self._lbl_rtc = QLabel("WebRTC: —")
+        self._lbl_rtc      = QLabel("WebRTC: —")
 
         for lbl in (self._lbl_fps, self._lbl_res, self._lbl_frames,
                     self._lbl_renderer, self._lbl_rtc):
@@ -634,10 +1217,45 @@ class VideoWindow(QWidget):
         super().resizeEvent(event)
         self._reposition_surface()
         self._reposition_overlay()
+        self._reposition_draw_canvas()
+        # Обновляем title bar при смене состояния окна (maximize/restore)
+        if hasattr(self, '_title_bar'):
+            self._title_bar.update_max_icon()
 
     def _reposition_surface(self):
         c = self._video_container
         self.surface.setGeometry(0, 0, c.width(), c.height())
+
+    def _reposition_draw_canvas(self):
+        """DrawCanvas покрывает весь video_container — совпадает с surface."""
+        if self._draw_canvas is None:
+            return
+        c = self._video_container
+        self._draw_canvas.setGeometry(0, 0, c.width(), c.height())
+        self._draw_canvas.raise_()      # поверх surface, но под overlay
+        # Сообщаем DrawCanvas актуальный letterbox-прямоугольник кадра
+        self._update_draw_canvas_frame_rect()
+
+    def _update_draw_canvas_frame_rect(self):
+        """
+        Вычисляет letterbox-прямоугольник кадра внутри video_container
+        и передаёт его в DrawCanvas для корректной нормализации координат.
+        """
+        if self._draw_canvas is None:
+            return
+        img = self.surface._current_image
+        c   = self._video_container
+        cw, ch = c.width(), c.height()
+        if img and not img.isNull() and img.width() > 0 and img.height() > 0:
+            scale  = min(cw / img.width(), ch / img.height())
+            dw = (int(img.width()  * scale) // 2) * 2
+            dh = (int(img.height() * scale) // 2) * 2
+            dx = (cw - dw) // 2
+            dy = (ch - dh) // 2
+            self._draw_canvas.update_frame_rect(QRect(dx, dy, dw, dh))
+        else:
+            # Нет кадра — считаем весь контейнер кадром
+            self._draw_canvas.update_frame_rect(QRect(0, 0, cw, ch))
 
     def _reposition_overlay(self):
         """
@@ -654,6 +1272,7 @@ class VideoWindow(QWidget):
         oy = c.height() - oh - 24
         self.overlay.setFixedWidth(ow)
         self.overlay.setGeometry(ox, oy, ow, oh)
+        self.overlay.raise_()   # оверлей поверх DrawCanvas
 
     # ------------------------------------------------------------------
     # Авто-показ / авто-скрытие
@@ -674,16 +1293,57 @@ class VideoWindow(QWidget):
             self.setCursor(Qt.CursorShape.BlankCursor)
 
     # ------------------------------------------------------------------
+    # Рисование: режим Draw
+    # ------------------------------------------------------------------
+    def _on_draw_toggled(self, enabled: bool):
+        """
+        Переключает режим рисования на DrawCanvas.
+        При включении overlay НЕ скрывается по таймеру — пользователь должен
+        видеть кнопку Draw чтобы понять что режим активен.
+        """
+        if self._draw_canvas is None:
+            return
+        self._draw_canvas.set_drawing_mode(enabled)
+        if enabled:
+            # Останавливаем авто-скрытие пока режим рисования активен
+            self._hide_timer.stop()
+            self.overlay.show()
+            self.overlay.raise_()
+        else:
+            # Возобновляем авто-скрытие
+            self._hide_timer.start(_HIDE_TIMEOUT_MS)
+
+    def add_remote_stroke(self, color: str, norm_points: list, width: int):
+        """
+        Принимает мазок от удалённого зрителя (ретранслированный сервером).
+        Вызывается из MainWindow при получении draw_stroke_received.
+        Также вызывается на стороне зрителя для эха своего же мазка
+        (сервер возвращает всем включая отправителя — для консистентности).
+        """
+        if self._draw_canvas is None:
+            return
+        self._draw_canvas.add_remote_stroke(color, norm_points, width)
+        # После нового мазка обновляем letterbox-прямоугольник (кадр мог смениться)
+        self._update_draw_canvas_frame_rect()
+
+    # ------------------------------------------------------------------
     # Перехват mouseMoveEvent со всех дочерних виджетов через eventFilter
     # ------------------------------------------------------------------
     def showEvent(self, event):
         super().showEvent(event)
         # Устанавливаем фильтр на все виджеты, которые могут «поглощать» move
-        for w in (self.surface, self.overlay, self._video_container):
+        widgets = [self.surface, self.overlay, self._video_container]
+        if self._draw_canvas:
+            widgets.append(self._draw_canvas)
+        for w in widgets:
             w.installEventFilter(self)
 
     def eventFilter(self, obj, event):
-        if event.type() == QEvent.Type.MouseMove:
+        t = event.type()
+        if t == QEvent.Type.MouseMove:
+            # В режиме рисования не перезапускаем таймер скрытия
+            if self._draw_canvas and self._draw_canvas._is_drawing_mode:
+                return False
             self._show_overlay()
         return False  # не поглощаем — пусть Qt продолжает обработку
 
@@ -703,12 +1363,15 @@ class VideoWindow(QWidget):
     def _enter_fullscreen(self):
         self._is_fullscreen = True
         self._bar.hide()
+        self._title_bar.hide()   # в fullscreen тайтлбар скрываем
         self.overlay.set_fullscreen_icon(True)
         self.showFullScreen()
 
     def _exit_fullscreen(self):
         self._is_fullscreen = False
         self._bar.show()
+        self._title_bar.show()
+        self._title_bar.update_max_icon()
         self.overlay.set_fullscreen_icon(False)
         self.setCursor(Qt.CursorShape.ArrowCursor)
         self.showNormal()
@@ -827,7 +1490,6 @@ class VideoWindow(QWidget):
 
         try:
             self.surface.set_frame(q_img)
-
             self._frame_count += 1
 
             # Разрешение обновляем на каждом кадре (дёшево — просто два int).
@@ -838,6 +1500,9 @@ class VideoWindow(QWidget):
                 self._fps_last_time = now
                 self._lbl_res.setText(f"Res: {q_img.width()}×{q_img.height()}")
                 self._lbl_frames.setText(f"Frames: {self._frame_count}")
+                # Обновляем letterbox rect в DrawCanvas раз в секунду —
+                # при смене разрешения стрима нормализация мазков должна пересчитаться.
+                self._update_draw_canvas_frame_rect()
 
         except Exception as e:
             print(f"[VideoWindow] Error updating frame: {e}")
@@ -849,6 +1514,14 @@ class VideoWindow(QWidget):
         """Перехватываем закрытие окна, испускаем сигнал до уничтожения объекта."""
         self._closing = True         # блокируем sync_audio_state от внешних сигналов
         self._hide_timer.stop()      # останавливаем таймер авто-скрытия
+
+        # Останавливаем DrawCanvas fade-таймер и выключаем режим рисования
+        try:
+            if self._draw_canvas is not None:
+                self._draw_canvas.set_drawing_mode(False)
+                self._draw_canvas._fade_timer.stop()
+        except (RuntimeError, AttributeError):
+            pass
 
         # Закрываем SoundboardPanel если открыта
         try:
@@ -882,4 +1555,5 @@ class VideoWindow(QWidget):
         super().closeEvent(event)
 
     def sizeHint(self) -> QSize:
-        return QSize(1280, 748)  # 720 + 28px тулбар
+        # 720px видео + 36px стеклянный тайтлбар + 28px статус-бар
+        return QSize(1280, 720 + _TITLE_H + 28)

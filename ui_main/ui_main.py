@@ -8,7 +8,7 @@ import winsound
 import keyboard
 import time
 from video_engine import VideoEngine
-from ui_video import VideoWindow
+from ui_video import VideoWindow, StreamerAnnotationOverlay
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QPushButton, QTreeWidget, QTreeWidgetItem,
                              QHeaderView, QMessageBox, QStackedWidget,
@@ -26,6 +26,7 @@ from config import (
     CMD_SOUNDBOARD, CMD_SERVER_TRANSFER, CMD_SERVER_MIGRATE,
     CMD_FORCE_MUTED,
     CHAT_MSG_MAX_LEN,
+    CMD_DRAW_STROKE,
 )
 from audio_engine import AudioHandler
 from network_engine import NetworkClient
@@ -210,6 +211,16 @@ class MainWindow(QMainWindow):
         self.net.connect_to_server(self.ip, self.nick, self.avatar)
         self.is_streaming = False
         self._sb_panel = None   # ссылка на SoundboardPanel (для toggle и lifecycle)
+
+        # ── Оверлей аннотаций на экране стримера ────────────────────────────
+        # Создаётся при старте стрима, уничтожается при остановке.
+        # Показывает мазки зрителей поверх захватываемого контента.
+        self._streamer_draw_overlay: StreamerAnnotationOverlay | None = None
+
+        # Входящие мазки (от сервера) → распределяем по назначению:
+        #   — если мы стример → _streamer_draw_overlay.add_stroke()
+        #   — если мы зритель → соответствующий VideoWindow.add_remote_stroke()
+        self.net.draw_stroke_received.connect(self._on_draw_stroke_received)
 
         # ── Тост soundboard ─────────────────────────────────────────────────────
         # QLabel поверх главного окна с абсолютным позиционированием.
@@ -1676,6 +1687,42 @@ class MainWindow(QMainWindow):
         else:
             self.play_notification("mute" if is_d else "unmute")
 
+    def _on_draw_stroke_received(self, sender_uid: int, nick: str,
+                                  color: str, points: list, width: int):
+        """
+        Центральный диспетчер входящих мазков (CMD_DRAW_STROKE от сервера).
+
+        Сервер ретранслирует мазок:
+          — всем зрителям стрима  (включая рисовавшего — для эха)
+          — стримеру              (он видит у себя на экране)
+
+        Здесь мы определяем кому адресован мазок и направляем его:
+          • Мы зритель и у нас открыт VideoWindow → add_remote_stroke()
+          • Мы стример и overlay создан → add_stroke()
+
+        streamer_uid в пакете не передаётся напрямую сюда (его фильтрует сервер
+        и шлёт нам только то что относится к нашему стриму/просмотру),
+        но для определения нужного VideoWindow мы ищем по UID стримера
+        (который является ключом stream_windows).
+        """
+        # ── Случай 1: мы зритель — ищем VideoWindow по streamer uid ─────────
+        # stream_windows: {streamer_uid: VideoWindow}
+        # Мазок может прийти пока нет открытых окон (race при закрытии) — guard.
+        for streamer_uid, win in list(self.stream_windows.items()):
+            try:
+                if win is not None and not win._closing:
+                    win.add_remote_stroke(color, points, width)
+            except (RuntimeError, AttributeError):
+                pass
+
+        # ── Случай 2: мы стример — показываем на прозрачном оверлее ─────────
+        # _streamer_draw_overlay существует только пока is_streaming=True.
+        if self._streamer_draw_overlay is not None:
+            try:
+                self._streamer_draw_overlay.add_stroke(nick, color, points, width)
+            except (RuntimeError, AttributeError):
+                pass
+
     def _on_force_muted(self):
         """
         Хост выключил наш микрофон (CMD_FORCE_MUTED от сервера).
@@ -2226,6 +2273,15 @@ class MainWindow(QMainWindow):
             # Синхронизируем ползунок попапа с текущим значением движка,
             # чтобы при повторном открытии окна ползунок не сбрасывался в 1.0.
             w.overlay.set_stream_volume_value(self.audio._stream_vol)
+
+            # ── Рисование: зритель закончил мазок → отправляем серверу ─────
+            # draw_stroke_ready(color, norm_points, width) испускается DrawCanvas
+            # при отпускании кнопки мыши. nick берём из self.nick (локальный).
+            # Сервер ретранслирует мазок всем зрителям + стримеру.
+            w.draw_stroke_ready.connect(
+                lambda color, pts, width, _uid=uid:
+                    self.net.send_draw_stroke(_uid, self.nick, color, pts, width)
+            )
 
             w.show()
             self.stream_windows[uid] = w
@@ -2966,6 +3022,14 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+        # Закрываем оверлей аннотаций стримера если активен
+        try:
+            if self._streamer_draw_overlay is not None:
+                self._streamer_draw_overlay.close()
+                self._streamer_draw_overlay = None
+        except Exception:
+            pass
+
         # Закрываем все открытые VideoWindow (стримы зрителей)
         for uid, w in list(self.stream_windows.items()):
             try:
@@ -3070,6 +3134,21 @@ class MainWindow(QMainWindow):
                     return
 
                 self.is_streaming = True
+
+                # ── Создаём прозрачный оверлей аннотаций для стримера ────────
+                # Показывает мазки зрителей поверх захватываемого экрана.
+                # WA_TransparentForMouseEvents → DXCam и мышь работают нормально.
+                # Уничтожается при остановке стрима (ниже).
+                try:
+                    if self._streamer_draw_overlay is not None:
+                        self._streamer_draw_overlay.close()
+                        self._streamer_draw_overlay = None
+                    self._streamer_draw_overlay = StreamerAnnotationOverlay()
+                    self._streamer_draw_overlay.show()
+                    print("[UI] StreamerAnnotationOverlay создан")
+                except Exception as e:
+                    print(f"[UI] StreamerAnnotationOverlay ошибка: {e}")
+                    self._streamer_draw_overlay = None
             else:
                 self.btn_stream.setChecked(False)
                 return
@@ -3079,6 +3158,15 @@ class MainWindow(QMainWindow):
             # WebRTC PC закрывается отдельно в net.stop_streaming_webrtc() если есть.
             self.is_streaming = False
             self.net.send_json({"action": CMD_STREAM_STOP})
+
+            # ── Уничтожаем оверлей аннотаций стримера ───────────────────────
+            try:
+                if self._streamer_draw_overlay is not None:
+                    self._streamer_draw_overlay.close()
+                    self._streamer_draw_overlay = None
+                    print("[UI] StreamerAnnotationOverlay закрыт")
+            except Exception:
+                self._streamer_draw_overlay = None
 
         self.update_stream_button_icon()
         self.refresh_ui()

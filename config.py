@@ -180,6 +180,14 @@ CHAT_MEDIA_MAX_B64   = 10_000_000
 CMD_HOST_MUTE   = 'host_mute'
 CMD_FORCE_MUTED = 'force_muted'
 
+# ── Аннотации стрима: рисование зрителем поверх стрима ──────────────────────
+# Зритель рисует → клиент отправляет draw_stroke серверу.
+# Сервер ретранслирует всем зрителям + стримеру.
+# points: нормализованные координаты [[x,y], ...] 0.0–1.0 относительно кадра.
+CMD_DRAW_STROKE = 'draw_stroke'
+DRAW_MAX_POINTS = 300       # макс. точек в одном мазке
+DRAW_FADE_SEC   = 5.0       # мазок живёт 5 секунд, последние 1 с плавно гасится
+
 CMD_CREATE_CHANNEL    = 'create_channel'
 CMD_CHANNEL_CREATED   = 'channel_created'
 CMD_CHANNEL_DELETED   = 'channel_deleted'

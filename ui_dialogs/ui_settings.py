@@ -1365,27 +1365,42 @@ class SettingsDialog(QDialog):
 
     def refresh_devices_list(self):
         devs = sd.query_devices()
-        try:
-            def_api = sd.query_hostapis(sd.default.hostapi)['name']
-        except Exception:
-            def_api = ""
+        apis = sd.query_hostapis()
+
+        # Ищем индекс WASAPI. Если его нет (что редкость) — фоллбэк на дефолт ОС.
+        wasapi_idx = next((i for i, a in enumerate(apis) if 'WASAPI' in a['name']), None)
+        target_api_idx = wasapi_idx if wasapi_idx is not None else sd.default.hostapi
+
         self.cb_in.clear()
         self.cb_out.clear()
         u_in, u_out = set(), set()
+
         s_in = self.app_settings.value("device_in_name", "")
         s_out = self.app_settings.value("device_out_name", "")
 
-        for d in devs:
-            api = sd.query_hostapis(d['hostapi'])['name']
-            if api != def_api:
+        for i, d in enumerate(devs):
+            if d['hostapi'] != target_api_idx:
                 continue
-            dn = f"{d['name']} ({api})"
+
+            api_name = apis[d['hostapi']]['name']
+            dn = f"{d['name']} ({api_name})"
+
             if d['max_input_channels'] > 0 and dn not in u_in:
                 self.cb_in.addItem(dn)
                 u_in.add(dn)
             if d['max_output_channels'] > 0 and dn not in u_out:
                 self.cb_out.addItem(dn)
                 u_out.add(dn)
+
+        # Если сохраненных настроек нет, выбираем дефолтные WASAPI устройства
+        if not s_in and target_api_idx is not None:
+            def_in_idx = apis[target_api_idx]['default_input_device']
+            s_in = f"{devs[def_in_idx]['name']} ({apis[target_api_idx]['name']})"
+
+        if not s_out and target_api_idx is not None:
+            def_out_idx = apis[target_api_idx]['default_output_device']
+            s_out = f"{devs[def_out_idx]['name']} ({apis[target_api_idx]['name']})"
+
         self.cb_in.setCurrentText(s_in)
         self.cb_out.setCurrentText(s_out)
 
