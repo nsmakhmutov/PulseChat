@@ -1465,15 +1465,13 @@ class VideoWindow(QWidget):
         Вызывать из MainWindow при изменении AudioHandler.is_muted / is_deafened,
         чтобы иконки в оверлее отражали реальное состояние.
         """
-        # Защита от гонки: сигнал может прийти уже после того, как Qt
-        # уничтожил C++ объекты (окно закрыто, но Python-лямбда ещё жива).
+
         if self._closing:
             return
         try:
             self.overlay.sync_mute_state(is_muted)
             self.overlay.sync_deafen_state(is_deafened)
         except RuntimeError:
-            # C++ объект уже удалён — игнорируем
             pass
 
     # ------------------------------------------------------------------
@@ -1492,17 +1490,12 @@ class VideoWindow(QWidget):
         try:
             self.surface.set_frame(q_img)
             self._frame_count += 1
-
-            # Разрешение обновляем на каждом кадре (дёшево — просто два int).
-            # FPS и Loss% приходят из VideoEngine.stream_stats_updated каждые 2 сек.
             now = time.monotonic()
             elapsed = now - self._fps_last_time
             if elapsed >= 1.0:
                 self._fps_last_time = now
                 self._lbl_res.setText(f"Res: {q_img.width()}×{q_img.height()}")
                 self._lbl_frames.setText(f"Frames: {self._frame_count}")
-                # Обновляем letterbox rect в DrawCanvas раз в секунду —
-                # при смене разрешения стрима нормализация мазков должна пересчитаться.
                 self._update_draw_canvas_frame_rect()
 
         except Exception as e:
@@ -1532,10 +1525,6 @@ class VideoWindow(QWidget):
         except (RuntimeError, AttributeError):
             self._sb_panel = None
 
-        # FIX MEM: явно очищаем последний кадр (QImage = ~3.7 МБ для 1280×720 RGB).
-        # Без этого _current_image держался до уничтожения VideoSurface объекта,
-        # что при deleteLater() может произойти не сразу.
-        # После очистки OpenGL текстура тоже освобождается при следующем paintGL().
         if hasattr(self, 'surface') and self.surface is not None:
             try:
                 self.surface._current_image = None

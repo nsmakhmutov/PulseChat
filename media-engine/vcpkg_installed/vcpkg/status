@@ -1,0 +1,111 @@
+Package: ffnvcodec
+Version: 12.2.72.0
+Port-Version: 1
+Architecture: x64-windows-static
+Multi-Arch: same
+Abi: 970bd0a9eedf92406e2933ec8eb213b1d415cfb3fe86df91e06eac2481140148
+Description: FFmpeg version of Nvidia Codec SDK headers.
+Status: install ok installed
+
+Package: vcpkg-cmake
+Version: 2024-04-23
+Architecture: x64-windows
+Multi-Arch: same
+Abi: 530ccbb4ba00a171efce2fc75dc3d0bee292bd5d24ace16f5edd3f3820f2d05f
+Status: install ok installed
+
+Package: vcpkg-cmake-get-vars
+Version: 2024-09-22
+Depends: vcpkg-cmake
+Architecture: x64-windows
+Multi-Arch: same
+Abi: bee238b9a72ffb04052abfef9b1eb63c966cfcc8491ca058e3aa192f8a169c41
+Status: install ok installed
+
+Package: vcpkg-tool-meson
+Version: 1.6.1
+Depends: vcpkg-cmake-get-vars
+Architecture: x64-windows
+Multi-Arch: same
+Abi: 5e6c776413ce4a5cc3bb6816dc669a85a84aeaf84a0ca622a7292e4ea70b9f43
+Description: Meson build system
+Status: install ok installed
+
+Package: pkgconf
+Version: 2.3.0
+Depends: vcpkg-tool-meson
+Architecture: x64-windows
+Multi-Arch: same
+Abi: 45af1d93a17e7941a2fbed4c47defa5666ef27de966a583892bcdccf404d503e
+Description: pkgconf is a program which helps to configure compiler and linker flags for development libraries. It is similar to pkg-config from freedesktop.org.
+Status: install ok installed
+
+Package: vcpkg-pkgconfig-get-modules
+Version: 2024-04-03
+Depends: pkgconf
+Architecture: x64-windows
+Multi-Arch: same
+Abi: 19491656083325897f2eb1c3ee402ad6c4a852dfd99ee8d87b8a3188d5d2b382
+Status: install ok installed
+
+Package: ffmpeg
+Version: 7.1.1
+Depends: vcpkg-cmake-get-vars:x64-windows, vcpkg-pkgconfig-get-modules:x64-windows
+Architecture: x64-windows-static
+Multi-Arch: same
+Abi: 9aec55ffbf0a12a678589714e32adac4e264e6d3a9782f5701939e66c519acc4
+Description: A library to decode, encode, transcode, mux, demux, stream, filter and play pretty much anything that humans and machines have created.
+    FFmpeg is the leading multimedia framework, able to decode, encode, transcode, mux, demux, stream, filter and play pretty much anything that humans and machines have created. It supports the most obscure ancient formats up to the cutting edge. No matter if they were designed by some standards committee, the community or a corporation. It is also highly portable: FFmpeg compiles, runs, and passes our testing infrastructure FATE across Linux, Mac OS X, Microsoft Windows, the BSDs, Solaris, etc. under a wide variety of build environments, machine architectures, and configurations.
+Default-Features: avcodec, avdevice, avfilter, avformat, swresample, swscale
+Status: install ok installed
+
+Package: ffmpeg
+Feature: avcodec
+Architecture: x64-windows-static
+Multi-Arch: same
+Description: Build the avcodec library
+Status: install ok installed
+
+Package: ffmpeg
+Feature: avdevice
+Architecture: x64-windows-static
+Multi-Arch: same
+Description: Build the avdevice library
+Status: install ok installed
+
+Package: ffmpeg
+Feature: avfilter
+Architecture: x64-windows-static
+Multi-Arch: same
+Description: Build the avfilter library
+Status: install ok installed
+
+Package: ffmpeg
+Feature: avformat
+Architecture: x64-windows-static
+Multi-Arch: same
+Description: Build the avformat library
+Status: install ok installed
+
+Package: ffmpeg
+Feature: nvcodec
+Depends: ffnvcodec
+Architecture: x64-windows-static
+Multi-Arch: same
+Description: Nvidia video decoding/encoding acceleration
+Status: install ok installed
+
+Package: ffmpeg
+Feature: swresample
+Architecture: x64-windows-static
+Multi-Arch: same
+Description: Build the swresample library
+Status: install ok installed
+
+Package: ffmpeg
+Feature: swscale
+Architecture: x64-windows-static
+Multi-Arch: same
+Description: Build the swscale library
+Status: install ok installed
+

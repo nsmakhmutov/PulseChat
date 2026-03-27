@@ -1,0 +1,1 @@
+E:\Mychat\VoiceChat\media-engine\target\release\inpulse-media-engine.exe: E:\Mychat\VoiceChat\media-engine\src\capture\mod.rs E:\Mychat\VoiceChat\media-engine\src\capture\wgc.rs E:\Mychat\VoiceChat\media-engine\src\encode\mod.rs E:\Mychat\VoiceChat\media-engine\src\ipc\mod.rs E:\Mychat\VoiceChat\media-engine\src\main.rs E:\Mychat\VoiceChat\media-engine\src\pipeline\mod.rs

@@ -100,6 +100,15 @@ except ImportError:
     SYSTEM_AUDIO_AVAILABLE = False
     print("[Net] WARNING: SystemAudioTrack недоступен — системный звук в стриме отключён")
 
+# ── Rust Media Engine bridge (capture + encode, Named Pipe → RustVideoTrack) ──
+try:
+    from media_engine_bridge import MediaEngineBridge
+    MEDIA_ENGINE_AVAILABLE = True
+except ImportError:
+    MediaEngineBridge = None
+    MEDIA_ENGINE_AVAILABLE = False
+    print("[Net] WARNING: MediaEngineBridge недоступен — Rust capture отключён, fallback на DXCam")
+
 
 class NetworkClient(QObject):
     connected           = pyqtSignal(dict)
@@ -221,6 +230,15 @@ class NetworkClient(QObject):
         # Создаётся в _start_streaming_coro, останавливается в stop_streaming_webrtc.
         # Ссылка нужна чтобы корректно вызвать .stop() и освободить DLL-захват.
         self._system_audio_track: "SystemAudioTrack | None" = None
+
+        # ── Rust Media Engine (v0.2: capture+encode → Named Pipe) ────────
+        self._media_bridge: "MediaEngineBridge | None" = None
+        if MEDIA_ENGINE_AVAILABLE:
+            self._media_bridge = MediaEngineBridge(
+                on_event=self._handle_media_event,
+                on_log=lambda s: print(f"[Media] {s}"),
+                on_exit=lambda c: print(f"[Media] процесс завершён (code={c})"),
+            )
 
         self._init_sockets()
 
@@ -383,6 +401,11 @@ class NetworkClient(QObject):
 
         # Запускаем WebRTC asyncio loop (один раз при первом подключении)
         self._start_webrtc_loop()
+
+        # Запускаем Rust Media Engine (один раз)
+        if self._media_bridge is not None and not self._media_bridge.is_running():
+            if not self._media_bridge.start():
+                print("[Net] WARNING: Rust Media Engine не запустился — fallback на DXCam+aiortc")
 
         print("[Net] Connected to server")
 
@@ -723,6 +746,13 @@ class NetworkClient(QObject):
         self.running = False
         self._is_connected = False
 
+        # Останавливаем Rust Media Engine
+        if self._media_bridge is not None:
+            try:
+                self._media_bridge.stop()
+            except Exception as e:
+                print(f"[Net] media_bridge stop error: {e}")
+
         # Закрываем WebRTC PeerConnections
         if self._webrtc_loop is not None and not self._webrtc_loop.is_closed():
             if self._streamer_pc is not None:
@@ -771,40 +801,51 @@ class NetworkClient(QObject):
         """
         Запускает WebRTC-стрим.
 
-        Порядок операций:
-        1. Создаёт DXCamTrack через VideoEngine.start_streaming(settings).
-        2. Создаёт RTCPeerConnection и добавляет трек.
-        3. Создаёт WebRTC offer.
-        4. Отправляет offer серверу через TCP (CMD_WEBRTC_OFFER, role="streamer").
-        5. Сервер создаёт PC на своей стороне, отвечает CMD_WEBRTC_ANSWER.
-        6. process_message принимает answer → _handle_streamer_answer_coro.
+        v0.2 архитектура:
+          - Rust Media Engine: WGC capture → HW H.264 encode → Named Pipe
+          - Python: RustVideoTrack (aiortc) читает pipe → aiortc PC → SFU
+          - WebRTC DTLS/ICE полностью через aiortc (гарантированная совместимость с SFU)
 
-        Должен вызываться после CMD_STREAM_START (чтобы сервер знал о стриме).
+        Fallback: если Rust недоступен — старый путь через DXCam+aiortc.
         """
         if not AIORTC_AVAILABLE:
             print("[Net] start_streaming_webrtc: aiortc не установлен")
-            return
-        if self.video is None:
-            print("[Net] start_streaming_webrtc: VideoEngine не установлен")
             return
         if self._webrtc_loop is None:
             print("[Net] start_streaming_webrtc: WebRTC loop не запущен")
             return
 
-        # Запускаем захват экрана через VideoEngine (создаёт DXCamTrack)
-        if not self.video.start_streaming(settings):
-            print("[Net] start_streaming_webrtc: VideoEngine.start_streaming() вернул False")
-            return
+        # Определяем источник видеотреков
+        use_rust = (
+            self._media_bridge is not None
+            and self._media_bridge.is_running()
+        )
 
-        self._run_in_webrtc_loop(self._start_streaming_coro(settings))
+        if use_rust:
+            # Rust: создаём RustVideoTrack (будут заполняться через Named Pipe)
+            s = settings or {}
+            fps = s.get('fps', 30)
+            simulcast = s.get('simulcast', True)
+            self._media_bridge.create_tracks(fps=fps, simulcast=simulcast)
+            print("[Net] RustVideoTrack создан, запуск стрима в Rust...")
+        else:
+            # Fallback: DXCam
+            if self.video is None:
+                print("[Net] start_streaming_webrtc: VideoEngine не установлен")
+                return
+            if not self.video.start_streaming(settings):
+                print("[Net] start_streaming_webrtc: VideoEngine.start_streaming() вернул False")
+                return
 
-    async def _start_streaming_coro(self, settings: dict | None = None) -> None:
+        self._run_in_webrtc_loop(self._start_streaming_coro(settings, use_rust))
+
+    async def _start_streaming_coro(self, settings: dict | None = None, use_rust: bool = False) -> None:
         """
         Корутина создания WebRTC PC стримера.
 
-        Закрывает старый PC если был (переподключение без перезапуска).
-        Добавляет DXCamTrack из VideoEngine.
-        Создаёт offer → ждёт ICE gathering → отправляет серверу.
+        use_rust=True: видеотреки из RustVideoTrack (Named Pipe от Rust).
+        use_rust=False: видеотреки из DXCamTrack (Python VideoEngine).
+        WebRTC PC всегда aiortc — гарантированная совместимость с SFU.
         """
         if self._streamer_pc is not None:
             try:
@@ -816,41 +857,63 @@ class NetworkClient(QObject):
         pc  = RTCPeerConnection(cfg)
         self._streamer_pc = pc
 
-        # Добавляем видеотрек (DXCamTrack)
-        dxcam_track = self.video.get_dxcam_track() if self.video else None
-        if dxcam_track is None:
-            print("[Net] _start_streaming_coro: DXCamTrack недоступен")
+        # ── Получаем видеотреки ───────────────────────────────────────────
+        hq_track = None
+        lq_track = None
+
+        if use_rust and self._media_bridge is not None:
+            from config import get_bitrate_for_resolution
+            s = settings or {}
+            width = s.get('width', 1280)
+            height = s.get('height', 720)
+
+            # RustVideoTrack уже созданы в start_streaming_webrtc → create_tracks()
+            hq_track = self._media_bridge._track_hq
+            lq_track = self._media_bridge._track_lq
+
+            # Запускаем capture+encode в Rust (Named Pipe → RustVideoTrack)
+            self._media_bridge.start_stream(
+                monitor=s.get('monitor_idx', 0),
+                width=width,
+                height=height,
+                fps=s.get('fps', 30),
+                bitrate=get_bitrate_for_resolution(width, height),
+                simulcast=s.get('simulcast', True),
+                stream_audio=s.get('stream_audio', False),
+            )
+            print(f"[Net] Стрим запущен через Rust Media Engine ({width}×{height})")
+        else:
+            # Fallback: DXCam треки
+            hq_track = self.video.get_dxcam_track() if self.video else None
+            lq_track = self.video.get_lq_track() if self.video else None
+
+        if hq_track is None:
+            print("[Net] _start_streaming_coro: HQ видеотрек недоступен")
+            self._streamer_pc = None
             return
 
-        pc.addTrack(dxcam_track)   # HQ: первый видеотрек
-
-        # Simulcast: добавляем LQ трек вторым (SFU идентифицирует по порядку)
-        lq_track = self.video.get_lq_track() if self.video else None
+        # Добавляем видеотреки в aiortc PC
+        pc.addTrack(hq_track)
         if lq_track is not None:
             pc.addTrack(lq_track)
             print("[Net] Simulcast LQ трек добавлен в RTCPeerConnection")
 
-        # Системный звук: захват через WASAPI Process Loopback DLL.
-        # Добавляется ТОЛЬКО если пользователь включил "Транслировать звук" в настройках.
-        # DLL нативно исключает весь звук процесса InPulse из loopback:
-        #   StartRender() → RAW WASAPI → PID python.exe атрибутирован
-        #   StartCapture(exclude_pid) → PROCESS_LOOPBACK_EXCLUDE работает.
-        # Программный голосовой gate удалён — дропов стрима при голосе нет.
+        # Системный звук (WASAPI) — остаётся в Python
         _stream_audio = (settings or {}).get('stream_audio', False)
         if _stream_audio and SYSTEM_AUDIO_AVAILABLE and SystemAudioTrack is not None:
             try:
                 audio_device_idx = (settings or {}).get('audio_device_idx', None)
                 self._system_audio_track = SystemAudioTrack(
                     device_idx=audio_device_idx,
-                    audio_handler=self.audio,   # AudioHandler → enable_dll_render()
+                    audio_handler=self.audio,
                 )
                 pc.addTrack(self._system_audio_track)
-                print("[Net] SystemAudioTrack добавлен в RTCPeerConnection (DLL-режим, gate-free)")
+                print("[Net] SystemAudioTrack добавлен в RTCPeerConnection")
             except Exception as e:
                 print(f"[Net] SystemAudioTrack ошибка инициализации: {e}")
                 self._system_audio_track = None
         elif _stream_audio and not SYSTEM_AUDIO_AVAILABLE:
-            print("[Net] SystemAudioTrack недоступен — стрим без системного звука (DLL не найдена?)")
+            print("[Net] SystemAudioTrack недоступен — стрим без системного звука")
         else:
             print("[Net] Системный звук отключён в настройках трансляции")
 
@@ -912,14 +975,19 @@ class NetworkClient(QObject):
     def stop_streaming_webrtc(self) -> None:
         """
         Останавливает WebRTC-стрим.
-        Закрывает PC стримера, останавливает DXCamTrack и SystemAudioTrack.
-        Должен вызываться вместе с (или после) CMD_STREAM_STOP.
+        Закрывает PC стримера, останавливает Rust capture, DXCamTrack, SystemAudioTrack.
         """
+        # Останавливаем Rust capture+encode (если работает)
+        if self._media_bridge is not None and self._media_bridge.is_running():
+            self._media_bridge.stop_stream()
+            print("[Net] Rust capture остановлен")
+
+        # Закрываем aiortc PC стримера
         if self._streamer_pc is not None:
             self._run_in_webrtc_loop(self._close_pc_coro(self._streamer_pc))
             self._streamer_pc = None
 
-        # Останавливаем захват системного звука — DLL::StopCapture()
+        # Останавливаем захват системного звука
         if self._system_audio_track is not None:
             try:
                 self._system_audio_track.stop()
@@ -927,8 +995,40 @@ class NetworkClient(QObject):
                 print(f"[Net] SystemAudioTrack stop error: {e}")
             self._system_audio_track = None
 
+        # Останавливаем Python VideoEngine (DXCam fallback)
         if self.video:
             self.video.stop_streaming()
+
+    # ------------------------------------------------------------------
+    # Rust Media Engine: обработка событий (v0.2: только STATS/ERROR)
+    # ------------------------------------------------------------------
+    def _handle_media_event(self, event: dict) -> None:
+        """
+        Callback для JSON-событий от Rust Media Engine (stdout).
+        В v0.2: WebRTC сигнализация в Python, поэтому OFFER/ICE не пересылаются.
+        Обрабатываем только информационные события.
+        """
+        ev = event.get('event', '')
+
+        if ev == 'PIPE_READY':
+            # Named Pipe создан — bridge автоматически подключит RustFramePipeReader
+            print(f"[Net] Rust Named Pipe: {event.get('pipe_name', '?')}")
+
+        elif ev == 'STREAM_STARTED':
+            print(
+                f"[Net] Rust стрим: {event.get('encoder', '?')} "
+                f"{event.get('width', 0)}×{event.get('height', 0)} "
+                f"@ {event.get('fps', 0)} fps"
+            )
+
+        elif ev == 'STREAM_STOPPED':
+            print("[Net] Rust стрим остановлен")
+
+        elif ev == 'STATS':
+            pass  # тихо — можно логировать при необходимости
+
+        elif ev == 'ERROR':
+            print(f"[Net] Rust Media Engine ERROR: {event.get('message', '?')}")
 
     # ------------------------------------------------------------------
     # Просмотр стрима — WebRTC

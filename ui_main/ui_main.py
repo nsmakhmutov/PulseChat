@@ -3215,17 +3215,24 @@ class MainWindow(QMainWindow):
                 #      Сервер должен знать о стриме ДО получения webrtc_offer,
                 #      иначе он не сможет связать offer с конкретным стримером.
                 #   2. net.start_streaming_webrtc(settings):
-                #        — создаёт DXCamTrack через VideoEngine
+                #        — создаёт DXCamTrack через VideoEngine или запускает Rust-мост
                 #        — создаёт RTCPeerConnection
                 #        — добавляет видео/аудио треки
                 #        — создаёт SDP offer → ждёт ICE gathering → отправляет серверу
                 self.net.send_json({"action": CMD_STREAM_START})
                 self.net.start_streaming_webrtc(settings)
 
-                # Синхронная проверка успеха: DXCamTrack создаётся синхронно
-                # внутри start_streaming_webrtc() → если None, что-то пошло не так
-                # (отсутствие зависимостей, loop не запущен и т.п.)
-                if self.video.get_dxcam_track() is None:
+                # Синхронная проверка успеха:
+                # Rust bridge = стрим OK (DXCam не используется).
+                # Fallback = проверяем DXCamTrack.
+                _rust_ok = (
+                        hasattr(self.net, '_media_bridge')
+                        and self.net._media_bridge is not None
+                        and self.net._media_bridge.is_running()
+                )
+
+                if not _rust_ok and self.video.get_dxcam_track() is None:
+                    print("[UI] Ошибка: Ни Rust-мост, ни DXCam не запустились.")
                     self.net.send_json({"action": CMD_STREAM_STOP})
                     self.btn_stream.setChecked(False)
                     return
