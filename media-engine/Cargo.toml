@@ -1,8 +1,8 @@
 [package]
 name = "inpulse-media-engine"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-description = "High-performance media sidecar: WGC capture → HW H.264 → Named Pipe"
+description = "High-performance media sidecar: WGC → NVENC H.264 → WebRTC → Pion SFU"
 authors = ["InPulse Team"]
 
 [dependencies]
@@ -21,7 +21,7 @@ anyhow      = "1"
 bytes       = "1"
 parking_lot = "0.12"
 
-# ── Windows APIs (D3D11, WGC, DXGI, Named Pipe) ───────────────────────────────
+# ── Windows APIs (D3D11, WGC, DXGI) ─────────────────────────────────────────────
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     # COM / Foundation
@@ -45,14 +45,11 @@ windows = { version = "0.58", features = [
     "Win32_Graphics_Gdi",
 ]}
 
-# Named Pipe API (CreateNamedPipeW, ConnectNamedPipe)
-windows-sys = { version = "0.52", features = [
-    "Win32_Foundation",
-    "Win32_Storage_FileSystem",
-    "Win32_System_Pipes",
-    "Win32_System_IO",       # ЭТОГО НЕ ХВАТАЛО
-    "Win32_Security",
-]}
+# windows-sys removed in v3 (Named Pipe → webrtc-rs)
+
+# ── WebRTC (webrtc-rs → Pion SFU) ────────────────────────────────────────────
+# Заменяет Named Pipe: H.264 NAL → RTP → WebRTC → Pion SFU → aiortc viewer
+webrtc = "0.11"
 
 # ── FFmpeg bindings (NVENC / AMF / QSV через libav*) ─────────────────────────
 ffmpeg-next = "8"

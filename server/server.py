@@ -29,7 +29,7 @@ from config import (
     CMD_CHAT_MEDIA, CHAT_MEDIA_MAX_B64,
     CMD_DRAW_STROKE, DRAW_MAX_POINTS,
 )
-from .server_webrtc import WebRTCSFU, AIORTC_AVAILABLE
+from .server_webrtc import PionSfuProxy
 
 
 # =============================================================================
@@ -85,7 +85,7 @@ class SFUServer:
         self.nudge_lock  = threading.Lock()
 
         # --- WebRTC SFU (создаётся в start()) ---
-        self.sfu: WebRTCSFU | None = None
+        self.sfu: PionSfuProxy | None = None
 
         # ── Кэш payload send_global_state (FIX 8) ───────────────────────────
         # send_global_state сериализует всех юзеров в JSON и шлёт всем клиентам.
@@ -678,7 +678,10 @@ class SFUServer:
                             with self.clients_lock:
                                 if conn in self.clients:
                                     self.clients[conn]['is_streaming'] = True
-                                    print(f"[Server] {self.clients[conn]['nick']} запустил стрим")
+                                    # Сохраняем реальный порт SFU стримера.
+                                    # Клиент передаёт его в сообщении (динамический порт).
+                                    self.clients[conn]['sfu_port'] = msg.get('sfu_port', 7788)
+                                    print(f"[Server] {self.clients[conn]['nick']} запустил стрим (SFU порт={self.clients[conn]['sfu_port']})")
                             self._mark_dirty()
                             self.send_global_state()
 
@@ -695,9 +698,7 @@ class SFUServer:
                                     self.watchers.pop(stopped_uid, None)
                                 # Закрываем WebRTC сессию стримера и всех его зрителей
                                 if self.sfu:
-                                    self.sfu.call_async(
-                                        self.sfu.close_streamer(stopped_uid)
-                                    )
+                                    self.sfu.close_streamer(stopped_uid)
                             self._mark_dirty()
                             self.send_global_state()
 
@@ -723,13 +724,31 @@ class SFUServer:
                                     f"[Server] {watcher_nick} "
                                     f"начал смотреть стрим uid={streamer_uid}"
                                 )
-                                # WebRTC: создаём offer для зрителя через SFU
+                                # WebRTC v3: посылаем зрителю триггер → он создаёт offer
                                 if self.sfu:
                                     quality = msg.get('quality', 'hq')
-                                    self.sfu.call_async(
-                                        self.sfu.handle_viewer_connect(
-                                            w_uid, streamer_uid, conn, quality
-                                        )
+                                    # Находим RadminVPN IP стримера для роутинга
+                                    # viewer-оффера к его sidecar.exe (не-хост стримеры).
+                                    streamer_ip = '127.0.0.1'
+                                    with self.clients_lock:
+                                        for _c in self.clients.values():
+                                            if _c.get('uid') == streamer_uid:
+                                                raw_ip = _c.get('ip', '127.0.0.1')
+                                                # FIX БАГ 3: стример — владелец
+                                                # embedded-сервера. Его IP хранится как
+                                                # RadminVPN-адрес (26.x.x.x), но SFU
+                                                # слушает только на localhost.
+                                                # Если IP == _owner_ip → 127.0.0.1.
+                                                if self._is_embedded and raw_ip == self._owner_ip:
+                                                    streamer_ip = '127.0.0.1'
+                                                else:
+                                                    streamer_ip = raw_ip
+                                                streamer_sfu_port = _c.get('sfu_port', 7788)
+                                                break
+                                    self.sfu.trigger_viewer_connect(
+                                        w_uid, streamer_uid, conn, quality,
+                                        streamer_ip=streamer_ip,
+                                        streamer_sfu_port=streamer_sfu_port,
                                     )
                             self._mark_dirty()
                             self.send_global_state()
@@ -749,50 +768,41 @@ class SFUServer:
                                     print(f"[Server] {nick} перестал смотреть стрим uid={streamer_uid}")
                                     # Закрываем WebRTC PC зрителя
                                     if self.sfu:
-                                        self.sfu.call_async(
-                                            self.sfu.close_viewer(w_uid)
-                                        )
+                                        self.sfu.close_viewer(w_uid)
                             self._mark_dirty()
                             self.send_global_state()
 
-                        # ── WebRTC Offer (от стримера или зрителя) ────────────
+                        # ── WebRTC Offer ──────────────────────────────────────
                         elif action == CMD_WEBRTC_OFFER:
                             sdp      = msg.get('sdp')
                             sdp_type = msg.get('type', 'offer')
                             role     = msg.get('role', '')
 
-                            if not sdp or not self.sfu:
+                            if not self.sfu:
                                 continue
 
-                            if role == 'streamer':
-                                # Стример прислал offer → SFU принимает треки
-                                self.sfu.call_async(
-                                    self.sfu.handle_streamer_offer(
-                                        uid, sdp, sdp_type, conn
-                                    )
-                                )
-                            # role == 'viewer' не обрабатывается здесь:
-                            # offer от SFU к зрителю уже отправлен в handle_viewer_connect.
-                            # Если придёт — это ошибка протокола, игнорируем.
+                            print(f"[Server] CMD_WEBRTC_OFFER: role={role!r}, uid={uid}, sdp_len={len(sdp) if sdp else 0}, sfu={bool(self.sfu)}")
+                            if role == 'viewer_offer':
+                                # v3: зритель прислал свой offer → прокси в Pion SFU
+                                if sdp:
+                                    print(f"[Server] → handle_viewer_offer(uid={uid})")
+                                    self.sfu.handle_viewer_offer(uid, sdp, conn)
+                                else:
+                                    print(f"[Server] ❌ viewer_offer с пустым SDP от uid={uid}")
+                            elif role == 'streamer':
+                                print(f"[Server] CMD_WEBRTC_OFFER role=streamer uid={uid}: ignored in v3")
+                            elif role == 'viewer':
+                                print(f"[Server] CMD_WEBRTC_OFFER role=viewer uid={uid}: триггер от старого клиента (без v3 offer)")
+                            else:
+                                print(f"[Server] CMD_WEBRTC_OFFER неизвестный role={role!r} uid={uid}")
 
-                        # ── WebRTC Answer (от зрителя) ────────────────────────
+                        # ── WebRTC Answer (v3: не используется — сервер сам отвечает) ──
                         elif action == CMD_WEBRTC_ANSWER:
-                            sdp      = msg.get('sdp')
-                            sdp_type = msg.get('type', 'answer')
+                            pass  # v3: answer идёт server→viewer, не viewer→server
 
-                            if sdp and self.sfu:
-                                # Зритель ответил на наш offer
-                                self.sfu.call_async(
-                                    self.sfu.handle_viewer_answer(uid, sdp, sdp_type)
-                                )
-
-                        # ── WebRTC ICE Candidate ──────────────────────────────
+                        # ── WebRTC ICE Candidate (v3: gather-complete — trickle не используется)
                         elif action == CMD_WEBRTC_ICE:
-                            candidate = msg.get('candidate')
-                            if candidate and self.sfu:
-                                self.sfu.call_async(
-                                    self.sfu.handle_ice_candidate(uid, candidate)
-                                )
+                            pass  # v3: gather-complete ICE, кандидаты в SDP
 
                         # ── Передача сервера другому участнику ────────────────
                         elif action == CMD_SERVER_TRANSFER:
@@ -1389,10 +1399,9 @@ class SFUServer:
 
                 # Закрываем WebRTC сессии отключившегося пользователя
                 if self.sfu:
-                    # Если был стримером — закрываем стример PC + все зрители
-                    self.sfu.call_async(self.sfu.close_streamer(u_id))
-                    # Если был зрителем — закрываем зритель PC
-                    self.sfu.call_async(self.sfu.close_viewer(u_id))
+                    # v3: PionSfuProxy — синхронные вызовы, нет call_async
+                    self.sfu.close_streamer(u_id)   # no-op если не был стримером
+                    self.sfu.close_viewer(u_id)     # no-op если не был зрителем
 
                 print(
                     f"[Server] ✖ {nick} (комната: {room}) "
@@ -1477,6 +1486,7 @@ class SFUServer:
                         'deaf':         c.get('deaf', False),
                         'ip':           c.get('ip', ''),
                         'is_streaming': c.get('is_streaming', False),
+                        'sfu_port':     c.get('sfu_port', 7788),
                         'watchers':     watchers_list,
                         'status_icon':  c.get('status_icon', ''),
                         'status_text':  c.get('status_text', ''),
@@ -1529,12 +1539,22 @@ class SFUServer:
         self._accepting   = True
         self._owner_ip    = host_ip   # FIX: сохраняем IP владельца для приоритета в host_order
 
-        # WebRTCSFU
-        if AIORTC_AVAILABLE:
-            self.sfu = WebRTCSFU()
-            print("[Server] WebRTCSFU запущен (встроенный режим)")
-        else:
-            print("[Server] WebRTCSFU ОТКЛЮЧЁН (aiortc не установлен)")
+        # Pion SFU Proxy (v3) — используем singleton чтобы не плодить sidecar.exe
+        try:
+            from sfu_bridge import get_shared as _get_sfu
+            _sfu_bridge = _get_sfu(
+                on_log=lambda s: print(f"[SFU] {s}"),
+                on_exit=lambda c: print(f"[SFU] завершён (code={c})"),
+            )
+            if not _sfu_bridge.is_running():
+                _sfu_bridge.start()
+            if _sfu_bridge.is_running():
+                self.sfu = PionSfuProxy(sfu_bridge=_sfu_bridge)
+                print("[Server] Pion SFU подключён (встроенный режим)")
+            else:
+                print("[Server] Pion SFU не запустился — WebRTC недоступен")
+        except ImportError:
+            print("[Server] SfuBridge не найден — WebRTC недоступен")
 
         # Фоновые потоки сервера
         threading.Thread(target=self.udp_handler,   daemon=True, name="srv-udp").start()
@@ -1734,12 +1754,18 @@ class SFUServer:
     # Запуск сервера (standalone режим — без изменений)
     # ------------------------------------------------------------------
     def start(self):
-        # Запускаем WebRTCSFU если aiortc установлен
-        if AIORTC_AVAILABLE:
-            self.sfu = WebRTCSFU()
-            print("[Server] WebRTCSFU запущен (aiortc доступен)")
-        else:
-            print("[Server] WebRTCSFU ОТКЛЮЧЁН (aiortc не установлен)")
+        # Pion SFU Proxy (v3) — переподключение (singleton)
+        if self.sfu is None:
+            try:
+                from sfu_bridge import get_shared as _get_sfu
+                _sfu_bridge = _get_sfu()
+                if not _sfu_bridge.is_running():
+                    _sfu_bridge.start()
+                if _sfu_bridge.is_running():
+                    self.sfu = PionSfuProxy(sfu_bridge=_sfu_bridge)
+                    print("[Server] Pion SFU подключён (переподключение)")
+            except ImportError:
+                pass
 
         threading.Thread(target=self.udp_handler,   daemon=True).start()
         threading.Thread(target=self.stats_monitor, daemon=True).start()

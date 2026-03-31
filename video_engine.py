@@ -722,7 +722,18 @@ class VideoReceiver(QObject):
 
 class VideoEngine(QObject):
     """
-    Менеджер WebRTC видео.
+    Менеджер WebRTC видео (v3).
+
+    Стример (v3):
+      Захват экрана — Rust WGC (media-engine.exe, ~2% CPU).
+      Кодирование   — NVENC/AMF через FFmpeg (Rust).
+      Отправка RTP  — webrtc-rs → Pion SFU (sidecar.exe).
+      Python не держит DXCamTrack — start_streaming() / stop_streaming()
+      вызываются из UI для GC + heap trim (очистка после стрима).
+
+    Зритель (v3):
+      Pion SFU → aiortc PC → VideoReceiver → frame_received → VideoWindow.
+      VideoReceiver и add_receiver() полностью сохранены.
     """
 
     frame_received       = pyqtSignal(int, QImage)
@@ -732,75 +743,43 @@ class VideoEngine(QObject):
         super().__init__()
         self.net = net_client
 
-        self._dxcam_track:    DXCamTrack    | None = None
-        self._dxcam_track_lq: DXCamTrackLQ  | None = None
-        self._receivers:      dict[int, VideoReceiver] = {}
+        # v3: DXCamTrack не используется (захват в Rust).
+        # Поля сохранены чтобы не ломать код, который делает get_dxcam_track().
+        self._dxcam_track:    None = None
+        self._dxcam_track_lq: None = None
+        self._receivers: dict[int, VideoReceiver] = {}
 
         self._webrtc_loop: asyncio.AbstractEventLoop | None = None
 
-    # ------------------------------------------------------------------
-    # WebRTC loop
-    # ------------------------------------------------------------------
+    # ── WebRTC loop ───────────────────────────────────────────────────────────
 
     def set_webrtc_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         self._webrtc_loop = loop
         print("[VideoEngine] WebRTC asyncio loop установлен")
 
-    # ------------------------------------------------------------------
-    # Стример: управление DXCamTrack + DXCamTrackLQ
-    # ------------------------------------------------------------------
+    # ── Стример: no-op в v3 (Rust делает захват + кодирование + отправку) ────
 
     def start_streaming(self, settings: dict | None = None) -> bool:
-        if not (AV_AVAILABLE and DXCAM_AVAILABLE and AIORTC_AVAILABLE):
-            print("[VideoEngine] start_streaming: отсутствуют зависимости")
-            return False
-        if self._dxcam_track is not None:
-            print("[VideoEngine] start_streaming: стрим уже запущен")
-            return False
-        if self._webrtc_loop is None:
-            print("[VideoEngine] start_streaming: WebRTC loop не установлен")
-            return False
-
-        s = settings or {}
-        w = s.get("width",  VIDEO_WIDTH)
-        h = s.get("height", VIDEO_HEIGHT)
-        fps = s.get("fps", VIDEO_FPS)
-
-        target_bitrate = get_bitrate_for_resolution(w, h, lq=False)
-        lq_w, lq_h = get_lq_resolution(w, h)
-        lq_bitrate = get_bitrate_for_resolution(lq_w, lq_h, lq=True)
-
-        set_encoder_bitrate(target_bitrate, lq_bitrate)
-
-        self._dxcam_track = DXCamTrack(
-            monitor_idx = s.get("monitor_idx", 0),
-            fps         = fps,
-            width       = w,
-            height      = h,
-        )
-
-        self._dxcam_track_lq = DXCamTrackLQ(hq_width=w, hq_height=h)
-        self._dxcam_track_lq.start(self._webrtc_loop)
-        self._dxcam_track._lq_track = self._dxcam_track_lq
-
-        self._dxcam_track.start(self._webrtc_loop)
-
-        print(
-            f"[VideoEngine] Стрим запущен: HQ={w}×{h}, LQ={lq_w}×{lq_h}, "
-            f"fps={fps}, HQ={target_bitrate//1000} kbps, LQ={lq_bitrate//1000} kbps"
-        )
+        """
+        v3: Захват и кодирование выполняет Rust Media Engine.
+        Python вызывает net.start_streaming_webrtc() напрямую.
+        Этот метод оставлен для совместимости с ui_main.py.
+        """
+        print("[VideoEngine] start_streaming: v3 — захват в Rust, no-op")
         return True
 
     def stop_streaming(self) -> None:
-        if self._dxcam_track is not None:
-            self._dxcam_track.stop()
-            self._dxcam_track    = None
+        """
+        v3: DXCamTrack отсутствует — выполняем только GC и heap trim.
+        Rust Media Engine останавливается через MediaEngineBridge.stop_stream().
+        """
+        self._dxcam_track    = None
         self._dxcam_track_lq = None
-        
+
         gc.collect(0)
         gc.collect(1)
         gc.collect(2)
-        gc.collect(0)   # второй gen0 — чистит хвосты после gen2
+        gc.collect(0)
 
         try:
             import ctypes
@@ -811,23 +790,30 @@ class VideoEngine(QObject):
                 ctypes.c_size_t(0xFFFFFFFF),
                 0,
             )
-            print("[VideoEngine] Стрим остановлен: GC + Windows heap trim")
+            print("[VideoEngine] stop_streaming: GC + Windows heap trim")
         except Exception:
-            print("[VideoEngine] Стрим остановлен, GC выполнен")
+            print("[VideoEngine] stop_streaming: GC выполнен")
 
-    def get_dxcam_track(self) -> 'DXCamTrack | None':
-        return self._dxcam_track
+    def get_dxcam_track(self):
+        """v3: всегда None — захват в Rust."""
+        return None
 
-    def get_lq_track(self) -> 'DXCamTrackLQ | None':
-        return self._dxcam_track_lq
+    def get_lq_track(self):
+        """v3: всегда None — simulcast управляется Pion SFU."""
+        return None
 
-    # ------------------------------------------------------------------
-    # Зрители: управление VideoReceiver
-    # ------------------------------------------------------------------
+    # ── Зрители: VideoReceiver (полностью сохранён) ───────────────────────────
 
     def add_receiver(self, uid: int, track) -> VideoReceiver:
+        """
+        Создаёт VideoReceiver для входящего WebRTC трека зрителя.
+        track — aiortc MediaStreamTrack от Pion SFU (через RTCPeerConnection).
+        """
         if self._webrtc_loop is None:
-            raise RuntimeError("WebRTC loop не установлен. Вызовите set_webrtc_loop() первым.")
+            raise RuntimeError(
+                "[VideoEngine] WebRTC loop не установлен. "
+                "Вызовите set_webrtc_loop() первым."
+            )
 
         if uid in self._receivers:
             old = self._receivers[uid]
@@ -857,9 +843,7 @@ class VideoEngine(QObject):
             receiver.stop()
         print(f"[VideoEngine] stop_viewer_for_uid({uid})")
 
-    # ------------------------------------------------------------------
-    # Заглушки для совместимости
-    # ------------------------------------------------------------------
+    # ── Заглушки для совместимости ────────────────────────────────────────────
 
     def process_incoming_packet(self, uid, data, is_lq: bool = False) -> None:
         pass
@@ -876,9 +860,7 @@ class VideoEngine(QObject):
     def handle_retransmit(self, frame_id: int, chunk_idx: int) -> None:
         pass
 
-    # ------------------------------------------------------------------
-    # Cleanup
-    # ------------------------------------------------------------------
+    # ── Cleanup ───────────────────────────────────────────────────────────────
 
     def cleanup_users(self, active_uids) -> None:
         for uid in list(self._receivers.keys()):
@@ -886,15 +868,11 @@ class VideoEngine(QObject):
                 self.stop_viewer_for_uid(uid)
 
     def shutdown(self) -> None:
-        print("[VideoEngine] shutdown(): останавливаем все компоненты...")
+        print("[VideoEngine] shutdown()")
 
-        if self._dxcam_track is not None:
-            try:
-                self._dxcam_track.stop()
-            except Exception as e:
-                print(f"[VideoEngine] DXCamTrack stop error: {e}")
-            self._dxcam_track    = None
-            self._dxcam_track_lq = None
+        # v3: нет DXCamTrack для остановки
+        self._dxcam_track    = None
+        self._dxcam_track_lq = None
 
         for uid in list(self._receivers.keys()):
             try:
@@ -902,5 +880,4 @@ class VideoEngine(QObject):
             except Exception as e:
                 print(f"[VideoEngine] VideoReceiver uid={uid} stop error: {e}")
         self._receivers.clear()
-
-        print("[VideoEngine] shutdown(): готово")
+        print("[VideoEngine] shutdown: все VideoReceiver остановлены")

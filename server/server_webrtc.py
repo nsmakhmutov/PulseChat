@@ -1,484 +1,279 @@
-import asyncio
+"""
+server_webrtc.py — Pion SFU Proxy v3
+
+Заменяет WebRTCSFU (aiortc на сервере) на тонкий HTTP-прокси к Go Pion SFU.
+
+─── FIX: remote streamer viewer connect ───────────────────────────────────────
+  Старый trigger_viewer_connect() проверял self._sfu.is_running() для ВСЕХ
+  стримеров — включая удалённых (другая машина, другой SFU).
+
+  Новый код: локальный SFU нужен ТОЛЬКО когда стример на той же машине.
+  Для удалённых стримеров (streamer_ip != 127.0.0.1):
+    - Триггер отправляем сразу, локальный SFU не нужен.
+    - Offer зрителя пойдёт напрямую к remote SFU (26.x.x.x:7788).
+
+─── Поток сигнализации ────────────────────────────────────────────────────────
+
+  Стример (любой участник):
+    Rust webrtc-rs → свой sidecar.exe (на машине стримера).
+    Сервер только отслеживает is_streaming=True.
+
+  Зритель:
+    1. Зритель: stream_watch_start → сервер
+    2. Сервер → зрителю: CMD_WEBRTC_OFFER role='viewer' (пустой триггер)
+    3. Зритель создаёт aiortc PC (recvonly), createOffer, ICE gathering
+    4. Зритель → сервер: CMD_WEBRTC_OFFER role='viewer_offer' sdp=<offer>
+    5a. Стример локальный: POST /viewer/{uid}/offer → localhost SFU → answer
+    5b. Стример удалённый: POST /viewer/{uid}/offer → streamer_ip:7788 → answer
+    6. Сервер → зрителю: CMD_WEBRTC_ANSWER sdp=<answer>
+    7. Зритель: setRemoteDescription(answer) → ICE → RTP от SFU стримера
+"""
+
 import json
 import threading
+from typing import Optional
 
-from config import (
-    CMD_WEBRTC_OFFER, CMD_WEBRTC_ANSWER, CMD_WEBRTC_ICE,
-    WEBRTC_ICE_TIMEOUT,
-)
-
-try:
-    from aiortc import (
-        RTCPeerConnection, RTCSessionDescription,
-        RTCConfiguration,
-    )
-    from aiortc.contrib.media import MediaRelay
-    AIORTC_AVAILABLE = True
-except ImportError:
-    AIORTC_AVAILABLE = False
-    print("[Server] WARNING: aiortc не установлен — WebRTC видео недоступно")
+from config import CMD_WEBRTC_OFFER, CMD_WEBRTC_ANSWER
 
 
-# =============================================================================
-# WebRTCSFU — asyncio SFU с поддержкой simulcast (HQ + LQ)
-# =============================================================================
-
-class WebRTCSFU:
+def _strip_mdns_candidates(sdp: str) -> str:
     """
-    asyncio-based SFU (Selective Forwarding Unit) для WebRTC видео/аудио.
+    Убираем mDNS *.local кандидаты из SDP answer Pion SFU.
 
-    ─── Simulcast (HQ + LQ) ────────────────────────────────────────────────
-    Стример отправляет ДВА видеотрека в одном RTCPeerConnection:
-        1-й video track = HQ (добавлен первым через pc.addTrack в network_engine)
-        2-й video track = LQ (DXCamTrackLQ, добавлен вторым)
+    Rust webrtc-rs регистрирует mDNS агент (0.0.0.0:5353).
+    Pion SFU включает *.local кандидаты в answer для зрителя.
+    aiortc на Windows пытается резолвить их через multicast mDNS —
+    это зависает навсегда (Bonjour/Avahi не установлен).
+    """
+    sep = "\r\n" if "\r\n" in sdp else "\n"
+    lines = sdp.split(sep)
+    filtered = [
+        line for line in lines
+        if not (line.startswith("a=candidate:") and ".local" in line)
+    ]
+    cleaned = sep.join(filtered)
+    removed = len(lines) - len(filtered)
+    if removed:
+        print(f"[SFU-Proxy] _strip_mdns_candidates: убрано {removed} mDNS кандидат(ов)")
+    return cleaned
 
-    SFU определяет порядок по счётчику on_track:
-        source_tracks = {'video_hq': ..., 'video_lq': ..., 'audio': ...}
 
-    Зритель выбирает качество в stream_watch_start:
-        {'action': 'stream_watch_start', 'streamer_uid': X, 'quality': 'lq'}
-    По умолчанию quality='hq'. Если LQ трек не пришёл от стримера —
-    fallback на HQ для всех зрителей.
+def _is_local_ip(ip: str) -> bool:
+    """Возвращает True если IP — это localhost (стример на той же машине)."""
+    return ip in ('127.0.0.1', '::1', '', 'localhost')
 
-    ─── ICE стратегия ──────────────────────────────────────────────────────
-    Host-only ICE (RadminVPN 26.x.x.x). STUN не нужен.
-    Gather-and-send: ждём завершения gathering, отправляем SDP целиком.
+
+class PionSfuProxy:
+    """
+    Тонкий прокси к Go Pion SFU (sidecar.exe).
+
+    Не держит WebRTC-состояние — всё в SFU.
+    Не нужен asyncio event loop — HTTP запросы синхронные (короткие, localhost).
+    Потокобезопасен.
     """
 
-    def __init__(self):
-        self._loop   = asyncio.new_event_loop()
-        self._thread = threading.Thread(
-            target=self._run_loop, daemon=True, name="webrtc-sfu"
-        )
-        self._thread.start()
+    def __init__(self, sfu_bridge=None):
+        """
+        sfu_bridge — экземпляр SfuBridge (уже запущенный).
+        Если None — режим без WebRTC (fallback).
+        """
+        self._sfu = sfu_bridge
+        self._lock = threading.Lock()
+        # viewer_uid (int) → conn (socket)
+        self._viewer_conns: dict[int, object] = {}
+        # viewer_uid (int) → RadminVPN IP стримера
+        self._viewer_streamer_ip: dict[int, str] = {}
+        # viewer_uid (int) → реальный порт SFU стримера (динамический)
+        self._viewer_streamer_sfu_port: dict[int, int] = {}
 
-        # streamer_uid → {
-        #   'pc':           RTCPeerConnection,
-        #   'relay':        MediaRelay,
-        #   'tracks':       {key: relayed_track},     # для совместимости
-        #   'source_tracks':{key: original_track},    # video_hq/video_lq/audio
-        #   'conn':         socket,
-        # }
-        self._streamer_entries: dict = {}
-
-        # viewer_uid → {'pc': RTCPeerConnection, 'conn': conn, 'streamer_uid': int}
-        self._viewer_entries: dict = {}
-
-        # Буфер ожидающих зрителей: streamer_uid → [(viewer_uid, conn, quality)]
-        self._pending_viewers: dict[int, list] = {}
-
-        # Входящие ICE-кандидаты до создания PC
-        self._pending_ice: dict[int, list] = {}
-
-    # ------------------------------------------------------------------
-    # Запуск asyncio loop
-    # ------------------------------------------------------------------
-
-    def _run_loop(self) -> None:
-        asyncio.set_event_loop(self._loop)
-        self._loop.run_forever()
-
-    def call_async(self, coro):
-        return asyncio.run_coroutine_threadsafe(coro, self._loop)
-
-    # ------------------------------------------------------------------
-    # Вспомогательные методы
-    # ------------------------------------------------------------------
-
-    async def _send_async(self, conn, msg: dict) -> None:
-        payload = json.dumps(msg).encode('utf-8')
-        loop = asyncio.get_running_loop()
-        try:
-            await loop.run_in_executor(None, conn.sendall, payload)
-        except Exception as e:
-            print(f"[SFU] send_async error: {e}")
+    # ── Утилита отправки ─────────────────────────────────────────────────────
 
     @staticmethod
-    async def _wait_ice_gathering(pc, timeout: float = WEBRTC_ICE_TIMEOUT) -> None:
-        loop     = asyncio.get_running_loop()
-        deadline = loop.time() + timeout
-        while pc.iceGatheringState != "complete":
-            if loop.time() >= deadline:
-                print(f"[SFU] ICE gathering timeout ({timeout}s) — отправляем что есть")
-                break
-            await asyncio.sleep(0.05)
-
-    # ------------------------------------------------------------------
-    # Стример: обработка offer
-    # ------------------------------------------------------------------
-
-    async def handle_streamer_offer(
-        self, streamer_uid: int, sdp: str, sdp_type: str, conn
-    ) -> None:
-        """
-        Принимает WebRTC offer от стримера.
-
-        Порядок video треков в on_track:
-          1-й video → video_hq (DXCamTrack)
-          2-й video → video_lq (DXCamTrackLQ)
-        Аудио → 'audio'.
-
-        Счётчик _video_count[] отслеживает порядок в замыкании.
-        """
-        old = self._streamer_entries.pop(streamer_uid, None)
-        if old:
-            try:
-                await old['pc'].close()
-            except Exception:
-                pass
-
-        cfg = RTCConfiguration(iceServers=[])
-        pc  = RTCPeerConnection(cfg)
-
-        relay = MediaRelay()
-        entry = {
-            'pc':            pc,
-            'relay':         relay,
-            'tracks':        {},
-            'source_tracks': {},
-            'conn':          conn,
-        }
-        self._streamer_entries[streamer_uid] = entry
-
-        # Счётчик video-треков в замыкании: 0=HQ, 1=LQ
-        _video_count = [0]
-
-        @pc.on("track")
-        def on_track(track):
-            if track.kind == 'video':
-                key = 'video_hq' if _video_count[0] == 0 else 'video_lq'
-                _video_count[0] += 1
-                print(
-                    f"[SFU] Стример uid={streamer_uid}: "
-                    f"video трек #{_video_count[0]-1} → {key}"
-                )
-            else:
-                key = track.kind   # 'audio'
-                print(
-                    f"[SFU] Стример uid={streamer_uid}: "
-                    f"✔ audio трек получен"
-                )
-
-            relayed = relay.subscribe(track, buffered=False)
-            entry['tracks'][key]        = relayed
-            entry['source_tracks'][key] = track
-
-            # ── Флаш pending-зрителей ────────────────────────────────────────
-            #
-            # Аудио трек пришёл → все треки готовы → флашим немедленно.
-            # video_hq пришёл → ставим отложенный флаш через 500 мс:
-            #   RadminVPN может давать задержку между треками до 300мс.
-            #   Если аудио придёт за это время — флаш выше отработает раньше.
-            #   Если нет (stream_audio=False) — флашим без аудио через 500мс.
-            #
-            if key == 'audio':
-                pending = self._pending_viewers.pop(streamer_uid, [])
-                for v_uid, v_conn, v_quality in pending:
-                    asyncio.ensure_future(
-                        self.handle_viewer_connect(v_uid, streamer_uid, v_conn, v_quality)
-                    )
-                if pending:
-                    print(
-                        f"[SFU] Стример uid={streamer_uid}: аудио готов — "
-                        f"флаш {len(pending)} pending-зрителей"
-                    )
-
-            elif key == 'video_hq':
-                # Отложенный флаш: 500 мс на приход LQ + аудио-трека
-                async def _fallback_flush(s_uid=streamer_uid):
-                    await asyncio.sleep(0.50)
-                    pending = self._pending_viewers.pop(s_uid, [])
-                    if pending:
-                        print(
-                            f"[SFU] Стример uid={s_uid}: отложенный флаш "
-                            f"(аудио не пришло за 500мс) — {len(pending)} зрителей"
-                        )
-                        for v_uid, v_conn, v_quality in pending:
-                            asyncio.ensure_future(
-                                self.handle_viewer_connect(v_uid, s_uid, v_conn, v_quality)
-                            )
-                asyncio.ensure_future(_fallback_flush())
-
-        @pc.on("icecandidate")
-        def on_ice(candidate):
-            if candidate:
-                asyncio.ensure_future(self._send_async(conn, {
-                    'action':     CMD_WEBRTC_ICE,
-                    'target_uid': streamer_uid,
-                    'candidate': {
-                        'sdpMid':        candidate.sdpMid,
-                        'sdpMLineIndex': candidate.sdpMLineIndex,
-                        'candidate':     candidate.candidate,
-                    },
-                }))
-
-        @pc.on("connectionstatechange")
-        async def on_state():
-            state = pc.connectionState
-            print(f"[SFU] Стример uid={streamer_uid}: PC state → {state}")
-            if state in ("failed", "closed", "disconnected"):
-                await self.close_streamer(streamer_uid)
-
+    def _send(conn, msg: dict) -> None:
         try:
-            await pc.setRemoteDescription(
-                RTCSessionDescription(sdp=sdp, type=sdp_type)
-            )
-            for ice in self._pending_ice.pop(streamer_uid, []):
-                try:
-                    from aiortc import RTCIceCandidate
-                    cand = RTCIceCandidate(
-                        sdpMid=ice['sdpMid'],
-                        sdpMLineIndex=ice['sdpMLineIndex'],
-                        candidate=ice['candidate'],
-                    )
-                    await pc.addIceCandidate(cand)
-                except Exception as e:
-                    print(f"[SFU] addIceCandidate error: {e}")
-
-            answer = await pc.createAnswer()
-            await pc.setLocalDescription(answer)
-            await self._wait_ice_gathering(pc)
-
-            await self._send_async(conn, {
-                'action': CMD_WEBRTC_ANSWER,
-                'sdp':    pc.localDescription.sdp,
-                'type':   pc.localDescription.type,
-            })
-            print(f"[SFU] Answer отправлен стримеру uid={streamer_uid}")
-
+            conn.sendall(json.dumps(msg).encode('utf-8'))
         except Exception as e:
-            print(f"[SFU] handle_streamer_offer error uid={streamer_uid}: {e}")
-            self._streamer_entries.pop(streamer_uid, None)
+            print(f"[SFU-Proxy] send error: {e}")
 
-    # ------------------------------------------------------------------
-    # Зритель: создание offer с нужным качеством (HQ или LQ)
-    # ------------------------------------------------------------------
+    # ── Совместимость call_async ──────────────────────────────────────────────
 
-    async def handle_viewer_connect(
+    def call_async(self, coro_or_whatever):
+        pass  # server.py вызывает методы напрямую
+
+    # ── Viewer connect ────────────────────────────────────────────────────────
+
+    def trigger_viewer_connect(
         self,
-        viewer_uid:   int,
+        viewer_uid: int,
         streamer_uid: int,
-        viewer_conn,
-        quality:      str = 'hq',
+        conn,
+        quality: str = 'hq',
+        streamer_ip: str = '127.0.0.1',
+        streamer_sfu_port: int = 7788,
     ) -> None:
         """
-        Создаёт WebRTC соединение для зрителя.
+        Шаг 2: посылаем зрителю пустой CMD_WEBRTC_OFFER (триггер).
+        Зритель создаст offer и пришлёт нам через handle_viewer_offer.
 
-        quality='hq' → маршрутизируем video_hq трек (default).
-        quality='lq' → маршрутизируем video_lq трек (слабый зритель).
-
-        Fallback: если LQ трек не пришёл от стримера (старая версия клиента
-        без simulcast) → всем зрителям отдаём video_hq.
-
-        Аудиотрек общий для всех зрителей — не зависит от quality.
-
-        КРИТИЧНО: relay.subscribe() заново для каждого зрителя.
-        Нельзя переиспользовать relayed_track из entry['tracks'] —
-        при закрытии старого viewer PC aiortc вызывает track.stop() →
-        relayed_track.readyState = 'ended' → нулевой RTP поток.
+        FIX: локальный SFU нужен ТОЛЬКО когда стример локальный.
+        Для удалённых стримеров (IP не localhost) локальный SFU не участвует —
+        offer зрителя пойдёт напрямую к sidecar.exe стримера по RadminVPN.
         """
-        entry = self._streamer_entries.get(streamer_uid)
+        is_local_streamer = _is_local_ip(streamer_ip)
 
-        # Проверяем, что нужный трек уже готов
-        hq_ready = entry is not None and 'video_hq' in entry.get('source_tracks', {})
-        if not hq_ready:
-            self._pending_viewers.setdefault(streamer_uid, []).append(
-                (viewer_uid, viewer_conn, quality)
-            )
-            print(
-                f"[SFU] Зритель uid={viewer_uid}: стример uid={streamer_uid} "
-                f"ещё не готов — помещён в pending (quality={quality})"
-            )
-            return
-
-        old = self._viewer_entries.pop(viewer_uid, None)
-        if old:
-            try:
-                await old['pc'].close()
-            except Exception:
-                pass
-
-        cfg = RTCConfiguration(iceServers=[])
-        pc  = RTCPeerConnection(cfg)
-
-        source_tracks = entry.get('source_tracks', {})
-        relay         = entry['relay']
-
-        # Выбираем video ключ по quality; fallback на video_hq
-        video_key = 'video_lq' if quality == 'lq' else 'video_hq'
-        if video_key not in source_tracks:
-            video_key = 'video_hq'   # LQ не пришёл → даём HQ
-            if quality == 'lq':
+        if is_local_streamer:
+            # Стример на нашей машине — нужен локальный SFU
+            if self._sfu is None:
                 print(
-                    f"[SFU] Зритель uid={viewer_uid}: LQ трек недоступен "
-                    f"(стример без simulcast) — используем HQ"
+                    f"[SFU-Proxy] ❌ локальный SFU не инициализирован — "
+                    f"не можем подключить viewer {viewer_uid}"
                 )
-
-        for key, source_track in source_tracks.items():
-            if key == video_key or key == 'audio':
-                fresh = relay.subscribe(source_track, buffered=False)
-                pc.addTrack(fresh)
-
-        self._viewer_entries[viewer_uid] = {
-            'pc':           pc,
-            'conn':         viewer_conn,
-            'streamer_uid': streamer_uid,
-            'quality':      video_key,
-        }
-
-        @pc.on("icecandidate")
-        def on_ice(candidate):
-            if candidate:
-                asyncio.ensure_future(self._send_async(viewer_conn, {
-                    'action':     CMD_WEBRTC_ICE,
-                    'target_uid': viewer_uid,
-                    'candidate': {
-                        'sdpMid':        candidate.sdpMid,
-                        'sdpMLineIndex': candidate.sdpMLineIndex,
-                        'candidate':     candidate.candidate,
-                    },
-                }))
-
-        @pc.on("connectionstatechange")
-        async def on_state():
-            state = pc.connectionState
-            print(f"[SFU] Зритель uid={viewer_uid}: PC state → {state}")
-            if state in ("failed", "closed", "disconnected"):
-                await self.close_viewer(viewer_uid)
-
-        try:
-            offer = await pc.createOffer()
-            await pc.setLocalDescription(offer)
-            await self._wait_ice_gathering(pc)
-
-            await self._send_async(viewer_conn, {
-                'action':       CMD_WEBRTC_OFFER,
-                'role':         'viewer',
-                'streamer_uid': streamer_uid,
-                'sdp':          pc.localDescription.sdp,
-                'type':         pc.localDescription.type,
-            })
-            print(
-                f"[SFU] Offer → зритель uid={viewer_uid} "
-                f"(стример uid={streamer_uid}, quality={video_key})"
-            )
-        except Exception as e:
-            print(f"[SFU] handle_viewer_connect error uid={viewer_uid}: {e}")
-            self._viewer_entries.pop(viewer_uid, None)
-
-    # ------------------------------------------------------------------
-    # Зритель: обработка answer
-    # ------------------------------------------------------------------
-
-    async def handle_viewer_answer(
-        self, viewer_uid: int, sdp: str, sdp_type: str
-    ) -> None:
-        entry = self._viewer_entries.get(viewer_uid)
-        if entry is None:
-            print(f"[SFU] handle_viewer_answer: нет PC для uid={viewer_uid}")
-            return
-        try:
-            await entry['pc'].setRemoteDescription(
-                RTCSessionDescription(sdp=sdp, type=sdp_type)
-            )
-            for ice in self._pending_ice.pop(viewer_uid, []):
-                try:
-                    from aiortc import RTCIceCandidate
-                    cand = RTCIceCandidate(
-                        sdpMid=ice['sdpMid'],
-                        sdpMLineIndex=ice['sdpMLineIndex'],
-                        candidate=ice['candidate'],
+                return
+            if not self._sfu.is_running():
+                # FIX #3: Пробуем перезапустить SFU перед тем как отказать зрителю
+                print(f"[SFU-Proxy] SFU не запущен — пробуем restart для viewer {viewer_uid}...")
+                ok = self._sfu.start()
+                if not ok:
+                    print(
+                        f"[SFU-Proxy] ❌ restart SFU не удался — "
+                        f"не можем подключить viewer {viewer_uid} к локальному стримеру"
                     )
-                    await entry['pc'].addIceCandidate(cand)
-                except Exception:
-                    pass
-            print(f"[SFU] Answer принят от зрителя uid={viewer_uid}")
-        except Exception as e:
-            print(f"[SFU] handle_viewer_answer error uid={viewer_uid}: {e}")
+                    return
+                print(f"[SFU-Proxy] ✅ SFU перезапущен, продолжаем для viewer {viewer_uid}")
+        # Для удалённых стримеров пропускаем проверку: локальный SFU не нужен
 
-    # ------------------------------------------------------------------
-    # ICE кандидаты (trickle ICE)
-    # ------------------------------------------------------------------
+        with self._lock:
+            self._viewer_conns[viewer_uid] = conn
+            self._viewer_streamer_ip[viewer_uid] = streamer_ip
+            self._viewer_streamer_sfu_port[viewer_uid] = streamer_sfu_port
 
-    async def handle_ice_candidate(
-        self, uid: int, candidate_dict: dict
+        print(
+            f"[SFU-Proxy] trigger_viewer_connect: viewer={viewer_uid}, "
+            f"streamer={streamer_uid}, quality={quality}, "
+            f"streamer_ip={streamer_ip} ({'local' if is_local_streamer else 'remote'})"
+        )
+        self._send(conn, {
+            'action':       CMD_WEBRTC_OFFER,
+            'role':         'viewer',
+            'streamer_uid': streamer_uid,
+            'sdp':          '',
+            'type':         'offer',
+        })
+
+    def handle_viewer_offer(
+        self,
+        viewer_uid: int,
+        sdp: str,
+        conn,
     ) -> None:
-        pc = None
-        if uid in self._streamer_entries:
-            pc = self._streamer_entries[uid]['pc']
-        elif uid in self._viewer_entries:
-            pc = self._viewer_entries[uid]['pc']
+        """
+        Шаг 4-6: получаем offer от зрителя → POST в SFU → answer → viewer.
 
-        if pc is None:
-            self._pending_ice.setdefault(uid, []).append(candidate_dict)
+        FIX: для локального стримера используем self._sfu (localhost HTTP).
+             для удалённого стримера — POST напрямую к streamer_ip:7788.
+        """
+        print(f"[SFU-Proxy] handle_viewer_offer: viewer={viewer_uid}, sdp_len={len(sdp) if sdp else 0}")
+
+        if not sdp:
+            print(f"[SFU-Proxy] ❌ пустой SDP от viewer={viewer_uid}")
             return
 
+        streamer_ip = self._viewer_streamer_ip.get(viewer_uid, '127.0.0.1')
+        is_local    = _is_local_ip(streamer_ip)
+
         try:
-            from aiortc import RTCIceCandidate
-            cand = RTCIceCandidate(
-                sdpMid=candidate_dict.get('sdpMid'),
-                sdpMLineIndex=candidate_dict.get('sdpMLineIndex'),
-                candidate=candidate_dict.get('candidate'),
-            )
-            await pc.addIceCandidate(cand)
+            if is_local:
+                # ── Локальный стример ────────────────────────────────────────
+                if self._sfu is None:
+                    print(f"[SFU-Proxy] ❌ _sfu is None — SfuBridge не инициализирован")
+                    self._send(conn, {'action': 'error', 'message': 'SFU not initialized'})
+                    return
+
+                if not self._sfu.is_running():
+                    print(f"[SFU-Proxy] ❌ локальный SFU не запущен (is_running=False)")
+                    self._send(conn, {'action': 'error', 'message': 'SFU not running'})
+                    return
+
+                print(f"[SFU-Proxy] viewer={viewer_uid}: → POST /viewer/{viewer_uid}/offer к localhost SFU...")
+                answer_sdp = self._sfu.post_viewer_offer(str(viewer_uid), sdp)
+
+            else:
+                # ── Удалённый стример (RadminVPN) ────────────────────────────
+                import urllib.request
+                import json as _json
+                sfu_port = self._viewer_streamer_sfu_port.get(viewer_uid, 7788)
+                url  = f"http://{streamer_ip}:{sfu_port}/viewer/{viewer_uid}/offer"
+                body = _json.dumps({'sdp': sdp}).encode('utf-8')
+                req  = urllib.request.Request(
+                    url, data=body,
+                    headers={'Content-Type': 'application/json'},
+                    method='POST',
+                )
+                print(f"[SFU-Proxy] viewer={viewer_uid}: → remote SFU {url}")
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    data = _json.loads(resp.read())
+                answer_sdp = data.get('sdp', '')
+                if not answer_sdp:
+                    raise RuntimeError(f"Remote SFU ({streamer_ip}) вернул пустой SDP")
+
+            print(f"[SFU-Proxy] viewer={viewer_uid}: ✅ SFU answer получен, len={len(answer_sdp)}")
+
         except Exception as e:
-            print(f"[SFU] handle_ice_candidate uid={uid}: {e}")
+            print(f"[SFU-Proxy] ❌ post_viewer_offer viewer={viewer_uid}: {e}")
+            import traceback; print(traceback.format_exc())
+            return
 
-    # ------------------------------------------------------------------
-    # Закрытие соединений
-    # ------------------------------------------------------------------
+        # Фильтруем mDNS *.local кандидаты
+        answer_sdp = _strip_mdns_candidates(answer_sdp)
 
-    async def close_streamer(self, streamer_uid: int) -> None:
-        entry = self._streamer_entries.pop(streamer_uid, None)
-        if entry:
-            try:
-                await entry['pc'].close()
-            except Exception:
-                pass
-            print(f"[SFU] Стример uid={streamer_uid}: PC закрыт")
+        print(f"[SFU-Proxy] viewer={viewer_uid}: → CMD_WEBRTC_ANSWER (len={len(answer_sdp)})")
+        self._send(conn, {
+            'action': CMD_WEBRTC_ANSWER,
+            'sdp':    answer_sdp,
+            'type':   'answer',
+        })
+        print(f"[SFU-Proxy] viewer={viewer_uid}: ✅ answer отправлен")
 
-        victims = [
-            v_uid for v_uid, ve in list(self._viewer_entries.items())
-            if ve['streamer_uid'] == streamer_uid
-        ]
-        for v_uid in victims:
-            await self.close_viewer(v_uid)
+    # ── Viewer disconnect ─────────────────────────────────────────────────────
 
-        self._pending_viewers.pop(streamer_uid, None)
+    def close_viewer(self, viewer_uid: int) -> None:
+        """DELETE /viewer/{viewer_uid} в Pion SFU (локальном)."""
+        with self._lock:
+            streamer_ip = self._viewer_streamer_ip.pop(viewer_uid, '127.0.0.1')
+            self._viewer_conns.pop(viewer_uid, None)
+            self._viewer_streamer_sfu_port.pop(viewer_uid, None)
 
-    async def close_viewer(self, viewer_uid: int) -> None:
-        entry = self._viewer_entries.pop(viewer_uid, None)
-        if entry:
-            try:
-                await entry['pc'].close()
-            except Exception:
-                pass
-            print(f"[SFU] Зритель uid={viewer_uid}: PC закрыт")
+        # Для удалённого стримера — не трогаем его SFU (он сам закроет)
+        if _is_local_ip(streamer_ip) and self._sfu is not None and self._sfu.is_running():
+            self._sfu.delete_viewer(str(viewer_uid))
+            print(f"[SFU-Proxy] close_viewer: viewer={viewer_uid}")
 
-    # ------------------------------------------------------------------
-    # Остановка SFU
-    # ------------------------------------------------------------------
+    def close_all_viewers(self) -> None:
+        with self._lock:
+            uids = list(self._viewer_conns.keys())
+        for uid in uids:
+            self.close_viewer(uid)
+
+    # ── Streamer disconnect ───────────────────────────────────────────────────
+
+    def close_streamer(self, streamer_uid: int) -> None:
+        """DELETE /streamer в Pion SFU."""
+        if self._sfu is not None and self._sfu.is_running():
+            self._sfu.delete_streamer()
+            print(f"[SFU-Proxy] close_streamer: streamer={streamer_uid}")
+        self.close_all_viewers()
+
+    # ── Status ────────────────────────────────────────────────────────────────
+
+    def status(self) -> dict:
+        if self._sfu is not None and self._sfu.is_running():
+            return self._sfu.status()
+        return {"streamer": "none", "viewers": 0}
+
+    # ── Shutdown ──────────────────────────────────────────────────────────────
 
     def shutdown(self) -> None:
-        if self._loop is None or self._loop.is_closed():
-            return
-
-        async def _close_all():
-            for uid in list(self._streamer_entries.keys()):
-                await self.close_streamer(uid)
-            for uid in list(self._viewer_entries.keys()):
-                await self.close_viewer(uid)
-            self._pending_viewers.clear()
-            self._pending_ice.clear()
-
-        try:
-            fut = asyncio.run_coroutine_threadsafe(_close_all(), self._loop)
-            fut.result(timeout=1.0)
-        except Exception as e:
-            print(f"[SFU] shutdown close_all error: {e}")
-
-        try:
-            self._loop.call_soon_threadsafe(self._loop.stop)
-        except Exception:
-            pass
-        print("[SFU] shutdown: event loop остановлен")
+        self.close_all_viewers()
+        if self._sfu is not None and self._sfu.is_running():
+            self._sfu.delete_streamer()
+        print("[SFU-Proxy] shutdown")

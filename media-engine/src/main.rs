@@ -1,10 +1,22 @@
-// main.rs — InPulse Media Engine (Rust Sidecar) v0.2.0
+// main.rs — InPulse Media Engine v0.3.0
+//
+// v3: Rust сам делает WebRTC (webrtc-rs) прямо в Pion SFU.
+//     Named Pipe удалён. Python только сигнализация.
+//
+// Протокол запуска:
+//   1. Rust → stdout: {"event":"READY","version":"0.3.0"}
+//   2. Python → stdin: {"cmd":"START_STREAM",...}
+//   3. Rust → stdout: {"event":"WEBRTC_OFFER","sdp":"..."}
+//   4. Python: POST sdp к Pion SFU → answer
+//   5. Python → stdin: {"cmd":"WEBRTC_ANSWER","sdp":"<answer>"}
+//   6. RTP кадры текут в Pion SFU
+//   7. Python → stdin: {"cmd":"STOP_STREAM"} / {"cmd":"SHUTDOWN"}
 
 mod capture;
 mod encode;
 mod ipc;
 mod pipeline;
-// mod webrtc_out;  ← УДАЛЁН в v2 (WebRTC перенесён в Python/aiortc)
+mod webrtc_out;
 
 use anyhow::{Context, Result};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -20,7 +32,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .with_writer(std::io::stderr)
         .with_target(false)
@@ -34,9 +47,7 @@ async fn main() -> Result<()> {
     .await?;
 
     let mut pipeline: Option<Pipeline> = None;
-
-    let stdin = tokio::io::stdin();
-    let mut reader = BufReader::new(stdin);
+    let mut reader = BufReader::new(tokio::io::stdin());
     let mut line = String::new();
 
     loop {
@@ -51,7 +62,7 @@ async fn main() -> Result<()> {
                     match serde_json::from_str::<Command>(trimmed) {
                         Ok(cmd) => {
                             if let Err(e) = handle_command(cmd, &mut pipeline).await {
-                                error!("Ошибка обработки команды: {e:#}");
+                                error!("Ошибка команды: {e:#}");
                                 let _ = ipc::send_event(&Event::Error {
                                     message: format!("{e:#}"),
                                 })
@@ -59,7 +70,7 @@ async fn main() -> Result<()> {
                             }
                         }
                         Err(e) => {
-                            warn!("Невалидный JSON: {e} — строка: {trimmed}");
+                            warn!("Невалидный JSON: {e} — «{trimmed}»");
                         }
                     }
                 }
@@ -83,22 +94,15 @@ async fn main() -> Result<()> {
 async fn handle_command(cmd: Command, pipeline: &mut Option<Pipeline>) -> Result<()> {
     match cmd {
         Command::StartStream {
-            monitor,
-            width,
-            height,
-            fps,
-            bitrate,
-            stream_audio,
-            simulcast,
+            monitor, width, height, fps, bitrate, stream_audio, simulcast,
         } => {
-            // Останавливаем предыдущий стрим если был
             if let Some(mut p) = pipeline.take() {
                 p.stop().await?;
             }
 
             let config = StreamConfig {
                 monitor,
-                width: width & !1,   // выравниваем до чётного (требование энкодера)
+                width:  width  & !1, // выравниваем до чётного
                 height: height & !1,
                 fps,
                 bitrate,
@@ -107,13 +111,9 @@ async fn handle_command(cmd: Command, pipeline: &mut Option<Pipeline>) -> Result
             };
 
             info!(
-                "START_STREAM: монитор={}, {}×{} @ {} fps, {} kbps, simulcast={}",
-                config.monitor,
-                config.width,
-                config.height,
-                config.fps,
-                config.bitrate / 1000,
-                config.simulcast
+                "START_STREAM: монитор={}, {}×{} @ {} fps, {} kbps",
+                config.monitor, config.width, config.height,
+                config.fps, config.bitrate / 1000,
             );
 
             let p = Pipeline::start(config).await.context("Pipeline::start")?;
@@ -128,17 +128,28 @@ async fn handle_command(cmd: Command, pipeline: &mut Option<Pipeline>) -> Result
             }
         }
 
+        // Python форвардит SDP answer от Pion SFU обратно нам
+        Command::WebrtcAnswer { sdp } => {
+            if let Some(p) = pipeline.as_ref() {
+                info!("WEBRTC_ANSWER получен (len={})", sdp.len());
+                p.set_webrtc_answer(sdp)
+                    .await
+                    .context("set_webrtc_answer")?;
+            } else {
+                warn!("WEBRTC_ANSWER: нет активного pipeline");
+            }
+        }
+
         Command::SetBitrate { bitrate, lq_bitrate } => {
             info!(
-                "SET_BITRATE: HQ={} kbps, LQ={} kbps",
-                bitrate / 1000,
-                lq_bitrate / 1000
+                "SET_BITRATE: {} kbps (LQ={} kbps)",
+                bitrate / 1000, lq_bitrate / 1000
             );
-            // TODO: передать новый битрейт в encode_loop через атомарный флаг
+            // TODO: передать через AtomicU32 в encode_loop
         }
 
         Command::Shutdown => {
-            info!("SHUTDOWN: завершаемся...");
+            info!("SHUTDOWN");
             if let Some(mut p) = pipeline.take() {
                 p.stop().await?;
             }

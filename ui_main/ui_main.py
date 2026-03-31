@@ -3219,20 +3219,29 @@ class MainWindow(QMainWindow):
                 #        — создаёт RTCPeerConnection
                 #        — добавляет видео/аудио треки
                 #        — создаёт SDP offer → ждёт ICE gathering → отправляет серверу
-                self.net.send_json({"action": CMD_STREAM_START})
+                # Передаём реальный порт SFU серверу — он рассылает его клиентам
+                # через global_state → sfu_port, чтобы удалённые зрители знали
+                # на какой порт идти (динамический, не всегда 7788).
+                _sfu_port = 7788
+                try:
+                    _sb = getattr(self.net, '_sfu_bridge', None)
+                    if _sb is not None:
+                        _sfu_port = _sb.port
+                except Exception:
+                    pass
+                self.net.send_json({"action": CMD_STREAM_START, "sfu_port": _sfu_port})
                 self.net.start_streaming_webrtc(settings)
 
                 # Синхронная проверка успеха:
-                # Rust bridge = стрим OK (DXCam не используется).
-                # Fallback = проверяем DXCamTrack.
+                # v3: Rust Media Engine — стрим OK, если процесс жив.
                 _rust_ok = (
                         hasattr(self.net, '_media_bridge')
                         and self.net._media_bridge is not None
                         and self.net._media_bridge.is_running()
                 )
 
-                if not _rust_ok and self.video.get_dxcam_track() is None:
-                    print("[UI] Ошибка: Ни Rust-мост, ни DXCam не запустились.")
+                if not _rust_ok:
+                    print("[UI] Ошибка: Rust Media Engine не запустился.")
                     self.net.send_json({"action": CMD_STREAM_STOP})
                     self.btn_stream.setChecked(False)
                     return
@@ -3268,9 +3277,8 @@ class MainWindow(QMainWindow):
             # затем закрываем PC (чтобы SFU успел разорвать соединение корректно).
             self.net.stop_streaming_webrtc()
 
-            # stop_streaming() останавливает DXCamTrack и освобождает D3D11.
-            # Вызываем ПОСЛЕ stop_streaming_webrtc() чтобы треки были сначала
-            # отсоединены от PC, а потом удалены.
+            # v3: VideoEngine.stop_streaming() выполняет GC + heap trim.
+            # Вызываем после stop_streaming_webrtc() для корректного порядка очистки.
             self.video.stop_streaming()
 
             # ── Уничтожаем оверлей аннотаций стримера ───────────────────────

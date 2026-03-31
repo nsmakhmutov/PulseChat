@@ -100,7 +100,7 @@ except ImportError:
     SYSTEM_AUDIO_AVAILABLE = False
     print("[Net] WARNING: SystemAudioTrack недоступен — системный звук в стриме отключён")
 
-# ── Rust Media Engine bridge (capture + encode, Named Pipe → RustVideoTrack) ──
+# ── Rust Media Engine bridge (capture + encode → webrtc-rs → Pion SFU) ──
 try:
     from media_engine_bridge import MediaEngineBridge
     MEDIA_ENGINE_AVAILABLE = True
@@ -108,6 +108,66 @@ except ImportError:
     MediaEngineBridge = None
     MEDIA_ENGINE_AVAILABLE = False
     print("[Net] WARNING: MediaEngineBridge недоступен — Rust capture отключён, fallback на DXCam")
+
+
+
+def _normalize_sdp_ice(sdp: str) -> str:
+    """
+    Нормализует ice-ufrag/ice-pwd в SDP для совместимости с Pion SFU.
+
+    aiortc создаёт offer где каждая m-секция (video, audio) имеет
+    собственный ice-ufrag/ice-pwd. Pion ожидает BUNDLE с единым ice-ufrag.
+
+    Решение: берём первый найденный ice-ufrag/ice-pwd,
+    заменяем все последующие — получаем BUNDLE-совместимый SDP.
+    """
+    sep = "\r\n" if "\r\n" in sdp else "\n"
+    lines = sdp.split(sep)
+
+    first_ufrag = None
+    first_pwd   = None
+    for line in lines:
+        if line.startswith("a=ice-ufrag:") and first_ufrag is None:
+            first_ufrag = line.split(":", 1)[1].strip()
+        if line.startswith("a=ice-pwd:") and first_pwd is None:
+            first_pwd = line.split(":", 1)[1].strip()
+        if first_ufrag and first_pwd:
+            break
+
+    if not first_ufrag or not first_pwd:
+        return sdp
+
+    result = []
+    for line in lines:
+        if line.startswith("a=ice-ufrag:"):
+            result.append(f"a=ice-ufrag:{first_ufrag}")
+        elif line.startswith("a=ice-pwd:"):
+            result.append(f"a=ice-pwd:{first_pwd}")
+        else:
+            result.append(line)
+
+    return sep.join(result)
+
+
+def _patch_audio_bitrate(sdp: str, bitrate_kbps: int) -> str:
+    """Вставляет b=AS:<kbps> в audio m-секцию SDP для ограничения Opus битрейта."""
+    sep = "\r\n" if "\r\n" in sdp else "\n"
+    lines = sdp.split(sep)
+    result = []
+    in_audio = False
+    for line in lines:
+        if line.startswith("m=audio"):
+            in_audio = True
+        elif line.startswith("m="):
+            in_audio = False
+
+        # Вставляем b=AS: сразу после c= строки внутри audio секции
+        if in_audio and line.startswith("c=") and not any(l.startswith("b=AS:") for l in result[-3:]):
+            result.append(line)
+            result.append(f"b=AS:{bitrate_kbps}")
+            continue
+        result.append(line)
+    return sep.join(result)
 
 
 class NetworkClient(QObject):
@@ -220,21 +280,41 @@ class NetworkClient(QObject):
         # asyncio event loop WebRTC (создаётся один раз при первом подключении)
         self._webrtc_loop: asyncio.AbstractEventLoop | None = None
 
-        # RTCPeerConnection стримера (если текущий клиент стримит)
-        self._streamer_pc = None
-
         # RTCPeerConnection зрителя (если текущий клиент смотрит)
         self._viewer_pc   = None
 
+        # asyncio.Future для получения WebRTC answer от сервера (v3 viewer flow)
+        self._viewer_answer_future = None
+
         # SystemAudioTrack — захват системного звука для трансляции.
-        # Создаётся в _start_streaming_coro, останавливается в stop_streaming_webrtc.
+        # Создаётся в _start_audio_stream_coro, останавливается в stop_streaming_webrtc.
         # Ссылка нужна чтобы корректно вызвать .stop() и освободить DLL-захват.
         self._system_audio_track: "SystemAudioTrack | None" = None
 
-        # ── Rust Media Engine (v0.2: capture+encode → Named Pipe) ────────
+        # FIX: RTCPeerConnection для Python-стороннего захвата системного звука.
+        # Rust media-engine не имеет доступа к InPulseAudioExclusion.dll —
+        # аудио захватывается здесь через aiortc + DLL и отправляется в SFU
+        # на /streamer/audio/offer как отдельный audio-only PC.
+        self._audio_streamer_pc = None
+
+        # ── Go Pion SFU (v3) — singleton, shared с EmbeddedServerManager ────────
+        # Не запускаем здесь — lazy start при первом streaming/watching.
+        # Если EmbeddedServerManager уже запустил SFU — получаем тот же процесс.
+        self._sfu_bridge = None
+        try:
+            from sfu_bridge import get_shared as _get_sfu
+            self._sfu_bridge = _get_sfu(
+                on_log=lambda s: print(f"[SFU] {s}"),
+                on_exit=lambda c: print(f"[SFU] завершён (code={c})"),
+            )
+        except ImportError:
+            print("[Net] WARNING: SfuBridge недоступен")
+
+        # ── Rust Media Engine (v3: capture+encode → webrtc-rs → Pion SFU) ──
         self._media_bridge: "MediaEngineBridge | None" = None
         if MEDIA_ENGINE_AVAILABLE:
             self._media_bridge = MediaEngineBridge(
+                sfu_bridge=self._sfu_bridge,
                 on_event=self._handle_media_event,
                 on_log=lambda s: print(f"[Media] {s}"),
                 on_exit=lambda c: print(f"[Media] процесс завершён (code={c})"),
@@ -402,10 +482,12 @@ class NetworkClient(QObject):
         # Запускаем WebRTC asyncio loop (один раз при первом подключении)
         self._start_webrtc_loop()
 
-        # Запускаем Rust Media Engine (один раз)
+        # Запускаем Rust Media Engine (один раз при подключении)
+        # SFU запускается лениво: только при start_streaming_webrtc()
+        # (или уже запущен EmbeddedServerManager)
         if self._media_bridge is not None and not self._media_bridge.is_running():
             if not self._media_bridge.start():
-                print("[Net] WARNING: Rust Media Engine не запустился — fallback на DXCam+aiortc")
+                print("[Net] WARNING: Rust Media Engine не запустился")
 
         print("[Net] Connected to server")
 
@@ -753,13 +835,18 @@ class NetworkClient(QObject):
             except Exception as e:
                 print(f"[Net] media_bridge stop error: {e}")
 
+        # SFU остановит EmbeddedServerManager или GC при выходе процесса.
+        # NetworkClient не останавливает SFU — он может быть нужен серверу.
+        # FIX: всё же убиваем SFU при закрытии приложения.
+        # is_running() после EOF stdout = False, поэтому вызываем stop() напрямую.
+        # Если SFU живой (process.poll() is None) — он будет убит.
+        # Если мёртвый — stop() вернёт ничего за ~0 мс.
+        if self._sfu_bridge is not None:
+            self._sfu_bridge.stop()
+
         # Закрываем WebRTC PeerConnections
+        # v3: нет _streamer_pc на стороне Python (webrtc-rs в Rust)
         if self._webrtc_loop is not None and not self._webrtc_loop.is_closed():
-            if self._streamer_pc is not None:
-                asyncio.run_coroutine_threadsafe(
-                    self._close_pc_coro(self._streamer_pc), self._webrtc_loop
-                )
-                self._streamer_pc = None
             if self._viewer_pc is not None:
                 asyncio.run_coroutine_threadsafe(
                     self._close_pc_coro(self._viewer_pc), self._webrtc_loop
@@ -801,193 +888,229 @@ class NetworkClient(QObject):
         """
         Запускает WebRTC-стрим.
 
-        v0.2 архитектура:
-          - Rust Media Engine: WGC capture → HW H.264 encode → Named Pipe
-          - Python: RustVideoTrack (aiortc) читает pipe → aiortc PC → SFU
-          - WebRTC DTLS/ICE полностью через aiortc (гарантированная совместимость с SFU)
-
-        Fallback: если Rust недоступен — старый путь через DXCam+aiortc.
+        v3 архитектура (Rust webrtc-rs → Pion SFU):
+          1. Запускаем Pion SFU (sidecar.exe) если не запущен
+          2. Запускаем Rust Media Engine если не запущен
+          3. Rust получает команду START_STREAM
+          4. Rust создаёт webrtc-rs PC, собирает ICE, эмитит WEBRTC_OFFER
+          5. MediaEngineBridge форвардит offer в SFU, возвращает answer
+          6. Rust set_remote_description → ICE connected → RTP → SFU
+          7. Viewers подключаются к SFU через post_viewer_offer()
         """
-        if not AIORTC_AVAILABLE:
-            print("[Net] start_streaming_webrtc: aiortc не установлен")
-            return
-        if self._webrtc_loop is None:
-            print("[Net] start_streaming_webrtc: WebRTC loop не запущен")
+        s = settings or {}
+
+        # ── Запускаем SFU если нужно (стример = всегда хост сервера) ─────────
+        # SFU нужен только на машине стримера (там же сервер).
+        # EmbeddedServerManager мог уже запустить его — get_shared() вернёт
+        # тот же экземпляр, start() будет no-op если уже running.
+        if self._sfu_bridge is not None and not self._sfu_bridge.is_running():
+            print("[Net] Запускаем Pion SFU (lazy, стрим)...")
+            if not self._sfu_bridge.start():
+                print("[Net] Ошибка запуска SFU — стрим отменён")
+                return
+
+        # ── Запускаем Rust Media Engine если нужно ───────────────────────────
+        if self._media_bridge is not None and not self._media_bridge.is_running():
+            print("[Net] Запускаем Rust Media Engine...")
+            if not self._media_bridge.start():
+                print("[Net] Ошибка запуска Media Engine — стрим отменён")
+                return
+
+        if self._media_bridge is None or not self._media_bridge.is_running():
+            print("[Net] start_streaming_webrtc: Media Engine недоступен")
             return
 
-        # Определяем источник видеотреков
-        use_rust = (
-            self._media_bridge is not None
-            and self._media_bridge.is_running()
+        from config import get_bitrate_for_resolution
+        width   = s.get("width", 1280)
+        height  = s.get("height", 720)
+        fps     = s.get("fps", 30)
+        bitrate = get_bitrate_for_resolution(width, height)
+
+        print(f"[Net] START_STREAM: {width}×{height} @ {fps} fps, {bitrate//1000} kbps")
+
+        self._media_bridge.start_stream(
+            monitor=s.get("monitor_idx", 0),
+            width=width,
+            height=height,
+            fps=fps,
+            bitrate=bitrate,
+            simulcast=False,           # SFU сам adaptive, simulcast не нужен
+            stream_audio=False,        # FIX: аудио захватывает Python через InPulseAudioExclusion.dll
         )
+        # Дальше: Rust → WEBRTC_OFFER → bridge → SFU → WEBRTC_ANSWER → Rust
+        # RTP начнёт течь автоматически после ICE connected (~200 мс).
 
-        if use_rust:
-            # Rust: создаём RustVideoTrack (будут заполняться через Named Pipe)
-            s = settings or {}
-            fps = s.get('fps', 30)
-            simulcast = s.get('simulcast', True)
-            self._media_bridge.create_tracks(fps=fps, simulcast=simulcast)
-            print("[Net] RustVideoTrack создан, запуск стрима в Rust...")
-        else:
-            # Fallback: DXCam
-            if self.video is None:
-                print("[Net] start_streaming_webrtc: VideoEngine не установлен")
-                return
-            if not self.video.start_streaming(settings):
-                print("[Net] start_streaming_webrtc: VideoEngine.start_streaming() вернул False")
-                return
-
-        self._run_in_webrtc_loop(self._start_streaming_coro(settings, use_rust))
-
-    async def _start_streaming_coro(self, settings: dict | None = None, use_rust: bool = False) -> None:
-        """
-        Корутина создания WebRTC PC стримера.
-
-        use_rust=True: видеотреки из RustVideoTrack (Named Pipe от Rust).
-        use_rust=False: видеотреки из DXCamTrack (Python VideoEngine).
-        WebRTC PC всегда aiortc — гарантированная совместимость с SFU.
-        """
-        if self._streamer_pc is not None:
-            try:
-                await self._streamer_pc.close()
-            except Exception:
-                pass
-
-        cfg = RTCConfiguration(iceServers=[])
-        pc  = RTCPeerConnection(cfg)
-        self._streamer_pc = pc
-
-        # ── Получаем видеотреки ───────────────────────────────────────────
-        hq_track = None
-        lq_track = None
-
-        if use_rust and self._media_bridge is not None:
-            from config import get_bitrate_for_resolution
-            s = settings or {}
-            width = s.get('width', 1280)
-            height = s.get('height', 720)
-
-            # RustVideoTrack уже созданы в start_streaming_webrtc → create_tracks()
-            hq_track = self._media_bridge._track_hq
-            lq_track = self._media_bridge._track_lq
-
-            # Запускаем capture+encode в Rust (Named Pipe → RustVideoTrack)
-            self._media_bridge.start_stream(
-                monitor=s.get('monitor_idx', 0),
-                width=width,
-                height=height,
-                fps=s.get('fps', 30),
-                bitrate=get_bitrate_for_resolution(width, height),
-                simulcast=s.get('simulcast', True),
-                stream_audio=s.get('stream_audio', False),
-            )
-            print(f"[Net] Стрим запущен через Rust Media Engine ({width}×{height})")
-        else:
-            # Fallback: DXCam треки
-            hq_track = self.video.get_dxcam_track() if self.video else None
-            lq_track = self.video.get_lq_track() if self.video else None
-
-        if hq_track is None:
-            print("[Net] _start_streaming_coro: HQ видеотрек недоступен")
-            self._streamer_pc = None
-            return
-
-        # Добавляем видеотреки в aiortc PC
-        pc.addTrack(hq_track)
-        if lq_track is not None:
-            pc.addTrack(lq_track)
-            print("[Net] Simulcast LQ трек добавлен в RTCPeerConnection")
-
-        # Системный звук (WASAPI) — остаётся в Python
-        _stream_audio = (settings or {}).get('stream_audio', False)
-        if _stream_audio and SYSTEM_AUDIO_AVAILABLE and SystemAudioTrack is not None:
-            try:
-                audio_device_idx = (settings or {}).get('audio_device_idx', None)
-                self._system_audio_track = SystemAudioTrack(
-                    device_idx=audio_device_idx,
-                    audio_handler=self.audio,
-                )
-                pc.addTrack(self._system_audio_track)
-                print("[Net] SystemAudioTrack добавлен в RTCPeerConnection")
-            except Exception as e:
-                print(f"[Net] SystemAudioTrack ошибка инициализации: {e}")
-                self._system_audio_track = None
-        elif _stream_audio and not SYSTEM_AUDIO_AVAILABLE:
-            print("[Net] SystemAudioTrack недоступен — стрим без системного звука")
-        else:
-            print("[Net] Системный звук отключён в настройках трансляции")
-
-        @pc.on("icecandidate")
-        def on_ice(candidate):
-            if candidate:
-                self.send_json({
-                    'action': CMD_WEBRTC_ICE,
-                    'role':   'streamer',
-                    'candidate': {
-                        'sdpMid':        candidate.sdpMid,
-                        'sdpMLineIndex': candidate.sdpMLineIndex,
-                        'candidate':     candidate.candidate,
-                    },
-                })
-
-        @pc.on("connectionstatechange")
-        async def on_state():
-            state = pc.connectionState
-            print(f"[Net] Стример PC state → {state}")
-            if state in ("failed", "disconnected"):
-                print("[Net] Стример PC потерян — WebRTC отключился")
-
-        try:
-            offer = await pc.createOffer()
-            await pc.setLocalDescription(offer)
-
-            # Ждём ICE gathering (host-only = быстро, ~50 мс)
-            await self._wait_ice_gathering(pc)
-
-            self.send_json({
-                'action': CMD_WEBRTC_OFFER,
-                'role':   'streamer',
-                'sdp':    pc.localDescription.sdp,
-                'type':   pc.localDescription.type,
-            })
-            print("[Net] WebRTC offer отправлен серверу (стример)")
-
-        except Exception as e:
-            print(f"[Net] _start_streaming_coro error: {e}")
-            self._streamer_pc = None
+        # FIX: запускаем Python-сторонний захват системного звука через C++ DLL.
+        # Rust media-engine не имеет доступа к InPulseAudioExclusion.dll,
+        # поэтому audio-only aiortc PC создаётся здесь и подключается к SFU
+        # на эндпоинт /streamer/audio/offer.
+        if s.get("stream_audio", False):
+            if SystemAudioTrack is not None:
+                self._run_in_webrtc_loop(self._start_audio_stream_coro(s))
+            else:
+                print("[Net] ⚠️  stream_audio=True, но SystemAudioTrack недоступен "
+                      "(audio_engine не установлен или DLL не найдена)")
 
     async def _handle_streamer_answer_coro(self, sdp: str, sdp_type: str) -> None:
+        """Устарел в v3 — стример использует webrtc-rs напрямую через Pion SFU."""
+        print("[Net] _handle_streamer_answer: игнорируем (v3: Rust webrtc-rs)")
+
+    async def _start_audio_stream_coro(self, settings: dict) -> None:
         """
-        Принимает WebRTC answer от сервера (ответ на наш offer стримера).
-        Завершает ICE negotiation на стороне стримера.
+        FIX: Запускает Python-сторонний захват системного звука через
+        InPulseAudioExclusion.dll и подключает его к Pion SFU.
+
+        Причина фикса:
+          Rust media-engine.exe не имеет доступа к C++ DLL (InPulseAudioExclusion.dll).
+          В v2 Python сам создавал aiortc PC стримера с SystemAudioTrack.
+          В v3 перешли на Rust для видео, но аудио-путь не был перенесён —
+          _system_audio_track никогда не создавался → зрители не слышали звук.
+
+        Поток данных:
+          InPulseAudioExclusion.dll (WASAPI Process Loopback, exclude_pid=python.exe)
+            → StreamAudioCapture._dll_audio_cb (C++ callback → numpy chunks)
+            → SystemAudioTrack.recv() (float32 → int16 → av.AudioFrame)
+            → aiortc Opus encoder → RTP
+            → RTCPeerConnection (sendonly, ICE host-only)
+            → POST /streamer/audio/offer → Pion SFU SetAudioStreamerOffer()
+            → relayRTP goroutine → viewer PCs
+            → зрители слышат звук десктопа (без голосов InPulse)
         """
-        if self._streamer_pc is None:
-            print("[Net] _handle_streamer_answer: нет активного streamer PC")
+        from aiortc import RTCPeerConnection, RTCConfiguration, RTCSessionDescription
+
+        if SystemAudioTrack is None:
+            print("[Net] ⚠️  SystemAudioTrack недоступен — audio стрим невозможен")
             return
+
+        if self._sfu_bridge is None or not self._sfu_bridge.is_running():
+            print("[Net] ⚠️  SFU не запущен — audio стрим отменён")
+            return
+
+            # Закрываем предыдущий audio PC если был
+        if self._audio_streamer_pc is not None:
+            try:
+                await self._audio_streamer_pc.close()
+            except Exception:
+                pass
+            self._audio_streamer_pc = None
+
+        if self._system_audio_track is not None:
+            try:
+                self._system_audio_track.stop()
+            except Exception:
+                pass
+            self._system_audio_track = None
+
+        print("[Net] [AudioStream] Создаём aiortc PC (sendonly audio)...")
+
+        cfg = RTCConfiguration(iceServers=[])
+        pc = RTCPeerConnection(cfg)
+        self._audio_streamer_pc = pc
+
+        audio_track = SystemAudioTrack(
+            device_idx=settings.get("system_audio_device"),
+            audio_handler=self.audio,
+        )
+        self._system_audio_track = audio_track
+        pc.addTrack(audio_track)
+
+        # ОПРЕДЕЛЯЕМ БИТРЕЙТ ПЕРЕД ИСПОЛЬЗОВАНИЕМ
         try:
-            await self._streamer_pc.setRemoteDescription(
-                RTCSessionDescription(sdp=sdp, type=sdp_type)
+            from config import STREAM_AUDIO_BITRATE as _sa_br
+        except (ImportError, AttributeError):
+            _sa_br = 48000
+
+        try:
+            # 1. Создаем offer
+            offer = await pc.createOffer()
+
+            # 2. ПАТЧИМ SDP (Ограничиваем битрейт здесь, это не ломает корутину)
+            patched_sdp = _patch_audio_bitrate(offer.sdp, _sa_br // 1000)
+            patched_offer = RTCSessionDescription(sdp=patched_sdp, type=offer.type)
+
+            # 3. Устанавливаем локальное описание
+            await pc.setLocalDescription(patched_offer)
+
+            print(f"[Net] [AudioStream] offer создан (битрейт: {_sa_br // 1000} kbps), ICE gathering...")
+            await self._wait_ice_gathering(pc)
+
+            offer_sdp = _normalize_sdp_ice(pc.localDescription.sdp)
+
+            loop = asyncio.get_running_loop()
+            answer_sdp = await loop.run_in_executor(
+                None,
+                self._sfu_bridge.post_streamer_audio_offer,
+                offer_sdp,
             )
-            print("[Net] Streamer PC: WebRTC answer принят, ICE завершается")
+
+            await asyncio.wait_for(
+                pc.setRemoteDescription(
+                    RTCSessionDescription(sdp=answer_sdp, type="answer")
+                ),
+                timeout=10.0,
+            )
+            print("[Net] [AudioStream] ✅ Звук успешно запущен")
+
         except Exception as e:
-            print(f"[Net] _handle_streamer_answer error: {e}")
+            import traceback as _tb
+            print(f"[Net] [AudioStream] ❌ Ошибка запуска: {e}")
+            print(_tb.format_exc())
+            if self._system_audio_track:
+                self._system_audio_track.stop()
+            await pc.close()
+            self._system_audio_track = None
+            self._audio_streamer_pc = None
+
+
 
     def stop_streaming_webrtc(self) -> None:
         """
-        Останавливает WebRTC-стрим.
-        Закрывает PC стримера, останавливает Rust capture, DXCamTrack, SystemAudioTrack.
+        Останавливает WebRTC-стрим (v3: Rust webrtc-rs → Pion SFU).
+        Нет aiortc PC на стороне стримера — только Media Engine + SFU.
         """
-        # Останавливаем Rust capture+encode (если работает)
+        # Шаг 1: мягкая остановка — даём Rust команду STOP_STREAM
         if self._media_bridge is not None and self._media_bridge.is_running():
             self._media_bridge.stop_stream()
-            print("[Net] Rust capture остановлен")
+            print("[Net] Rust capture: STOP_STREAM отправлен")
 
-        # Закрываем aiortc PC стримера
-        if self._streamer_pc is not None:
-            self._run_in_webrtc_loop(self._close_pc_coro(self._streamer_pc))
-            self._streamer_pc = None
+        # FIX БАГ 1: после мягкой остановки убиваем оба процесса принудительно.
+        #
+        # Проблема: stop_stream() шлёт stdin-команду, но webrtc-rs и Pion SFU
+        # оставляют зависшее ICE-состояние — незакрытые UDP-сокеты, висячие
+        # goroutine, незавершённый mDNS-агент. При повторном start_streaming_webrtc()
+        # новый ICE не может нормально подключиться к тем же портам/адресам.
+        # Именно поэтому ручной taskkill работал — он сбрасывал ВСЁ состояние.
+        #
+        # Решение: даём 100 мс на STOP_STREAM, затем terminate().
+        # При следующем start_streaming_webrtc() оба поднимаются заново — чистые.
+        import time as _t
+        _t.sleep(0.1)
 
-        # Останавливаем захват системного звука
+        if self._media_bridge is not None and self._media_bridge.is_running():
+            self._media_bridge.stop()
+            print("[Net] media-engine.exe: завершён принудительно (FIX)")
+
+        if self._sfu_bridge is not None:
+            # FIX: убиваем SFU безусловно, не через is_running().
+            # После EOF stdout is_running() = False, но Go-процесс жив на 7788.
+            # Если не убить здесь — следующий старт стрима не сможет занять порт.
+            self._sfu_bridge.stop()
+            print("[Net] sidecar.exe: завершён принудительно (FIX)")
+
+        # FIX: закрываем Python audio streamer PC (aiortc + DLL)
+        if self._audio_streamer_pc is not None:
+            if self._webrtc_loop is not None and not self._webrtc_loop.is_closed():
+                self._run_in_webrtc_loop(self._close_pc_coro(self._audio_streamer_pc))
+            self._audio_streamer_pc = None
+
+        # Сообщаем SFU закрыть audio streamer PC
+        if self._sfu_bridge is not None and self._sfu_bridge.is_running():
+            try:
+                self._sfu_bridge.delete_audio_streamer()
+            except Exception as e:
+                print(f"[Net] delete_audio_streamer error (не критично): {e}")
+
+        # Останавливаем захват системного звука (DLL)
         if self._system_audio_track is not None:
             try:
                 self._system_audio_track.stop()
@@ -995,26 +1118,23 @@ class NetworkClient(QObject):
                 print(f"[Net] SystemAudioTrack stop error: {e}")
             self._system_audio_track = None
 
-        # Останавливаем Python VideoEngine (DXCam fallback)
+        # GC + heap trim (VideoEngine.stop_streaming() в v3 не останавливает DXCam)
         if self.video:
             self.video.stop_streaming()
 
     # ------------------------------------------------------------------
-    # Rust Media Engine: обработка событий (v0.2: только STATS/ERROR)
+    # Rust Media Engine: обработка событий (v3)
     # ------------------------------------------------------------------
     def _handle_media_event(self, event: dict) -> None:
         """
         Callback для JSON-событий от Rust Media Engine (stdout).
-        В v0.2: WebRTC сигнализация в Python, поэтому OFFER/ICE не пересылаются.
-        Обрабатываем только информационные события.
+        v3: Rust делает WebRTC сам (webrtc-rs → Pion SFU).
+        WEBRTC_OFFER обрабатывается в MediaEngineBridge напрямую.
+        Сюда приходят только STREAM_STARTED/STOPPED/STATS/ERROR.
         """
         ev = event.get('event', '')
 
-        if ev == 'PIPE_READY':
-            # Named Pipe создан — bridge автоматически подключит RustFramePipeReader
-            print(f"[Net] Rust Named Pipe: {event.get('pipe_name', '?')}")
-
-        elif ev == 'STREAM_STARTED':
+        if ev == 'STREAM_STARTED':
             print(
                 f"[Net] Rust стрим: {event.get('encoder', '?')} "
                 f"{event.get('width', 0)}×{event.get('height', 0)} "
@@ -1069,10 +1189,15 @@ class NetworkClient(QObject):
                 pass
             self._stream_audio_task = None
 
-        # Закрываем viewer PC
+        # Закрываем viewer PC (aiortc)
         if self._viewer_pc is not None:
             self._run_in_webrtc_loop(self._close_pc_coro(self._viewer_pc))
             self._viewer_pc = None
+
+        # Удаляем viewer из Pion SFU (освобождаем relay PC и треки)
+        if self._sfu_bridge is not None and self._sfu_bridge.is_running():
+            viewer_id = str(getattr(self.audio, 'my_uid', 0) or 0)
+            self._sfu_bridge.delete_viewer(viewer_id)
 
         if streamer_uid:
             self.send_json({
@@ -1091,83 +1216,137 @@ class NetworkClient(QObject):
             self.audio.stop_stream_playback()
 
     async def _handle_viewer_offer_coro(
-        self, streamer_uid: int, sdp: str, sdp_type: str
+        self, streamer_uid: int, sdp: str = None, sdp_type: str = None
     ) -> None:
         """
-        Принимает WebRTC offer от сервера (SFU создал PC со треками стримера).
+        Подключает нас как зрителя к Pion SFU через сигнализационный сервер.
 
-        1. Закрывает старый viewer PC (если был).
-        2. Создаёт новый RTCPeerConnection.
-        3. on("track"): видео → VideoEngine.add_receiver; аудио → _recv_stream_audio_coro.
-        4. setRemoteDescription(offer) → createAnswer → setLocalDescription.
-        5. Ждёт ICE gathering → отправляет answer серверу.
+        v3 поток:
+          1. Создаём aiortc PC (recvonly video + audio)
+          2. createOffer() → ICE gathering (gather-complete)
+          3. Отправляем offer серверу: CMD_WEBRTC_OFFER role='viewer_offer'
+          4. Ждём CMD_WEBRTC_ANSWER от сервера (сервер POST в Pion SFU)
+          5. setRemoteDescription(answer) → ICE → RTP течёт от SFU
         """
-        # Закрываем старый PC зрителя
+        print(f"[Viewer] _handle_viewer_offer_coro START: streamer_uid={streamer_uid}")
+
+        if not AIORTC_AVAILABLE:
+            print("[Viewer] ❌ aiortc не установлен")
+            return
+
+        # Закрываем старый viewer PC
         if self._viewer_pc is not None:
+            print("[Viewer] закрываем старый viewer PC")
             try:
                 await self._viewer_pc.close()
             except Exception:
                 pass
+            self._viewer_pc = None
 
+        print("[Viewer] создаём RTCPeerConnection (recvonly)...")
         cfg = RTCConfiguration(iceServers=[])
         pc  = RTCPeerConnection(cfg)
         self._viewer_pc = pc
 
+        pc.addTransceiver("video", direction="recvonly")
+        pc.addTransceiver("audio", direction="recvonly")
+        print("[Viewer] PC создан, transceivers: video+audio recvonly")
+        print("[Viewer] transceivers добавлены: video+audio recvonly")
+
         @pc.on("track")
         def on_track(track):
             print(
-                f"[Net] Viewer PC: получен трек kind={track.kind} "
-                f"от стримера uid={streamer_uid}"
+                f"[Viewer] ✅ ТРЕК ПОЛУЧЕН: kind={track.kind} "
+                f"от стримера uid={streamer_uid}, readyState={track.readyState}"
             )
             if track.kind == "video" and self.video:
+                print(f"[Viewer] Передаём video трек в VideoEngine.add_receiver()")
                 self.video.add_receiver(streamer_uid, track)
             elif track.kind == "audio":
-                # FIX LEAK #2: сохраняем Task чтобы cancel() при stop_watching.
-                # ensure_future без сохранения = задача висит вечно в event loop
-                # и держит ссылку на трек + буферы.
                 self._stream_audio_task = asyncio.ensure_future(
                     self._recv_stream_audio_coro(track, streamer_uid)
                 )
 
-        @pc.on("icecandidate")
-        def on_ice(candidate):
-            if candidate:
-                self.send_json({
-                    'action': CMD_WEBRTC_ICE,
-                    'role':   'viewer',
-                    'candidate': {
-                        'sdpMid':        candidate.sdpMid,
-                        'sdpMLineIndex': candidate.sdpMLineIndex,
-                        'candidate':     candidate.candidate,
-                    },
-                })
-
         @pc.on("connectionstatechange")
         async def on_state():
             state = pc.connectionState
-            print(f"[Net] Viewer PC state → {state}")
-            if state in ("failed", "disconnected"):
-                print(f"[Net] Viewer PC для uid={streamer_uid} потерян")
+            ice   = pc.iceConnectionState
+            print(f"[Viewer] PC state → {state}  ICE → {ice}")
+            if state == "connected":
+                print(f"[Viewer] ✅ WebRTC connected! Видео должно течь.")
+            elif state in ("failed", "disconnected", "closed"):
+                if self._viewer_pc is pc:
+                    print(f"[Viewer] ❌ PC потерян: {state}, ICE={ice}")
+                    # FIX БАГ 2: обнуляем ссылку на мёртвый PC.
+                    # Без этого при следующем _handle_viewer_offer_coro
+                    # вызов await old_broken_pc.close() может зависнуть навсегда,
+                    # блокируя весь viewer flow.
+                    self._viewer_pc = None
 
         try:
-            await pc.setRemoteDescription(
-                RTCSessionDescription(sdp=sdp, type=sdp_type)
-            )
-            answer = await pc.createAnswer()
-            await pc.setLocalDescription(answer)
-
+            print("[Viewer] createOffer()...")
+            offer = await pc.createOffer()
+            await pc.setLocalDescription(offer)
+            print(f"[Viewer] offer создан, ICE gathering...")
             await self._wait_ice_gathering(pc)
 
+            offer_sdp = pc.localDescription.sdp
+
+            # Нормализуем ice-ufrag/ice-pwd для Pion BUNDLE совместимости
+            offer_sdp = _normalize_sdp_ice(offer_sdp)
+            print(f"[Viewer] ICE собран, offer len={len(offer_sdp)}, отправляем серверу...")
+
+            loop = asyncio.get_running_loop()
+            self._viewer_answer_future = loop.create_future()
+
             self.send_json({
-                'action': CMD_WEBRTC_ANSWER,
-                'sdp':    pc.localDescription.sdp,
-                'type':   pc.localDescription.type,
+                'action': CMD_WEBRTC_OFFER,
+                'role':   'viewer_offer',
+                'sdp':    offer_sdp,
+                'type':   'offer',
             })
-            print(f"[Net] WebRTC answer отправлен серверу (зритель uid={streamer_uid})")
+            print(f"[Viewer] viewer_offer отправлен серверу, ждём answer (timeout=15s)...")
+
+            try:
+                answer_sdp = await asyncio.wait_for(
+                    self._viewer_answer_future, timeout=15.0
+                )
+                print(f"[Viewer] answer получен от сервера, len={len(answer_sdp)}")
+            except asyncio.TimeoutError:
+                print("[Viewer] ❌ TIMEOUT 15s: answer от сервера не получен — SFU не ответил?")
+                self._viewer_pc = None
+                return
+            finally:
+                self._viewer_answer_future = None
+
+            print("[Viewer] setRemoteDescription(answer)...")
+            try:
+                await asyncio.wait_for(
+                    pc.setRemoteDescription(
+                        RTCSessionDescription(sdp=answer_sdp, type="answer")
+                    ),
+                    timeout=10.0,
+                )
+            except asyncio.TimeoutError:
+                print("[Viewer] ❌ setRemoteDescription завис (>10s) — перезапустите смотрение")
+                if self._viewer_pc is pc:
+                    self._viewer_pc = None
+                try:
+                    await pc.close()
+                except Exception:
+                    pass
+                return
+            print(f"[Viewer] ✅ подключён к Pion SFU, streamer_uid={streamer_uid}")
 
         except Exception as e:
-            print(f"[Net] _handle_viewer_offer_coro error: {e}")
+            import traceback
+            print(f"[Viewer] ❌ _handle_viewer_offer_coro EXCEPTION: {e}")
+            print(traceback.format_exc())
             if self._viewer_pc is pc:
+                try:
+                    await pc.close()
+                except Exception:
+                    pass
                 self._viewer_pc = None
 
     async def _recv_stream_audio_coro(self, track, streamer_uid: int) -> None:
@@ -1266,23 +1445,10 @@ class NetworkClient(QObject):
         self, role: str, candidate_dict: dict
     ) -> None:
         """
-        Добавляет входящий ICE-кандидат к нужному PC.
-        role="streamer" → _streamer_pc
-        role="viewer"   → _viewer_pc
+        v3: gather-complete ICE — trickle кандидаты не используются.
+        Метод оставлен для обратной совместимости с сервером.
         """
-        pc = self._streamer_pc if role == "streamer" else self._viewer_pc
-        if pc is None:
-            return
-        try:
-            from aiortc import RTCIceCandidate
-            cand = RTCIceCandidate(
-                sdpMid=candidate_dict.get('sdpMid'),
-                sdpMLineIndex=candidate_dict.get('sdpMLineIndex'),
-                candidate=candidate_dict.get('candidate'),
-            )
-            await pc.addIceCandidate(cand)
-        except Exception as e:
-            print(f"[Net] addIceCandidate ({role}): {e}")
+        pass  # v3: gather-complete, trickle ICE не нужен
 
     @staticmethod
     async def _close_pc_coro(pc) -> None:
@@ -1577,37 +1743,36 @@ class NetworkClient(QObject):
                 msg.get('file'), msg.get('data_b64'), msg.get('from_nick')
             )
 
-        # ── WebRTC: offer от сервера → мы зритель ─────────────────────────
+        # ── WebRTC: сервер сигнализирует нам смотреть стрим ──────────────
         elif act == CMD_WEBRTC_OFFER:
             role         = msg.get('role', '')
-            sdp          = msg.get('sdp')
-            sdp_type     = msg.get('type', 'offer')
             streamer_uid = msg.get('streamer_uid', self._watching_streamer_uid)
+            print(f"[Viewer] CMD_WEBRTC_OFFER получен: role={role!r}, streamer_uid={streamer_uid}, aiortc={AIORTC_AVAILABLE}")
 
-            if role == 'viewer' and sdp and AIORTC_AVAILABLE:
-                # Сервер прислал нам offer — мы зритель, создаём answer
+            if role == 'viewer' and AIORTC_AVAILABLE:
+                print(f"[Viewer] → запускаем _handle_viewer_offer_coro(streamer_uid={streamer_uid})")
                 self._run_in_webrtc_loop(
-                    self._handle_viewer_offer_coro(streamer_uid, sdp, sdp_type)
+                    self._handle_viewer_offer_coro(streamer_uid)
                 )
+            elif role == 'viewer' and not AIORTC_AVAILABLE:
+                print("[Viewer] ❌ aiortc не установлен — просмотр невозможен")
+            elif role != 'viewer':
+                print(f"[Viewer] role={role!r} — игнорируем (не viewer)")
 
-        # ── WebRTC: answer от сервера → мы стример ────────────────────────
+        # ── WebRTC: answer от сервера (Pion SFU answer для зрителя) ─────
         elif act == CMD_WEBRTC_ANSWER:
-            sdp      = msg.get('sdp')
-            sdp_type = msg.get('type', 'answer')
-            if sdp and AIORTC_AVAILABLE:
-                # Сервер ответил на наш offer стримера
-                self._run_in_webrtc_loop(
-                    self._handle_streamer_answer_coro(sdp, sdp_type)
-                )
+            sdp = msg.get('sdp', '')
+            fut = self._viewer_answer_future
+            print(f"[Viewer] ← CMD_WEBRTC_ANSWER получен от сервера: len={len(sdp)}, future={'есть' if fut else 'НЕТ'}")
+            if sdp and fut is not None:
+                def _resolve(f=fut, s=sdp):
+                    if not f.done(): f.set_result(s)
+                if self._webrtc_loop and not self._webrtc_loop.is_closed():
+                    self._webrtc_loop.call_soon_threadsafe(_resolve)
 
-        # ── WebRTC: ICE кандидат ───────────────────────────────────────────
+        # ── WebRTC: ICE кандидат (устарел в v3 — gather-complete) ─────────
         elif act == CMD_WEBRTC_ICE:
-            candidate = msg.get('candidate')
-            role      = msg.get('role', '')
-            if candidate and AIORTC_AVAILABLE:
-                self._run_in_webrtc_loop(
-                    self._handle_ice_candidate_coro(role, candidate)
-                )
+            pass  # v3: gather-complete ICE, trickle не используется
 
         # ── Nudge ──────────────────────────────────────────────────────────
         elif act == CMD_PLAY_NUDGE:

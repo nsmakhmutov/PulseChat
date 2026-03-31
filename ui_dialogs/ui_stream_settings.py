@@ -114,22 +114,20 @@ class StreamSettingsDialog(QDialog):
         layout.addWidget(QLabel("Разрешение:"))
         self.res_combo = QComboBox()
 
-        # Фиксированные пресеты — битрейт указан в актуальных значениях из config.py
-        # (был неверный: 720p=4.5 Mbps, 480p=2.2 Mbps, 360p=1.0 Mbps)
+        # Три фиксированных пресета — нативное разрешение убрано:
+        # оно создаёт избыточную нагрузку на RadminVPN и не даёт
+        # осмысленного прироста качества при сетевой демонстрации.
         self._fixed_res_options: dict[str, tuple[int, int]] = {
-            "720p  (HD)  — 6 Mbps":   (1280, 720),
-            "480p  (SD)  — 3 Mbps":   ( 854, 480),
-            "360p        — 1.5 Mbps": ( 640, 360),
+            "720p  (HD)   — 6 Mbps":  (1280, 720),
+            "480p  (SD)   — 3 Mbps":  ( 854, 480),
+            "360p         — 1.5 Mbps":( 640, 360),
         }
 
-        # Динамическая запись «Источник» добавляется первой и обновляется
-        # при смене монитора. Хранится как userData='source'.
-        self.res_combo.addItem("Источник (нативное разрешение)", "source")
         for text, res in self._fixed_res_options.items():
             self.res_combo.addItem(text, res)
 
-        # По умолчанию выбираем 720p
-        self.res_combo.setCurrentIndex(1)
+        # По умолчанию 720p
+        self.res_combo.setCurrentIndex(0)
         layout.addWidget(self.res_combo)
 
         # Примечание о simulcast
@@ -175,10 +173,6 @@ class StreamSettingsDialog(QDialog):
         QTimer.singleShot(0, lambda: _fix_stream_combo(self.res_combo))
         QTimer.singleShot(0, lambda: _fix_stream_combo(self.fps_combo))
 
-        # Обновляем надпись «Источник» при смене монитора
-        self.monitor_combo.currentIndexChanged.connect(self._update_source_label)
-        # Первичное обновление после построения
-        QTimer.singleShot(0, self._update_source_label)
 
         layout.addSpacing(10)
 
@@ -248,31 +242,6 @@ class StreamSettingsDialog(QDialog):
 
         self.adjustSize()
 
-    # ------------------------------------------------------------------
-    # Динамическое обновление надписи «Источник»
-    # ------------------------------------------------------------------
-
-    def _update_source_label(self) -> None:
-        """
-        Обновляет текст пункта «Источник» при смене монитора.
-        Показывает реальное разрешение выбранного монитора.
-        """
-        monitor_idx = self.monitor_combo.currentData()
-        try:
-            screens = QGuiApplication.screens()
-            if monitor_idx is not None and int(monitor_idx) < len(screens):
-                screen = screens[int(monitor_idx)]
-                geo    = screen.geometry()
-                w, h   = geo.width(), geo.height()
-                text   = f"Источник  ({w}×{h})  — нативное"
-            else:
-                text = "Источник  (нативное разрешение)"
-        except Exception:
-            text = "Источник  (нативное разрешение)"
-
-        # Пункт «Источник» всегда имеет index=0
-        if self.res_combo.itemData(0) == "source":
-            self.res_combo.setItemText(0, text)
 
     # ------------------------------------------------------------------
     # Получение настроек
@@ -291,21 +260,7 @@ class StreamSettingsDialog(QDialog):
         audio_on     = self.cb_stream_audio.isChecked()
 
         res_data = self.res_combo.currentData()
-        if res_data == "source":
-            # Нативное разрешение выбранного монитора
-            try:
-                screens = QGuiApplication.screens()
-                idx     = int(monitor_idx) if monitor_idx is not None else 0
-                if idx < len(screens):
-                    geo    = screens[idx].geometry()
-                    width  = geo.width()
-                    height = geo.height()
-                else:
-                    width, height = 1920, 1080
-            except Exception:
-                width, height = 1920, 1080
-        else:
-            width, height = res_data
+        width, height = res_data  # всегда tuple (w, h)
 
         return {
             "monitor_idx":         monitor_idx,

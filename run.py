@@ -25,6 +25,59 @@ _base = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
 if _base not in sys.path:
     sys.path.insert(0, _base)
 
+
+# ── Stdout → logging (чтобы print() тоже попадал в файл) ─────────────────────
+# Все print([Net] ...), print([Server] ...) и т.д. будут в inpulse.log.
+# Строки [OUT-DIAG] и [Stats] — периодический диагностический шум —
+# фильтруются: в файл не пишутся (остаются только в консоли/stdout).
+class _PrintToLog:
+    """
+    Перехватывает sys.stdout.write() и направляет каждую непустую строку
+    в logging.info() под именем «app».
+
+    Исключения (пишутся только в консоль, не в файл):
+      • строки, начинающиеся с [OUT-DIAG] — аудио-диагностика раз в секунду
+      • строки, начинающиеся с [Stats]    — сетевая статистика раз в 5 с
+    """
+
+    # Префиксы, которые НЕ нужно писать в файл
+    _SKIP_PREFIXES = ('[OUT-DIAG]', '[Stats]')
+
+    def __init__(self, original_stream, logger: logging.Logger):
+        self._orig = original_stream
+        self._log  = logger
+        self._buf  = ''
+
+    def write(self, text: str) -> int:
+        # Всегда дублируем в оригинальный stdout (для консоли/отладчика)
+        if self._orig is not None:
+            try:
+                self._orig.write(text)
+            except Exception:
+                pass
+
+        self._buf += text
+        # Флашим по строкам
+        while '\n' in self._buf:
+            line, self._buf = self._buf.split('\n', 1)
+            line = line.rstrip('\r')
+            if line and not any(line.startswith(p) for p in self._SKIP_PREFIXES):
+                self._log.info('%s', line)
+
+        return len(text)
+
+    def flush(self):
+        if self._orig is not None:
+            try:
+                self._orig.flush()
+            except Exception:
+                pass
+
+    # Proxy остальных атрибутов потока (encoding, isatty, etc.)
+    def __getattr__(self, name):
+        return getattr(self._orig, name)
+
+
 # ── Настройка логирования ─────────────────────────────────────────────────────
 # Логи пишутся в %APPDATA%\InPulse\logs\inpulse.log
 # Ротация: 5 MB × 5 файлов. Крашлог отдельно: crash.log
@@ -54,12 +107,56 @@ def _setup_logging() -> str:
     _root.addHandler(_fh)
 
     # ── Консольный хендлер (только WARNING+, чтобы не мусорить в stdout) ────
-    _ch = logging.StreamHandler(sys.stdout)
+    _ch = logging.StreamHandler(sys.__stdout__)   # sys.__stdout__ = настоящий stdout до редиректа
     _ch.setLevel(logging.WARNING)
     _ch.setFormatter(logging.Formatter('[%(levelname)s] %(message)s'))
     _root.addHandler(_ch)
 
-    # ── Перехват необработанных исключений главного потока ────────────────────
+    # ══════════════════════════════════════════════════════════════════════
+    # ФИЛЬТРАЦИЯ ШУМНЫХ СТОРОННИХ БИБЛИОТЕК
+    # ══════════════════════════════════════════════════════════════════════
+    #
+    # aiortc.rtcrtpsender — пишет КАЖДЫЙ RTP-пакет на уровне DEBUG.
+    #   При голосовом чате: 50 пакетов/сек на соединение = 3 000 строк/мин.
+    #   На 3 участниках это ~9 000 строк/мин — весь 5 MB файл за ~8 минут.
+    #
+    # aioice.ice — STUN Binding keepalive каждые ~5 сек на каждый ICE-кандидат.
+    #
+    # comtypes / comtypes._post_coinit.unknwn — Release() COM-объектов DirectX
+    #   при инициализации захвата экрана (WGC/DXGI).
+    #
+    # asyncio — «Using proactor: IocpProactor» и прочие внутренности event loop.
+    #
+    # Уровень WARNING оставляет: ошибки ICE, ошибки DTLS, сбои кодека.
+
+    _THIRD_PARTY_SILENCE = (
+        # ── aiortc: пакетный трафик (самый громкий) ──────────────────────
+        'aiortc.rtcrtpsender',      # RtpPacket / RtcpSrPacket / RtcpSdesPacket
+        'aiortc.rtcrtpreceiver',    # входящие RTP
+        'aiortc.rtcrtpparameters',  # параметры кодека при старте
+        # ── aioice: ICE STUN keepalive ───────────────────────────────────
+        'aioice',                   # покрывает aioice.ice, aioice.stun, ...
+        # ── comtypes: COM / DirectX ──────────────────────────────────────
+        'comtypes',                 # покрывает comtypes._post_coinit.unknwn, ...
+        # ── asyncio internals ────────────────────────────────────────────
+        'asyncio',
+    )
+    for _name in _THIRD_PARTY_SILENCE:
+        logging.getLogger(_name).setLevel(logging.WARNING)
+
+    # ── aiortc state-change логгеры: оставить на INFO ────────────────────
+    # Полезны для диагностики: «ICE connected», «DTLS handshake done»,
+    # смена состояний PeerConnection — именно по ним видно, подключился ли клиент.
+    _AIORTC_INFO = (
+        'aiortc.rtcpeerconnection',  # iceConnectionState, connectionState
+        'aiortc.rtcdtlstransport',   # DTLS handshake, State.CONNECTED/CLOSED
+        'aiortc.rtcicetransport',    # ICE completed / failed / closed
+        'aiortc.rtcdatachannel',     # DataChannel open/close
+    )
+    for _name in _AIORTC_INFO:
+        logging.getLogger(_name).setLevel(logging.INFO)
+
+    # ── Перехват необработанных исключений главного потока ────────────────
     _crash_file = os.path.join(_logs_dir, 'crash.log')
 
     def _excepthook(exc_type, exc_value, exc_tb):
@@ -75,6 +172,32 @@ def _setup_logging() -> str:
         sys.__excepthook__(exc_type, exc_value, exc_tb)
 
     sys.excepthook = _excepthook
+
+    # ── Перехват необработанных исключений в потоках (threading) ──────────
+    import threading
+
+    def _thread_excepthook(args):
+        import traceback
+        msg = ''.join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+        thread_name = args.thread.name if args.thread else 'unknown'
+        logging.critical('CRASH (thread=%s):\n%s', thread_name, msg)
+        try:
+            with open(_crash_file, 'a', encoding='utf-8') as _f:
+                import datetime
+                _f.write(
+                    f'\n[{datetime.datetime.now():%Y-%m-%d %H:%M:%S}]'
+                    f' CRASH (thread={thread_name}):\n{msg}'
+                )
+        except Exception:
+            pass
+
+    threading.excepthook = _thread_excepthook
+    logging.debug('threading.excepthook установлен')
+
+    # ── Перенаправление sys.stdout → logging (print() попадает в файл) ───
+    _app_logger = logging.getLogger('app')
+    _app_logger.setLevel(logging.DEBUG)
+    sys.stdout = _PrintToLog(sys.__stdout__, _app_logger)
 
     logging.info('=== InPulse запущен. Логи: %s ===', _logs_dir)
     return _logs_dir

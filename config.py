@@ -104,7 +104,8 @@ def get_bitrate_for_resolution(width: int, height: int, lq: bool = False) -> int
 
 # ── Opus (голос комнаты — без изменений) ─────────────────────────────────────
 OPUS_APPLICATION = 2048   # opuslib.APPLICATION_VOIP
-DEFAULT_BITRATE  = 64000
+DEFAULT_BITRATE        = 64000   # битрейт голоса (Opus, моно, 64 kbps)
+STREAM_AUDIO_BITRATE   = 48000   # битрейт звука при демонстрации (стерео, 48 kbps достаточно)
 
 # ── UDP-заголовок ─────────────────────────────────────────────────────────────
 UDP_HEADER_STRUCT = struct.Struct("!IdIB")
