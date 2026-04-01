@@ -6,7 +6,7 @@
 # ──────────────────────────────────────────────────────────────────────────────
 
 APP_NAME    = "InPulse"
-APP_VERSION = "1.0.47"           # SemVer: MAJOR.MINOR.PATCH
+APP_VERSION = "1.0.48"           # SemVer: MAJOR.MINOR.PATCH
 APP_AUTHOR  = "Impulse Company"     # ← замените на своё имя/псевдоним
 APP_YEAR    = "2026"
 # GitHub репозиторий для проверки обновлений.

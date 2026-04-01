@@ -134,25 +134,37 @@ impl HwEncoder {
         video.set_frame_rate(Some(Rational::new(fps as i32, 1)));
         video.set_bit_rate(bitrate as usize);
         video.set_max_bit_rate(bitrate as usize);
-        video.set_gop(fps * 2); // IDR каждые 2 секунды
+        video.set_gop(fps * 5); // IDR каждые 2 секунды
 
         let mut opts = ffmpeg::Dictionary::new();
         match profile.codec_name.as_str() {
             "h264_nvenc" => {
                 opts.set("preset", "p4");
-                opts.set("tune", "hq");
-                opts.set("rc", "vbr");
-                // cq=18 (было 20): лучше визуальное качество при низких разрешениях.
-                // Разница в битрейте минимальна (статичные UI-сцены), зато текст чётче.
-                opts.set("cq", "18");
-                // B-кадры убраны: DTS≠PTS ломает пакетизацию в webrtc-rs.
+                opts.set("tune", "ull");
+
+                // 1. УБИРАЕМ INTRA-REFRESH (из-за него падает aiortc)
+                // opts.set("intra-refresh", "1");
+                // opts.set("intra-refresh-period", &(fps * 2).to_string());
+
+                // 2. ВМЕСТО НЕГО ВКЛЮЧАЕМ СТРОГИЙ CBR И VBV-БУФЕР
+                opts.set("rc", "cbr");
+                // Буфер (bufsize) заставит энкодер "размазывать" всплески I-кадров
+                opts.set("bufsize", &(bitrate * 2).to_string());
+                // Жесткий лимит битрейта, чтобы не убить Radmin VPN
+                opts.set("maxrate", &bitrate.to_string());
+
+                // 3. ОБЯЗАТЕЛЬНО УДАЛЯЕМ (ИЛИ КОММЕНТИРУЕМ) ПАРАМЕТР CQ!
+                // opts.set("cq", "18"); // При CBR он ломает логику лимитов
+
+                // Возвращаем классические, чистые I-кадры по запросу PLI
+                opts.set("forced-idr", "1");
+
                 opts.set("bf", "0");
                 opts.set("profile", "high");
                 opts.set("spatial-aq", "1");
                 opts.set("temporal-aq", "1");
-                opts.set("aq-strength", "15"); // выше = точнее AQ на мелких деталях
-                opts.set("lookahead", "8");     // короткий lookahead улучшает I-кадры
-                opts.set("forced-idr", "1");
+                opts.set("aq-strength", "15");
+                opts.set("lookahead", "8");
             }
             "h264_amf" => {
                 opts.set("usage", "transcoding");

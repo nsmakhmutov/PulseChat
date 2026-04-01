@@ -1217,8 +1217,9 @@ class VideoWindow(QWidget):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._reposition_surface()
-        self._reposition_overlay()
-        self._reposition_draw_canvas()
+        self._reposition_draw_canvas()  # Сначала обновляем и поднимаем холст
+        self._reposition_overlay()  # Оверлей поднимаем В САМОМ КОНЦЕ, чтобы он был поверх холста
+
         # Обновляем title bar при смене состояния окна (maximize/restore)
         if hasattr(self, '_title_bar'):
             self._title_bar.update_max_icon()
