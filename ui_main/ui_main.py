@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QHeaderView, QMessageBox, QStackedWidget,
                              QFrame, QSizeGrip, QFileDialog, QLineEdit,
                              QScrollArea, QDialog, QCheckBox,
-                             QMenu, QApplication)
+                             QMenu, QApplication, QSystemTrayIcon)
 from PyQt6.QtCore import Qt, QTimer, QSize, QSettings, QRect, QPoint, QEvent, QThread, pyqtSignal, QPropertyAnimation, QEasingCurve
 from PyQt6.QtGui import QIcon, QFont, QFontDatabase, QBrush, QColor, QCursor, QFontMetrics
 
@@ -136,6 +136,22 @@ class MainWindow(QMainWindow):
 
         self.setup_ui()
         self.apply_theme(self.app_settings.value("theme", "Темная"))
+
+        # ── System Tray Icon ─────────────────────────────────────────────────
+        self._tray_icon = QSystemTrayIcon(
+            QIcon(resource_path("assets/icon/logo.ico")), self
+        )
+        _tray_menu = QMenu()
+        _act_show = _tray_menu.addAction("Показать InPulse")
+        _act_show.triggered.connect(self._tray_show)
+        _tray_menu.addSeparator()
+        _act_quit = _tray_menu.addAction("Выйти")
+        _act_quit.triggered.connect(self._tray_quit)
+        self._tray_icon.setContextMenu(_tray_menu)
+        self._tray_icon.activated.connect(self._on_tray_activated)
+        self._tray_icon.setToolTip(f"{APP_NAME} — {self.nick}")
+        self._tray_icon.show()
+        self._force_quit = False   # True = полный выход из трея
 
         # ── ChatPanel: встроена в _main_row (окно расширяется при открытии) ───
         # ChatPanel добавлена в QHBoxLayout рядом с main_page в setup_ui().
@@ -3065,19 +3081,41 @@ class MainWindow(QMainWindow):
         # fast_switch_to: без задержки RECONNECT_DELAY, быстрые попытки 0.35 сек
         self.net.fast_switch_to(new_ip)
 
-    def closeEvent(self, e):
-        """При нажатии ✕ — корректно завершаем приложение.
+    # ------------------------------------------------------------------
+    # System Tray
+    # ------------------------------------------------------------------
+    def _tray_show(self):
+        """Показать окно из трея."""
+        self.showNormal()
+        self.activateWindow()
+        self.raise_()
 
-        Порядок завершения критичен:
-          1. Останавливаем UI-таймеры — прекращаем refresh_ui во время teardown.
-          2. Снимаем keyboard-хуки — убираем глобальные перехватчики клавиш.
-          3. Закрываем вспомогательные UI-элементы (лобби, оверлеи).
-          4. Останавливаем AudioHandler — закрывает PortAudio поток и pkt-поток.
-          5. VideoEngine.shutdown() — DXCamTrack + все VideoReceiver.
-          6. NetworkClient.stop() — сокеты, WebRTC PC, asyncio loop.
-          7. EmbeddedServerManager.stop() — broadcast server_migrate → close.
-          8. QApplication.quit() — завершаем event loop Qt.
-        """
+    def _tray_quit(self):
+        """Полный выход из трея."""
+        self._force_quit = True
+        self.close()
+
+    def _on_tray_activated(self, reason):
+        """Двойной клик по иконке трея — показать окно."""
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self._tray_show()
+
+    def closeEvent(self, e):
+        """Крестик → сворачиваем в трей. Полный выход — через меню трея."""
+
+        # ── Сворачиваем в трей (если не запрошен полный выход) ────────────
+        if not self._force_quit:
+            e.ignore()
+            self.hide()
+            self._tray_icon.showMessage(
+                APP_NAME,
+                "Приложение свёрнуто в трей. ПКМ по иконке → Выйти.",
+                QSystemTrayIcon.MessageIcon.Information,
+                2000,
+            )
+            return
+
+        # ── Полное завершение (из трея) ──────────────────────────────────
         print("[UI] closeEvent: начинаем shutdown...")
 
         # Очищаем кэш медиафайлов чата (конвертированные GIF→MP4, temp-видео)
@@ -3170,8 +3208,9 @@ class MainWindow(QMainWindow):
         except Exception as ex:
             print(f"[UI] closeEvent EmbeddedServer stop error: {ex}")
 
-        # ── 8. Завершаем Qt ───────────────────────────────────────────────────
+        # ── 8. Убираем иконку из трея и завершаем Qt ────────────────────
         print("[UI] closeEvent: shutdown завершён")
+        self._tray_icon.hide()
         from PyQt6.QtWidgets import QApplication
         QApplication.quit()
         e.accept()

@@ -901,7 +901,10 @@ class SFUServer:
                                     c['uid'] for c in self.clients.values()
                                     if c['room'] == voter_room
                                 ]
-                                threshold = max(1, len(room_uids) - 1)
+                                # Большинство голосующих (все кроме цели).
+                                # 5 чел → 2 голоса, 4 → 2, 3 → 1, 2 → 1.
+                                voters_count = max(1, len(room_uids) - 1)
+                                threshold = max(1, (voters_count + 1) // 2)
 
                                 for c_conn, c_data in self.clients.items():
                                     if (c_data['uid'] == target_uid

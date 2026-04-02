@@ -145,7 +145,11 @@ async fn handle_command(cmd: Command, pipeline: &mut Option<Pipeline>) -> Result
                 "SET_BITRATE: {} kbps (LQ={} kbps)",
                 bitrate / 1000, lq_bitrate / 1000
             );
-            // TODO: передать через AtomicU32 в encode_loop
+            if let Some(p) = pipeline.as_ref() {
+                p.set_bitrate(bitrate);
+            } else {
+                warn!("SET_BITRATE: нет активного pipeline");
+            }
         }
 
         Command::Shutdown => {

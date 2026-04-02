@@ -119,15 +119,15 @@ class StreamSettingsDialog(QDialog):
         # осмысленного прироста качества при сетевой демонстрации.
         self._fixed_res_options: dict[str, tuple[int, int]] = {
             "720p  (HD)   — 6 Mbps":  (1280, 720),
-            "480p  (SD)   — 3 Mbps":  ( 854, 480),
-            "360p         — 1.5 Mbps":( 640, 360),
+            "480p  (SD)   — 2 Mbps":  ( 854, 480),
+            "360p         — 1 Mbps":  ( 640, 360),
         }
 
         for text, res in self._fixed_res_options.items():
             self.res_combo.addItem(text, res)
 
-        # По умолчанию 720p
-        self.res_combo.setCurrentIndex(0)
+        # По умолчанию 480p
+        self.res_combo.setCurrentIndex(1)
         layout.addWidget(self.res_combo)
 
         # Примечание о simulcast
@@ -145,7 +145,7 @@ class StreamSettingsDialog(QDialog):
         # ── FPS ───────────────────────────────────────────────────────────────
         layout.addWidget(QLabel("Частота кадров (FPS):"))
         self.fps_combo = QComboBox()
-        self.fps_combo.addItems(["15", "30", "60"])
+        self.fps_combo.addItems(["15", "30"])
         self.fps_combo.setCurrentText("30")
         layout.addWidget(self.fps_combo)
 
@@ -182,7 +182,7 @@ class StreamSettingsDialog(QDialog):
         layout.addWidget(sep)
 
         self.cb_stream_audio = QCheckBox("🔊 Транслировать звук")
-        self.cb_stream_audio.setChecked(False)
+        self.cb_stream_audio.setChecked(True)
         layout.addWidget(self.cb_stream_audio)
 
         self._hint_lbl = QLabel(
@@ -194,7 +194,7 @@ class StreamSettingsDialog(QDialog):
             "border-radius: 6px; padding: 8px; font-size: 11px;"
         )
         self._hint_lbl.setWordWrap(True)
-        self._hint_lbl.setVisible(False)
+        self._hint_lbl.setVisible(True)
         layout.addWidget(self._hint_lbl)
 
         self.cb_stream_audio.toggled.connect(

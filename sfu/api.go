@@ -1,18 +1,8 @@
 // api.go — HTTP-обработчики сигнализации SFU
 //
-// ── Эндпоинты ────────────────────────────────────────────────────────────────
-//
-//   POST /streamer/offer
-//   DELETE /streamer
-//
-//   POST /streamer/audio/offer          ← FIX: Python DLL audio streamer
-//   DELETE /streamer/audio              ← FIX: закрыть audio PC
-//
-//   POST /viewer/{id}/offer
-//   DELETE /viewer/{id}
-//
-//   GET /health
-//   GET /status
+// ИЗМЕНЕНИЯ v2:
+//   Добавлен GET /stats/loss — возвращает агрегированную статистику потерь
+//   для ABR (Adaptive Bitrate). Python опрашивает этот эндпоинт каждые 3 сек.
 
 package main
 
@@ -34,27 +24,25 @@ func NewAPI(sfu *SFU) *API {
 func (a *API) Handler() http.Handler {
 	mux := http.NewServeMux()
 
-	// ── Видео стример (Rust webrtc-rs) ───────────────────────────────────────
 	mux.HandleFunc("/streamer/offer", a.handleStreamerOffer)
 	mux.HandleFunc("/streamer", a.handleStreamer)
 
-	// ── Аудио стример (Python aiortc + InPulseAudioExclusion.dll) ─────────────
-	// FIX: зарегистрировать ДО /streamer/audio (более специфичный путь первым)
 	mux.HandleFunc("/streamer/audio/offer", a.handleAudioStreamerOffer)
 	mux.HandleFunc("/streamer/audio", a.handleAudioStreamer)
 
-	// ── Зрители ───────────────────────────────────────────────────────────────
 	mux.HandleFunc("/viewer/", a.handleViewer)
 
 	mux.HandleFunc("/health", a.handleHealth)
 	mux.HandleFunc("/status", a.handleStatus)
+
+	// ── ABR: статистика потерь для адаптивного битрейта ─────────────────
+	mux.HandleFunc("/stats/loss", a.handleLossStats)
 
 	return corsMiddleware(mux)
 }
 
 // ─── Video Streamer handlers ──────────────────────────────────────────────────
 
-// POST /streamer/offer
 func (a *API) handleStreamerOffer(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -85,7 +73,6 @@ func (a *API) handleStreamerOffer(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"sdp": answerSDP})
 }
 
-// DELETE /streamer
 func (a *API) handleStreamer(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -96,12 +83,8 @@ func (a *API) handleStreamer(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// ─── Audio Streamer handlers (FIX: Python DLL захват) ─────────────────────────
+// ─── Audio Streamer handlers ─────────────────────────────────────────────────
 
-// POST /streamer/audio/offer
-// Принимает audio-only SDP offer от Python aiortc (SystemAudioTrack).
-// Python захватывает системный звук через InPulseAudioExclusion.dll
-// (WASAPI Process Loopback с исключением PID InPulse).
 func (a *API) handleAudioStreamerOffer(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -132,7 +115,6 @@ func (a *API) handleAudioStreamerOffer(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"sdp": answerSDP})
 }
 
-// DELETE /streamer/audio
 func (a *API) handleAudioStreamer(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -173,7 +155,6 @@ func (a *API) handleViewer(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// POST /viewer/{id}/offer
 func (a *API) handleViewerOffer(w http.ResponseWriter, r *http.Request, viewerID string) {
 	var req struct {
 		SDP string `json:"sdp"`
@@ -197,6 +178,19 @@ func (a *API) handleViewerOffer(w http.ResponseWriter, r *http.Request, viewerID
 	}
 
 	writeJSON(w, http.StatusOK, map[string]string{"sdp": answerSDP, "viewer_id": viewerID})
+}
+
+// ─── ABR: Loss Stats ──────────────────────────────────────────────────────────
+
+// GET /stats/loss — агрегированная статистика потерь от RTCP Receiver Reports.
+// Python ABR поток опрашивает каждые 3 секунды для адаптации битрейта.
+func (a *API) handleLossStats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	stats := a.sfu.LossStats()
+	writeJSON(w, http.StatusOK, stats)
 }
 
 // ─── Health / Status ──────────────────────────────────────────────────────────

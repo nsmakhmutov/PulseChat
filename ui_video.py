@@ -797,8 +797,7 @@ class VideoOverlay(QFrame):
     stop_watch_clicked = pyqtSignal()
     fullscreen_clicked = pyqtSignal()
     stream_volume_changed = pyqtSignal(float)   # 0.0–2.0
-    # Клик по кнопке soundboard в оверлее стрима → VideoWindow.open_soundboard()
-    soundboard_clicked = pyqtSignal()
+    # Soundboard убран из оверлея зрителя (доступен только в главном окне).
     # Кнопка Draw: зажата → режим рисования включён
     draw_toggled = pyqtSignal(bool)   # True = рисование включено
 
@@ -849,9 +848,9 @@ class VideoOverlay(QFrame):
         self.btn_vol_stream.installEventFilter(self)
         self._vol_popup.installEventFilter(self)
 
-        # --- Soundboard ---
-        self.btn_soundboard = self._make_btn("assets/icon/bells.svg", "Soundboard")
-        self.btn_soundboard.clicked.connect(self.soundboard_clicked)
+        # --- Soundboard убран из оверлея зрителя ---
+        # Звуковая панель доступна только в главном окне (btn_sb).
+        # В окне просмотра стрима она отвлекает и не нужна зрителю.
 
         # --- Draw (рисование поверх стрима) ---
         self.btn_draw = self._make_btn("assets/icon/draw.svg", "Рисовать на стриме (5 сек)")
@@ -875,7 +874,6 @@ class VideoOverlay(QFrame):
         layout.addWidget(self.btn_deafen)
         layout.addWidget(self.btn_stop)
         layout.addWidget(self.btn_vol_stream)
-        layout.addWidget(self.btn_soundboard)
         layout.addWidget(self.btn_draw)
         layout.addWidget(sep, alignment=Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(self.btn_fs)
@@ -1093,29 +1091,8 @@ class VideoWindow(QWidget):
     # ------------------------------------------------------------------
     # Soundboard поверх стрима
     # ------------------------------------------------------------------
-    def open_soundboard(self):
-        """
-        Открывает / закрывает SoundboardPanel поверх окна трансляции.
-        Полностью аналогична MainWindow.open_soundboard().
-        """
-        if self._net is None:
-            return
-        from ui_dialogs import SoundboardPanel
-        try:
-            if self._sb_panel is not None:
-                if self._sb_panel.isVisible():
-                    self._sb_panel.close()
-                    self._sb_panel = None
-                    return
-                else:
-                    self._sb_panel.deleteLater()
-                    self._sb_panel = None
-        except RuntimeError:
-            self._sb_panel = None
-
-        panel = SoundboardPanel(self._net, self)
-        self._sb_panel = panel
-        panel.show_above(self.overlay.btn_soundboard)
+    # open_soundboard убран — кнопка удалена из оверлея зрителя.
+    # ------------------------------------------------------------------
 
     # ------------------------------------------------------------------
     # Построение UI
@@ -1176,7 +1153,6 @@ class VideoWindow(QWidget):
         self.overlay.stop_watch_clicked.connect(self._on_overlay_stop)
         self.overlay.fullscreen_clicked.connect(self.toggle_fullscreen)
         self.overlay.stream_volume_changed.connect(self.overlay_stream_volume_changed)
-        self.overlay.soundboard_clicked.connect(self.open_soundboard)
         # Кнопка Draw → включить/выключить режим рисования на DrawCanvas
         self.overlay.draw_toggled.connect(self._on_draw_toggled)
         self.overlay.hide()  # скрыт по умолчанию

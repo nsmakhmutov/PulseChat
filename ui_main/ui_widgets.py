@@ -1291,6 +1291,26 @@ class ChatPanel(QFrame):
         i_lay.addWidget(self._send_btn)
         main_lay.addWidget(input_bar)
 
+        # ── Drag & Drop файлов в чат ─────────────────────────────────────
+        self.setAcceptDrops(True)
+
+        # Оверлей «Перетащите файлы сюда» — показывается при наведении файла
+        self._drop_overlay = QLabel("📎  Перетащите файлы сюда", self)
+        self._drop_overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._drop_overlay.setObjectName("chatDropOverlay")
+        self._drop_overlay.setStyleSheet("""
+            #chatDropOverlay {
+                background: rgba(91, 142, 245, 0.12);
+                border: 2px dashed rgba(91, 142, 245, 0.6);
+                border-radius: 12px;
+                color: rgba(91, 142, 245, 0.9);
+                font-size: 15px;
+                font-weight: 600;
+                letter-spacing: 0.3px;
+            }
+        """)
+        self._drop_overlay.hide()
+
     # Максимум сообщений в панели чата.
     # При превышении удаляем самое старое: виджет + запись из _msg_widgets.
     # Выбрано 200 — достаточно контекста для разговора на 30 человек,
@@ -1510,6 +1530,81 @@ class ChatPanel(QFrame):
 
         # GIF конвертация может занять время — делаем в фоне
         threading.Thread(target=_load_and_prepare, daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # Drag & Drop
+    # ------------------------------------------------------------------
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            # Показываем оверлей поверх чата
+            self._drop_overlay.setGeometry(
+                8, 8,
+                self.width() - 16,
+                self.height() - 16,
+            )
+            self._drop_overlay.raise_()
+            self._drop_overlay.show()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dragLeaveEvent(self, event):
+        self._drop_overlay.hide()
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event):
+        """Файлы перетащены в чат — обрабатываем первый файл."""
+        self._drop_overlay.hide()
+        urls = event.mimeData().urls()
+        if not urls:
+            return
+        path = urls[0].toLocalFile()
+        if not path or not os.path.isfile(path):
+            return
+        event.acceptProposedAction()
+        self._process_dropped_file(path)
+
+    def _process_dropped_file(self, path: str) -> None:
+        """Загружает файл в фоне и ставит в _pending_media (как attach)."""
+        ext = os.path.splitext(path)[1].lower()
+
+        def _load():
+            try:
+                with open(path, "rb") as f:
+                    data = f.read()
+
+                if ext == ".gif":
+                    mp4 = _gif_to_mp4(data)
+                    if mp4:
+                        final_data, file_type = mp4, "video"
+                        file_name = os.path.splitext(os.path.basename(path))[0] + ".mp4"
+                    else:
+                        final_data, file_type = data, "image"
+                        file_name = os.path.basename(path)
+                elif ext in (".mp4", ".mov", ".avi", ".mkv", ".webm"):
+                    final_data, file_type, file_name = data, "video", os.path.basename(path)
+                elif ext in (".png", ".jpg", ".jpeg", ".webp", ".bmp"):
+                    final_data, file_type, file_name = data, "image", os.path.basename(path)
+                else:
+                    final_data, file_type, file_name = data, "file", os.path.basename(path)
+
+                self._pending_media = (
+                    file_name, file_type,
+                    base64.b64encode(final_data).decode("ascii"),
+                )
+                print(f"[Chat] drop: {file_name} ({file_type})")
+                QMetaObject.invokeMethod(
+                    self, "_emit_ready",
+                    Qt.ConnectionType.QueuedConnection,
+                )
+            except Exception as ex:
+                print(f"[Chat] drop error: {ex}")
+
+        threading.Thread(target=_load, daemon=True).start()
 
     def _scroll_to_bottom(self) -> None:
         sb = self._scroll.verticalScrollBar()

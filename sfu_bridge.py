@@ -406,6 +406,18 @@ class SfuBridge:
         except Exception:
             return False
 
+    def get_loss_stats(self) -> dict | None:
+        """
+        GET /stats/loss → агрегированная статистика потерь от зрителей.
+        Возвращает {'avg_loss_pct': float, 'max_loss_pct': float,
+                    'avg_jitter_ms': float, 'viewers': int} или None при ошибке.
+        Используется ABR потоком для адаптации битрейта.
+        """
+        try:
+            return self._get("/stats/loss")
+        except Exception:
+            return None
+
     # ──────────────────────────────────────────────────────────────────────────
     # Внутренние HTTP helpers
     # ──────────────────────────────────────────────────────────────────────────

@@ -245,7 +245,14 @@ async fn send_loop(
 
     let frame_dur = Duration::from_secs_f64(1.0 / fps as f64);
 
-    while let Some((data, _is_key)) = rx.recv().await {
+    // ── I-frame pacing ───────────────────────────────────────────────────
+    // I-кадр при 720p ≈ 80KB = ~70 RTP-пакетов. Отправка burst'ом через
+    // RadminVPN вызывает потери в буфере VPN. Добавляем паузу 30мс после
+    // I-кадра чтобы размазать пакетную нагрузку. P-кадры (~5KB) не требуют
+    // pacing — они вписываются в 2-3 RTP пакета.
+    const KEYFRAME_PACE_DELAY: Duration = Duration::from_millis(30);
+
+    while let Some((data, is_key)) = rx.recv().await {
         let sample = Sample {
             data,
             duration: frame_dur,
@@ -253,6 +260,11 @@ async fn send_loop(
         };
         if let Err(e) = track.write_sample(&sample).await {
             warn!("[WebRTC send_loop] write_sample: {e}");
+        }
+
+        // Pacing: после I-кадра даём RadminVPN время переварить burst
+        if is_key {
+            tokio::time::sleep(KEYFRAME_PACE_DELAY).await;
         }
     }
     info!("[WebRTC send_loop] frame channel closed — exiting");

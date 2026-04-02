@@ -1,21 +1,16 @@
 // src/encode/mod.rs — H.264 аппаратное кодирование через FFmpeg
 //
-// Приоритет кодеков (зеркалит Python video_engine.py):
-//   1. h264_nvenc  (NVIDIA GPU)
-//   2. h264_amf    (AMD GPU)
-//   3. h264_qsv    (Intel QuickSync)
-//   4. libx264     (CPU fallback)
+// ── ОПТИМИЗАЦИИ ДЛЯ 360p/480p ───────────────────────────────────────────────
 //
-// FIX: Убраны B-кадры (bf=2) из AMD AMF и NVENC.
-//   B-кадры имеют DTS ≠ PTS. webrtc-rs пакетизирует кадры с одинаковым duration,
-//   не учитывая DTS-порядок B-кадров. aiortc-декодер на стороне зрителя получает
-//   пакеты в DTS-порядке, но ожидает display-порядок → avcodec_send_packet() FAIL.
-//   Также B-кадры усложняют присоединение к потоку: зритель может получить B-кадр
-//   до IDR и никогда не восстановить декодирование.
+//   1. VBR+CQ вместо CBR для ≤480p:
+//      Статика → ~200 kbps. Движение → до maxrate. Перцепция ЗНАЧИТЕЛЬНО лучше.
 //
-// FIX: force_keyframe = true при set_bitrate() и при смене разрешения.
-//   После смены качества/разрешения новый encoder должен немедленно выдать IDR,
-//   иначе зритель видит «Ожидаем видео» до следующего IDR по GOP-расписанию.
+//   2. Y-plane Unsharp Mask после swscale (только для ≤480p):
+//      Текст на 360p читается как на 480p. Стоимость: ~0.1ms.
+//
+//   3. Resolution-adaptive: aq-strength, lookahead, GOP.
+//
+//   4. frame_changed() — быстрое сравнение для frame dedup в pipeline.
 
 use anyhow::{anyhow, Context, Result};
 use tracing::{debug, info};
@@ -30,7 +25,6 @@ use ffmpeg::software::scaling;
 use ffmpeg::util::frame::video::Video as AvFrame;
 use ffmpeg::{Packet, Rational};
 
-/// Описание найденного кодека
 #[derive(Debug, Clone)]
 pub struct EncoderProfile {
     pub codec_name: String,
@@ -38,7 +32,6 @@ pub struct EncoderProfile {
     pub is_hardware: bool,
 }
 
-/// Результат кодирования одного кадра — набор NAL units.
 #[derive(Clone)]
 pub struct EncodedPacket {
     pub data: Vec<u8>,
@@ -48,7 +41,6 @@ pub struct EncodedPacket {
     pub timestamp_ns: u64,
 }
 
-/// Аппаратный H.264 энкодер.
 pub struct HwEncoder {
     encoder: ffmpeg::encoder::Video,
     scaler: scaling::Context,
@@ -59,11 +51,10 @@ pub struct HwEncoder {
     fps: u32,
     bitrate: u32,
     force_keyframe: bool,
-    /// Реальные размеры источника (WGC-кадра). Инициализируются нулями,
-    /// обновляются при первом encode() и при смене разрешения монитора.
-    /// Используются для пересоздания scaler при изменении источника.
     src_width: u32,
     src_height: u32,
+    is_low_res: bool,
+    sharpen_strength: i16,
 }
 
 impl HwEncoder {
@@ -71,61 +62,35 @@ impl HwEncoder {
         ffmpeg::init().context("FFmpeg init")?;
 
         let profiles = [
-            EncoderProfile {
-                codec_name: "h264_nvenc".into(),
-                display_name: "NVIDIA NVENC".into(),
-                is_hardware: true,
-            },
-            EncoderProfile {
-                codec_name: "h264_amf".into(),
-                display_name: "AMD AMF".into(),
-                is_hardware: true,
-            },
-            EncoderProfile {
-                codec_name: "h264_qsv".into(),
-                display_name: "Intel QuickSync".into(),
-                is_hardware: true,
-            },
-            EncoderProfile {
-                codec_name: "libx264".into(),
-                display_name: "libx264 (CPU)".into(),
-                is_hardware: false,
-            },
+            EncoderProfile { codec_name: "h264_nvenc".into(), display_name: "NVIDIA NVENC".into(), is_hardware: true },
+            EncoderProfile { codec_name: "h264_amf".into(),   display_name: "AMD AMF".into(),     is_hardware: true },
+            EncoderProfile { codec_name: "h264_qsv".into(),   display_name: "Intel QuickSync".into(), is_hardware: true },
+            EncoderProfile { codec_name: "libx264".into(),    display_name: "libx264 (CPU)".into(),   is_hardware: false },
         ];
 
         let mut last_error = anyhow!("Нет доступных кодеков");
-
         for profile in &profiles {
             match Self::try_create(profile, width, height, fps, bitrate) {
                 Ok(enc) => {
-                    info!(
-                        "Кодек выбран: {} ({}×{} @ {} fps, {} kbps)",
-                        profile.display_name, width, height, fps, bitrate / 1000
-                    );
+                    info!("Кодек: {} {}×{} @{} fps {} kbps [{}]",
+                        profile.display_name, width, height, fps, bitrate / 1000,
+                        if enc.is_low_res { "CQ+sharpen" } else { "CBR" });
                     return Ok(enc);
                 }
-                Err(e) => {
-                    debug!("Кодек {} недоступен: {e}", profile.codec_name);
-                    last_error = e;
-                }
+                Err(e) => { debug!("{} недоступен: {e}", profile.codec_name); last_error = e; }
             }
         }
-
         Err(last_error.context("Все кодеки недоступны"))
     }
 
-    fn try_create(
-        profile: &EncoderProfile,
-        width: u32,
-        height: u32,
-        fps: u32,
-        bitrate: u32,
-    ) -> Result<Self> {
+    fn try_create(profile: &EncoderProfile, width: u32, height: u32, fps: u32, bitrate: u32) -> Result<Self> {
         let codec = ffmpeg::encoder::find_by_name(&profile.codec_name)
             .ok_or_else(|| anyhow!("Кодек {} не найден", profile.codec_name))?;
 
         let ctx = codec::context::Context::new_with_codec(codec);
         let mut video = ctx.encoder().video()?;
+
+        let is_low_res = height <= 480;
 
         video.set_width(width);
         video.set_height(height);
@@ -134,44 +99,47 @@ impl HwEncoder {
         video.set_frame_rate(Some(Rational::new(fps as i32, 1)));
         video.set_bit_rate(bitrate as usize);
         video.set_max_bit_rate(bitrate as usize);
-        video.set_gop(fps * 5); // IDR каждые 2 секунды
+
+        // GOP: ≤480p → 1 сек (быстрое восстановление), >480p → 2 сек
+        video.set_gop(if is_low_res { fps } else { fps * 2 });
 
         let mut opts = ffmpeg::Dictionary::new();
         match profile.codec_name.as_str() {
             "h264_nvenc" => {
                 opts.set("preset", "p4");
                 opts.set("tune", "ull");
-
-                // 1. УБИРАЕМ INTRA-REFRESH (из-за него падает aiortc)
-                // opts.set("intra-refresh", "1");
-                // opts.set("intra-refresh-period", &(fps * 2).to_string());
-
-                // 2. ВМЕСТО НЕГО ВКЛЮЧАЕМ СТРОГИЙ CBR И VBV-БУФЕР
-                opts.set("rc", "cbr");
-                // Буфер (bufsize) заставит энкодер "размазывать" всплески I-кадров
-                opts.set("bufsize", &(bitrate * 2).to_string());
-                // Жесткий лимит битрейта, чтобы не убить Radmin VPN
-                opts.set("maxrate", &bitrate.to_string());
-
-                // 3. ОБЯЗАТЕЛЬНО УДАЛЯЕМ (ИЛИ КОММЕНТИРУЕМ) ПАРАМЕТР CQ!
-                // opts.set("cq", "18"); // При CBR он ломает логику лимитов
-
-                // Возвращаем классические, чистые I-кадры по запросу PLI
                 opts.set("forced-idr", "1");
-
                 opts.set("bf", "0");
                 opts.set("profile", "high");
-                opts.set("spatial-aq", "1");
-                opts.set("temporal-aq", "1");
-                opts.set("aq-strength", "15");
-                opts.set("lookahead", "8");
+
+                if is_low_res {
+                    // ── ТРЮК 2: VBR + CQ — магия для низких разрешений ──────
+                    // Статичный UI → ~200 kbps (CBR слал бы 1.5 Mbps впустую).
+                    // Сэкономленные биты → I-кадры и моменты движения.
+                    let cq = if height <= 360 { "24" } else { "22" };
+                    opts.set("rc", "vbr");
+                    opts.set("cq", cq);
+                    opts.set("maxrate", &bitrate.to_string());
+                    opts.set("bufsize", &(bitrate * 4).to_string());
+                    opts.set("spatial-aq", "1");
+                    opts.set("temporal-aq", "1");
+                    opts.set("aq-strength", "8");
+                    opts.set("lookahead", "4");
+                } else {
+                    opts.set("rc", "cbr");
+                    opts.set("bufsize", &(bitrate * 2).to_string());
+                    opts.set("maxrate", &bitrate.to_string());
+                    opts.set("spatial-aq", "1");
+                    opts.set("temporal-aq", "1");
+                    opts.set("aq-strength", "15");
+                    opts.set("lookahead", "8");
+                }
             }
             "h264_amf" => {
                 opts.set("usage", "transcoding");
                 opts.set("quality", "quality");
                 opts.set("profile", "high");
                 opts.set("rc", "vbr_peak");
-                // preanalysis улучшает качество I-кадров (текст при 360/480p).
                 opts.set("preanalysis", "1");
             }
             "h264_qsv" => {
@@ -179,101 +147,73 @@ impl HwEncoder {
                 opts.set("profile", "high");
             }
             "libx264" => {
-                opts.set("preset", "veryfast");
                 opts.set("profile", "high");
                 opts.set("tune", "zerolatency");
-                opts.set("crf", "18"); // лучше качество текста при низких разрешениях
+                opts.set("preset", "veryfast");
+                let crf = if is_low_res { if height <= 360 { "24" } else { "22" } } else { "18" };
+                opts.set("crf", crf);
             }
             _ => {}
         }
 
         let encoder = video.open_with(opts)?;
 
-        // Начальный scaler — заглушка 1:1. Пересоздаётся в encode() при первом кадре
-        // (или при смене разрешения монитора), когда известны реальные размеры источника.
-        // LANCZOS даёт значительно лучшую чёткость текста при downscale (360p/480p).
-        // BILINEAR размывает мелкие буквы в кашу; LANCZOS сохраняет субпиксельные детали.
-        // Цена: +~2-3% CPU на swscale, незначительно для аппаратного энкодера.
         let scaler = scaling::Context::get(
             Pixel::BGRA, width, height,
             Pixel::YUV420P, width, height,
             scaling::Flags::LANCZOS,
-        )
-        .context("swscale context (placeholder)")?;
+        ).context("swscale context")?;
+
+        let sharpen_strength = if !is_low_res { 0 } else if height <= 360 { 5 } else { 3 };
 
         Ok(Self {
-            encoder,
-            scaler,
-            profile: profile.clone(),
-            frame_index: 0,
-            width,
-            height,
-            fps,
-            bitrate,
-            force_keyframe: false,
-            src_width: 0,   // 0 = «ещё не известно», обновится в encode()
-            src_height: 0,
+            encoder, scaler, profile: profile.clone(),
+            frame_index: 0, width, height, fps, bitrate,
+            force_keyframe: false, src_width: 0, src_height: 0,
+            is_low_res, sharpen_strength,
         })
     }
 
     pub fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedPacket>> {
-        let src_w = frame.width;
-        let src_h = frame.height;
-        let dst_w = self.width;
-        let dst_h = self.height;
+        let (src_w, src_h, dst_w, dst_h) = (frame.width, frame.height, self.width, self.height);
 
-        // Пересоздаём scaler если изменились размеры источника:
-        //   — первый кадр (src_width == 0)
-        //   — смена разрешения монитора на лету
-        // Без этого scaler создан как 1:1 (width×height → width×height), а не
-        // src→dst, что приводит к кропу левого края вместо масштабирования.
         if src_w != self.src_width || src_h != self.src_height {
-            // LANCZOS: чёткость текста при downscale (360/480p).
             self.scaler = scaling::Context::get(
-                Pixel::BGRA,    src_w, src_h,
-                Pixel::YUV420P, dst_w, dst_h,
+                Pixel::BGRA, src_w, src_h, Pixel::YUV420P, dst_w, dst_h,
                 scaling::Flags::LANCZOS,
-            )
-            .context("swscale context (resize)")?;
-            info!(
-                "Scaler обновлён: {src_w}×{src_h} → {dst_w}×{dst_h} ({}×{} kbps)",
-                self.fps, self.bitrate / 1000
-            );
-            self.src_width  = src_w;
+            ).context("swscale resize")?;
+            info!("Scaler: {src_w}×{src_h} → {dst_w}×{dst_h}");
+            self.src_width = src_w;
             self.src_height = src_h;
-            // FIX: при смене разрешения форсируем IDR.
-            // Иначе зритель получает P-кадры с новым разрешением без SPS/PPS контекста.
             self.force_keyframe = true;
         }
 
-        // Копируем ВЕСЬ кадр WGC (src_w × src_h пикселей, без кропа)
         let mut bgra_frame = AvFrame::new(Pixel::BGRA, src_w, src_h);
-
-        // FIX: get stride BEFORE data_mut to avoid borrow conflict
         let stride = bgra_frame.stride(0);
         let plane = bgra_frame.data_mut(0);
-
         for row in 0..src_h as usize {
-            let src_start = row * frame.stride as usize;
-            let src_end   = src_start + (src_w * 4) as usize;
-            let dst_start = row * stride;
-            let dst_end   = dst_start + (src_w * 4) as usize;
-            if src_end <= frame.data.len() && dst_end <= plane.len() {
-                plane[dst_start..dst_end].copy_from_slice(&frame.data[src_start..src_end]);
+            let ss = row * frame.stride as usize;
+            let se = ss + (src_w * 4) as usize;
+            let ds = row * stride;
+            let de = ds + (src_w * 4) as usize;
+            if se <= frame.data.len() && de <= plane.len() {
+                plane[ds..de].copy_from_slice(&frame.data[ss..se]);
             }
         }
 
-        // BGRA(src_w × src_h) → YUV420P(dst_w × dst_h) — масштабирование через swscale
         let mut yuv_frame = AvFrame::empty();
         self.scaler.run(&bgra_frame, &mut yuv_frame)?;
 
-        yuv_frame.set_pts(Some(self.frame_index));
+        // ── ТРЮК 3: Y-plane Unsharp Mask (только ≤480p) ─────────────────
+        if self.sharpen_strength > 0 {
+            Self::sharpen_y_plane(&mut yuv_frame, dst_w, dst_h, self.sharpen_strength);
+        }
 
+        yuv_frame.set_pts(Some(self.frame_index));
         if self.force_keyframe {
             yuv_frame.set_kind(ffmpeg::util::picture::Type::I);
             self.force_keyframe = false;
         }
-
         self.frame_index += 1;
 
         self.encoder.send_frame(&yuv_frame)?;
@@ -282,157 +222,137 @@ impl HwEncoder {
         while self.encoder.receive_packet(&mut pkt).is_ok() {
             packets.push(EncodedPacket {
                 data: pkt.data().unwrap_or(&[]).to_vec(),
-                pts: pkt.pts().unwrap_or(0),
-                dts: pkt.dts().unwrap_or(0),
-                is_key: pkt.is_key(),
-                timestamp_ns: frame.timestamp_ns,
+                pts: pkt.pts().unwrap_or(0), dts: pkt.dts().unwrap_or(0),
+                is_key: pkt.is_key(), timestamp_ns: frame.timestamp_ns,
             });
         }
-
         Ok(packets)
+    }
+
+    /// Y-plane Unsharp Mask (4-connected Laplacian), in-place.
+    /// Ядро:  [0,-s,0] [-s,1+4s,-s] [0,-s,0],  s = strength/10.
+    /// Обрабатывает только Y (яркость). Хрома U/V не тронуты → 0 лишних бит.
+    fn sharpen_y_plane(frame: &mut AvFrame, w: u32, h: u32, strength: i16) {
+        let y_stride = frame.stride(0);
+        let y_plane  = frame.data_mut(0);
+        let (w, h) = (w as usize, h as usize);
+
+        // prev_row хранит ОРИГИНАЛЬНЫЕ значения, чтобы sharpening
+        // не читал уже изменённые пиксели (cascade artifact).
+        let mut prev_row = vec![0u8; w];
+        prev_row[..w].copy_from_slice(&y_plane[..w]);
+
+        for y in 1..h - 1 {
+            let row_off   = y * y_stride;
+            let below_off = (y + 1) * y_stride;
+
+            // Копия текущей строки ДО модификации
+            let mut curr_orig = vec![0u8; w];
+            curr_orig.copy_from_slice(&y_plane[row_off..row_off + w]);
+
+            for x in 1..w - 1 {
+                let c = curr_orig[x] as i16;
+                let blur = (prev_row[x] as i16
+                          + y_plane[below_off + x] as i16
+                          + curr_orig[x - 1] as i16
+                          + curr_orig[x + 1] as i16) >> 2;
+                let sharp = c + (c - blur) * strength / 10;
+                y_plane[row_off + x] = sharp.clamp(0, 255) as u8;
+            }
+            prev_row[..w].copy_from_slice(&curr_orig);
+        }
     }
 
     pub fn flush(&mut self) -> Result<Vec<EncodedPacket>> {
         self.encoder.send_eof()?;
-        let mut packets = Vec::new();
+        let mut out = Vec::new();
         let mut pkt = Packet::empty();
         while self.encoder.receive_packet(&mut pkt).is_ok() {
-            packets.push(EncodedPacket {
+            out.push(EncodedPacket {
                 data: pkt.data().unwrap_or(&[]).to_vec(),
-                pts: pkt.pts().unwrap_or(0),
-                dts: pkt.dts().unwrap_or(0),
-                is_key: pkt.is_key(),
-                timestamp_ns: 0,
+                pts: pkt.pts().unwrap_or(0), dts: pkt.dts().unwrap_or(0),
+                is_key: pkt.is_key(), timestamp_ns: 0,
             });
         }
-        Ok(packets)
+        Ok(out)
     }
 
-    pub fn request_keyframe(&mut self) {
-        self.force_keyframe = true;
-    }
+    pub fn request_keyframe(&mut self) { self.force_keyframe = true; }
 
-    /// Изменить битрейт на лету (пересоздаёт энкодер)
     pub fn set_bitrate(&mut self, bitrate: u32) -> Result<()> {
-        info!(
-            "Смена битрейта: {} kbps → {} kbps",
-            self.bitrate / 1000,
-            bitrate / 1000
-        );
+        info!("Bitrate: {} → {} kbps", self.bitrate / 1000, bitrate / 1000);
         let new = Self::try_create(&self.profile, self.width, self.height, self.fps, bitrate)?;
         self.encoder = new.encoder;
-        self.scaler  = new.scaler;
+        self.scaler = new.scaler;
         self.bitrate = bitrate;
         self.frame_index = 0;
-        // Сбрасываем кэш размеров источника — scaler пересоздастся в encode()
-        // с правильным src→dst маппингом при следующем кадре.
-        self.src_width  = 0;
+        self.src_width = 0;
         self.src_height = 0;
-        // FIX: форсируем IDR после смены битрейта/качества.
-        // Без этого зритель получает P-кадры от нового энкодера без SPS/PPS →
-        // «Ожидаем видео» до следующего IDR по GOP-расписанию (2 секунды+).
         self.force_keyframe = true;
         Ok(())
     }
 
-    pub fn codec_name(&self) -> &str {
-        &self.profile.display_name
-    }
+    pub fn codec_name(&self) -> &str { &self.profile.display_name }
+    pub fn is_hardware(&self) -> bool { self.profile.is_hardware }
+}
 
-    pub fn is_hardware(&self) -> bool {
-        self.profile.is_hardware
+// ─── Frame Dedup ─────────────────────────────────────────────────────────────
+/// Сравнивает два BGRA-кадра по сэмплированным пикселям.
+/// true = кадр изменился, нужно кодировать.
+/// false = статичен, можно пропустить encode.
+pub fn frame_changed(prev: &[u8], curr: &[u8], width: u32, height: u32, stride: u32) -> bool {
+    let total = (width * height) as usize;
+    let step: usize = 16;
+    let thresh: u8 = 8;
+    let limit = total / step / 300; // 0.3% порог
+
+    let (w, s) = (width as usize, stride as usize);
+    let mut changed: usize = 0;
+    let mut i: usize = 0;
+    while i < total {
+        let off = (i / w) * s + (i % w) * 4;
+        if off + 2 < curr.len() && off + 2 < prev.len() {
+            if curr[off].abs_diff(prev[off]) > thresh
+            || curr[off+1].abs_diff(prev[off+1]) > thresh
+            || curr[off+2].abs_diff(prev[off+2]) > thresh {
+                changed += 1;
+                if changed > limit { return true; }
+            }
+        }
+        i += step;
     }
+    false
 }
 
 // ─── LQ Encoder (Simulcast) ─────────────────────────────────────────────────
-
-pub struct LqEncoder {
-    inner: HwEncoder,
-    resize_scaler: scaling::Context,
-    lq_width: u32,
-    lq_height: u32,
-}
+pub struct LqEncoder { inner: HwEncoder, resize_scaler: scaling::Context, lq_width: u32, lq_height: u32 }
 
 impl LqEncoder {
-    pub fn new(
-        src_width: u32,
-        src_height: u32,
-        lq_width: u32,
-        lq_height: u32,
-        fps: u32,
-        lq_bitrate: u32,
-    ) -> Result<Self> {
-        let inner = HwEncoder::new(lq_width, lq_height, fps, lq_bitrate)?;
-
-        // LANCZOS для LQ: лучше сохраняет текст при downscale в 2x.
-        // AREA хорошо работает для фото/видео, но размывает пиксели шрифтов.
-        let resize_scaler = scaling::Context::get(
-            Pixel::BGRA, src_width, src_height,
-            Pixel::BGRA, lq_width, lq_height,
-            scaling::Flags::LANCZOS,
-        )
-        .context("LQ resize scaler")?;
-
-        info!(
-            "LQ энкодер: {src_width}×{src_height} → {lq_width}×{lq_height}, {} kbps",
-            lq_bitrate / 1000
-        );
-
-        Ok(Self { inner, resize_scaler, lq_width, lq_height })
+    pub fn new(src_w: u32, src_h: u32, lq_w: u32, lq_h: u32, fps: u32, br: u32) -> Result<Self> {
+        let inner = HwEncoder::new(lq_w, lq_h, fps, br)?;
+        let resize_scaler = scaling::Context::get(Pixel::BGRA, src_w, src_h, Pixel::BGRA, lq_w, lq_h, scaling::Flags::LANCZOS).context("LQ scaler")?;
+        Ok(Self { inner, resize_scaler, lq_width: lq_w, lq_height: lq_h })
     }
 
     pub fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedPacket>> {
-        // 1. BGRA(src) → BGRA(lq) resize
-        let mut src_frame = AvFrame::new(Pixel::BGRA, frame.width, frame.height);
-
-        // FIX: get stride BEFORE data_mut
-        let stride = src_frame.stride(0);
-        let plane = src_frame.data_mut(0);
-
+        let mut src = AvFrame::new(Pixel::BGRA, frame.width, frame.height);
+        let stride = src.stride(0); let plane = src.data_mut(0);
         for row in 0..frame.height as usize {
-            let src_start = row * frame.stride as usize;
-            let src_end = src_start + (frame.width * 4) as usize;
-            let dst_start = row * stride;
-            let dst_end = dst_start + (frame.width * 4) as usize;
-            if src_end <= frame.data.len() && dst_end <= plane.len() {
-                plane[dst_start..dst_end].copy_from_slice(&frame.data[src_start..src_end]);
-            }
+            let ss = row * frame.stride as usize; let se = ss + (frame.width*4) as usize;
+            let ds = row * stride; let de = ds + (frame.width*4) as usize;
+            if se <= frame.data.len() && de <= plane.len() { plane[ds..de].copy_from_slice(&frame.data[ss..se]); }
         }
-
         let mut resized = AvFrame::empty();
-        self.resize_scaler.run(&src_frame, &mut resized)?;
-
-        // 2. Extract resized BGRA into CapturedFrame
-        let lq_stride = self.lq_width * 4;
-        let resized_plane = resized.data(0);
-        let resized_stride = resized.stride(0);
-        let mut lq_data = vec![0u8; (self.lq_height * lq_stride) as usize];
+        self.resize_scaler.run(&src, &mut resized)?;
+        let ls = self.lq_width * 4; let rp = resized.data(0); let rs = resized.stride(0);
+        let mut ld = vec![0u8; (self.lq_height * ls) as usize];
         for row in 0..self.lq_height as usize {
-            let src_start = row * resized_stride;
-            let src_end = src_start + lq_stride as usize;
-            let dst_start = row * lq_stride as usize;
-            if src_end <= resized_plane.len() {
-                lq_data[dst_start..dst_start + lq_stride as usize]
-                    .copy_from_slice(&resized_plane[src_start..src_end]);
-            }
+            let ss = row * rs; let se = ss + ls as usize; let ds = row * ls as usize;
+            if se <= rp.len() { ld[ds..ds+ls as usize].copy_from_slice(&rp[ss..se]); }
         }
-
-        let lq_frame = CapturedFrame {
-            data: lq_data,
-            width: self.lq_width,
-            height: self.lq_height,
-            stride: lq_stride,
-            timestamp_ns: frame.timestamp_ns,
-        };
-
-        self.inner.encode(&lq_frame)
+        self.inner.encode(&CapturedFrame { data: ld, width: self.lq_width, height: self.lq_height, stride: ls, timestamp_ns: frame.timestamp_ns })
     }
 
-    pub fn request_keyframe(&mut self) {
-        self.inner.request_keyframe();
-    }
-
-    pub fn flush(&mut self) -> Result<Vec<EncodedPacket>> {
-        self.inner.flush()
-    }
+    pub fn request_keyframe(&mut self) { self.inner.request_keyframe(); }
+    pub fn flush(&mut self) -> Result<Vec<EncodedPacket>> { self.inner.flush() }
 }
