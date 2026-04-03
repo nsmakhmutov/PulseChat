@@ -7,6 +7,7 @@ from config import (
     CMD_CHAT_MSG, CMD_CHAT_HISTORY, CMD_CHAT_HISTORY_REQ,
     CHAT_MSG_MAX_LEN, CHAT_HISTORY_MAX,
     CMD_CHAT_MEDIA, CHAT_MEDIA_MAX_B64,
+    CMD_TYPING, TYPING_THROTTLE_MS,
 )
 
 
@@ -16,6 +17,20 @@ class ChatMixin:
     # ------------------------------------------------------------------
     # Отправка
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Typing indicator
+    # ------------------------------------------------------------------
+    _last_typing_ts: float = 0.0
+
+    def send_typing(self) -> None:
+        """Отправить typing indicator (throttled, не чаще TYPING_THROTTLE_MS)."""
+        import time
+        now = time.time()
+        if now - self._last_typing_ts < TYPING_THROTTLE_MS / 1000.0:
+            return
+        self._last_typing_ts = now
+        self.send_json({'action': CMD_TYPING})
+
     def send_quick_msg(self, text: str) -> None:
         text = text.strip()[:QUICK_MSG_MAX_LEN]
         if not text:
@@ -123,6 +138,13 @@ class ChatMixin:
                 })
                 print(f"[Net] chat_history → uid={requester_uid}: "
                       f"{len(history_slice)} сообщений")
+            return True
+
+        elif act == CMD_TYPING:
+            sender_uid = int(msg.get('uid', 0))
+            sender_nick = str(msg.get('nick', '?'))
+            if sender_uid:
+                self.typing_received.emit(sender_uid, sender_nick)
             return True
 
         return False

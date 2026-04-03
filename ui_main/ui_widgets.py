@@ -271,9 +271,7 @@ class QuickMsgBubble(QWidget):
 # CustomTitleBar
 # ──────────────────────────────────────────────────────────────────────────────
 class CustomTitleBar(QWidget):
-    """Кастомный title bar. Кнопка 💬 эмитит chat_toggled(bool)."""
-
-    chat_toggled = pyqtSignal(bool)
+    """Кастомный title bar с минимизацией / максимизацией / закрытием."""
 
     def __init__(self, parent_window, title=""):
         super().__init__(parent_window)
@@ -295,14 +293,6 @@ class CustomTitleBar(QWidget):
         self._title_lbl.setObjectName("titleBarText")
         layout.addWidget(self._title_lbl, stretch=1)
 
-        self._btn_chat = QPushButton("💬")
-        self._btn_chat.setObjectName("titleBtnChat")
-        self._btn_chat.setFixedSize(30, 26)
-        self._btn_chat.setCheckable(True)
-        self._btn_chat.setToolTip("Чат (Ctrl+T)")
-        self._btn_chat.clicked.connect(lambda checked: self.chat_toggled.emit(checked))
-        layout.addWidget(self._btn_chat)
-
         _sep = QFrame()
         _sep.setFrameShape(QFrame.Shape.VLine)
         _sep.setObjectName("titleBtnSep")
@@ -314,31 +304,16 @@ class CustomTitleBar(QWidget):
         self._btn_min.setFixedSize(34, 30)
         self._btn_min.clicked.connect(parent_window.showMinimized)
 
-        self._btn_max = QPushButton("□")
-        self._btn_max.setObjectName("titleBtnMax")
-        self._btn_max.setFixedSize(34, 30)
-        self._btn_max.clicked.connect(self._toggle_maximize)
-
         self._btn_close = QPushButton("✕")
         self._btn_close.setObjectName("titleBtnClose")
         self._btn_close.setFixedSize(34, 30)
         self._btn_close.clicked.connect(parent_window.close)
 
         layout.addWidget(self._btn_min)
-        layout.addWidget(self._btn_max)
         layout.addWidget(self._btn_close)
 
     def set_title(self, title: str):
         self._title_lbl.setText(title)
-
-    def set_chat_checked(self, checked: bool) -> None:
-        self._btn_chat.setChecked(checked)
-
-    def _toggle_maximize(self):
-        if self._win.isMaximized():
-            self._win.showNormal(); self._btn_max.setText("□")
-        else:
-            self._win.showMaximized(); self._btn_max.setText("❐")
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
@@ -347,9 +322,6 @@ class CustomTitleBar(QWidget):
 
     def mouseMoveEvent(self, e):
         if e.buttons() == Qt.MouseButton.LeftButton and self._drag_pos is not None:
-            if self._win.isMaximized():
-                self._win.showNormal(); self._btn_max.setText("□")
-                self._drag_pos = QPoint(self._win.width() // 2, 20)
             self._win.move(e.globalPosition().toPoint() - self._drag_pos)
         super().mouseMoveEvent(e)
 
@@ -517,7 +489,6 @@ class ChatMessageWidget(QWidget):
                     display = url_re.sub(r'<a href="\1" style="color:#5b8ef5;">\1</a>', text)
                     t_fmt   = Qt.TextFormat.RichText
                 else:
-                    # PlainText переносит любой непрерывный текст
                     display = text
                     t_fmt   = Qt.TextFormat.PlainText
 
@@ -528,6 +499,13 @@ class ChatMessageWidget(QWidget):
                     Qt.TextInteractionFlag.TextSelectableByMouse |
                     Qt.TextInteractionFlag.LinksAccessibleByMouse)
                 t_lbl.setOpenExternalLinks(True)
+
+                # ── Link Preview Card ─────────────────────────────────
+                if has_url:
+                    first_url = url_re.search(text)
+                    if first_url:
+                        self._preview_card = _LinkPreviewCard(first_url.group(0))
+                        b_lay.addWidget(self._preview_card)
                 # ВАЖНО: не ставим qproperty-alignment в stylesheet —
                 # он перекрывает setAlignment() и текст всегда слева
                 t_lbl.setStyleSheet(
@@ -1196,6 +1174,8 @@ class _ChatInput(QLineEdit):
     """
     image_pasted = pyqtSignal(QImage)
 
+    typing_started = pyqtSignal()
+
     def keyPressEvent(self, e):
         if (e.key() == Qt.Key.Key_V
                 and e.modifiers() & Qt.KeyboardModifier.ControlModifier):
@@ -1203,8 +1183,135 @@ class _ChatInput(QLineEdit):
             img = cb.image()
             if not img.isNull():
                 self.image_pasted.emit(img)
-                return  # не вставляем текст
+                return
+        # Любая печатная клавиша → typing indicator
+        if e.text() and not e.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self.typing_started.emit()
         super().keyPressEvent(e)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Link Preview Card — показывает OG-метаданные ссылки (заголовок, описание)
+# ──────────────────────────────────────────────────────────────────────────────
+class _LinkPreviewCard(QFrame):
+    """Карточка превью ссылки (Open Graph). Загружается в фоновом потоке."""
+
+    def __init__(self, url: str, parent=None):
+        super().__init__(parent)
+        self.setObjectName("linkPreviewCard")
+        self.setStyleSheet("""
+            #linkPreviewCard {
+                background: rgba(255,255,255,0.04);
+                border: 1px solid rgba(255,255,255,0.08);
+                border-left: 3px solid #5b8ef5;
+                border-radius: 6px;
+                padding: 8px 10px;
+                margin-top: 4px;
+            }
+        """)
+        self.setMaximumWidth(400)
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(2)
+
+        self._title_lbl = QLabel("Загрузка...")
+        self._title_lbl.setStyleSheet(
+            "font-size:12px; font-weight:bold; color:#5b8ef5;"
+            " background:transparent; border:none;"
+        )
+        self._title_lbl.setWordWrap(True)
+        lay.addWidget(self._title_lbl)
+
+        self._desc_lbl = QLabel("")
+        self._desc_lbl.setStyleSheet(
+            "font-size:11px; color:rgba(200,208,224,0.7);"
+            " background:transparent; border:none;"
+        )
+        self._desc_lbl.setWordWrap(True)
+        self._desc_lbl.hide()
+        lay.addWidget(self._desc_lbl)
+
+        self._domain_lbl = QLabel(self._extract_domain(url))
+        self._domain_lbl.setStyleSheet(
+            "font-size:10px; color:rgba(140,148,175,0.6);"
+            " background:transparent; border:none;"
+        )
+        lay.addWidget(self._domain_lbl)
+
+        # Фоновая загрузка OG-метаданных
+        threading.Thread(
+            target=self._fetch_og, args=(url,), daemon=True
+        ).start()
+
+    @staticmethod
+    def _extract_domain(url: str) -> str:
+        try:
+            from urllib.parse import urlparse
+            return urlparse(url).netloc
+        except Exception:
+            return url[:40]
+
+    def _fetch_og(self, url: str) -> None:
+        """Загружает страницу и парсит og:title, og:description."""
+        try:
+            import urllib.request
+            req = urllib.request.Request(url, headers={
+                'User-Agent': 'Mozilla/5.0 (InPulse LinkPreview)',
+            })
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                # Читаем только первые 32KB — OG-теги в <head>
+                html = resp.read(32768).decode('utf-8', errors='ignore')
+
+            title = self._parse_meta(html, 'og:title') or self._parse_title(html) or url[:60]
+            desc  = self._parse_meta(html, 'og:description') or ''
+
+            # Обновляем UI из главного потока
+            from PyQt6.QtCore import QMetaObject, Qt as _Qt
+            QMetaObject.invokeMethod(
+                self._title_lbl, "setText", _Qt.ConnectionType.QueuedConnection,
+                _Qt.Q_ARG(str, title[:120]),
+            )
+            if desc:
+                QMetaObject.invokeMethod(
+                    self._desc_lbl, "setText", _Qt.ConnectionType.QueuedConnection,
+                    _Qt.Q_ARG(str, desc[:200]),
+                )
+                QMetaObject.invokeMethod(
+                    self._desc_lbl, "show", _Qt.ConnectionType.QueuedConnection,
+                )
+
+        except Exception:
+            from PyQt6.QtCore import QMetaObject, Qt as _Qt
+            QMetaObject.invokeMethod(
+                self._title_lbl, "setText", _Qt.ConnectionType.QueuedConnection,
+                _Qt.Q_ARG(str, self._extract_domain(url)),
+            )
+
+    @staticmethod
+    def _parse_meta(html: str, prop: str) -> str:
+        """Быстрый парсинг meta property без BeautifulSoup."""
+        import re
+        pat = re.compile(
+            rf'<meta[^>]+property=["\']{prop}["\'"][^>]+content=["\']([^"\'>]+)',
+            re.IGNORECASE,
+        )
+        m = pat.search(html)
+        if m:
+            return m.group(1).strip()
+        # fallback: content before property
+        pat2 = re.compile(
+            rf'<meta[^>]+content=["\']([^"\'>]+)["\'"][^>]+property=["\']{prop}',
+            re.IGNORECASE,
+        )
+        m2 = pat2.search(html)
+        return m2.group(1).strip() if m2 else ''
+
+    @staticmethod
+    def _parse_title(html: str) -> str:
+        import re
+        m = re.search(r'<title[^>]*>([^<]+)</title>', html, re.IGNORECASE)
+        return m.group(1).strip() if m else ''
 
 
 class ChatPanel(QFrame):
@@ -1214,6 +1321,7 @@ class ChatPanel(QFrame):
     """
     message_sent         = pyqtSignal(str)
     media_send_requested = pyqtSignal()
+    typing_started       = pyqtSignal()   # пользователь начал печатать
 
     PANEL_WIDTH = 600
 
@@ -1258,6 +1366,25 @@ class ChatPanel(QFrame):
         sep2.setFixedHeight(1)
         main_lay.addWidget(sep2)
 
+        # ── Typing indicator ──────────────────────────────────────────────
+        self._typing_lbl = QLabel("")
+        self._typing_lbl.setObjectName("chatTypingLbl")
+        self._typing_lbl.setFixedHeight(18)
+        self._typing_lbl.setStyleSheet(
+            "#chatTypingLbl { color: rgba(140,148,175,0.7); font-size: 11px;"
+            " font-style: italic; background: transparent; border: none;"
+            " padding-left: 14px; }"
+        )
+        self._typing_lbl.hide()
+        main_lay.addWidget(self._typing_lbl)
+
+        # Таймер гашения typing indicator (5 сек без обновления)
+        self._typing_timer = QTimer(self)
+        self._typing_timer.setSingleShot(True)
+        self._typing_timer.setInterval(5000)
+        self._typing_timer.timeout.connect(self._hide_typing)
+        self._typing_nicks: dict[int, str] = {}  # uid → nick
+
         # Поле ввода
         input_bar = QFrame()
         input_bar.setObjectName("chatInputBar")
@@ -1280,6 +1407,7 @@ class ChatPanel(QFrame):
         self._input.setMaxLength(CHAT_MSG_MAX_LEN)
         self._input.setFixedHeight(32)
         self._input.returnPressed.connect(self._on_send)
+        self._input.typing_started.connect(self.typing_started)
         self._input.image_pasted.connect(self._on_image_pasted)
         i_lay.addWidget(self._input, stretch=1)
 
@@ -1605,6 +1733,37 @@ class ChatPanel(QFrame):
                 print(f"[Chat] drop error: {ex}")
 
         threading.Thread(target=_load, daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # Typing indicator
+    # ------------------------------------------------------------------
+    def show_typing(self, uid: int, nick: str) -> None:
+        """Показать что пользователь печатает."""
+        self._typing_nicks[uid] = nick
+        self._update_typing_text()
+        self._typing_timer.start()  # перезапуск таймера
+
+    def _hide_typing(self) -> None:
+        self._typing_nicks.clear()
+        self._typing_lbl.hide()
+
+    def _update_typing_text(self) -> None:
+        nicks = list(self._typing_nicks.values())
+        if not nicks:
+            self._typing_lbl.hide()
+            return
+        if len(nicks) == 1:
+            self._typing_lbl.setText(f"{nicks[0]} печатает...")
+        elif len(nicks) <= 3:
+            self._typing_lbl.setText(", ".join(nicks) + " печатают...")
+        else:
+            self._typing_lbl.setText(f"{len(nicks)} человек печатают...")
+        self._typing_lbl.show()
+
+    def clear_typing(self, uid: int) -> None:
+        """Убрать typing для конкретного uid (после получения его сообщения)."""
+        self._typing_nicks.pop(uid, None)
+        self._update_typing_text()
 
     def _scroll_to_bottom(self) -> None:
         sb = self._scroll.verticalScrollBar()

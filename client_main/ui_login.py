@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QFrame, QLabel, QLineEdit,
     QPushButton, QCheckBox,
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QIcon
 
 from config import resource_path, USER_CONFIG_PATH, KNOWN_USERS_PATH
@@ -119,6 +119,8 @@ def load_server_name() -> str:
 class LoginWindow(QWidget):
     """Окно первичного входа: IP, ник, аватар."""
 
+    go_back = pyqtSignal()  # вернуться на экран выбора серверов
+
     def __init__(
         self,
         ip: str = "127.0.0.1",
@@ -167,6 +169,18 @@ class LoginWindow(QWidget):
         sep.setFixedHeight(1)
         sep.setStyleSheet("background: rgba(255,255,255,0.08); border: none;")
         card_lay.addWidget(sep)
+
+        # ── Кнопка «Назад» (хлебные крошки) ──────────────────────────────────
+        btn_back = QPushButton("←  Назад")
+        btn_back.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_back.setStyleSheet(
+            "QPushButton { background: transparent; color: #667799;"
+            " border: none; font-size: 12px; padding: 6px 12px;"
+            " text-align: left; }"
+            "QPushButton:hover { color: #aabbdd; }"
+        )
+        btn_back.clicked.connect(self._on_go_back)
+        card_lay.addWidget(btn_back, alignment=Qt.AlignmentFlag.AlignLeft)
 
         layout = QVBoxLayout()
         layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -286,6 +300,11 @@ class LoginWindow(QWidget):
     def _hide_error(self):
         self.frm_error.hide()
         self.lbl_error.clear()
+
+    def _on_go_back(self):
+        """Возврат на экран выбора серверов."""
+        self.go_back.emit()
+        self.close()
 
     # ── Логин ─────────────────────────────────────────────────────────────────
 

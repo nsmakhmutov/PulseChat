@@ -127,6 +127,15 @@ def main():
                 ) if f_ip else "",
             )
             _login_window.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
+
+            def _back_to_servers():
+                nonlocal _connect_screen
+                _connect_screen = MultiServerScreen(nick, avatar, server_name=server_name)
+                _connect_screen.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
+                _connect_screen.open_login.connect(_fallback_to_login)
+                _connect_screen.show()
+
+            _login_window.go_back.connect(_back_to_servers)
             _login_window.show()
 
         _connect_screen.open_login.connect(_fallback_to_login)

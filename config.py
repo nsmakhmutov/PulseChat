@@ -181,6 +181,17 @@ CHAT_MEDIA_MAX_B64   = 10_000_000
 CMD_HOST_MUTE   = 'host_mute'
 CMD_FORCE_MUTED = 'force_muted'
 
+# ── Typing indicator ──────────────────────────────────────────────────────────
+CMD_TYPING         = 'typing'
+TYPING_THROTTLE_MS = 3000    # клиент шлёт не чаще одного раза в 3 секунды
+TYPING_EXPIRE_SEC  = 5.0     # "печатает" гаснет через 5 секунд без обновления
+
+# ── SQLite чат (хост хранит историю на диске) ────────────────────────────────
+CHAT_DB_PATH = os.path.join(get_appdata_dir(), "chat_history.db")
+
+# ── Единый конфиг приложения ─────────────────────────────────────────────────
+APP_CONFIG_PATH = os.path.join(get_appdata_dir(), "inpulse_config.json")
+
 # ── Аннотации стрима: рисование зрителем поверх стрима ──────────────────────
 # Зритель рисует → клиент отправляет draw_stroke серверу.
 # Сервер ретранслирует всем зрителям + стримеру.

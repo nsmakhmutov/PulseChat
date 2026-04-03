@@ -81,6 +81,9 @@ class NetworkClient(WebRTCMixin, ChatMixin, FeaturesMixin, QObject):
 
     draw_stroke_received = pyqtSignal(int, str, str, list, int)
 
+    # Typing indicator: (uid, nick) — кто-то печатает в комнате
+    typing_received = pyqtSignal(int, str)
+
     def __init__(self, audio):
         super().__init__()
         self.audio  = audio
@@ -192,9 +195,9 @@ class NetworkClient(WebRTCMixin, ChatMixin, FeaturesMixin, QObject):
 
         self._start_webrtc_loop()
 
-        if self._media_bridge is not None and not self._media_bridge.is_running():
-            if not self._media_bridge.start():
-                print("[Net] WARNING: Rust Media Engine не запустился")
+        # media-engine.exe и SFU запускаются лениво:
+        # только при start_streaming_webrtc() когда пользователь начинает стрим.
+        # Зрителям media-engine не нужен — они используют aiortc viewer PC.
 
         print("[Net] Connected to server")
 

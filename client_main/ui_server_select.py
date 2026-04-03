@@ -413,13 +413,32 @@ class MultiServerScreen(QWidget):
         root.setContentsMargins(20, 16, 20, 14)
         card_lay.addLayout(root)
 
+        # ── Заголовок + кнопка обновления (справа, как в браузерах) ─────────
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+
         self.lbl_status = QLabel("Поиск серверов в сети...")
-        self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         self.lbl_status.setStyleSheet(
             "font-size: 15px; font-weight: bold; color: #cdd6f4;"
             "background: transparent; border: none;"
         )
-        root.addWidget(self.lbl_status)
+        header_row.addWidget(self.lbl_status, stretch=1)
+
+        self.btn_retry = QPushButton("Обновить")
+        self.btn_retry.setFixedSize(90, 30)
+        self.btn_retry.setToolTip("Обновить список серверов")
+        self.btn_retry.setStyleSheet(
+            "QPushButton { background: rgba(255,255,255,0.06); color: #8899aa;"
+            " border: 1px solid rgba(255,255,255,0.10); border-radius: 6px;"
+            " font-size: 12px; padding: 0; }"
+            "QPushButton:hover { background: rgba(255,255,255,0.14); color: #fff; }"
+        )
+        self.btn_retry.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_retry.clicked.connect(self._start_discovery)
+        header_row.addWidget(self.btn_retry)
+
+        root.addLayout(header_row)
 
         # Список серверов
         scroll = QScrollArea()
@@ -477,33 +496,18 @@ class MultiServerScreen(QWidget):
         self.btn_create.setStyleSheet(BTN_CREATE_SS)
         self.btn_create.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_create.clicked.connect(self._on_create_server)
-        bot_row.addWidget(self.btn_create, stretch=2)
+        bot_row.addWidget(self.btn_create, stretch=1)
 
-        self.btn_retry = QPushButton("🔁")
-        self.btn_retry.setFixedWidth(40)
-        self.btn_retry.setToolTip("Обновить список серверов")
-        self.btn_retry.setStyleSheet(
-            "QPushButton { background: rgba(255,255,255,0.10); color: #aab4c8;"
-            " border: 1px solid rgba(255,255,255,0.16); border-radius: 8px;"
-            " font-size: 16px; padding: 6px; }"
-            "QPushButton:hover { background: rgba(255,255,255,0.18); color: #fff; }"
-        )
-        self.btn_retry.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_retry.clicked.connect(self._start_discovery)
-        bot_row.addWidget(self.btn_retry)
-
-        self.btn_manual = QPushButton("✏️  IP")
-        self.btn_manual.setFixedWidth(56)
-        self.btn_manual.setToolTip("Ввести IP вручную")
+        self.btn_manual = QPushButton("✏️  Ввести вручную")
+        self.btn_manual.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_manual.setStyleSheet(
-            "QPushButton { background: rgba(255,255,255,0.08); color: #8899aa;"
+            "QPushButton { background: rgba(255,255,255,0.08); color: #8899bb;"
             " border: 1px solid rgba(127,140,141,0.35); border-radius: 8px;"
-            " font-size: 13px; padding: 6px; }"
+            " font-size: 13px; font-weight: 600; padding: 10px 0; }"
             "QPushButton:hover { background: rgba(149,165,166,0.28); color: #c8d0e0; }"
         )
-        self.btn_manual.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_manual.clicked.connect(self._on_manual_ip)
-        bot_row.addWidget(self.btn_manual)
+        bot_row.addWidget(self.btn_manual, stretch=1)
 
         root.addLayout(bot_row)
 

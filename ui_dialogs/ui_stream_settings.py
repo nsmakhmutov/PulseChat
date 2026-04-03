@@ -130,18 +130,6 @@ class StreamSettingsDialog(QDialog):
         self.res_combo.setCurrentIndex(1)
         layout.addWidget(self.res_combo)
 
-        # Примечание о simulcast
-        self._simulcast_lbl = QLabel(
-            "ℹ️ Simulcast: параллельно транслируется LQ-поток (половинное\n"
-            "разрешение) для зрителей с медленным каналом или слабым ПК."
-        )
-        self._simulcast_lbl.setStyleSheet(
-            "background-color: rgba(35,60,100,0.45); color: #a8c8e8; "
-            "border-radius: 6px; padding: 7px; font-size: 11px;"
-        )
-        self._simulcast_lbl.setWordWrap(True)
-        layout.addWidget(self._simulcast_lbl)
-
         # ── FPS ───────────────────────────────────────────────────────────────
         layout.addWidget(QLabel("Частота кадров (FPS):"))
         self.fps_combo = QComboBox()
@@ -173,33 +161,12 @@ class StreamSettingsDialog(QDialog):
         QTimer.singleShot(0, lambda: _fix_stream_combo(self.res_combo))
         QTimer.singleShot(0, lambda: _fix_stream_combo(self.fps_combo))
 
-
         layout.addSpacing(10)
 
         # ── Аудио ─────────────────────────────────────────────────────────────
-        sep = QLabel("── Аудио трансляции ──────────────────")
-        sep.setStyleSheet("color: gray; font-size: 11px;")
-        layout.addWidget(sep)
-
         self.cb_stream_audio = QCheckBox("🔊 Транслировать звук")
         self.cb_stream_audio.setChecked(True)
         layout.addWidget(self.cb_stream_audio)
-
-        self._hint_lbl = QLabel(
-            "ℹ️  Захват системного звука через WASAPI Loopback.\n"
-            "Зрители будут слышать то, что играет на вашем ПК."
-        )
-        self._hint_lbl.setStyleSheet(
-            "background-color: rgba(22,75,107,0.55); color: #aed6f1; "
-            "border-radius: 6px; padding: 8px; font-size: 11px;"
-        )
-        self._hint_lbl.setWordWrap(True)
-        self._hint_lbl.setVisible(True)
-        layout.addWidget(self._hint_lbl)
-
-        self.cb_stream_audio.toggled.connect(
-            lambda checked: self._hint_lbl.setVisible(checked)
-        )
 
         layout.addSpacing(8)
 

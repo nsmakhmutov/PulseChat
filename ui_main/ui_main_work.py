@@ -329,12 +329,7 @@ class MainWindow(QMainWindow):
 
     def setup_ui(self):
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — {self.nick}")
-        # Минимальная ширина рассчитана по содержимому bottom_bar:
-        # margin(12) + mute(46)+sp(8) + deafen(46)+sp(8) + sb(46)+sp(8)
-        # + stream(46)+sp(8) + lobby(46) + stretch(0)
-        # + latency(64)+sp(8) + settings(46) + margin(12) = 404 px
-        # + stream_conn_lbl(22)+sp(8) когда видим = 434 px → округляем до 440.
-        self.setMinimumSize(440, 500)
+        self.setMinimumSize(400, 600)
         self.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
         # Прозрачность по краям окна — углы и 4px внешний отступ становятся
@@ -449,6 +444,7 @@ class MainWindow(QMainWindow):
         self._btn_chat_main.clicked.connect(
             lambda checked: self._toggle_chat_panel(checked)
         )
+        self._chat_has_unread = False
         layout.addWidget(self._btn_chat_main)
 
         # ── Нижняя панель кнопок управления ─────────────────────────────────
@@ -521,13 +517,13 @@ class MainWindow(QMainWindow):
             QIcon(resource_path("assets/icon/connection_bad.svg")).pixmap(QSize(22, 22))
         )
 
-        # ── Пинг (текст с цифрами, не иконка) ──────────────────────────────────
-        self._latency_btn = QPushButton("-- мс")
-        self._latency_btn.setFixedSize(64, 46)
-        self._latency_btn.setObjectName("barBtn")
-        self._latency_btn.setStyleSheet(
-            "QPushButton#barBtn { font-size: 11px; font-weight: bold;"
-            " color: #8899aa; padding: 4px; }"
+        # ── Пинг (компактный текст, не кнопка) ────────────────────────────────
+        self._latency_lbl = QLabel("--")
+        self._latency_lbl.setFixedSize(46, 20)
+        self._latency_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._latency_lbl.setStyleSheet(
+            "font-size: 10px; font-weight: bold; color: #8899aa;"
+            "background: transparent; border: none;"
         )
 
         btn_set = QPushButton()
@@ -537,6 +533,13 @@ class MainWindow(QMainWindow):
         btn_set.setIconSize(QSize(26, 26))
         btn_set.clicked.connect(self.open_settings)
 
+        # Пинг + настройки в вертикальном мини-стеке справа
+        _right_col = QVBoxLayout()
+        _right_col.setContentsMargins(0, 0, 0, 0)
+        _right_col.setSpacing(0)
+        _right_col.addWidget(self._latency_lbl, alignment=Qt.AlignmentFlag.AlignCenter)
+        _right_col.addWidget(btn_set, alignment=Qt.AlignmentFlag.AlignCenter)
+
         btns.addWidget(self.btn_mute)
         btns.addWidget(self.btn_deafen)
         btns.addWidget(self.btn_sb)
@@ -544,8 +547,7 @@ class MainWindow(QMainWindow):
         btns.addWidget(self._stream_conn_lbl)
         btns.addWidget(self.btn_lobby)
         btns.addStretch()
-        btns.addWidget(self._latency_btn)
-        btns.addWidget(btn_set)
+        btns.addLayout(_right_col)
 
         layout.addWidget(self._bottom_bar)
 
@@ -1516,6 +1518,33 @@ class MainWindow(QMainWindow):
         self._btn_chat_main.setChecked(checked)
         self._btn_chat_main.blockSignals(False)
 
+        # Сбрасываем индикатор "новое сообщение" при открытии
+        if checked and self._chat_has_unread:
+            self._chat_has_unread = False
+            self._btn_chat_main.setText("💬  Чат")
+            self._btn_chat_main.setStyleSheet("""
+                QPushButton#btnChatMain {
+                    background-color: rgba(255, 255, 255, 0.04);
+                    border: 1px solid rgba(255, 255, 255, 0.08);
+                    border-radius: 8px;
+                    color: #8899bb;
+                    font-size: 13px;
+                    font-weight: 600;
+                    letter-spacing: 0.5px;
+                    margin: 4px 0px 2px 0px;
+                }
+                QPushButton#btnChatMain:hover {
+                    background-color: rgba(255, 255, 255, 0.08);
+                    border-color: rgba(255, 255, 255, 0.15);
+                    color: #c8d0e0;
+                }
+                QPushButton#btnChatMain:checked {
+                    background-color: rgba(91, 142, 245, 0.12);
+                    border-color: rgba(91, 142, 245, 0.35);
+                    color: #5b8ef5;
+                }
+            """)
+
     def _on_typing_received(self, uid: int, nick: str) -> None:
         """Typing indicator: другой пользователь печатает в чате."""
         if uid != self.audio.my_uid:
@@ -1531,11 +1560,29 @@ class MainWindow(QMainWindow):
         self._chat_panel.add_message(entry)
         is_own = (entry.get('uid', 0) == self.audio.my_uid)
         if is_own:
-            # Собственное сообщение подтверждено сервером — звук отправки
             self.play_notification("chat_msg_out")
         else:
-            # Чужое сообщение
             self.play_notification("chat_msg_in")
+            # Показываем индикатор если чат закрыт
+            if not self._chat_panel.isVisible():
+                self._chat_has_unread = True
+                self._btn_chat_main.setText("💬  Чат                    новое сообщение")
+                self._btn_chat_main.setStyleSheet("""
+                    QPushButton#btnChatMain {
+                        background-color: rgba(255, 255, 255, 0.04);
+                        border: 1px solid rgba(231, 76, 60, 0.35);
+                        border-radius: 8px;
+                        color: #e88;
+                        font-size: 13px;
+                        font-weight: 600;
+                        margin: 4px 0px 2px 0px;
+                    }
+                    QPushButton#btnChatMain:hover {
+                        background-color: rgba(231, 76, 60, 0.08);
+                        border-color: rgba(231, 76, 60, 0.50);
+                        color: #ff9999;
+                    }
+                """)
 
     def _on_chat_history_received(self, messages: list) -> None:
         """История чата получена (при подключении) — загружаем в панель."""
@@ -1560,6 +1607,23 @@ class MainWindow(QMainWindow):
         self._chat_panel.add_message(entry)
         if entry.get('uid', 0) != self.audio.my_uid:
             self.play_notification("chat_msg_in")
+            if not self._chat_panel.isVisible() and not self._chat_has_unread:
+                self._chat_has_unread = True
+                self._btn_chat_main.setText("💬  Чат                    новое сообщение")
+                self._btn_chat_main.setStyleSheet("""
+                    QPushButton#btnChatMain {
+                        background-color: rgba(255, 255, 255, 0.04);
+                        border: 1px solid rgba(231, 76, 60, 0.35);
+                        border-radius: 8px; color: #e88;
+                        font-size: 13px; font-weight: 600;
+                        margin: 4px 0px 2px 0px;
+                    }
+                    QPushButton#btnChatMain:hover {
+                        background-color: rgba(231, 76, 60, 0.08);
+                        border-color: rgba(231, 76, 60, 0.50);
+                        color: #ff9999;
+                    }
+                """)
 
     def _on_quick_msg_received(self, sender_uid: int, from_nick: str, text: str):
         """
@@ -2042,14 +2106,11 @@ class MainWindow(QMainWindow):
                     col = "#f1c40f"
                 else:
                     col = "#e74c3c"
-                self._latency_btn.setStyleSheet(
-                    f"QPushButton#barBtn {{"
-                    f"  font-size: 11px; font-weight: bold;"
-                    f"  color: {col}; padding: 4px;"
-                    f"}}"
+                self._latency_lbl.setStyleSheet(
+                    f"font-size: 10px; font-weight: bold; color: {col};"
+                    f"background: transparent; border: none;"
                 )
-            # Обновляем текст при каждом вызове (пинг меняется чаще чем зона)
-            self._latency_btn.setText(f"{ping} мс")
+            self._latency_lbl.setText(f"{ping} мс")
 
             # FIX: perf_counter() — синхронизируем с last_packet_time и last_voice_time
             # в audio_engine (тоже переведены на perf_counter). time.time() и

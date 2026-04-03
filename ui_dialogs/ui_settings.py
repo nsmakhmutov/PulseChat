@@ -6,8 +6,8 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QSc
                              QWidget, QLabel, QSlider, QTabWidget, QComboBox, QFrame,
                              QGroupBox, QSizePolicy, QFileDialog, QMessageBox,
                              QLineEdit, QCheckBox, QProgressBar)
-from PyQt6.QtCore import (Qt, QSize, QSettings, QTimer, pyqtSignal, QObject)
-from PyQt6.QtGui import QIcon, QPainter, QColor, QPen, QStandardItem
+from PyQt6.QtCore import (Qt, QSize, QSettings, QTimer, pyqtSignal, QObject, QPoint)
+from PyQt6.QtGui import QIcon, QPainter, QColor, QPen, QStandardItem, QPolygon
 
 from config import (resource_path, USER_CONFIG_PATH, KNOWN_USERS_PATH)
 from audio_engine import PYRNNOISE_AVAILABLE
@@ -25,53 +25,89 @@ from .ui_dialogs import (
 # ──────────────────────────────────────────────────────────────────────────────
 class MicVadWidget(QWidget):
     """
-    Комбинированный виджет: отображает уровень микрофона (зелёная полоса)
-    и порог VAD (красная вертикальная линия) в одном пространстве.
-    Так пользователь сразу видит, насколько нужно поднять/опустить громкость
-    относительно порога активации.
+    Комбинированный виджет: VU-метр + встроенный порог VAD.
+    Перетаскивание мышью по полосе меняет порог.
+    Плавные цвета, без кислотного зелёного.
     """
+    threshold_changed = pyqtSignal(int)  # slider_val 1-50
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._level = 0          # 0–100 (из volume_level_signal)
-        self._threshold_pos = 10 # 0–100 (позиция на полосе)
-        self.setMinimumHeight(30)
+        self._level = 0          # 0–100
+        self._smooth_level = 0.0 # для плавной анимации
+        self._threshold_pos = 10 # 0–100
+        self._dragging = False
+        self.setMinimumHeight(32)
+        self.setMaximumHeight(32)
         self.setMinimumWidth(200)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def set_level(self, val: int):
-        self._level = max(0, min(100, val))
+        target = max(0, min(100, val))
+        # Плавная анимация: быстро вверх, медленно вниз
+        if target > self._smooth_level:
+            self._smooth_level = self._smooth_level * 0.3 + target * 0.7
+        else:
+            self._smooth_level = self._smooth_level * 0.85 + target * 0.15
+        self._level = int(self._smooth_level)
         self.update()
 
     def set_threshold(self, slider_val: int):
-        # slider_val: 1–50 → позиция 2–100 на полосе (slider_val * 2)
         self._threshold_pos = max(0, min(100, slider_val * 2))
         self.update()
 
+    def _pos_to_slider(self, x: int) -> int:
+        ratio = max(0.0, min(1.0, x / max(1, self.width())))
+        return max(1, min(50, int(ratio * 50)))
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._dragging = True
+            sv = self._pos_to_slider(int(e.position().x()))
+            self.set_threshold(sv)
+            self.threshold_changed.emit(sv)
+
+    def mouseMoveEvent(self, e):
+        if self._dragging:
+            sv = self._pos_to_slider(int(e.position().x()))
+            self.set_threshold(sv)
+            self.threshold_changed.emit(sv)
+
+    def mouseReleaseEvent(self, e):
+        self._dragging = False
+
     def paintEvent(self, event):
         p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
 
-        # Фон
-        p.fillRect(0, 0, w, h, QColor("#2a2a2a"))
+        # Фон скруглённый
+        p.setBrush(QColor(35, 38, 52))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawRoundedRect(0, 0, w, h, 6, 6)
 
-        # Полоса уровня микрофона
+        # Полоса уровня — мягкий градиент
         bar_w = int(self._level / 100.0 * w)
-        if self._level < self._threshold_pos:
-            bar_color = QColor("#e74c3c")   # ниже порога — красный
-        else:
-            bar_color = QColor("#2ecc71")   # выше порога — зелёный
-        p.fillRect(0, 0, bar_w, h, bar_color)
+        if bar_w > 0:
+            if self._level < self._threshold_pos:
+                bar_color = QColor(180, 80, 70, 180)    # приглушённый красный
+            else:
+                bar_color = QColor(80, 180, 120, 200)   # мягкий зелёный
+            p.setBrush(bar_color)
+            p.drawRoundedRect(0, 0, bar_w, h, 6, 6)
 
-        # Маркер порога VAD — вертикальная красная линия
-        threshold_x = int(self._threshold_pos / 100.0 * w)
-        pen = QPen(QColor("#ff4444"), 2)
+        # Маркер порога — треугольник сверху + вертикальная линия
+        tx = int(self._threshold_pos / 100.0 * w)
+        pen = QPen(QColor(255, 100, 80, 200), 2)
         p.setPen(pen)
-        p.drawLine(threshold_x, 0, threshold_x, h)
+        p.drawLine(tx, 4, tx, h - 4)
+        # Маленький треугольник-ручка сверху
+        p.setBrush(QColor(255, 100, 80))
+        p.setPen(Qt.PenStyle.NoPen)
+        tri = [QPoint(tx - 4, 0), QPoint(tx + 4, 0), QPoint(tx, 6)]
+        p.drawPolygon(QPolygon(tri))
 
-        # Тонкая рамка
-        p.setPen(QPen(QColor("#555555"), 1))
-        p.drawRect(0, 0, w - 1, h - 1)
         p.end()
 
 
@@ -526,7 +562,7 @@ class SettingsDialog(QDialog):
         # каждого комбобокса и снимаем флаг TranslucentBackground с его окна.
         QTimer.singleShot(0, self._fix_combo_popups)
 
-    # ── Вкладка «О себе» ──────────────────────────────────────────────────────
+    # ── Вкладка «Главное» ──────────────────────────────────────────────────────
     def setup_profile_tab(self):
         tab = QWidget()
         lay = QVBoxLayout(tab)
@@ -545,8 +581,56 @@ class SettingsDialog(QDialog):
         self.ed_nick = QLineEdit(self.mw.nick)
         lay.addWidget(self.ed_nick)
 
+        # ── Очистка кеша сервера ─────────────────────────────────────────────
+        lay.addSpacing(20)
+        sep_cache = QLabel("── Данные сервера ─────────────────────")
+        sep_cache.setStyleSheet("color: gray; font-size: 11px;")
+        lay.addWidget(sep_cache)
+
+        from ui_dialogs.ui_dialogs import NudgeHoldButton
+
+        btn_clear_cache = NudgeHoldButton("🗑  Удерживайте 3 сек — очистить кеш")
+        btn_clear_cache.setToolTip("Удаляет локальную историю чата (SQLite)")
+        btn_clear_cache.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(231,76,60,0.15);
+                color: #e88;
+                border: 1px solid rgba(231,76,60,0.30);
+                border-radius: 7px;
+                padding: 8px 14px;
+                font-size: 13px;
+            }
+            QPushButton:hover {
+                background-color: rgba(231,76,60,0.30);
+                border-color: rgba(231,76,60,0.60);
+                color: #fff;
+            }
+        """)
+        btn_clear_cache.hold_complete.connect(self._on_clear_server_cache)
+        lay.addWidget(btn_clear_cache)
+
         lay.addStretch()
-        self.tabs.addTab(tab, "О себе")
+        self.tabs.addTab(tab, "Главное")
+
+    def _on_clear_server_cache(self):
+        """Очищает SQLite историю чата через открытое соединение."""
+        try:
+            from server import EmbeddedServerManager
+            mgr = EmbeddedServerManager.get()
+            srv = getattr(mgr, '_server', None)
+            chat_db = getattr(srv, '_chat_db', None) if srv else None
+
+            if chat_db is not None:
+                chat_db.clear()
+            else:
+                from config import CHAT_DB_PATH
+                import os
+                for path in [CHAT_DB_PATH, CHAT_DB_PATH + '-wal', CHAT_DB_PATH + '-shm']:
+                    if os.path.exists(path):
+                        os.remove(path)
+            print("[Settings] Кеш сервера очищен")
+        except Exception as e:
+            print(f"[Settings] Ошибка очистки: {e}")
 
     # ── Вкладка «Аудио» ───────────────────────────────────────────────────────
     def setup_audio_tab(self):
@@ -645,23 +729,11 @@ class SettingsDialog(QDialog):
         self.audio.volume_level_signal.connect(self.mic_vad.set_level)
         mic_lay.addWidget(self.mic_vad)
 
-        # Ползунок VAD — прямо под полосой, одинаковой ширины
+        # Ползунок VAD встроен в MicVadWidget (перетаскивание мышью)
         vad_slider_val = int(self.app_settings.value("vad_threshold_slider", 5))
-        self.lbl_vad = QLabel()
-        self._update_vad_label(vad_slider_val)
-        self.lbl_vad.setStyleSheet("font-size: 12px; font-weight: normal;")
-        mic_lay.addWidget(self.lbl_vad)
-
-        self.sl_vad = QSlider(Qt.Orientation.Horizontal)
-        self.sl_vad.setRange(1, 50)
-        self.sl_vad.setValue(vad_slider_val)
-        self.sl_vad.setTickPosition(QSlider.TickPosition.TicksBelow)
-        self.sl_vad.setTickInterval(5)
-        self.sl_vad.valueChanged.connect(self._on_vad_slider_changed)
-        mic_lay.addWidget(self.sl_vad)
-
-        # Инициализируем начальное положение маркера
+        self._current_vad_val = vad_slider_val
         self.mic_vad.set_threshold(vad_slider_val)
+        self.mic_vad.threshold_changed.connect(self._on_vad_slider_changed)
 
         aud_lay.addWidget(mic_group)
 
@@ -1404,24 +1476,8 @@ class SettingsDialog(QDialog):
         self.cb_in.setCurrentText(s_in)
         self.cb_out.setCurrentText(s_out)
 
-    def _update_vad_label(self, val: int):
-        threshold = val / 1000.0
-        if val <= 5:
-            desc = "Очень высокая"
-        elif val <= 12:
-            desc = "Высокая"
-        elif val <= 20:
-            desc = "Средняя"
-        elif val <= 35:
-            desc = "Низкая"
-        else:
-            desc = "Минимальная"
-        self.lbl_vad.setText(
-            f"Порог VAD: {threshold:.3f}  —  чувствительность: {desc}"
-        )
-
     def _on_vad_slider_changed(self, val: int):
-        self._update_vad_label(val)
+        self._current_vad_val = val
         self.audio.set_vad_threshold(val)
         self.mic_vad.set_threshold(val)
 
@@ -1484,7 +1540,7 @@ class SettingsDialog(QDialog):
         s.setValue("device_out_name", self.cb_out.currentText())
         s.setValue("system_sound_volume", self.sl_sys.value())
         s.setValue("soundboard_volume", self.sl_sb.value())
-        s.setValue("vad_threshold_slider", self.sl_vad.value())
+        s.setValue("vad_threshold_slider", self._current_vad_val)
 
         # ── Сохраняем таблицу горячих клавиш ─────────────────────────────────
         s.setValue("hk_table_count", len(self._hk_rows))

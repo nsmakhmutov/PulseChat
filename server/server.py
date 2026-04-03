@@ -2,6 +2,7 @@
 import asyncio
 import json
 import hashlib
+import os
 import secrets
 import socket
 import threading
@@ -28,7 +29,9 @@ from config import (
     CMD_CHAT_MSG, CMD_CHAT_HISTORY, CMD_CHAT_HISTORY_REQ, CHAT_MSG_MAX_LEN,
     CMD_CHAT_MEDIA, CHAT_MEDIA_MAX_B64,
     CMD_DRAW_STROKE, DRAW_MAX_POINTS,
+    CMD_TYPING, CHAT_DB_PATH, CHAT_HISTORY_MAX,
 )
+from .chat_db import ChatDB
 from .server_webrtc import PionSfuProxy
 
 
@@ -167,6 +170,15 @@ class SFUServer:
         self._media_cache_lock = threading.Lock()
         self._media_cache_max  = 30
         self._media_cache_ttl  = 300.0  # секунд
+
+        # ── SQLite чат (хост хранит историю на диске) ────────────────────────
+        self._chat_db: ChatDB | None = None
+        try:
+            self._chat_db = ChatDB()
+            print(f"[Server] SQLite чат: {CHAT_DB_PATH}")
+        except Exception as e:
+            print(f"[Server] ChatDB init error: {e}")
+            self._chat_db = None
 
     # ------------------------------------------------------------------
     # Управление каналами
@@ -1082,49 +1094,51 @@ class SFUServer:
                                     else:
                                         room_conns_cm = []
                                 if sender_uid_cm:
+                                    ts_cm = time.time()
                                     broadcast_cm = json.dumps({
                                         'action':    CMD_CHAT_MSG,
                                         'uid':       sender_uid_cm,
                                         'from_nick': sender_nick_cm,
                                         'avatar':    sender_avatar_cm,
                                         'text':      text_cm,
-                                        'ts':        time.time(),
+                                        'ts':        ts_cm,
                                         'room':      sender_room_cm or '',
                                     }).encode('utf-8')
+                                    # SQLite: сохраняем на диске
+                                    if self._chat_db:
+                                        self._chat_db.add_message({
+                                            'uid': sender_uid_cm, 'nick': sender_nick_cm,
+                                            'avatar': sender_avatar_cm, 'text': text_cm,
+                                            'room': sender_room_cm or '', 'ts': ts_cm,
+                                        })
                                     for bc in room_conns_cm:
                                         try:
                                             bc.sendall(broadcast_cm)
                                         except Exception:
                                             pass
 
-                        # ── Постоянный чат: запрос истории от нового клиента ──
-                        # Сервер пересылает запрос хосту (host_order[0]).
-                        # Хост ответит CMD_CHAT_HISTORY с target_uid=requester.
+                        # ── Постоянный чат: запрос истории (SQLite) ──────────
+                        # Сервер читает из SQLite напрямую, не relay к хосту.
                         elif action == CMD_CHAT_HISTORY_REQ:
-                            with self._host_order_lock:
-                                host_uid_ch = (
-                                    self._host_order[0]
-                                    if self._host_order else 0
+                            requester_room = None
+                            with self.clients_lock:
+                                if conn in self.clients:
+                                    requester_room = self.clients[conn].get('room', '')
+                            if requester_room:
+                                messages_db = (
+                                    self._chat_db.get_history(requester_room, CHAT_HISTORY_MAX)
+                                    if self._chat_db else []
                                 )
-                            requester_uid_ch = uid
-                            if host_uid_ch and host_uid_ch != requester_uid_ch:
-                                with self.clients_lock:
-                                    host_conn_ch = next(
-                                        (c for c, d in self.clients.items()
-                                         if d.get('uid') == host_uid_ch),
-                                        None
-                                    )
-                                if host_conn_ch:
+                                if messages_db:
                                     try:
-                                        host_conn_ch.sendall(json.dumps({
-                                            'action':        CMD_CHAT_HISTORY_REQ,
-                                            'requester_uid': requester_uid_ch,
+                                        conn.sendall(json.dumps({
+                                            'action':   CMD_CHAT_HISTORY,
+                                            'messages': messages_db,
                                         }).encode('utf-8'))
                                     except Exception:
                                         pass
 
-                        # ── Постоянный чат: хост отвечает историей ────────────
-                        # Сервер пересылает пакет конкретному target_uid.
+                        # ── Постоянный чат: relay истории (совместимость) ─────
                         elif action == CMD_CHAT_HISTORY:
                             target_uid_ch = int(msg.get('target_uid', 0))
                             messages_ch   = msg.get('messages', [])
@@ -1143,6 +1157,32 @@ class SFUServer:
                                         }).encode('utf-8'))
                                     except Exception:
                                         pass
+
+                        # ── Typing indicator ──────────────────────────────────
+                        elif action == CMD_TYPING:
+                            with self.clients_lock:
+                                if conn in self.clients:
+                                    c_t = self.clients[conn]
+                                    t_uid  = c_t['uid']
+                                    t_nick = c_t['nick']
+                                    t_room = c_t.get('room')
+                                    if t_room:
+                                        t_payload = json.dumps({
+                                            'action': CMD_TYPING,
+                                            'uid':    t_uid,
+                                            'nick':   t_nick,
+                                        }).encode('utf-8')
+                                        t_conns = [
+                                            cc for cc, cd in self.clients.items()
+                                            if cd.get('room') == t_room and cc is not conn
+                                        ]
+                                else:
+                                    t_conns = []
+                            for tc in t_conns:
+                                try:
+                                    tc.sendall(t_payload)
+                                except Exception:
+                                    pass
 
                         # ── Постоянный чат: медиа-вложение (фото/файл) ────────
                         # FIX #1: кэш пейлоадов по MD5(file_data_b64).
@@ -1240,6 +1280,16 @@ class SFUServer:
                                             bc.sendall(broadcast_md)
                                         except Exception:
                                             pass
+                                    # SQLite: сохраняем медиа на диске
+                                    if self._chat_db:
+                                        self._chat_db.add_media({
+                                            'uid': s_uid_md, 'nick': s_nick_md,
+                                            'avatar': s_avatar_md,
+                                            'room': s_room_md or '', 'ts': now_ts,
+                                            'file_name': msg.get('file_name', 'file'),
+                                            'file_type': msg.get('file_type', ''),
+                                            'file_data_b64': file_data_b64,
+                                        })
 
                         # ── Хост выключает микрофон участника ─────────────────
                         # Только mic off — уши не трогаются.
@@ -1540,6 +1590,14 @@ class SFUServer:
         """
         self._is_embedded = True
         self._accepting   = True
+
+        # Инициализируем SQLite чат при запуске встроенного сервера
+        if self._chat_db is None:
+            try:
+                self._chat_db = ChatDB()
+                print("[Server] ChatDB инициализирован")
+            except Exception as e:
+                print(f"[Server] ChatDB init error: {e}")
         self._owner_ip    = host_ip   # FIX: сохраняем IP владельца для приоритета в host_order
 
         # Pion SFU Proxy (v3) — используем singleton чтобы не плодить sidecar.exe

@@ -1065,17 +1065,6 @@ class AudioHandler(QObject):
         self._diag_cnt        += 1
 
         if curr_time >= self._diag_next_ts and self._diag_cnt > 0:
-            n = self._diag_cnt
-            v_rms = (self._diag_voice_sum  / n) ** 0.5
-            s_rms = (self._diag_stream_sum / n) ** 0.5
-            m_rms = (self._diag_mix_sum    / n) ** 0.5
-            _sa = "ДА" if self._stream_active else "нет"
-            print(
-                f"[OUT-DIAG] voice_rms={v_rms:.4f}  stream_rms={s_rms:.4f}  "
-                f"mix_rms={m_rms:.4f}  stream_active={_sa}  "
-                f"n_active={_n_active}  deafen={self._is_deafened.is_set()}",
-                flush=True,
-            )
             self._diag_voice_sum  = 0.0
             self._diag_stream_sum = 0.0
             self._diag_mix_sum    = 0.0
