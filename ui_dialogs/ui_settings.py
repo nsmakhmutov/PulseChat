@@ -583,7 +583,8 @@ class SettingsDialog(QDialog):
 
         # ── Очистка кеша сервера ─────────────────────────────────────────────
         lay.addSpacing(20)
-        sep_cache = QLabel("── Данные сервера ─────────────────────")
+        lay.addWidget(QLabel("Сервер:"))
+        sep_cache = QLabel("")
         sep_cache.setStyleSheet("color: gray; font-size: 11px;")
         lay.addWidget(sep_cache)
 

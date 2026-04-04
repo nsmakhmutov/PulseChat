@@ -449,6 +449,30 @@ class MainWindow(QMainWindow):
         self._btn_chat_main.clicked.connect(
             lambda checked: self._toggle_chat_panel(checked)
         )
+        self._chat_has_unread = False
+
+        # ── Бейдж «новое сообщение» — дочерний QLabel поверх кнопки ─────────
+        # Текст кнопки «💬  Чат» НИКОГДА не меняется — бейдж отдельный виджет.
+        self._chat_badge = QLabel("● новое", self._btn_chat_main)
+        self._chat_badge.setStyleSheet("""
+            QLabel {
+                color: #e74c3c;
+                font-size: 10px;
+                font-weight: bold;
+                background: transparent;
+                border: none;
+                padding: 0px;
+            }
+        """)
+        self._chat_badge.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._chat_badge.setVisible(False)
+
+        # Таймер мигания: 900 мс — чередует setVisible(True/False)
+        self._chat_blink_timer = QTimer(self)
+        self._chat_blink_timer.setInterval(900)
+        self._chat_blink_timer.timeout.connect(self._on_chat_badge_blink)
+        self._chat_blink_state = True
+
         layout.addWidget(self._btn_chat_main)
 
         # ── Нижняя панель кнопок управления ─────────────────────────────────
@@ -1488,6 +1512,90 @@ class MainWindow(QMainWindow):
 
     # ── Постоянный чат (ChatPanel) ─────────────────────────────────────────────
 
+    # ── Бейдж «новое сообщение» ───────────────────────────────────────────────
+
+    def _position_chat_badge(self) -> None:
+        """Позиционирует бейдж у правого края кнопки (вертикально по центру)."""
+        btn = self._btn_chat_main
+        badge = self._chat_badge
+        badge.adjustSize()
+        margin = 8
+        x = btn.width() - badge.width() - margin
+        y = (btn.height() - badge.height()) // 2
+        badge.move(x, y)
+
+    def _show_chat_badge(self) -> None:
+        """Показывает мигающий бейдж и меняет рамку кнопки на красную."""
+        if self._chat_has_unread:
+            return  # уже показан
+        self._chat_has_unread = True
+        self._position_chat_badge()
+        self._chat_badge.setVisible(True)
+        self._chat_blink_state = True
+        self._chat_blink_timer.start()
+        # Красная рамка кнопки (только border — текст «Чат» не трогаем)
+        self._btn_chat_main.setStyleSheet("""
+            QPushButton#btnChatMain {
+                background-color: rgba(255, 255, 255, 0.04);
+                border: 1px solid rgba(231, 76, 60, 0.45);
+                border-radius: 8px;
+                color: #8899bb;
+                font-size: 13px;
+                font-weight: 600;
+                letter-spacing: 0.5px;
+                margin: 4px 0px 2px 0px;
+            }
+            QPushButton#btnChatMain:hover {
+                background-color: rgba(255, 255, 255, 0.08);
+                border-color: rgba(231, 76, 60, 0.65);
+                color: #c8d0e0;
+            }
+            QPushButton#btnChatMain:checked {
+                background-color: rgba(91, 142, 245, 0.12);
+                border-color: rgba(91, 142, 245, 0.35);
+                color: #5b8ef5;
+            }
+        """)
+
+    def _hide_chat_badge(self) -> None:
+        """Скрывает бейдж, останавливает мигание, сбрасывает стиль кнопки."""
+        self._chat_has_unread = False
+        self._chat_blink_timer.stop()
+        self._chat_badge.setVisible(False)
+        self._btn_chat_main.setStyleSheet("""
+            QPushButton#btnChatMain {
+                background-color: rgba(255, 255, 255, 0.04);
+                border: 1px solid rgba(255, 255, 255, 0.08);
+                border-radius: 8px;
+                color: #8899bb;
+                font-size: 13px;
+                font-weight: 600;
+                letter-spacing: 0.5px;
+                margin: 4px 0px 2px 0px;
+            }
+            QPushButton#btnChatMain:hover {
+                background-color: rgba(255, 255, 255, 0.08);
+                border-color: rgba(255, 255, 255, 0.15);
+                color: #c8d0e0;
+            }
+            QPushButton#btnChatMain:checked {
+                background-color: rgba(91, 142, 245, 0.12);
+                border-color: rgba(91, 142, 245, 0.35);
+                color: #5b8ef5;
+            }
+        """)
+
+    def _on_chat_badge_blink(self) -> None:
+        """Слот таймера мигания — чередует видимость бейджа."""
+        self._chat_blink_state = not self._chat_blink_state
+        self._chat_badge.setVisible(self._chat_blink_state)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        """Перепозиционируем бейдж при изменении размера окна."""
+        super().resizeEvent(event)
+        if hasattr(self, '_chat_badge') and self._chat_has_unread:
+            self._position_chat_badge()
+
     def _toggle_chat_panel(self, checked: bool = None) -> None:
         """
         Открыть/закрыть ChatPanel. Окно расширяется/сжимается на PANEL_WIDTH.
@@ -1516,6 +1624,10 @@ class MainWindow(QMainWindow):
         self._btn_chat_main.setChecked(checked)
         self._btn_chat_main.blockSignals(False)
 
+        # Сбрасываем индикатор "новое сообщение" при открытии
+        if checked and self._chat_has_unread:
+            self._hide_chat_badge()
+
     def _on_typing_received(self, uid: int, nick: str) -> None:
         """Typing indicator: другой пользователь печатает в чате."""
         if uid != self.audio.my_uid:
@@ -1531,11 +1643,12 @@ class MainWindow(QMainWindow):
         self._chat_panel.add_message(entry)
         is_own = (entry.get('uid', 0) == self.audio.my_uid)
         if is_own:
-            # Собственное сообщение подтверждено сервером — звук отправки
             self.play_notification("chat_msg_out")
         else:
-            # Чужое сообщение
             self.play_notification("chat_msg_in")
+            # Показываем бейдж если чат закрыт
+            if not self._chat_panel.isVisible():
+                self._show_chat_badge()
 
     def _on_chat_history_received(self, messages: list) -> None:
         """История чата получена (при подключении) — загружаем в панель."""
@@ -1560,6 +1673,8 @@ class MainWindow(QMainWindow):
         self._chat_panel.add_message(entry)
         if entry.get('uid', 0) != self.audio.my_uid:
             self.play_notification("chat_msg_in")
+            if not self._chat_panel.isVisible():
+                self._show_chat_badge()
 
     def _on_quick_msg_received(self, sender_uid: int, from_nick: str, text: str):
         """

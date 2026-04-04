@@ -1,29 +1,6 @@
 # updater.py
 # ──────────────────────────────────────────────────────────────────────────────
 # Тихое автообновление через GitHub Releases.
-#
-# Логика работы:
-#   1. check_for_updates_async(callback) — запускает проверку в фоновом потоке.
-#   2. Делает GET https://api.github.com/repos/{owner}/{repo}/releases/latest
-#   3. Сравнивает tag_name с APP_VERSION.
-#   4. Если новее — вызывает callback(new_version: str, download_url: str).
-#   5. download_and_install(url) — скачивает .zip/.7z в %TEMP%,
-#      распаковывает, находит .exe внутри и запускает его.
-#
-# Требования к GitHub релизу:
-#   - Прикрепи файл VoiceChat.zip или VoiceChat.7z (содержащий VoiceChat.exe)
-#   - Тег релиза должен быть в формате "v1.2.3" или "1.2.3"
-#
-# Зависимости:
-#   - py7zr      (для .7z архивов)  pip install py7zr
-#   - packaging  (для SemVer)       pip install packaging
-#
-# ⚠ ВАЖНО ДЛЯ РАЗРАБОТЧИКОВ:
-#   Этот файл ДОЛЖЕН лежать в КОРНЕ проекта (рядом с run.py, config.py).
-#   Все точки вызова используют плоский импорт:  from updater import ...
-#   Корень проекта всегда добавляется в sys.path через run.py (_base).
-#   Если перенести updater.py в пакет — нужно обновить импорты во ВСЕХ файлах:
-#     ui_main/ui_main.py, ui_dialogs/ui_settings.py, client_main/ui_connecting.py
 # ──────────────────────────────────────────────────────────────────────────────
 
 import threading

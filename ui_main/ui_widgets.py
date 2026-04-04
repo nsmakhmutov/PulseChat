@@ -1403,7 +1403,7 @@ class ChatPanel(QFrame):
 
         self._input = _ChatInput()
         self._input.setObjectName("chatInput")
-        self._input.setPlaceholderText("Написать в чат… (Ctrl+V — вставить скриншот)")
+        self._input.setPlaceholderText("Сообщение ...")
         self._input.setMaxLength(CHAT_MSG_MAX_LEN)
         self._input.setFixedHeight(32)
         self._input.returnPressed.connect(self._on_send)
