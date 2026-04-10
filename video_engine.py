@@ -1,18 +1,20 @@
 # video_engine.py — WebRTC видеодвижок (aiortc)
 
 import asyncio
+import collections
 import gc
 import threading
 import time
 from fractions import Fraction
 
 import numpy as np
-from PyQt6.QtCore import QObject, pyqtSignal
+from PyQt6.QtCore import QObject, pyqtSignal, QTimer, Qt
 from PyQt6.QtGui import QImage
 
 from config import (
     VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_FPS, VIDEO_BITRATE, VIDEO_BITRATES,
     get_lq_resolution, get_bitrate_for_resolution,
+    VIEWER_JITTER_BUFFER_MS,
 )
 
 # ─── Опциональные зависимости ─────────────────────────────────────────────────
@@ -620,6 +622,15 @@ class DXCamTrackLQ(_AiortcVideoStreamTrack):
 class VideoReceiver(QObject):
     """
     Принимает один видеотрек от WebRTC и конвертирует кадры в QImage.
+
+    Jitter Buffer (VIEWER_JITTER_BUFFER_MS):
+      Кадры не отдаются на отрисовку сразу — они накапливаются в буфере.
+      Playback-таймер достаёт кадры с фиксированной задержкой относительно
+      момента прибытия. Это сглаживает jitter (разброс задержек пакетов)
+      и устраняет фризы/рывки на клиентах с высоким пингом.
+
+      VIEWER_JITTER_BUFFER_MS = 0  → буфер отключён (старое поведение)
+      VIEWER_JITTER_BUFFER_MS = 600 → 600ms задержка (оптимально для просмотра)
     """
 
     frame_received       = pyqtSignal(int, QImage)
@@ -642,7 +653,88 @@ class VideoReceiver(QObject):
         self._stats_decoded   = 0
         self._stats_last_time = time.monotonic()
 
+        # ── Jitter Buffer ────────────────────────────────────────────────
+        self._buffer_ms = VIEWER_JITTER_BUFFER_MS
+        self._jitter_buf: collections.deque = collections.deque()
+        # _buf_t0: wall-clock время прибытия первого кадра в текущей сессии
+        # _play_t0: wall-clock время начала воспроизведения (= _buf_t0 + buffer_ms)
+        self._buf_t0:  float | None = None
+        self._play_t0: float | None = None
+        self._last_emitted_img: QImage | None = None
+
+        # Playback timer — тикает с частотой VIDEO_FPS
+        self._playback_timer: QTimer | None = None
+        if self._buffer_ms > 0:
+            self._playback_timer = QTimer()
+            self._playback_timer.setTimerType(Qt.TimerType.PreciseTimer)
+            self._playback_timer.setInterval(max(1, 1000 // VIDEO_FPS))
+            self._playback_timer.timeout.connect(self._playback_tick)
+            self._playback_timer.start()
+            print(
+                f"[VideoReceiver] uid={uid}: jitter buffer = "
+                f"{self._buffer_ms} ms"
+            )
+        else:
+            print(f"[VideoReceiver] uid={uid}: jitter buffer OFF")
+
         asyncio.run_coroutine_threadsafe(self._recv_loop(), loop)
+
+    # ------------------------------------------------------------------
+    # Jitter buffer: добавить кадр (из asyncio-потока)
+    # ------------------------------------------------------------------
+
+    def _buf_push(self, q_img: QImage) -> None:
+        """
+        Кладёт кадр в jitter buffer.
+        Вызывается из _recv_loop (asyncio thread) — deque thread-safe в CPython.
+        """
+        now = time.monotonic()
+        if self._buf_t0 is None:
+            self._buf_t0 = now
+            self._play_t0 = now + self._buffer_ms / 1000.0
+        # Сохраняем: (время_прибытия, QImage)
+        self._jitter_buf.append((now, q_img))
+        # Ограничиваем размер (макс ~5 сек при 30fps = 150 кадров)
+        while len(self._jitter_buf) > 150:
+            self._jitter_buf.popleft()
+
+    # ------------------------------------------------------------------
+    # Jitter buffer: playback tick (Qt main thread)
+    # ------------------------------------------------------------------
+
+    def _playback_tick(self) -> None:
+        """
+        Вызывается QTimer каждые ~33ms.
+        Достаёт из буфера все кадры, которые «пора» показать,
+        и эмитит последний из них (остальные дропаются как устаревшие).
+        """
+        if not self._running:
+            return
+        if self._play_t0 is None:
+            return  # ещё ничего не пришло
+
+        now = time.monotonic()
+        # Время воспроизведения = сколько прошло с начала playback
+        play_elapsed = now - self._play_t0
+        if play_elapsed < 0:
+            return  # ещё копим буфер
+
+        # «Целевое» время прибытия = buf_t0 + play_elapsed
+        # Показываем все кадры, прибывшие до этого момента
+        target_arrival = self._buf_t0 + play_elapsed
+
+        frame_to_show: QImage | None = None
+        while self._jitter_buf:
+            arrival, img = self._jitter_buf[0]
+            if arrival <= target_arrival:
+                self._jitter_buf.popleft()
+                frame_to_show = img  # берём последний "созревший"
+            else:
+                break
+
+        if frame_to_show is not None:
+            self._last_emitted_img = frame_to_show
+            self.frame_received.emit(self.uid, frame_to_show)
 
     # ------------------------------------------------------------------
     # Asyncio recv loop
@@ -651,6 +743,7 @@ class VideoReceiver(QObject):
     async def _recv_loop(self) -> None:
 
         _loop = asyncio.get_running_loop()
+        _use_buffer = self._buffer_ms > 0
 
         try:
             while self._running:
@@ -682,11 +775,17 @@ class VideoReceiver(QObject):
                     q_img = QImage(
                         img_np.data, w, h, bytes_per_line,
                         QImage.Format.Format_RGB888
-                    )
-                    self.frame_received.emit(self.uid, q_img.copy())
+                    ).copy()   # .copy() — данные numpy могут быть перезаписаны
+
+                    if _use_buffer:
+                        # Кладём в jitter buffer — playback_tick эмитит позже
+                        self._buf_push(q_img)
+                    else:
+                        # Без буфера — эмитим сразу (старое поведение)
+                        self.frame_received.emit(self.uid, q_img)
 
                     self._stats_decoded += 1
-                    del img_np, q_img
+                    del img_np
 
                     now = time.monotonic()
                     if now - self._stats_last_time >= self._STATS_INTERVAL:
@@ -709,6 +808,10 @@ class VideoReceiver(QObject):
 
     def stop(self) -> None:
         self._running = False
+        if self._playback_timer is not None:
+            self._playback_timer.stop()
+            self._playback_timer = None
+        self._jitter_buf.clear()
         try:
             if hasattr(self._track, 'stop'):
                 self._track.stop()

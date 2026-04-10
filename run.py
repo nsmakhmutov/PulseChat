@@ -1,6 +1,6 @@
 # run.py — точка входа PyInstaller для InPulse
 #
-# ПОЧЕМУ ЭТОТ ПОДХОД РАБОТАЕТ:
+# ПОЧЕМУ ЯВНЫЙ ИМПОРТ РАБОТАЕТ:
 #
 #   "from client_main.client_main import main" — явный статический импорт.
 #   PyInstaller видит его при анализе зависимостей и включает модуль в сборку.
@@ -15,6 +15,8 @@
 #
 #   sys.path: PyInstaller сам добавляет _MEIPASS в sys.path для frozen exe.
 #
+
+# ── Стандартные импорты ───────────────────────────────────────────────────────
 import sys
 import os
 import logging
@@ -204,6 +206,12 @@ def _setup_logging() -> str:
 
 
 LOGS_DIR: str = _setup_logging()
+
+# ── Явный import — PyInstaller гарантированно включает updater в сборку ──────
+# hiddenimports ненадёжен для локальных .py файлов: если PyInstaller не смог
+# импортировать модуль при анализе, он молча выпадает из бандла без ошибки.
+# Статический import здесь = модуль всегда виден через граф зависимостей.
+import updater  # noqa: F401
 
 # ── Явный import — PyInstaller включает client_main.client_main в сборку ─────
 from client_main.client_main import main  # noqa: E402

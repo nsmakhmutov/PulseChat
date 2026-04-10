@@ -1266,27 +1266,19 @@ class _LinkPreviewCard(QFrame):
             title = self._parse_meta(html, 'og:title') or self._parse_title(html) or url[:60]
             desc  = self._parse_meta(html, 'og:description') or ''
 
-            # Обновляем UI из главного потока
-            from PyQt6.QtCore import QMetaObject, Qt as _Qt
-            QMetaObject.invokeMethod(
-                self._title_lbl, "setText", _Qt.ConnectionType.QueuedConnection,
-                _Qt.Q_ARG(str, title[:120]),
-            )
+            # FIX: Qt.Q_ARG убран в PyQt6 — используем QTimer.singleShot(0, lambda)
+            # QTimer.singleShot всегда выполняется в GUI-потоке через очередь событий,
+            # что потокобезопасно и не требует Q_ARG.
+            _title_safe = title[:120]
+            QTimer.singleShot(0, lambda t=_title_safe: self._title_lbl.setText(t))
             if desc:
-                QMetaObject.invokeMethod(
-                    self._desc_lbl, "setText", _Qt.ConnectionType.QueuedConnection,
-                    _Qt.Q_ARG(str, desc[:200]),
-                )
-                QMetaObject.invokeMethod(
-                    self._desc_lbl, "show", _Qt.ConnectionType.QueuedConnection,
-                )
+                _desc_safe = desc[:200]
+                _lbl_d = self._desc_lbl
+                QTimer.singleShot(0, lambda d=_desc_safe, l=_lbl_d: (l.setText(d), l.show()))
 
         except Exception:
-            from PyQt6.QtCore import QMetaObject, Qt as _Qt
-            QMetaObject.invokeMethod(
-                self._title_lbl, "setText", _Qt.ConnectionType.QueuedConnection,
-                _Qt.Q_ARG(str, self._extract_domain(url)),
-            )
+            _domain = self._extract_domain(url)
+            QTimer.singleShot(0, lambda d=_domain: self._title_lbl.setText(d))
 
     @staticmethod
     def _parse_meta(html: str, prop: str) -> str:

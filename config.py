@@ -31,7 +31,11 @@ VIDEO_WIDTH   = 1280
 VIDEO_HEIGHT  = 720
 VIDEO_FPS     = 30
 
-VIDEO_BITRATE = 6_000_000   # 6 Mbps (720p default, maxrate для CQ режима)
+# Jitter buffer для зрителя (мс). Сглаживает неравномерность доставки пакетов.
+# 0 = отключён (старое поведение), 500-700 = оптимально для просмотра стримов.
+VIEWER_JITTER_BUFFER_MS = 600
+
+VIDEO_BITRATE = 4_500_000   # 4.5 Mbps (720p default, maxrate для CQ режима)
 
 # ── HQ битрейты по разрешению ─────────────────────────────────────────────────
 #
@@ -42,7 +46,7 @@ VIDEO_BITRATES: dict = {
     (3840, 2160): 20_000_000,   # 4K     — 20 Mbps
     (2560, 1440): 12_000_000,   # 1440p  — 12 Mbps
     (1920, 1080): 10_000_000,   # 1080p  — 10 Mbps
-    (1280,  720):  6_000_000,   # 720p   —  6 Mbps
+    (1280,  720):  4_500_000,   # 720p   —  4.5 Mbps
     ( 854,  480):  2_000_000,   # 480p   —  2 Mbps (CQ экономит на статике)
     ( 640,  360):  1_000_000,   # 360p   —  1 Mbps (CQ экономит на статике)
 }
@@ -92,7 +96,7 @@ def get_bitrate_for_resolution(width: int, height: int, lq: bool = False) -> int
         return table[(width, height)]
 
     ref_w, ref_h = 1280, 720
-    ref_br = 1_000_000 if lq else 6_000_000
+    ref_br = 1_000_000 if lq else 4_500_000
     pixels = width * height
     ref_pixels = ref_w * ref_h
     estimated = int(ref_br * (pixels / ref_pixels) ** 0.75)

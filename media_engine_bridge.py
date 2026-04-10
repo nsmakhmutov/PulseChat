@@ -278,6 +278,22 @@ class MediaEngineBridge:
                 self._on_exit(code or 0)
 
     def _read_stderr(self) -> None:
+        """
+        Читает логи Rust media-engine из stderr.
+        Дополнительно парсит строки [DLL-DIAG] для watchdog аудио-захвата:
+        если RMS=0.0000 и peak=0.0000 удерживается > DLL_SILENCE_TIMEOUT секунд —
+        шлём RESTART_CAPTURE команду в Rust.
+
+        Устраняет баг из логов 03:16:25–03:17:08: DLL Capture завис,
+        RMS/peak упали в 0, что вызвало burst статичных кадров и PLI-шторм.
+        """
+        DLL_SILENCE_TIMEOUT = 3.0
+        _dll_zero_since: 'float | None' = None
+
+        import time as _time_mod
+        import re as _re
+        _dll_diag_re = _re.compile(r'\[DLL-DIAG\].*?RMS=([\d.]+).*?peak=([\d.]+)')
+
         try:
             for raw in iter(self._process.stderr.readline, b""):
                 if not self._running:
@@ -285,5 +301,27 @@ class MediaEngineBridge:
                 line = raw.decode("utf-8", errors="replace").rstrip()
                 if line:
                     self._on_log(line)
+
+                # ── DLL-DIAG watchdog ──────────────────────────────────────
+                m = _dll_diag_re.search(line)
+                if m:
+                    rms  = float(m.group(1))
+                    peak = float(m.group(2))
+                    now  = _time_mod.time()
+                    if rms == 0.0 and peak == 0.0:
+                        if _dll_zero_since is None:
+                            _dll_zero_since = now
+                        elif now - _dll_zero_since >= DLL_SILENCE_TIMEOUT:
+                            logger.warning(
+                                "[Bridge] DLL Capture RMS=0 уже %.1f сек — рестарт захвата",
+                                now - _dll_zero_since,
+                            )
+                            try:
+                                self.send_command({"cmd": "RESTART_CAPTURE"})
+                            except Exception as e:
+                                logger.warning("[Bridge] RESTART_CAPTURE error: %s", e)
+                            _dll_zero_since = now  # не спамим рестартами
+                    else:
+                        _dll_zero_since = None  # звук есть — сбрасываем
         except Exception:
             pass

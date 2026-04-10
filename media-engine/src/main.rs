@@ -152,6 +152,23 @@ async fn handle_command(cmd: Command, pipeline: &mut Option<Pipeline>) -> Result
             }
         }
 
+        Command::RestartCapture => {
+            // Python watchdog обнаружил зависание DLL Capture (RMS=0 > 3 сек).
+            // Перезапускаем только захват — WebRTC и SFU-сессия остаются живыми.
+            info!("RESTART_CAPTURE: получена команда от Python watchdog");
+            if let Some(p) = pipeline.as_mut() {
+                if let Err(e) = p.restart_capture().await {
+                    error!("RESTART_CAPTURE failed: {e:#}");
+                    let _ = ipc::send_event(&Event::Error {
+                        message: format!("restart_capture: {e}"),
+                    })
+                    .await;
+                }
+            } else {
+                warn!("RESTART_CAPTURE: нет активного pipeline — игнорируем");
+            }
+        }
+
         Command::Shutdown => {
             info!("SHUTDOWN");
             if let Some(mut p) = pipeline.take() {

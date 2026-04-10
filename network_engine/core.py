@@ -212,6 +212,23 @@ class NetworkClient(WebRTCMixin, ChatMixin, FeaturesMixin, QObject):
         self.running             = False
         self._reconnect_attempts = 0
 
+        # FIX: закрываем viewer PC до reconnect.
+        # Старый _viewer_pc привязан к упавшему ICE — новый handshake поверх него
+        # невозможен. Без явного close() Pion SFU продолжает слать PLI
+        # по мёртвому треку что создаёт PLI-шторм в Rust pipeline.
+        if self._viewer_pc is not None:
+            try:
+                self._run_in_webrtc_loop(self._close_pc_coro(self._viewer_pc))
+            except Exception:
+                pass
+            self._viewer_pc = None
+        # Останавливаем audio playback зрителя (иначе старый буфер продолжает играть)
+        if self.audio is not None and hasattr(self.audio, 'stop_stream_playback'):
+            try:
+                self.audio.stop_stream_playback()
+            except Exception:
+                pass
+
         print("[Net] Connection lost. Starting reconnect loop...")
         self.connection_lost.emit()
         threading.Thread(target=self._reconnect_loop, daemon=True).start()

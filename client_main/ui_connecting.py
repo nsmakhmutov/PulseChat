@@ -1,17 +1,14 @@
 # ui_connecting.py
 # ──────────────────────────────────────────────────────────────────────────────
-# Экран подключения к серверу с проверкой обновлений.
+# Экран подключения к серверу с обязательной проверкой обновлений.
 #
 # Поток работы:
 #   _start_probe()
-#     └─► _check_for_update_then_connect()   (первый запуск)
-#           ├─ on_update_found → _on_update_found() → _start_download()
-#           │     ├─ on_progress → прогресс-бар
-#           │     ├─ on_done    → updater вызывает sys.exit(0)
-#           │     └─ on_error   → ошибка + кнопка «Пропустить»
+#     └─► _check_for_update_then_connect()   (всегда первым делом)
+#           ├─ on_update_found → скачиваем → PS1 перезапустит приложение
 #           ├─ on_no_update  → _do_tcp_probe()
 #           └─ on_error      → _do_tcp_probe()   (fail-safe)
-#     └─► _do_tcp_probe()                    (повторная попытка)
+#     └─► _do_tcp_probe()                    (после проверки обновлений)
 # ──────────────────────────────────────────────────────────────────────────────
 
 import os
@@ -25,7 +22,7 @@ from PyQt6.QtCore import Qt, QTimer, QThread, QObject, pyqtSignal
 from PyQt6.QtGui import QIcon, QPixmap
 
 from config import resource_path, DEFAULT_PORT_TCP
-from .ui_styles import GLASS_CARD_SS, GLASS_ERROR_SS, BTN_PRIMARY_SS, BTN_SECONDARY_SS, BTN_SKIP_SS
+from .ui_styles import GLASS_CARD_SS, GLASS_ERROR_SS, BTN_PRIMARY_SS, BTN_SECONDARY_SS
 from .ui_titlebar import AppTitleBar
 
 
@@ -70,12 +67,12 @@ class _UpdaterSignals(QObject):
     PyQt6 гарантирует, что сигналы, испущенные из любого потока,
     доставляются в UI-поток через event loop — никаких мьютексов не нужно.
     """
-    update_found = pyqtSignal(str, str)   # (new_version, download_url)
+    update_found = pyqtSignal(str, int, int)   # (new_version, n_files, total_bytes)
     no_update    = pyqtSignal()
-    check_error  = pyqtSignal(str)        # message
-    dl_progress  = pyqtSignal(int)        # 0..100
+    check_error  = pyqtSignal(str)   # message
+    dl_progress  = pyqtSignal(int, str)   # (0..100, status_text)
     dl_done      = pyqtSignal()
-    dl_error     = pyqtSignal(str)        # message
+    dl_error     = pyqtSignal(str)   # message
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -98,7 +95,6 @@ class ConnectingScreen(QWidget):
         ip: str,
         nick: str,
         avatar: str,
-        skip_update_check: bool = False,
     ):
         super().__init__()
         self.ip     = ip
@@ -107,9 +103,6 @@ class ConnectingScreen(QWidget):
 
         self._worker: ConnectWorker | None = None
         self._main_window = None   # держим ссылку — GC не убьёт MainWindow
-
-        # Флаг: при повторном нажатии «Повторить» — не проверяем апдейты снова.
-        self._update_checked: bool = skip_update_check
 
         # Сигналы для безопасного взаимодействия updater-потока с UI
         self._upd_sigs = _UpdaterSignals()
@@ -232,13 +225,6 @@ class ConnectingScreen(QWidget):
 
         root.addLayout(btn_row)
 
-        # Кнопка «Пропустить обновление»
-        self.btn_skip_update = QPushButton("⏭️  Пропустить обновление и войти")
-        self.btn_skip_update.setStyleSheet(BTN_SKIP_SS)
-        self.btn_skip_update.hide()
-        self.btn_skip_update.clicked.connect(self._skip_update)
-        root.addWidget(self.btn_skip_update)
-
         self._set_image("connecting")
 
     # ── Изображение состояния ─────────────────────────────────────────────────
@@ -296,16 +282,13 @@ class ConnectingScreen(QWidget):
         self.frm_error.hide()
         self.btn_retry.hide()
         self.btn_change_ip.hide()
-        self.btn_skip_update.hide()
         self.progress_bar.hide()
         self.progress_bar.setValue(0)
         self.lbl_ip.setText(f"Адрес:  {self.ip}")
         self._set_image("connecting")
 
-        if not self._update_checked:
-            self._check_for_update_then_connect()
-        else:
-            self._do_tcp_probe()
+        # Обновление ОБЯЗАТЕЛЬНО — всегда проверяем первым делом
+        self._check_for_update_then_connect()
 
     # ── Шаг 1: Проверка обновлений ───────────────────────────────────────────
 
@@ -316,51 +299,54 @@ class ConnectingScreen(QWidget):
         sigs = self._upd_sigs
         from updater import check_for_updates_async
         check_for_updates_async(
-            on_update_found=lambda v, u: sigs.update_found.emit(v, u),
+            on_update_found=lambda v, n, b: sigs.update_found.emit(v, n, b),
             on_no_update=lambda: sigs.no_update.emit(),
             on_error=lambda msg: sigs.check_error.emit(msg),
         )
 
     def _on_no_update(self):
-        self._update_checked = True
-        print("[Updater] Версия актуальна, продолжаем подключение.")
+        print("[Updater] Версия актуальна.")
         self._do_tcp_probe()
 
     def _on_update_check_error(self, msg: str):
-        """Ошибка проверки — тихо логируем, не блокируем пользователя."""
-        self._update_checked = True
-        print(f"[Updater] Ошибка проверки (проигнорирована): {msg}")
+        """Ошибка проверки — логируем, не блокируем (fail-safe)."""
+        print(f"[Updater] Ошибка проверки: {msg}")
         self._do_tcp_probe()
 
     # ── Шаг 2а: Найдено обновление → скачиваем ───────────────────────────────
 
-    def _on_update_found(self, new_version: str, download_url: str):
-        self._update_checked = True
-        print(f"[Updater] Найдена новая версия {new_version}, скачиваем...")
+    def _on_update_found(self, new_version: str, n_files: int, total_bytes: int):
+        mb = total_bytes / (1 << 20)
+        print(f"[Updater] Найдена v{new_version}: {mb:.1f} MB")
 
-        self.lbl_status.setText(f"⬇️  Обновление {new_version}")
+        size_str = f"{mb:.1f} MB" if mb >= 0.1 else f"{total_bytes // 1024} KB"
+        self.lbl_status.setText(f"⬇️  Обновление v{new_version} ({size_str})")
         self._set_status_style("#c39ef5")
         self.progress_bar.setValue(0)
         self.progress_bar.show()
 
         sigs = self._upd_sigs
-        from updater import download_and_install
-        download_and_install(
-            download_url=download_url,
-            on_progress=lambda pct: sigs.dl_progress.emit(pct),
+        from updater import download_and_apply
+        download_and_apply(
+            on_progress=lambda pct, status: sigs.dl_progress.emit(pct, status),
             on_done=lambda: sigs.dl_done.emit(),
             on_error=lambda msg: sigs.dl_error.emit(msg),
         )
 
-    def _on_dl_progress(self, pct: int):
+    def _on_dl_progress(self, pct: int, status: str = ""):
         self.progress_bar.setValue(pct)
-        self.lbl_status.setText(f"⬇️  Скачивание обновления...  {pct}%")
+        if status:
+            self.lbl_status.setText(f"⬇️  {status}")
+        else:
+            self.lbl_status.setText(f"⬇️  Обновление...  {pct}%")
 
     def _on_dl_done(self):
-        """updater сейчас вызовет sys.exit(0). Показываем финальный статус."""
+        """PS1 скрипт применит обновление и перезапустит приложение."""
         self.progress_bar.setValue(100)
         self.lbl_status.setText("✅  Обновление установлено, перезапуск...")
         self._set_status_style("#82e0aa")
+        from PyQt6.QtWidgets import QApplication
+        QTimer.singleShot(1500, QApplication.instance().quit)
 
     def _on_dl_error(self, msg: str):
         print(f"[Updater] Ошибка скачивания: {msg}")
@@ -369,14 +355,7 @@ class ConnectingScreen(QWidget):
         self._set_status_style("#ff8080")
         self.lbl_error.setText(f"⚠️  {msg}")
         self.frm_error.show()
-        self.btn_skip_update.show()
-
-    def _skip_update(self):
-        self.frm_error.hide()
-        self.btn_skip_update.hide()
-        self.progress_bar.hide()
-        self._set_status_style("#cdd6f4")
-        self._do_tcp_probe()
+        self.btn_retry.show()
 
     # ── Шаг 2б: TCP probe ────────────────────────────────────────────────────
 
@@ -387,7 +366,6 @@ class ConnectingScreen(QWidget):
         self.frm_error.hide()
         self.btn_retry.hide()
         self.btn_change_ip.hide()
-        self.btn_skip_update.hide()
         self.progress_bar.hide()
         self._set_image("connecting")
 

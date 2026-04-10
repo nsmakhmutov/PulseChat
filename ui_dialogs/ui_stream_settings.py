@@ -118,7 +118,7 @@ class StreamSettingsDialog(QDialog):
         # оно создаёт избыточную нагрузку на RadminVPN и не даёт
         # осмысленного прироста качества при сетевой демонстрации.
         self._fixed_res_options: dict[str, tuple[int, int]] = {
-            "720p  (HD)   — 6 Mbps":  (1280, 720),
+            "720p  (HD)   — 4,5 Mbps":  (1280, 720),
             "480p  (SD)   — 2 Mbps":  ( 854, 480),
             "360p         — 1 Mbps":  ( 640, 360),
         }

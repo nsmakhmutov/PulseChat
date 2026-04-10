@@ -153,6 +153,89 @@ impl Pipeline {
         info!("Pipeline: ABR target → {} kbps", bitrate / 1000);
     }
 
+    /// Перезапускает только поток захвата экрана без остановки WebRTC/энкодера.
+    ///
+    /// Вызывается по команде RESTART_CAPTURE когда Python watchdog обнаруживает
+    /// что DLL Capture завис (RMS=0, peak=0 дольше 3 секунд).
+    ///
+    /// Алгоритм:
+    ///   1. Ставим `running = false` → старый capture_loop завершается при следующей итерации.
+    ///   2. Ждём завершения старого capture_thread (join с таймаутом 2 сек).
+    ///   3. Ставим `running = true`, создаём новый frame_channel.
+    ///   4. Запускаем новый capture_loop и новый encode_loop с тем же sender.
+    ///
+    /// WebRTC PeerConnection и Pion SFU-сессия при этом не трогаются —
+    /// зритель увидит кратковременный стоп (<2 сек) без разрыва соединения.
+    pub async fn restart_capture(&mut self) -> Result<()> {
+        info!("[Pipeline] RESTART_CAPTURE: останавливаем старый захват...");
+
+        // 1. Сигнализируем capture_loop об остановке
+        self.running.store(false, Ordering::Relaxed);
+
+        // 2. Ждём завершения capture_thread
+        if let Some(h) = self.capture_handle.take() {
+            // join() блокирует — делаем в spawn_blocking чтобы не заблокировать tokio
+            tokio::task::spawn_blocking(move || {
+                if h.join().is_err() {
+                    warn!("[Pipeline] capture_thread join error");
+                }
+            })
+            .await
+            .ok();
+        }
+
+        info!("[Pipeline] RESTART_CAPTURE: старый захват остановлен, запускаем новый...");
+
+        // 3. Возобновляем running и создаём новый frame_channel
+        self.running.store(true, Ordering::Relaxed);
+
+        let (frame_tx, mut frame_rx) = mpsc::channel::<CapturedFrame>(4);
+
+        // 4. Запускаем новый поток захвата
+        let cap_running = self.running.clone();
+        let cap_stats   = self.stats.clone();
+        let cap_config  = self.config.clone();
+
+        let capture_handle = thread::Builder::new()
+            .name("wgc-capture-restarted".into())
+            .spawn(move || {
+                capture_loop(cap_config, cap_running, cap_stats, frame_tx);
+            })
+            .context("spawn restarted capture thread")?;
+
+        self.capture_handle = Some(capture_handle);
+
+        // 5. Запускаем новый encode_loop с тем же WebRtcSender
+        //    (WebRTC соединение живо — просто начинаем кодировать снова)
+        let enc_running = self.running.clone();
+        let enc_stats   = self.stats.clone();
+        let enc_config  = self.config.clone();
+        let enc_sender  = Arc::clone(&self.webrtc_sender);
+        let enc_bitrate = Arc::clone(&self.target_bitrate);
+
+        tokio::spawn(async move {
+            if let Err(e) = encode_loop(
+                enc_config, enc_running, enc_stats,
+                &mut frame_rx, enc_sender, enc_bitrate,
+            ).await {
+                error!("Restarted encode loop error: {e:#}");
+                let _ = ipc::send_event(&Event::Error {
+                    message: format!("{e}"),
+                }).await;
+            }
+        });
+
+        info!("[Pipeline] RESTART_CAPTURE: новый захват запущен ✓");
+
+        ipc::send_event(&Event::CaptureRestarted {
+            reason: "DLL Capture watchdog: RMS=0 timeout".to_string(),
+        })
+        .await
+        .ok();
+
+        Ok(())
+    }
+
     pub async fn stop(&mut self) -> Result<()> {
         info!("Pipeline: остановка...");
         self.running.store(false, Ordering::Relaxed);

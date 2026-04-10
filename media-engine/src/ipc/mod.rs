@@ -56,6 +56,15 @@ pub enum Command {
         lq_bitrate: u32,
     },
 
+    /// Перезапустить только захват экрана/звука без остановки WebRTC.
+    ///
+    /// Посылается Python watchdog-ом из media_engine_bridge._read_stderr()
+    /// когда DLL-DIAG показывает RMS=0 и peak=0 дольше DLL_SILENCE_TIMEOUT секунд.
+    /// WebRTC-соединение, SFU-сессия и энкодер при этом остаются живыми —
+    /// зритель не видит разрыва, получает лишь кратковременный стоп видео.
+    #[serde(rename = "RESTART_CAPTURE")]
+    RestartCapture,
+
     #[serde(rename = "SHUTDOWN")]
     Shutdown,
 }
@@ -85,6 +94,11 @@ pub enum Event {
 
     #[serde(rename = "STREAM_STOPPED")]
     StreamStopped,
+
+    /// DLL Capture был перезапущен по команде RESTART_CAPTURE.
+    /// Python может использовать для диагностики / сброса watchdog-таймера.
+    #[serde(rename = "CAPTURE_RESTARTED")]
+    CaptureRestarted { reason: String },
 
     #[serde(rename = "STATS")]
     Stats {

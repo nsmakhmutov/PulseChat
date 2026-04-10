@@ -687,13 +687,42 @@ class SFUServer:
 
                         # ── Stream Start ──────────────────────────────────────
                         elif action == CMD_STREAM_START:
+                            started_uid = None
                             with self.clients_lock:
                                 if conn in self.clients:
                                     self.clients[conn]['is_streaming'] = True
                                     # Сохраняем реальный порт SFU стримера.
                                     # Клиент передаёт его в сообщении (динамический порт).
                                     self.clients[conn]['sfu_port'] = msg.get('sfu_port', 7788)
+                                    started_uid = self.clients[conn]['uid']
                                     print(f"[Server] {self.clients[conn]['nick']} запустил стрим (SFU порт={self.clients[conn]['sfu_port']})")
+
+                            # FIX: если у стримера были зрители от предыдущей сессии —
+                            # уведомляем их о возврате через 'streamer_reconnected'.
+                            # Без этого зрители навсегда остаются в "Ожидание видео...":
+                            # их _viewer_pc привязан к старому мёртвому ICE-соединению,
+                            # и они не знают что нужно заново делать WebRTC handshake.
+                            if started_uid is not None:
+                                existing_watchers: dict = {}
+                                with self.watchers_lock:
+                                    existing_watchers = dict(self.watchers.get(started_uid, {}))
+
+                                if existing_watchers:
+                                    notify = json.dumps({
+                                        'action': 'streamer_reconnected',
+                                        'streamer_uid': started_uid,
+                                    }).encode('utf-8')
+                                    notified = 0
+                                    with self.clients_lock:
+                                        for c, info in list(self.clients.items()):
+                                            if info.get('uid') in existing_watchers:
+                                                try:
+                                                    c.sendall(notify)
+                                                    notified += 1
+                                                except Exception:
+                                                    pass
+                                    print(f"[Server] streamer_reconnected uid={started_uid} → {notified} зрителей")
+
                             self._mark_dirty()
                             self.send_global_state()
 

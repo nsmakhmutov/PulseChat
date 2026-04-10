@@ -380,6 +380,12 @@ class MainWindow(QMainWindow):
         self.tree.setIconSize(QSize(32, 32))
         self.tree.setSelectionMode(QTreeWidget.SelectionMode.NoSelection)
         self.tree.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        # Убирает пустое место слева от названий комнат (# GENERAL).
+        # Qt по умолчанию резервирует колонку branch (20 px) под стрелку
+        # раскрытия корневых элементов — даже если стрелка не рисуется.
+        # setRootIsDecorated(False) отключает эту колонку для элементов
+        # верхнего уровня; дочерние элементы (пользователи) сохраняют отступ.
+        self.tree.setRootIsDecorated(False)
 
         header = self.tree.header()
         header.setStretchLastSection(False)
@@ -2911,13 +2917,12 @@ class MainWindow(QMainWindow):
             print("[Update] updater module не найден — автопроверка отключена")
             return
 
-        def _on_found(version: str, url: str):
-            # Используем QTimer чтобы обновление UI произошло в главном потоке
-            QTimer.singleShot(0, lambda: self._show_update_banner(version, url))
+        def _on_found(version: str, n_files: int, total_bytes: int):
+            QTimer.singleShot(0, lambda: self._show_update_banner(version))
 
         check_for_updates_async(on_update_found=_on_found)
 
-    def _show_update_banner(self, version: str, url: str):
+    def _show_update_banner(self, version: str):
         """Показывает зелёный баннер-кнопку с сообщением об обновлении."""
         self._update_banner.setText(
             f"🎉 Доступна новая версия v{version}  —  нажмите чтобы обновить"

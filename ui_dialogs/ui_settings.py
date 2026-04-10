@@ -718,8 +718,7 @@ class SettingsDialog(QDialog):
         mic_lay = QVBoxLayout(mic_group)
 
         hint_lbl = QLabel(
-            "Говорите в микрофон — зелёная полоса показывает уровень.\n"
-            "Красная черта — порог VAD. Поднимите полосу выше черты чтобы передать голос."
+            "Установите VAD ниже полосы голоса, чтобы передать ваш изумительный голос."
         )
         hint_lbl.setStyleSheet("font-size: 11px; color: #aaa; font-weight: normal;")
         hint_lbl.setWordWrap(True)
@@ -1247,7 +1246,7 @@ class SettingsDialog(QDialog):
     # ── Вкладка «Версия» ──────────────────────────────────────────────────────
     def setup_version_tab(self):
         class _Bridge(QObject):
-            sig_found    = pyqtSignal(str, str)
+            sig_found    = pyqtSignal(str)
             sig_no_upd   = pyqtSignal()
             sig_error    = pyqtSignal(str)
             sig_progress = pyqtSignal(int)
@@ -1301,7 +1300,6 @@ class SettingsDialog(QDialog):
         )
         self._btn_install_update.clicked.connect(self._on_install_update_clicked)
         lay.addWidget(self._btn_install_update)
-        self._pending_download_url = None
 
         self._ver_progress = QProgressBar()
         self._ver_progress.setVisible(False)
@@ -1348,8 +1346,7 @@ class SettingsDialog(QDialog):
 
     # ── Слоты обновления ──────────────────────────────────────────────────────
 
-    def _slot_update_found(self, version: str, url: str):
-        self._pending_download_url = url
+    def _slot_update_found(self, version: str):
         self._ver_status_lbl.setTextFormat(Qt.TextFormat.RichText)
         self._ver_status_lbl.setText(
             f"🎉 Доступна новая версия: <b>v{version}</b>"
@@ -1370,9 +1367,9 @@ class SettingsDialog(QDialog):
         self._ver_progress.setValue(pct)
 
     def _slot_download_done(self):
-        self._ver_status_lbl.setText(
-            "✅ Загрузка завершена. Приложение сейчас перезапустится..."
-        )
+        self._ver_status_lbl.setText("✅ Загрузка завершена. Перезапуск...")
+        from PyQt6.QtWidgets import QApplication
+        QTimer.singleShot(1500, QApplication.instance().quit)
 
     def _on_open_logs_folder(self):
         """Открывает папку с логами в Проводнике Windows (или файловом менеджере ОС)."""
@@ -1402,24 +1399,21 @@ class SettingsDialog(QDialog):
         self._ver_status_lbl.setText("⏳ Проверяю...")
         bridge = self._upd_bridge
         check_for_updates_async(
-            on_update_found=lambda v, u: bridge.sig_found.emit(v, u),
+            on_update_found=lambda v, n, b: bridge.sig_found.emit(v),
             on_no_update=lambda: bridge.sig_no_upd.emit(),
             on_error=lambda msg: bridge.sig_error.emit(msg),
         )
 
     def _on_install_update_clicked(self):
-        if not self._pending_download_url:
-            return
-        from updater import download_and_install
+        from updater import download_and_apply
         self._btn_install_update.setEnabled(False)
         self._btn_check_update.setEnabled(False)
         self._ver_progress.setVisible(True)
         self._ver_progress.setValue(0)
         self._ver_status_lbl.setText("⬇ Загружаю обновление...")
         bridge = self._upd_bridge
-        download_and_install(
-            self._pending_download_url,
-            on_progress=lambda pct: bridge.sig_progress.emit(pct),
+        download_and_apply(
+            on_progress=lambda pct, status: bridge.sig_progress.emit(pct),
             on_done=lambda: bridge.sig_done.emit(),
             on_error=lambda msg: bridge.sig_error.emit(msg),
         )

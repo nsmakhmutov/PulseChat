@@ -50,13 +50,19 @@ except ImportError:
 
 
 # ── ABR константы ─────────────────────────────────────────────────────────────
-ABR_POLL_INTERVAL   = 3.0    # секунд между опросами SFU
-ABR_LOSS_HIGH       = 5.0    # loss% — снижаем битрейт
-ABR_LOSS_LOW        = 1.0    # loss% — поднимаем битрейт
-ABR_DECREASE_FACTOR = 0.75   # множитель при снижении
-ABR_INCREASE_FACTOR = 1.10   # множитель при повышении
+
+ABR_POLL_INTERVAL   = 0.5    # было 3.0 — в 6× быстрее реакция
+ABR_LOSS_HIGH       = 4.0    # было 5.0 — реагируем раньше
+ABR_LOSS_LOW        = 0.5    # было 1.0 — поднимаем только при почти чистом канале
+ABR_DECREASE_FACTOR = 0.85   # было 0.75 — менее агрессивное снижение
+ABR_INCREASE_FACTOR = 1.05   # было 1.10 — медленнее поднимаем (меньше осцилляций)
 ABR_MIN_BITRATE     = 500_000
 ABR_MAX_BITRATE     = 20_000_000
+
+# Cooldown: минимальный интервал между двумя изменениями битрейта.
+# Нужен чтобы ABR не «пилил» битрейт туда-обратно при кратковременных
+# пиках потерь (например, одиночный burst при загрузке страницы).
+ABR_COOLDOWN_SECS   = 2.0
 
 
 class WebRTCMixin:
@@ -180,7 +186,7 @@ class WebRTCMixin:
         self._start_abr()
 
     def _start_abr(self) -> None:
-        """Запускает фоновый ABR-поток, опрашивающий SFU /stats/loss."""
+        """Запускает фоновый ABR-поток."""
         if self._abr_running:
             return
         self._abr_running = True
@@ -190,7 +196,7 @@ class WebRTCMixin:
             name="abr-loop",
         )
         self._abr_thread.start()
-        print("[ABR] Запущен")
+        print(f"[ABR] Запущен (poll={ABR_POLL_INTERVAL}s, cooldown={ABR_COOLDOWN_SECS}s)")
 
     def _stop_abr(self) -> None:
         self._abr_running = False
@@ -199,11 +205,22 @@ class WebRTCMixin:
 
     def _abr_loop(self) -> None:
         """
-        Adaptive Bitrate: опрашивает SFU /stats/loss каждые 3 секунды.
-        При высоких потерях — снижаем битрейт, при низких — поднимаем.
+        Adaptive Bitrate: опрашивает SFU /stats/loss каждые ABR_POLL_INTERVAL сек.
+
+        Логика:
+          - avg_loss > ABR_LOSS_HIGH  → снижаем на DECREASE_FACTOR
+          - avg_loss < ABR_LOSS_LOW   → поднимаем на INCREASE_FACTOR (если < max)
+          - cooldown: не меняем чаще чем раз в ABR_COOLDOWN_SECS
+
+        Изменения ≤ 20% обрабатываются Rust как "soft" (только IDR, без rebuild).
+        Изменения > 20% для NVENC/AMF — in-place AVCodecContext update.
+        Изменения > 20% для libx264/QSV — полный rebuild энкодера.
         """
+        _last_change_ts: float = 0.0
+
         while self._abr_running:
             time.sleep(ABR_POLL_INTERVAL)
+
             if not self._abr_running:
                 break
 
@@ -215,32 +232,42 @@ class WebRTCMixin:
                 if stats is None:
                     continue
 
-                avg_loss = stats.get('avg_loss_pct', 0.0)
-                avg_jitter = stats.get('avg_jitter_ms', 0.0)
+                # Нет зрителей — нечего адаптировать
+                if stats.get('viewers', 0) == 0:
+                    continue
 
-                old_br = self._abr_current_bitrate
+                avg_loss   = stats.get('avg_loss_pct',  0.0)
+                avg_jitter = stats.get('avg_jitter_ms', 0.0)
+                old_br     = self._abr_current_bitrate
+                new_br     = old_br
 
                 if avg_loss > ABR_LOSS_HIGH:
-                    # Высокие потери — снижаем
-                    new_br = int(old_br * ABR_DECREASE_FACTOR)
-                    new_br = max(ABR_MIN_BITRATE, new_br)
+                    new_br = max(ABR_MIN_BITRATE, int(old_br * ABR_DECREASE_FACTOR))
                 elif avg_loss < ABR_LOSS_LOW and old_br < self._abr_max_bitrate:
-                    # Низкие потери — плавно поднимаем
-                    new_br = int(old_br * ABR_INCREASE_FACTOR)
-                    new_br = min(self._abr_max_bitrate, new_br)
-                else:
-                    continue  # Ничего не меняем
+                    new_br = min(self._abr_max_bitrate, int(old_br * ABR_INCREASE_FACTOR))
 
-                if new_br != old_br:
-                    self._abr_current_bitrate = new_br
-                    # Отправляем новый битрейт в Rust Media Engine
-                    if self._media_bridge is not None and self._media_bridge.is_running():
-                        self._media_bridge.set_bitrate(new_br, new_br // 4)
+                if new_br == old_br:
+                    continue
+
+                # Cooldown: защита от быстрых осцилляций
+                now = time.time()
+                if now - _last_change_ts < ABR_COOLDOWN_SECS:
+                    continue
+
+                _last_change_ts = now
+                self._abr_current_bitrate = new_br
+
+                if self._media_bridge is not None and self._media_bridge.is_running():
+                    self._media_bridge.set_bitrate(new_br, new_br // 4)
+
+                if hasattr(self, 'bitrate_adjusted'):
                     self.bitrate_adjusted.emit(new_br)
-                    print(
-                        f"[ABR] {old_br//1000}→{new_br//1000} kbps "
-                        f"(loss={avg_loss:.1f}%, jitter={avg_jitter:.1f}ms)"
-                    )
+
+                direction = "↓" if new_br < old_br else "↑"
+                print(
+                    f"[ABR] {direction} {old_br // 1000}→{new_br // 1000} kbps "
+                    f"(loss={avg_loss:.1f}%, jitter={avg_jitter:.1f}ms)"
+                )
 
             except Exception as e:
                 print(f"[ABR] Ошибка: {e}")
@@ -436,6 +463,57 @@ class WebRTCMixin:
 
         if self.audio is not None and hasattr(self.audio, 'stop_stream_playback'):
             self.audio.stop_stream_playback()
+
+    def _restart_watching(self, streamer_uid: int) -> None:
+        """
+        FIX: Автоматический перезапуск просмотра когда стример переподключился.
+        Вызывается при получении 'streamer_reconnected' от сервера.
+
+        Последовательность:
+          1. Закрываем старый _viewer_pc (он привязан к упавшему ICE-соединению).
+          2. Сбрасываем SFU viewer-сессию (иначе Pion SFU откажет в новом offer).
+          3. Через 500 мс вызываем start_watching() — новый WebRTC handshake.
+
+        500 мс задержка нужна чтобы:
+          - SFU успел удалить старую viewer-сессию (асинхронная операция в Go)
+          - media-engine.exe стримера успел пересоединиться с SFU
+        """
+        print(f"[Net] _restart_watching: стример uid={streamer_uid} переподключился → перезапуск")
+
+        # 1. Закрываем старый viewer PC
+        if self._viewer_pc is not None:
+            self._run_in_webrtc_loop(self._close_pc_coro(self._viewer_pc))
+            self._viewer_pc = None
+
+        # 2. Сбрасываем audio
+        if self._stream_audio_task is not None:
+            try:
+                self._stream_audio_task.cancel()
+            except Exception:
+                pass
+            self._stream_audio_task = None
+        if self.audio is not None and hasattr(self.audio, 'stop_stream_playback'):
+            self.audio.stop_stream_playback()
+
+        # 3. Удаляем старую SFU viewer-сессию
+        if self._sfu_bridge is not None and self._sfu_bridge.is_running():
+            viewer_id = str(getattr(self.audio, 'my_uid', 0) or 0)
+            self._sfu_bridge.delete_viewer(viewer_id)
+
+        # 4. Уведомляем VideoEngine чтобы остановил старый VideoReceiver
+        if self.video and streamer_uid:
+            self.video.stop_viewer_for_uid(streamer_uid)
+
+        # 5. Перезапускаем через 500 мс
+        import threading as _threading
+        def _delayed_restart():
+            import time as _t
+            _t.sleep(0.5)
+            if self._watching_streamer_uid == streamer_uid:
+                print(f"[Net] _restart_watching: запускаем новый offer для uid={streamer_uid}")
+                self.start_watching(streamer_uid)
+
+        _threading.Thread(target=_delayed_restart, daemon=True, name="restart-watch").start()
 
     async def _handle_viewer_offer_coro(
         self, streamer_uid: int, sdp: str = None, sdp_type: str = None
@@ -660,6 +738,16 @@ class WebRTCMixin:
 
         elif act == CMD_WEBRTC_ICE:
             return True  # v3: gather-complete
+
+        elif act == 'streamer_reconnected':
+            # FIX: стример вернулся после разрыва → перезапускаем WebRTC handshake.
+            # Без этого зритель навсегда остаётся в "Ожидание видео..." потому что
+            # старый _viewer_pc привязан к мёртвому ICE-соединению.
+            streamer_uid = msg.get('streamer_uid', 0)
+            if streamer_uid and streamer_uid == self._watching_streamer_uid:
+                print(f"[Net] streamer_reconnected uid={streamer_uid}")
+                self._restart_watching(streamer_uid)
+            return True
 
         return False
 

@@ -665,12 +665,11 @@ class MultiServerScreen(QWidget):
         except Exception:
             local_ip = '127.0.0.1'
 
-        skip_upd = (ip in ('127.0.0.1', local_ip))
 
         from .ui_connecting import ConnectingScreen
         self._connecting_screen = ConnectingScreen(
             ip, self.nick, self.avatar,
-            skip_update_check=skip_upd,
+
         )
         self._connecting_screen.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
         self._connecting_screen.show_login.connect(self._on_return_to_login)
@@ -961,12 +960,11 @@ class DiscoveryScreen(QWidget):
         except Exception:
             local_ip = '127.0.0.1'
 
-        skip_upd = (ip in ('127.0.0.1', local_ip))
 
         from .ui_connecting import ConnectingScreen
         self._connecting_screen = ConnectingScreen(
             ip, self.nick, self.avatar,
-            skip_update_check=skip_upd,
+
         )
         self._connecting_screen.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
         self._connecting_screen.show_login.connect(self._on_return_to_login)
