@@ -1,4 +1,31 @@
 // src/webrtc_out/mod.rs — WebRTC sender: H.264 NAL → RTP → Pion SFU
+//
+// ── Исправления v3 ──────────────────────────────────────────────────────────
+//
+//   FIX 1 (КРИТИЧНО): Убран мёртвый const RTP_MAX_PAYLOAD = 900.
+//     webrtc-rs 0.11 не имеет публичного API для установки MTU через
+//     TrackLocalStaticSample. Константа была, но нигде не применялась.
+//     Дефолтный payload 1200б даёт пакет 1240б < RadminVPN MTU (~1440б). OK.
+//
+//   FIX 2 (КРИТИЧНО): H.264 Payload Types синхронизированы с исправленным sfu.go.
+//     Было: 3 профиля с одинаковым payload_type=96 → дублирующиеся a=rtpmap.
+//     После исправления sfu.go ожидает:
+//       PT 96 → High Profile 5.0 (640032)  ← NVENC/AMF кодируют именно сюда
+//       PT 97 → Constrained Baseline 3.1 (42e01f)
+//       PT 98 → Baseline 3.1 mode-1 (42001f)
+//       PT 99 → Baseline 3.1 mode-0 (42001f, pm=0)
+//     video_track также переведён на High Profile.
+//
+//   ОТКАТ (FIX 3 из v2 ОТМЕНЁН): NALU splitting убран полностью.
+//     write_sample() ожидает ПОЛНЫЙ Access Unit (SPS+PPS+IDR как один блок).
+//     webrtc-rs сам пакетизирует его по 1200б с единым RTP timestamp.
+//     Разбивка на отдельные write_sample() давала каждому NAL свой timestamp
+//     → декодер зрителя получал SPS, PPS, IDR как три разных кадра
+//     → зелёные артефакты и битые пиксели.
+//
+//     I-frame pacing: простой sleep(30ms) после write_sample() одного I-кадра.
+//     Это оригинальное рабочее решение. 30ms даёт RadminVPN время разгрузить
+//     очередь из ~67 RTP-пакетов до прихода следующих P-кадров.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,26 +47,13 @@ use webrtc::peer_connection::RTCPeerConnection;
 use webrtc::rtp_transceiver::rtp_codec::{
     RTCRtpCodecCapability, RTCRtpCodecParameters, RTPCodecType,
 };
+use webrtc::rtp_transceiver::RTCPFeedback;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocal;
 
-// ─── Публичный тип ───────────────────────────────────────────────────────────
-
-// ── MTU / RadminVPN ──────────────────────────────────────────────────────────
-// RadminVPN добавляет ~60 байт оверхеда на пакет (TUN-заголовок + шифрование).
-// Физический MTU сети обычно 1500 байт.
-// RTP-стек (webrtc-rs) фрагментирует H.264 NAL-юниты на чанки размером
-// RTP_MAX_PAYLOAD байт. Каждый чанк → IP-пакет + UDP(8б) + RTP(12б) + данные.
-// При дефолтных 1200б: пакет = 12+8+20+1200 = 1240 байт — OK для Radmin (~1440 MTU).
-// 
-// Артефакты при 720p — НЕ MTU, а потери пакетов в RadminVPN при всплеске I-кадра.
-// I-кадр 720p ≈ 80KB = ~70 пакетов за 1 кадр (~66ms при 15fps).
-// RadminVPN буфер может не успеть — пакеты теряются → артефакты.
-//
-// Решение: уменьшаем RTP payload до 900б (консервативно).
-// Больше пакетов, но меньше — меньший burst → меньше потерь в буфере Radmin.
-// Цена: незначительный рост RTP-оверхеда (~1.5%).
-const RTP_MAX_PAYLOAD: usize = 900;
+// I-frame pacing: пауза после отправки полного I-кадра.
+// НЕ разбиваем I-кадр на части — весь Access Unit идёт одним write_sample().
+const KEYFRAME_PACE_DELAY: Duration = Duration::from_millis(30);
 
 pub struct WebRtcSender {
     pc:            Arc<RTCPeerConnection>,
@@ -53,11 +67,24 @@ impl WebRtcSender {
     pub async fn new(fps: u32) -> Result<(Arc<Self>, String)> {
         let mut me = MediaEngine::default();
 
-        for fmtp in &[
-            "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f",
-            "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
-            "level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42001f",
-        ] {
+        // FIX 2: Уникальные PT, зеркально с исправленным sfu.go.
+        // Порядок регистрации = приоритет в SDP offer.
+        // PT=96 (High Profile) первым — NVENC/AMF кодируют именно в High.
+        let h264_profiles: &[(u8, &str)] = &[
+            (96, "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640032"),
+            (97, "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"),
+            (98, "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f"),
+            (99, "level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42001f"),
+        ];
+
+        let h264_feedback = vec![
+            RTCPFeedback { typ: "goog-remb".to_string(), parameter: "".to_string() },
+            RTCPFeedback { typ: "ccm".to_string(),       parameter: "fir".to_string() },
+            RTCPFeedback { typ: "nack".to_string(),      parameter: "".to_string() },
+            RTCPFeedback { typ: "nack".to_string(),      parameter: "pli".to_string() },
+        ];
+
+        for (pt, fmtp) in h264_profiles {
             me.register_codec(
                 RTCRtpCodecParameters {
                     capability: RTCRtpCodecCapability {
@@ -65,13 +92,14 @@ impl WebRtcSender {
                         clock_rate:    90_000,
                         channels:      0,
                         sdp_fmtp_line: fmtp.to_string(),
-                        rtcp_feedback: vec![],
+                        rtcp_feedback: h264_feedback.clone(),
                     },
-                    payload_type: 96,
+                    payload_type: *pt,
                     ..Default::default()
                 },
                 RTPCodecType::Video,
             )?;
+            info!("[WebRTC] Зарегистрирован PT={pt}: {fmtp}");
         }
 
         let mut reg = Registry::new();
@@ -80,11 +108,9 @@ impl WebRtcSender {
 
         let setting_engine = {
             let mut s = webrtc::api::setting_engine::SettingEngine::default();
-            // Уменьшаем размер RTP-пакета для RadminVPN.
-            // По умолчанию webrtc-rs пакетизирует H.264 NAL по 1200 байт.
-            // При 900б I-кадровый burst менее агрессивен → меньше потерь.
-            s.set_srtp_protection_profiles(vec![]);  // не меняем SRTP
-            // MTU передаётся через SettingEngine в webrtc-rs >= 0.10
+            // DTLS replay window 512 вместо дефолта 64.
+            // При высоком битрейте + jitter в RadminVPN нормален out-of-order
+            // на 100+ пакетов. С маленьким окном SRTP дропает их как replay.
             s.set_dtls_replay_protection_window(512);
             s
         };
@@ -105,12 +131,13 @@ impl WebRtcSender {
                 .context("new_peer_connection")?,
         );
 
+        // FIX 2: video_track — High Profile (640032), согласовано с энкодером
         let video_track = Arc::new(TrackLocalStaticSample::new(
             RTCRtpCodecCapability {
                 mime_type:     MIME_TYPE_H264.to_owned(),
                 clock_rate:    90_000,
                 channels:      0,
-                sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f"
+                sdp_fmtp_line: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640032"
                     .to_owned(),
                 rtcp_feedback: vec![],
             },
@@ -125,24 +152,25 @@ impl WebRtcSender {
 
         let pli_flag = Arc::new(AtomicBool::new(false));
 
-        // Drain RTCP loop
+        // RTCP drain loop: читает PLI от Pion SFU → форсируем IDR
         {
             let pli_flag_clone = Arc::clone(&pli_flag);
             tokio::spawn(async move {
                 loop {
-                    // Используем read_rtcp(), чтобы получить Vec<Box<dyn Packet>>
                     match rtp_sender.read_rtcp().await {
                         Ok((packets, _)) => {
                             for pkt in packets {
-                                // Проверяем, является ли пакет PLI
-                                if pkt.as_any().downcast_ref::<webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication>().is_some() {
+                                if pkt
+                                    .as_any()
+                                    .downcast_ref::<webrtc::rtcp::payload_feedbacks::picture_loss_indication::PictureLossIndication>()
+                                    .is_some()
+                                {
                                     pli_flag_clone.store(true, Ordering::Release);
                                     info!("[WebRTC] PLI получен от SFU → форсируем IDR-кадр");
                                 }
                             }
                         }
                         Err(e) => {
-                            // Если ошибка — значит соединение закрыто, выходим из цикла
                             debug!("[WebRTC RTCP loop] stopped: {:?}", e);
                             break;
                         }
@@ -245,13 +273,6 @@ async fn send_loop(
 
     let frame_dur = Duration::from_secs_f64(1.0 / fps as f64);
 
-    // ── I-frame pacing ───────────────────────────────────────────────────
-    // I-кадр при 720p ≈ 80KB = ~70 RTP-пакетов. Отправка burst'ом через
-    // RadminVPN вызывает потери в буфере VPN. Добавляем паузу 30мс после
-    // I-кадра чтобы размазать пакетную нагрузку. P-кадры (~5KB) не требуют
-    // pacing — они вписываются в 2-3 RTP пакета.
-    const KEYFRAME_PACE_DELAY: Duration = Duration::from_millis(30);
-
     while let Some((data, is_key)) = rx.recv().await {
         let sample = Sample {
             data,
@@ -262,10 +283,15 @@ async fn send_loop(
             warn!("[WebRTC send_loop] write_sample: {e}");
         }
 
-        // Pacing: после I-кадра даём RadminVPN время переварить burst
+        // Pacing после I-кадра: даём RadminVPN время разгрузить очередь.
+        // I-кадр 720p ≈ 80 KB = ~67 RTP-пакетов (по 1200б каждый).
+        // 30ms позволяет сети переварить burst до следующих P-кадров.
+        // write_sample() здесь уже завершён — задержка не блокирует кодирование,
+        // только отправку следующего кадра по сети.
         if is_key {
             tokio::time::sleep(KEYFRAME_PACE_DELAY).await;
         }
     }
+
     info!("[WebRTC send_loop] frame channel closed — exiting");
 }

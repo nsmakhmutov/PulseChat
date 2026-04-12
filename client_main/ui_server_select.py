@@ -653,11 +653,7 @@ class MultiServerScreen(QWidget):
             return
         self._connecting_in_progress = True
 
-        try:
-            from video_engine import patch_aiortc_nvenc
-            patch_aiortc_nvenc()
-        except Exception as e:
-            print(f"[MultiServer] patch_aiortc_nvenc error: {e}")
+        # v3: encoder patch removed — Rust handles encoding, aiortc is decode-only
 
         try:
             from server_discovery import get_local_radmin_ip
@@ -948,11 +944,7 @@ class DiscoveryScreen(QWidget):
             return
         self._connecting_in_progress = True
 
-        try:
-            from video_engine import patch_aiortc_nvenc
-            patch_aiortc_nvenc()
-        except Exception as e:
-            print(f"[Discovery] patch_aiortc_nvenc error: {e}")
+        # v3: encoder patch removed — Rust handles encoding, aiortc is decode-only
 
         try:
             from server_discovery import get_local_radmin_ip

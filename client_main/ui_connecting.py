@@ -395,12 +395,8 @@ class ConnectingScreen(QWidget):
             self.btn_change_ip.show()
 
     def _open_main_window(self):
-        # NVENC monkey-patch должен вызываться ДО создания первого RTCPeerConnection.
-        try:
-            from video_engine import patch_aiortc_nvenc
-            patch_aiortc_nvenc()
-        except Exception as e:
-            print(f"[Main] patch_aiortc_nvenc() error (non-fatal): {e}")
+        # v3: encoder patch removed — encoding is done by Rust (media-engine.exe)
+        # (media-engine.exe). aiortc у зрителя только декодирует, патч не нужен.
 
         from ui_main.ui_main import MainWindow
         self._main_window = MainWindow(self.ip, self.nick, self.avatar)

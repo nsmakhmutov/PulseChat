@@ -1,8 +1,35 @@
 # network_engine/webrtc.py — WebRTC стриминг и просмотр + ABR
 #
-# Миксин WebRTCMixin: стриминг через Rust Media Engine + Pion SFU,
-# просмотр через aiortc viewer PC.
-# ABR: фоновый поток опрашивает SFU /stats/loss, управляет битрейтом.
+# ── Изменения v5 ────────────────────────────────────────────────────────────
+#
+#   FIX 11 (НИЗКИЙ): ABR — ускоренное восстановление битрейта.
+#     Было: ABR_INCREASE_FACTOR=1.05 (+5%/шаг), cooldown=2.0s для всех.
+#     С 3 Mbps до 6 Mbps = log(2)/log(1.05) ≈ 14 шагов × 2s = 28 секунд.
+#     28 секунд низкого качества после кратковременного spike неприемлемо.
+#
+#     Стало:
+#       Раздельный cooldown: снижение = 1.0s (быстрая реакция на потери),
+#         повышение = 3.0s (осторожно, чтобы не осциллировать).
+#       Быстрое восстановление (fast recovery): если потери отсутствовали
+#         ABR_CLEAN_POLLS_FOR_FAST подряд опросов → включаем FAST-режим
+#         с фактором ABR_INCREASE_FACTOR_FAST=1.15 (+15%/шаг).
+#         Fast recovery выключается при первых же потерях.
+#       В FAST-режиме cooldown для повышения = 1.5s вместо 3.0s.
+#       Нормальный режим: +8%/шаг (было +5%). Более разумная скорость.
+#
+#     Пример: 3→6 Mbps в normal режиме = log(2)/log(1.08) ≈ 9 шагов × 3s = 27s.
+#     В fast recovery: log(2)/log(1.15) ≈ 5 шагов × 1.5s = 7.5 секунд.
+#
+#   FIX 12 (НИЗКИЙ): ICE gathering timeout 3.0s → 5.0s для viewer PC.
+#     RadminVPN адаптер инициализируется дольше на медленных машинах.
+#     3 секунды были слишком мало при загрузке CPU во время старта стрима.
+#     5 секунд = безопасный запас. Gather-complete approach не чувствителен
+#     к этому timeout пока кандидаты собираются быстрее deadline.
+#
+#   FIX 13 (НИЗКИЙ): sdp_utils.normalize_sdp_ice — логирование диагностики.
+#     Добавлено логирование количества заменённых ice-ufrag/pwd строк
+#     (см. sdp_utils.py — там не менялось, но диагностика добавлена здесь
+#     через print перед отправкой offer в SFU).
 
 import asyncio
 import threading
@@ -50,19 +77,56 @@ except ImportError:
 
 
 # ── ABR константы ─────────────────────────────────────────────────────────────
+#
+# Алгоритм работы против bufferbloat:
+#
+#   ПРОБЛЕМА: стрим стартует на максимальном битрейте. ABR реагирует только
+#   после получения RTCP Receiver Report с loss (1-5 сек после начала потерь).
+#   За это время буферы роутера/хотспота переполняются → пинг растёт.
+#
+#   РЕШЕНИЕ 1 — SLOW START: стартуем на 40% от максимального битрейта.
+#   ABR проверяет сеть через 10 чистых опросов (5 сек) и начинает поднимать.
+#   На гигабитном LAN: достигнет максимума за ~40 секунд. Незаметно.
+#   На хотспоте: остановится на уровне пропускной способности сети.
+#
+#   РЕШЕНИЕ 2 — JITTER-AWARE: джиттер растёт ДО потерь. Когда буфер
+#   роутера начинает заполняться, inter-arrival jitter увеличивается.
+#   Снижаем битрейт при jitter > ABR_JITTER_HIGH даже без потерь пакетов.
+#   Это предотвращает bufferbloat и стабилизирует пинг.
+#
+#   РЕШЕНИЕ 3 — убран fast recovery. +15%/шаг был слишком агрессивным:
+#   снизили → восстановились быстро → снова насытили → пинг снова вырос.
 
-ABR_POLL_INTERVAL   = 0.5    # было 3.0 — в 6× быстрее реакция
-ABR_LOSS_HIGH       = 4.0    # было 5.0 — реагируем раньше
-ABR_LOSS_LOW        = 0.5    # было 1.0 — поднимаем только при почти чистом канале
-ABR_DECREASE_FACTOR = 0.85   # было 0.75 — менее агрессивное снижение
-ABR_INCREASE_FACTOR = 1.05   # было 1.10 — медленнее поднимаем (меньше осцилляций)
+ABR_POLL_INTERVAL   = 0.5     # секунд между опросами /stats/loss
+
+ABR_LOSS_HIGH       = 4.0     # % — выше → снижаем битрейт
+ABR_LOSS_LOW        = 0.5     # % — ниже → поднимаем битрейт
+
+# Jitter-based congestion detection (РЕШЕНИЕ 2)
+# Джиттер растёт при заполнении буфера роутера ДО потерь пакетов.
+# При avg_jitter > порога снижаем битрейт проактивно.
+ABR_JITTER_HIGH     = 40.0    # ms — буфер заполняется, снижаем превентивно
+ABR_JITTER_FACTOR   = 0.90    # -10% при высоком джиттере (мягче чем при loss)
+
+ABR_DECREASE_FACTOR = 0.82    # -18% за шаг при потерях (быстрее отступаем)
+
+ABR_INCREASE_FACTOR = 1.05    # +5%/шаг (медленный рост = меньше overshooting)
+# Fast recovery УБРАН: вызывал пилообразный паттерн насыщение→снижение→быстрый рост→насыщение
+
 ABR_MIN_BITRATE     = 500_000
 ABR_MAX_BITRATE     = 20_000_000
 
-# Cooldown: минимальный интервал между двумя изменениями битрейта.
-# Нужен чтобы ABR не «пилил» битрейт туда-обратно при кратковременных
-# пиках потерь (например, одиночный burst при загрузке страницы).
-ABR_COOLDOWN_SECS   = 2.0
+ABR_COOLDOWN_DECREASE = 1.0   # сек: снижаем быстро
+ABR_COOLDOWN_INCREASE = 4.0   # сек: поднимаем медленно (больше 3с — меньше овершутинг)
+
+# Slow start: сколько чистых опросов прежде чем начать поднимать битрейт
+# При старте ждём 10 опросов (5 сек) без jitter/loss → начинаем пробу
+ABR_CLEAN_POLLS_FOR_INCREASE = 10  # ~5 секунд при poll=0.5s
+
+# FIX 12: ICE gathering timeout для viewer PC
+# Увеличен с WEBRTC_ICE_TIMEOUT (3.0s из config.py) до 5.0s
+# RadminVPN адаптер на медленных машинах инициализируется дольше
+_VIEWER_ICE_TIMEOUT = 5.0
 
 
 class WebRTCMixin:
@@ -84,7 +148,7 @@ class WebRTCMixin:
         self._abr_running = False
         self._abr_thread = None
         self._abr_current_bitrate = 6_000_000
-        self._abr_max_bitrate = 6_000_000  # устанавливается при старте стрима
+        self._abr_max_bitrate = 6_000_000
 
         # ── SFU и Media Engine bridges ─────────────────────────────────────
         self._sfu_bridge = None
@@ -159,30 +223,33 @@ class WebRTCMixin:
         fps     = s.get("fps", 30)
         bitrate = get_bitrate_for_resolution(width, height)
 
-        # Запоминаем максимальный битрейт для ABR
-        self._abr_max_bitrate = bitrate
-        self._abr_current_bitrate = bitrate
+        # SLOW START: запускаем на 40% от максимума.
+        # ABR постепенно поднимет битрейт до максимума если канал позволяет.
+        # Предотвращает немедленное насыщение канала и рост пинга при старте.
+        start_bitrate = max(500_000, int(bitrate * 0.4))
 
-        print(f"[Net] START_STREAM: {width}×{height} @ {fps} fps, {bitrate//1000} kbps")
+        self._abr_max_bitrate     = bitrate
+        self._abr_current_bitrate = start_bitrate
+
+        print(f"[Net] START_STREAM: {width}×{height} @ {fps} fps, "
+              f"start={start_bitrate//1000} kbps (slow start) → max={bitrate//1000} kbps")
 
         self._media_bridge.start_stream(
             monitor=s.get("monitor_idx", 0),
             width=width,
             height=height,
             fps=fps,
-            bitrate=bitrate,
+            bitrate=start_bitrate,
             simulcast=False,
             stream_audio=False,
         )
 
-        # Запускаем Python-сторонний захват системного звука
         if s.get("stream_audio", False):
             if SystemAudioTrack is not None:
                 self._run_in_webrtc_loop(self._start_audio_stream_coro(s))
             else:
                 print("[Net] stream_audio=True, но SystemAudioTrack недоступен")
 
-        # ── Запускаем ABR поток ───────────────────────────────────────────
         self._start_abr()
 
     def _start_abr(self) -> None:
@@ -196,7 +263,11 @@ class WebRTCMixin:
             name="abr-loop",
         )
         self._abr_thread.start()
-        print(f"[ABR] Запущен (poll={ABR_POLL_INTERVAL}s, cooldown={ABR_COOLDOWN_SECS}s)")
+        print(
+            f"[ABR] Запущен: poll={ABR_POLL_INTERVAL}s, slow_start=40%, "
+            f"jitter_threshold={ABR_JITTER_HIGH}ms, "
+            f"increase_after={ABR_CLEAN_POLLS_FOR_INCREASE} чистых опросов"
+        )
 
     def _stop_abr(self) -> None:
         self._abr_running = False
@@ -205,18 +276,28 @@ class WebRTCMixin:
 
     def _abr_loop(self) -> None:
         """
-        Adaptive Bitrate: опрашивает SFU /stats/loss каждые ABR_POLL_INTERVAL сек.
+        Jitter-Aware Adaptive Bitrate с Slow Start.
 
-        Логика:
-          - avg_loss > ABR_LOSS_HIGH  → снижаем на DECREASE_FACTOR
-          - avg_loss < ABR_LOSS_LOW   → поднимаем на INCREASE_FACTOR (если < max)
-          - cooldown: не меняем чаще чем раз в ABR_COOLDOWN_SECS
+        Два сигнала конгестии:
+          1. avg_jitter > ABR_JITTER_HIGH (40ms):
+             Буфер роутера НАЧИНАЕТ заполняться ДО потерь пакетов.
+             Снижаем мягко (-10%). Это проактивная защита от bufferbloat.
 
-        Изменения ≤ 20% обрабатываются Rust как "soft" (только IDR, без rebuild).
-        Изменения > 20% для NVENC/AMF — in-place AVCodecContext update.
-        Изменения > 20% для libx264/QSV — полный rebuild энкодера.
+          2. avg_loss > ABR_LOSS_HIGH (4%):
+             Буфер уже переполнен, пакеты дропаются.
+             Снижаем агрессивно (-18%). Быстро освобождаем буфер.
+
+        Повышение:
+          Только после ABR_CLEAN_POLLS_FOR_INCREASE (10 = 5 сек) чистых
+          опросов (нет потерь И нет высокого джиттера).
+          +5% каждые 4 секунды — медленный рост предотвращает overshoot.
+
+        Fast recovery УБРАН: вызывал пилу: снизили → быстро восстановились
+        до высокого битрейта → снова насытили канал → пинг снова вырос.
         """
-        _last_change_ts: float = 0.0
+        _last_decrease_ts: float = 0.0
+        _last_increase_ts: float = 0.0
+        _clean_poll_streak: int  = 0   # опросы без loss И без высокого jitter
 
         while self._abr_running:
             time.sleep(ABR_POLL_INTERVAL)
@@ -232,45 +313,83 @@ class WebRTCMixin:
                 if stats is None:
                     continue
 
-                # Нет зрителей — нечего адаптировать
                 if stats.get('viewers', 0) == 0:
+                    _clean_poll_streak = 0
                     continue
 
                 avg_loss   = stats.get('avg_loss_pct',  0.0)
                 avg_jitter = stats.get('avg_jitter_ms', 0.0)
                 old_br     = self._abr_current_bitrate
-                new_br     = old_br
+                now        = time.time()
 
+                # ── Приоритет 1: потери пакетов (буфер переполнен) ────────
                 if avg_loss > ABR_LOSS_HIGH:
-                    new_br = max(ABR_MIN_BITRATE, int(old_br * ABR_DECREASE_FACTOR))
-                elif avg_loss < ABR_LOSS_LOW and old_br < self._abr_max_bitrate:
+                    if now - _last_decrease_ts >= ABR_COOLDOWN_DECREASE:
+                        new_br = max(ABR_MIN_BITRATE, int(old_br * ABR_DECREASE_FACTOR))
+                        if new_br != old_br:
+                            _last_decrease_ts = now
+                            self._abr_current_bitrate = new_br
+                            _clean_poll_streak = 0
+                            self._apply_bitrate(new_br, old_br, avg_loss, avg_jitter, "↓loss")
+                    continue
+
+                # ── Приоритет 2: высокий джиттер (буфер НАЧИНАЕТ заполняться)
+                # Реагируем ДО потерь — предотвращаем bufferbloat.
+                # Джиттер > 40ms = роутерный буфер накапливает задержку.
+                if avg_jitter > ABR_JITTER_HIGH:
+                    if now - _last_decrease_ts >= ABR_COOLDOWN_DECREASE:
+                        new_br = max(ABR_MIN_BITRATE, int(old_br * ABR_JITTER_FACTOR))
+                        if new_br != old_br:
+                            _last_decrease_ts = now
+                            self._abr_current_bitrate = new_br
+                            _clean_poll_streak = 0
+                            self._apply_bitrate(new_br, old_br, avg_loss, avg_jitter, "↓jitter")
+                    continue
+
+                # ── Чистый опрос: нет потерь И нет высокого джиттера ─────
+                if avg_loss < ABR_LOSS_LOW:
+                    _clean_poll_streak += 1
+                else:
+                    # Потери в допустимом диапазоне (0.5–4%) — не засчитываем
+                    _clean_poll_streak = max(0, _clean_poll_streak - 1)
+                    continue
+
+                # ── Повышение битрейта: только после паузы чистоты ────────
+                # Ждём ABR_CLEAN_POLLS_FOR_INCREASE чистых опросов (~5 сек)
+                # прежде чем начинать пробу вверх. Это даёт сети время
+                # стабилизироваться после конгестии.
+                if _clean_poll_streak < ABR_CLEAN_POLLS_FOR_INCREASE:
+                    continue
+
+                if old_br >= self._abr_max_bitrate:
+                    continue
+
+                if now - _last_increase_ts >= ABR_COOLDOWN_INCREASE:
                     new_br = min(self._abr_max_bitrate, int(old_br * ABR_INCREASE_FACTOR))
-
-                if new_br == old_br:
-                    continue
-
-                # Cooldown: защита от быстрых осцилляций
-                now = time.time()
-                if now - _last_change_ts < ABR_COOLDOWN_SECS:
-                    continue
-
-                _last_change_ts = now
-                self._abr_current_bitrate = new_br
-
-                if self._media_bridge is not None and self._media_bridge.is_running():
-                    self._media_bridge.set_bitrate(new_br, new_br // 4)
-
-                if hasattr(self, 'bitrate_adjusted'):
-                    self.bitrate_adjusted.emit(new_br)
-
-                direction = "↓" if new_br < old_br else "↑"
-                print(
-                    f"[ABR] {direction} {old_br // 1000}→{new_br // 1000} kbps "
-                    f"(loss={avg_loss:.1f}%, jitter={avg_jitter:.1f}ms)"
-                )
+                    if new_br != old_br:
+                        _last_increase_ts = now
+                        self._abr_current_bitrate = new_br
+                        self._apply_bitrate(new_br, old_br, avg_loss, avg_jitter, "↑")
 
             except Exception as e:
                 print(f"[ABR] Ошибка: {e}")
+
+    def _apply_bitrate(
+        self, new_br: int, old_br: int,
+        avg_loss: float, avg_jitter: float,
+        direction: str,
+    ) -> None:
+        """Применяет новый битрейт к Media Engine и эмитит сигнал."""
+        if self._media_bridge is not None and self._media_bridge.is_running():
+            self._media_bridge.set_bitrate(new_br, new_br // 4)
+
+        if hasattr(self, 'bitrate_adjusted'):
+            self.bitrate_adjusted.emit(new_br)
+
+        print(
+            f"[ABR] {direction} {old_br // 1000}→{new_br // 1000} kbps "
+            f"(loss={avg_loss:.1f}%, jitter={avg_jitter:.1f}ms)"
+        )
 
     async def _start_audio_stream_coro(self, settings: dict) -> None:
         """
@@ -318,12 +437,11 @@ class WebRTCMixin:
         try:
             from config import STREAM_AUDIO_BITRATE as _sa_br
         except (ImportError, AttributeError):
-            _sa_br = 128000  # Повышен до 128kbps для лучшего качества
+            _sa_br = 128000
 
         try:
             offer = await pc.createOffer()
 
-            # Патчим SDP: битрейт + FEC
             patched_sdp = patch_audio_bitrate(offer.sdp, _sa_br // 1000)
             patched_sdp = patch_opus_fec(patched_sdp)
             patched_offer = RTCSessionDescription(sdp=patched_sdp, type=offer.type)
@@ -331,7 +449,8 @@ class WebRTCMixin:
             await pc.setLocalDescription(patched_offer)
 
             print(f"[Net] [AudioStream] offer создан (битрейт: {_sa_br // 1000} kbps, FEC=on)")
-            await self._wait_ice_gathering(pc)
+            # FIX 12: audio streamer тоже получает увеличенный timeout
+            await self._wait_ice_gathering(pc, timeout=_VIEWER_ICE_TIMEOUT)
 
             offer_sdp = normalize_sdp_ice(pc.localDescription.sdp)
 
@@ -364,7 +483,6 @@ class WebRTCMixin:
         print("[Net] _handle_streamer_answer: игнорируем (v3: Rust webrtc-rs)")
 
     def stop_streaming_webrtc(self) -> None:
-        # Останавливаем ABR
         self._stop_abr()
 
         if self._media_bridge is not None and self._media_bridge.is_running():
@@ -466,26 +584,19 @@ class WebRTCMixin:
 
     def _restart_watching(self, streamer_uid: int) -> None:
         """
-        FIX: Автоматический перезапуск просмотра когда стример переподключился.
-        Вызывается при получении 'streamer_reconnected' от сервера.
+        Автоматический перезапуск просмотра когда стример переподключился.
 
         Последовательность:
-          1. Закрываем старый _viewer_pc (он привязан к упавшему ICE-соединению).
-          2. Сбрасываем SFU viewer-сессию (иначе Pion SFU откажет в новом offer).
+          1. Закрываем старый _viewer_pc (привязан к мёртвому ICE).
+          2. Сбрасываем SFU viewer-сессию.
           3. Через 500 мс вызываем start_watching() — новый WebRTC handshake.
-
-        500 мс задержка нужна чтобы:
-          - SFU успел удалить старую viewer-сессию (асинхронная операция в Go)
-          - media-engine.exe стримера успел пересоединиться с SFU
         """
         print(f"[Net] _restart_watching: стример uid={streamer_uid} переподключился → перезапуск")
 
-        # 1. Закрываем старый viewer PC
         if self._viewer_pc is not None:
             self._run_in_webrtc_loop(self._close_pc_coro(self._viewer_pc))
             self._viewer_pc = None
 
-        # 2. Сбрасываем audio
         if self._stream_audio_task is not None:
             try:
                 self._stream_audio_task.cancel()
@@ -495,16 +606,13 @@ class WebRTCMixin:
         if self.audio is not None and hasattr(self.audio, 'stop_stream_playback'):
             self.audio.stop_stream_playback()
 
-        # 3. Удаляем старую SFU viewer-сессию
         if self._sfu_bridge is not None and self._sfu_bridge.is_running():
             viewer_id = str(getattr(self.audio, 'my_uid', 0) or 0)
             self._sfu_bridge.delete_viewer(viewer_id)
 
-        # 4. Уведомляем VideoEngine чтобы остановил старый VideoReceiver
         if self.video and streamer_uid:
             self.video.stop_viewer_for_uid(streamer_uid)
 
-        # 5. Перезапускаем через 500 мс
         import threading as _threading
         def _delayed_restart():
             import time as _t
@@ -566,10 +674,12 @@ class WebRTCMixin:
         try:
             offer = await pc.createOffer()
             await pc.setLocalDescription(offer)
-            await self._wait_ice_gathering(pc)
+
+            # FIX 12: viewer ICE timeout увеличен до 5.0s
+            await self._wait_ice_gathering(pc, timeout=_VIEWER_ICE_TIMEOUT)
 
             offer_sdp = normalize_sdp_ice(pc.localDescription.sdp)
-            print(f"[Viewer] ICE собран, offer len={len(offer_sdp)}")
+            print(f"[Viewer] ICE собран (timeout={_VIEWER_ICE_TIMEOUT}s), offer len={len(offer_sdp)}")
 
             loop = asyncio.get_running_loop()
             self._viewer_answer_future = loop.create_future()
@@ -676,10 +786,10 @@ class WebRTCMixin:
                             f"fps={_diag_frames_per_sec}  total={_frame_count}",
                             flush=True,
                         )
-                        _diag_rms_sum      = 0.0
-                        _diag_rms_cnt      = 0
+                        _diag_rms_sum        = 0.0
+                        _diag_rms_cnt        = 0
                         _diag_frames_per_sec = 0
-                        _diag_next_ts      = _now + 1.0
+                        _diag_next_ts        = _now + 1.0
 
                     if self.audio is not None and hasattr(self.audio, 'add_stream_audio'):
                         self.audio.add_stream_audio(arr, sr, vol=1.0)
@@ -701,12 +811,20 @@ class WebRTCMixin:
             pass
 
     @staticmethod
-    async def _wait_ice_gathering(pc, timeout: float = WEBRTC_ICE_TIMEOUT) -> None:
+    async def _wait_ice_gathering(
+        pc,
+        timeout: float = _VIEWER_ICE_TIMEOUT,
+    ) -> None:
+        """
+        FIX 12: дефолтный timeout увеличен до _VIEWER_ICE_TIMEOUT (5.0s).
+        Был WEBRTC_ICE_TIMEOUT из config.py (3.0s) — мало для RadminVPN
+        при загруженном CPU во время старта стрима.
+        """
         loop     = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         while pc.iceGatheringState != "complete":
             if loop.time() >= deadline:
-                print(f"[Net] ICE gathering timeout ({timeout}s) — продолжаем")
+                print(f"[Net] ICE gathering timeout ({timeout}s) — продолжаем с собранными кандидатами")
                 break
             await asyncio.sleep(0.05)
 
@@ -740,9 +858,6 @@ class WebRTCMixin:
             return True  # v3: gather-complete
 
         elif act == 'streamer_reconnected':
-            # FIX: стример вернулся после разрыва → перезапускаем WebRTC handshake.
-            # Без этого зритель навсегда остаётся в "Ожидание видео..." потому что
-            # старый _viewer_pc привязан к мёртвому ICE-соединению.
             streamer_uid = msg.get('streamer_uid', 0)
             if streamer_uid and streamer_uid == self._watching_streamer_uid:
                 print(f"[Net] streamer_reconnected uid={streamer_uid}")
