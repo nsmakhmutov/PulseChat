@@ -156,14 +156,17 @@ class ServerAnnouncer:
             while self._running:
                 # user_count и user_nicks запрашиваем каждый цикл — они меняются динамически
                 _nicks = self._get_nicks()
+                # Обрезаем каждый ник до 16 символов и ограничиваем список
+                # чтобы UDP-пакет не превысил безопасный размер (~1400 байт)
+                _safe_nicks = [n[:16] for n in _nicks[:20]]
                 msg = json.dumps({
                     "action":      "server_announce",
                     "ip":          self.server_ip,
                     "port":        self.server_port,
-                    "host_nick":   self.host_nick,
+                    "host_nick":   self.host_nick[:16],
                     "server_name": self.server_name,
                     "user_count":  self._get_count(),
-                    "user_nicks":  _nicks[:30],  # макс 30 ников, безопасный размер UDP
+                    "user_nicks":  _safe_nicks,
                 }).encode('utf-8')
 
                 for target in self._BROADCAST_TARGETS:
@@ -224,7 +227,7 @@ class ServerDiscovery:
 
             while True:
                 try:
-                    data, _addr = sock.recvfrom(1024)
+                    data, _addr = sock.recvfrom(4096)
                     msg = json.loads(data.decode('utf-8'))
                     if msg.get('action') == 'server_announce':
                         ip   = msg.get('ip', '')
@@ -285,7 +288,7 @@ class ServerDiscovery:
             deadline = time.time() + timeout
             while time.time() < deadline:
                 try:
-                    data, _addr = sock.recvfrom(1024)
+                    data, _addr = sock.recvfrom(4096)
                     msg = json.loads(data.decode('utf-8'))
                     if msg.get('action') == 'server_announce':
                         ip = msg.get('ip', '')

@@ -243,6 +243,7 @@ class LoginWindow(QWidget):
 
         self.nick_in = QLineEdit(nick)
         self.nick_in.setPlaceholderText("User")
+        self.nick_in.setMaxLength(16)
         layout.addWidget(self.nick_in)
 
         self.cb_save = QCheckBox("Сохранить данные для следующего запуска")
@@ -310,7 +311,7 @@ class LoginWindow(QWidget):
 
     def _on_login(self):
         ip   = self.ip_in.text().strip()
-        nick = self.nick_in.text().strip() or "User"
+        nick = (self.nick_in.text().strip() or "User")[:16]
 
         if not ip:
             self._show_error("⚠️  Введите IP-адрес сервера")

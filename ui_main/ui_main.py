@@ -48,6 +48,105 @@ from version import APP_VERSION, APP_NAME, GITHUB_REPO
 
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# HoldToDisconnectButton — кнопка «Отключиться» с удержанием 1 сек
+# ──────────────────────────────────────────────────────────────────────────────
+
+class HoldToDisconnectButton(QPushButton):
+    """При удержании 1 секунду заливка заполняется слева направо,
+    после чего вызывается callback отключения."""
+
+    HOLD_MS = 1000          # длительность удержания
+    TICK_MS = 16            # ~60 fps
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._callback = None
+        self._progress = 0.0
+
+        self._hold_timer = QTimer(self)
+        self._hold_timer.setSingleShot(True)
+        self._hold_timer.timeout.connect(self._on_hold_complete)
+
+        self._tick_timer = QTimer(self)
+        self._tick_timer.setInterval(self.TICK_MS)
+        self._tick_timer.timeout.connect(self._tick)
+
+    def set_hold_callback(self, callback):
+        self._callback = callback
+
+    # ── events ────────────────────────────────────────────────────────────────
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._progress = 0.0
+            self._hold_timer.start(self.HOLD_MS)
+            self._tick_timer.start()
+            self._apply_style()
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._cancel()
+        super().mouseReleaseEvent(event)
+
+    def leaveEvent(self, event):
+        """Отмена, если курсор ушёл с кнопки во время удержания."""
+        self._cancel()
+        super().leaveEvent(event)
+
+    # ── internals ─────────────────────────────────────────────────────────────
+
+    def _tick(self):
+        self._progress = min(self._progress + self.TICK_MS / self.HOLD_MS, 1.0)
+        self._apply_style()
+
+    def _cancel(self):
+        if self._hold_timer.isActive() or self._tick_timer.isActive():
+            self._hold_timer.stop()
+            self._tick_timer.stop()
+            self._progress = 0.0
+            self.setStyleSheet("")          # вернуть стиль из родительского QSS
+
+    def _on_hold_complete(self):
+        self._tick_timer.stop()
+        self._progress = 1.0
+        self._apply_style()
+        if self._callback:
+            QTimer.singleShot(80, self._callback)   # мини-пауза — видна полная заливка
+        QTimer.singleShot(120, lambda: self.setStyleSheet(""))
+
+    def _apply_style(self):
+        p = self._progress
+        bg_empty  = "rgba(255,255,255,0.14)"
+        bg_fill   = "rgba(192,57,43,0.75)"
+        border_c  = "rgba(231,76,60,0.70)"
+
+        if p <= 0.0:
+            gradient = bg_empty
+        elif p >= 1.0:
+            gradient = bg_fill
+        else:
+            lo = f"{max(p - 0.005, 0.0):.4f}"
+            hi = f"{min(p + 0.005, 1.0):.4f}"
+            gradient = (
+                f"qlineargradient(x1:0,y1:0,x2:1,y2:0,"
+                f"stop:0 {bg_fill},"
+                f"stop:{lo} {bg_fill},"
+                f"stop:{hi} {bg_empty},"
+                f"stop:1 {bg_empty})"
+            )
+
+        self.setStyleSheet(
+            f"QPushButton#barBtnDisconnect {{"
+            f"  background: {gradient};"
+            f"  border: 1px solid {border_c};"
+            f"  border-radius: 10px;"
+            f"  padding: 4px;"
+            f"}}"
+        )
+
+
 class MainWindow(QMainWindow):
     def __init__(self, ip, nick, avatar):
         super().__init__()
@@ -152,6 +251,7 @@ class MainWindow(QMainWindow):
         self._tray_icon.setToolTip(f"{APP_NAME} — {self.nick}")
         self._tray_icon.show()
         self._force_quit = False   # True = полный выход из трея
+        self._returning_to_lobby = False  # True = отключение → возврат в лобби
 
         # ── ChatPanel: встроена в _main_row (окно расширяется при открытии) ───
         # ChatPanel добавлена в QHBoxLayout рядом с main_page в setup_ui().
@@ -330,10 +430,10 @@ class MainWindow(QMainWindow):
     def setup_ui(self):
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — {self.nick}")
         # Минимальная ширина рассчитана по содержимому bottom_bar:
-        # margin(12) + mute(46)+sp(8) + deafen(46)+sp(8) + sb(46)+sp(8)
-        # + stream(46)+sp(8) + lobby(46) + stretch(0)
-        # + latency(64)+sp(8) + settings(46) + margin(12) = 404 px
-        # + stream_conn_lbl(22)+sp(8) когда видим = 434 px → округляем до 440.
+        # margin(12) + mute(46)+sp(8) + deafen(46)+sp(8) + disconnect(46)+sp(8)
+        # + sb(46)+sp(8) + stream(46)+sp(8) + stretch(0)
+        # + latency(64)+sp(8) + settings(46) + margin(12) = 412 px
+        # + stream_conn_lbl(22)+sp(8) когда видим = 442 px → округляем до 450.
         self.setMinimumSize(440, 500)
         self.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
@@ -495,7 +595,7 @@ class MainWindow(QMainWindow):
         self.btn_mute = QPushButton()
         self.btn_mute.setCheckable(True)
         self.btn_mute.setFixedSize(46, 46)
-        self.btn_mute.setObjectName("barBtn")
+        self.btn_mute.setObjectName("barBtnMic")
         self.btn_mute.setIcon(QIcon(resource_path("assets/icon/mic_on.svg")))
         self.btn_mute.setIconSize(QSize(26, 26))
         self.btn_mute.clicked.connect(self.toggle_mute)
@@ -503,7 +603,7 @@ class MainWindow(QMainWindow):
         self.btn_deafen = QPushButton()
         self.btn_deafen.setCheckable(True)
         self.btn_deafen.setFixedSize(46, 46)
-        self.btn_deafen.setObjectName("barBtn")
+        self.btn_deafen.setObjectName("barBtnDeafen")
         self.btn_deafen.setIcon(QIcon(resource_path("assets/icon/volume_on.svg")))
         self.btn_deafen.setIconSize(QSize(26, 26))
         self.btn_deafen.clicked.connect(self.toggle_deafen)
@@ -523,17 +623,15 @@ class MainWindow(QMainWindow):
         self.btn_stream.setCheckable(True)
         self.btn_stream.clicked.connect(self.toggle_stream)
 
-        # ── Кнопка лобби: открыть экран выбора сервера ────────────────────────
-        # Пользователь остаётся подключённым к текущему серверу пока явно
-        # не выберет другой. Кнопка просто открывает MultiServerScreen поверх
-        # главного окна, не обрывая соединение.
-        self.btn_lobby = QPushButton()
+        # ── Кнопка отключения: отключиться от сервера → показать лобби ──────────
+        # При клике: обрываем соединение (если хост — миграция как при резком
+        # отключении), закрываем главное окно, показываем экран выбора серверов.
+        self.btn_lobby = HoldToDisconnectButton()
         self.btn_lobby.setFixedSize(46, 46)
-        self.btn_lobby.setObjectName("barBtn")
+        self.btn_lobby.setObjectName("barBtnDisconnect")
         self.btn_lobby.setIcon(QIcon(resource_path("assets/icon/lobby.svg")))
         self.btn_lobby.setIconSize(QSize(26, 26))
-        self.btn_lobby.setToolTip("Лобби — выбрать сервер")
-        self.btn_lobby.clicked.connect(self._open_lobby)
+        self.btn_lobby.set_hold_callback(self._disconnect_and_show_lobby)
 
         # --- Индикатор качества соединения стримера ---
         # Маленький QLabel с иконкой connection_bad.svg, появляется рядом
@@ -569,10 +667,10 @@ class MainWindow(QMainWindow):
 
         btns.addWidget(self.btn_mute)
         btns.addWidget(self.btn_deafen)
+        btns.addWidget(self.btn_lobby)
         btns.addWidget(self.btn_sb)
         btns.addWidget(self.btn_stream)
         btns.addWidget(self._stream_conn_lbl)
-        btns.addWidget(self.btn_lobby)
         btns.addStretch()
         btns.addWidget(self._latency_btn)
         btns.addWidget(btn_set)
@@ -1048,6 +1146,54 @@ class MainWindow(QMainWindow):
             #barBtn:checked {{
                 background-color: rgba(231,76,60,0.35);
                 border-color: rgba(231,76,60,0.65);
+            }}
+            /* ── Микрофон: зелёный когда работает, красный когда замьючен ── */
+            #barBtnMic {{
+                background-color: rgba(46,204,113,0.25);
+                border: 1px solid rgba(46,204,113,0.50);
+                border-radius: 10px;
+                padding: 4px;
+            }}
+            #barBtnMic:hover {{
+                background-color: rgba(46,204,113,0.40);
+                border-color: rgba(46,204,113,0.70);
+            }}
+            #barBtnMic:checked {{
+                background-color: rgba(231,76,60,0.35);
+                border-color: rgba(231,76,60,0.65);
+            }}
+            #barBtnMic:checked:hover {{
+                background-color: rgba(231,76,60,0.50);
+                border-color: rgba(231,76,60,0.80);
+            }}
+            /* ── Динамики: зелёный когда работают, красный когда замьючены ── */
+            #barBtnDeafen {{
+                background-color: rgba(46,204,113,0.25);
+                border: 1px solid rgba(46,204,113,0.50);
+                border-radius: 10px;
+                padding: 4px;
+            }}
+            #barBtnDeafen:hover {{
+                background-color: rgba(46,204,113,0.40);
+                border-color: rgba(46,204,113,0.70);
+            }}
+            #barBtnDeafen:checked {{
+                background-color: rgba(231,76,60,0.35);
+                border-color: rgba(231,76,60,0.65);
+            }}
+            #barBtnDeafen:checked:hover {{
+                background-color: rgba(231,76,60,0.50);
+                border-color: rgba(231,76,60,0.80);
+            }}
+            #barBtnDisconnect {{
+                background-color: {btn_bg};
+                border: 1px solid {btn_border};
+                border-radius: 10px;
+                padding: 4px;
+            }}
+            #barBtnDisconnect:hover {{
+                background-color: rgba(192,57,43,0.30);
+                border-color: rgba(231,76,60,0.55);
             }}
             #btnStream {{
                 background-color: {btn_bg};
@@ -1898,8 +2044,11 @@ class MainWindow(QMainWindow):
         # Тост над нижней панелью
         self._sb_toast.setText("🎤  Хост выключил ваш микрофон")
         self._sb_toast.adjustSize()
+        _main_w = self.width()
+        if self._chat_panel.isVisible():
+            _main_w -= ChatPanel.PANEL_WIDTH
         tw = self._sb_toast.width()
-        tx = (self.width() - tw) // 2
+        tx = (_main_w - tw) // 2
         ty = self._bottom_bar.y() - self._sb_toast.height() - 28
         self._sb_toast.move(tx, max(4, ty))
         self._sb_toast.raise_()
@@ -2589,11 +2738,12 @@ class MainWindow(QMainWindow):
         # ── Тост поверх главного окна ─────────────────────────────────────────
         self._sb_toast.setText(f"🎵  {from_nick}  включил звук")
         self._sb_toast.adjustSize()
-        # Центрируем по ширине окна, над нижней панелью.
-        # Используем _bottom_bar.y() — btn_sb.y() даёт позицию внутри bottomBar (~13px),
-        # а не относительно окна → тост позиционировался почти у заголовка.
+        # Центрируем по ширине ОСНОВНОЙ области (без ChatPanel).
+        _main_w = self.width()
+        if self._chat_panel.isVisible():
+            _main_w -= ChatPanel.PANEL_WIDTH
         tw = self._sb_toast.width()
-        tx = (self.width() - tw) // 2
+        tx = (_main_w - tw) // 2
         ty = self._bottom_bar.y() - self._sb_toast.height() - 28
         self._sb_toast.move(tx, max(4, ty))
         self._sb_toast.raise_()
@@ -3067,82 +3217,140 @@ class MainWindow(QMainWindow):
         temporary = [ch['name'] for ch in channel_list if not ch.get('permanent', False)]
         self.default_rooms = (permanent or ['General']) + sorted(temporary)
 
-    def _open_lobby(self):
+    def _disconnect_and_show_lobby(self):
         """
-        Открывает экран выбора сервера (MultiServerScreen) поверх главного окна.
+        Отключение от сервера и возврат на экран выбора серверов (лобби).
 
-        Пользователь остаётся подключённым к текущему серверу до тех пор пока
-        явно не выберет другой и нажмёт «Подключиться». Соединение не обрывается.
-        Повторное нажатие — если лобби уже открыто, поднимаем его вперёд.
-
-        Ключевой трюк: переопределяем _open_connecting у MultiServerScreen,
-        чтобы выбор сервера вёл через _on_switch_server, а не через отдельный
-        ConnectingScreen + новый MainWindow.
+        Логика:
+          1. Останавливаем UI-таймеры и keyboard-хуки.
+          2. Закрываем вспомогательные окна (стримы, оверлеи).
+          3. Останавливаем audio, video, net.
+          4. Если мы хост — EmbeddedServerManager.stop() делает graceful
+             миграцию (рассылает CMD_SERVER_MIGRATE), точно так же как при
+             резком отключении хоста.
+          5. Создаём свежий MultiServerScreen (лобби) — стандартный flow:
+             выбор сервера → ConnectingScreen → новый MainWindow.
+          6. Закрываем текущее главное окно без выхода из приложения.
         """
-        # Если лобби уже открыто — просто поднимаем поверх
+        print("[UI] _disconnect_and_show_lobby: начинаем отключение...")
+
+        # ── 1. Останавливаем UI-таймеры ───────────────────────────────────────
+        try:
+            self.ui_timer.stop()
+        except Exception:
+            pass
+
+        # ── 2. Снимаем keyboard-хуки ──────────────────────────────────────────
+        try:
+            import keyboard as _kb
+            _kb.unhook_all()
+        except Exception:
+            pass
+
+        # ── 3. Закрываем вспомогательные UI-элементы ──────────────────────────
         if hasattr(self, '_lobby_screen') and self._lobby_screen is not None:
             try:
-                if self._lobby_screen.isVisible():
-                    self._lobby_screen.raise_()
-                    self._lobby_screen.activateWindow()
-                    return
-            except RuntimeError:
-                self._lobby_screen = None
+                self._lobby_screen.close()
+            except Exception:
+                pass
+            self._lobby_screen = None
 
         try:
+            self._whisper_overlay.hide_overlay()
+        except Exception:
+            pass
+
+        try:
+            if self._streamer_draw_overlay is not None:
+                self._streamer_draw_overlay.close()
+                self._streamer_draw_overlay = None
+        except Exception:
+            pass
+
+        for uid, w in list(self.stream_windows.items()):
+            try:
+                w.close()
+            except Exception:
+                pass
+        self.stream_windows.clear()
+
+        # Очищаем кэш медиафайлов чата
+        try:
+            from .ui_widgets import clear_media_cache
+            clear_media_cache()
+        except Exception:
+            pass
+
+        # ── 4. AudioHandler.stop() ────────────────────────────────────────────
+        try:
+            self.audio.stop()
+        except Exception as ex:
+            print(f"[UI] disconnect audio.stop() error: {ex}")
+
+        # ── 5. VideoEngine.shutdown() ─────────────────────────────────────────
+        try:
+            self.video.shutdown()
+        except Exception as ex:
+            print(f"[UI] disconnect video.shutdown() error: {ex}")
+
+        # ── 6. NetworkClient.stop() ───────────────────────────────────────────
+        # ВАЖНО: ставим _reconnecting=True ДО stop(), чтобы tcp_listen при
+        # выходе не запустил _on_connection_lost → _reconnect_loop (CPU баг).
+        self.net._reconnecting = True
+        self.net._migration_pending = False
+        try:
+            self.net.stop()
+        except Exception as ex:
+            print(f"[UI] disconnect net.stop() error: {ex}")
+
+        # ── 7. EmbeddedServer — graceful миграция (как при резком отключении) ─
+        try:
+            from server import EmbeddedServerManager
+            mgr = EmbeddedServerManager.get()
+            if mgr.is_running():
+                mgr.stop()
+        except Exception as ex:
+            print(f"[UI] disconnect EmbeddedServer stop error: {ex}")
+
+        # ── 8. Открываем свежий экран выбора серверов ─────────────────────────
+        try:
             from client_main.ui_server_select import MultiServerScreen
-            from client_main.ui_login import load_server_name
+            from client_main.ui_login import load_server_name, LoginWindow
             server_name = load_server_name()
             screen = MultiServerScreen(self.nick, self.avatar, server_name=server_name)
             screen.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
 
-            # ── Перехватываем выбор сервера ───────────────────────────────────
-            # MultiServerScreen._open_connecting() по умолчанию создаёт новый
-            # ConnectingScreen → новый MainWindow. Нам это не нужно: MainWindow
-            # уже открыт. Подменяем метод чтобы переключение шло через нас.
-            _main = self   # ссылка на MainWindow для замыкания
+            # Привязываем «Ввести вручную» → LoginWindow (стандартный flow)
+            def _fallback_to_login(f_ip: str, f_nick: str, f_avatar: str):
+                login_win = LoginWindow(
+                    ip=f_ip, nick=f_nick, avatar=f_avatar,
+                    error_msg=(
+                        f"⚠️  Сервер недоступен: {f_ip}\n"
+                        "Измените адрес и нажмите «Войти»."
+                    ) if f_ip else "",
+                )
+                login_win.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
+                # Кнопка «Назад» из LoginWindow → снова открыть MultiServerScreen
+                def _back_to_servers():
+                    s2 = MultiServerScreen(self.nick, self.avatar, server_name=server_name)
+                    s2.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
+                    s2.open_login.connect(_fallback_to_login)
+                    s2.show()
+                login_win.go_back.connect(_back_to_servers)
+                login_win.show()
 
-            def _lobby_open_connecting(ip: str):
-                """Перехватчик: закрываем лобби, вызываем быстрое переключение."""
-                try:
-                    screen.hide()
-                except RuntimeError:
-                    pass
-                _main._lobby_screen = None
-                # Ищем имя сервера по IP из последнего списка Discovery
-                server_info = {'ip': ip, 'server_name': ip}
-                try:
-                    for srv in (screen._worker.result if hasattr(screen._worker, 'result') else []):
-                        if srv.get('ip') == ip:
-                            server_info = srv
-                            break
-                except Exception:
-                    pass
-                _main._on_switch_server(server_info)
-
-            screen._open_connecting = _lobby_open_connecting
-
-            # При «Ввести IP вручную» — закрываем лобби, открываем LoginWindow
-            screen.open_login.connect(self._on_lobby_manual_ip)
-
-            self._lobby_screen = screen
+            screen.open_login.connect(_fallback_to_login)
             screen.show()
         except Exception as e:
-            print(f"[UI] _open_lobby error: {e}")
+            print(f"[UI] _disconnect_and_show_lobby lobby error: {e}")
 
-    def _on_lobby_manual_ip(self, ip: str, nick: str, avatar: str):
-        """
-        Из лобби нажали «Ввести IP вручную».
-        Закрываем лобби, переключаемся на введённый IP если он не пустой.
-        """
-        if hasattr(self, '_lobby_screen') and self._lobby_screen is not None:
-            try:
-                self._lobby_screen.hide()
-            except RuntimeError:
-                pass
-            self._lobby_screen = None
-        if ip and ip != self.ip:
-            self._on_switch_server({'ip': ip, 'server_name': ip})
+        # ── 9. Убираем трей и закрываем MainWindow (без QApplication.quit) ───
+        self._tray_icon.hide()
+        self._returning_to_lobby = True
+        self._force_quit = True
+        self.close()
+
+        print("[UI] _disconnect_and_show_lobby: завершено")
 
     def _on_switch_server(self, info: dict):
         """
@@ -3240,7 +3448,19 @@ class MainWindow(QMainWindow):
             self._tray_show()
 
     def closeEvent(self, e):
-        """Крестик → сворачиваем в трей. Полный выход — через меню трея."""
+        """
+        Крестик → сворачиваем в трей. Полный выход — через меню трея.
+        Возврат в лобби → закрываем окно без QApplication.quit().
+        """
+
+        # ── Возврат в лобби (отключение от сервера) ────────────────────────
+        # Cleanup уже выполнен в _disconnect_and_show_lobby. Просто закрываем
+        # окно и НЕ завершаем Qt — лобби уже показан.
+        if self._returning_to_lobby:
+            print("[UI] closeEvent: возврат в лобби, закрываем MainWindow")
+            e.accept()
+            self.deleteLater()
+            return
 
         # ── Сворачиваем в трей (если не запрошен полный выход) ────────────
         if not self._force_quit:

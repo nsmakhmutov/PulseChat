@@ -155,6 +155,24 @@ BTN_CONNECT_SS = (
     "QPushButton:disabled { opacity: 0.4; }"
 )
 
+BTN_EXIT_SS = (
+    "QPushButton {"
+    "  background-color: rgba(192,57,43,0.22);"
+    "  color: #e8a0a0;"
+    "  border: 1px solid rgba(231,76,60,0.45);"
+    "  border-radius: 8px;"
+    "  font-size: 14px;"
+    "  font-weight: bold;"
+    "  padding: 9px 0;"
+    "}"
+    "QPushButton:hover {"
+    "  background-color: rgba(231,76,60,0.38);"
+    "  border-color: rgba(231,76,60,0.75);"
+    "  color: #ffcccc;"
+    "}"
+    "QPushButton:pressed { background-color: rgba(231,76,60,0.55); }"
+)
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Карточки серверов
 # ══════════════════════════════════════════════════════════════════════════════

@@ -80,6 +80,7 @@ class NudgeHoldButton(QPushButton):
       • каждый тик  → _progress растёт 0 → 1, вызывает update() для перерисовки.
       • mouseRelease / leaveEvent до завершения → сброс (_progress=0).
       • progress == 1 → emit hold_complete, кнопка блокируется (_fired=True).
+      • Опциональный hold_sound: .wav файл играет в цикле пока кнопка зажата.
 
     paintEvent:
       • super().paintEvent() рисует стандартную кнопку (фон, текст, рамка).
@@ -97,12 +98,43 @@ class NudgeHoldButton(QPushButton):
         self._progress: float = 0.0   # 0.0–1.0
         self._holding:  bool  = False
         self._fired:    bool  = False  # сработал → больше не принимаем нажатия
+        self._hold_sound_path: str | None = None  # путь к .wav для loop
 
         self._tick_timer = QTimer(self)
         self._tick_timer.setInterval(self._TICK_MS)
         self._tick_timer.timeout.connect(self._on_tick)
 
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def set_hold_sound(self, path: str) -> None:
+        """Устанавливает .wav файл, который играет в цикле во время удержания."""
+        import os
+        resolved = os.path.normpath(os.path.abspath(path))
+        if os.path.isfile(resolved):
+            self._hold_sound_path = resolved
+        else:
+            print(f"[NudgeHoldButton] hold_sound НЕ НАЙДЕН: {resolved}")
+            self._hold_sound_path = None
+
+    def _start_hold_sound(self) -> None:
+        if self._hold_sound_path:
+            try:
+                import winsound
+                winsound.PlaySound(
+                    self._hold_sound_path,
+                    winsound.SND_FILENAME | winsound.SND_ASYNC
+                    | winsound.SND_LOOP | winsound.SND_NODEFAULT,
+                )
+            except Exception as ex:
+                print(f"[NudgeHoldButton] PlaySound error: {ex}")
+
+    def _stop_hold_sound(self) -> None:
+        if self._hold_sound_path:
+            try:
+                import winsound
+                winsound.PlaySound(None, winsound.SND_PURGE)
+            except Exception:
+                pass
 
     # ── Таймер ────────────────────────────────────────────────────────────────
     def _on_tick(self):
@@ -112,6 +144,7 @@ class NudgeHoldButton(QPushButton):
             self._tick_timer.stop()
             self._holding = False
             self._fired = True
+            self._stop_hold_sound()
             self.update()
             self.hold_complete.emit()
         else:
@@ -125,6 +158,7 @@ class NudgeHoldButton(QPushButton):
             self._holding = True
             self._progress = 0.0
             self._tick_timer.start()
+            self._start_hold_sound()
         super().mousePressEvent(e)
 
     def mouseReleaseEvent(self, e):
@@ -132,6 +166,7 @@ class NudgeHoldButton(QPushButton):
             self._holding = False
             self._progress = 0.0
             self._tick_timer.stop()
+            self._stop_hold_sound()
             self.update()
         super().mouseReleaseEvent(e)
 
@@ -141,6 +176,7 @@ class NudgeHoldButton(QPushButton):
             self._holding = False
             self._progress = 0.0
             self._tick_timer.stop()
+            self._stop_hold_sound()
             self.update()
         super().leaveEvent(e)
 

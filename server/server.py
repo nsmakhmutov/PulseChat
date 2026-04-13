@@ -340,8 +340,10 @@ class SFUServer:
     # ------------------------------------------------------------------
     def stats_monitor(self):
         last_bytes = 0
-        while True:
+        while self._accepting:
             time.sleep(5)
+            if not self._accepting:
+                break
             with self.clients_lock:
                 active = len(self.clients)
             curr_bytes = self.stats["bytes"]   # int — атомарное чтение
@@ -367,7 +369,7 @@ class SFUServer:
         Видеопакеты (FLAG_VIDEO, FLAG_STREAM_AUDIO) больше не приходят через UDP —
         стрим передаётся через WebRTC.
         """
-        while True:
+        while self._accepting:
             try:
                 data, addr = self.udp_sock.recvfrom(BUFFER_SIZE)
                 if len(data) < UDP_HEADER_SIZE:
@@ -446,8 +448,11 @@ class SFUServer:
                         except Exception:
                             pass
 
+            except OSError:
+                break   # сокет закрыт — выходим
             except Exception:
-                pass
+                if not self._accepting:
+                    break
 
     # ------------------------------------------------------------------
     # TCP-обработчик одного клиента
@@ -474,7 +479,7 @@ class SFUServer:
 
                         # ── Login ─────────────────────────────────────────────
                         if action == CMD_LOGIN:
-                            client_nick   = msg.get('nick', 'User')
+                            client_nick   = msg.get('nick', 'User')[:16]
                             client_avatar = msg.get('avatar', '1.svg')
                             _gcn = self._general_channel_name
                             with self.clients_lock:
@@ -738,8 +743,9 @@ class SFUServer:
                                 with self.watchers_lock:
                                     self.watchers.pop(stopped_uid, None)
                                 # Закрываем WebRTC сессию стримера и всех его зрителей
-                                if self.sfu:
-                                    self.sfu.close_streamer(stopped_uid)
+                                _sfu = self.sfu
+                                if _sfu:
+                                    _sfu.close_streamer(stopped_uid)
                             self._mark_dirty()
                             self.send_global_state()
 
@@ -766,7 +772,8 @@ class SFUServer:
                                     f"начал смотреть стрим uid={streamer_uid}"
                                 )
                                 # WebRTC v3: посылаем зрителю триггер → он создаёт offer
-                                if self.sfu:
+                                _sfu = self.sfu
+                                if _sfu:
                                     quality = msg.get('quality', 'hq')
                                     # Находим RadminVPN IP стримера для роутинга
                                     # viewer-оффера к его sidecar.exe (не-хост стримеры).
@@ -786,7 +793,7 @@ class SFUServer:
                                                     streamer_ip = raw_ip
                                                 streamer_sfu_port = _c.get('sfu_port', 7788)
                                                 break
-                                    self.sfu.trigger_viewer_connect(
+                                    _sfu.trigger_viewer_connect(
                                         w_uid, streamer_uid, conn, quality,
                                         streamer_ip=streamer_ip,
                                         streamer_sfu_port=streamer_sfu_port,
@@ -808,8 +815,9 @@ class SFUServer:
                                         nick = self.clients[conn]['nick'] if conn in self.clients else '?'
                                     print(f"[Server] {nick} перестал смотреть стрим uid={streamer_uid}")
                                     # Закрываем WebRTC PC зрителя
-                                    if self.sfu:
-                                        self.sfu.close_viewer(w_uid)
+                                    _sfu = self.sfu
+                                    if _sfu:
+                                        _sfu.close_viewer(w_uid)
                             self._mark_dirty()
                             self.send_global_state()
 
@@ -1480,10 +1488,11 @@ class SFUServer:
                     self.watchers.pop(u_id, None)
 
                 # Закрываем WebRTC сессии отключившегося пользователя
-                if self.sfu:
+                _sfu = self.sfu
+                if _sfu:
                     # v3: PionSfuProxy — синхронные вызовы, нет call_async
-                    self.sfu.close_streamer(u_id)   # no-op если не был стримером
-                    self.sfu.close_viewer(u_id)     # no-op если не был зрителем
+                    _sfu.close_streamer(u_id)   # no-op если не был стримером
+                    _sfu.close_viewer(u_id)     # no-op если не был зрителем
 
                 print(
                     f"[Server] ✖ {nick} (комната: {room}) "

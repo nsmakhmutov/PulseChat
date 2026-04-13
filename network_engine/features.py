@@ -32,13 +32,9 @@ class FeaturesMixin:
     def play_soundboard_file(self, filename, data_b64=None, from_nick=None):
         """
         Воспроизвести soundboard-файл через sounddevice.
-        Защита от спама: новый звук не запускается пока предыдущий играет.
+        Разрешён одновременный запуск нескольких звуков.
         """
         try:
-            if self._sb_playing.is_set():
-                print(f"[Net] Soundboard: пропущен {filename!r} — звук ещё играет")
-                return
-
             _gs = getattr(self.audio, 'global_settings', None)
             if _gs is None:
                 _gs = QSettings("MyVoiceChat", "GlobalSettings")
@@ -67,7 +63,6 @@ class FeaturesMixin:
 
             def _play():
                 try:
-                    self._sb_playing.set()
                     data, sr = sf.read(audio_source, dtype='float32')
                     if hasattr(self.audio, 'play_internal_sound') and self.audio.stream:
                         self.audio.play_internal_sound(data, sr, vol)
@@ -78,8 +73,6 @@ class FeaturesMixin:
                         sd.wait()
                 except Exception as e:
                     print(f"[Net] Soundboard playback error: {e}")
-                finally:
-                    self._sb_playing.clear()
 
             threading.Thread(
                 target=_play, daemon=True, name="soundboard-play"

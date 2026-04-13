@@ -839,6 +839,11 @@ class WebRTCMixin:
             streamer_uid = msg.get('streamer_uid', self._watching_streamer_uid)
 
             if role == 'viewer' and AIORTC_AVAILABLE:
+                # FIX: зритель может получить offer до запуска webrtc loop
+                # (только стример вызывает start_streaming_webrtc →
+                # _start_webrtc_loop). Без этого поздний зритель получает
+                # "WebRTC loop не готов" и стрим не подключается.
+                self._start_webrtc_loop()
                 self._run_in_webrtc_loop(
                     self._handle_viewer_offer_coro(streamer_uid)
                 )

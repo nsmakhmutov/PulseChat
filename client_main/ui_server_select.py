@@ -27,7 +27,7 @@ from config import resource_path, DEFAULT_PORT_TCP
 from .ui_styles import (
     GLASS_CARD_SS, GLASS_ERROR_SS,
     BTN_PRIMARY_SS, BTN_SECONDARY_SS, BTN_SKIP_SS,
-    BTN_CREATE_SS, BTN_CONNECT_SS,
+    BTN_CREATE_SS, BTN_CONNECT_SS, BTN_EXIT_SS,
     SERVER_ITEM_SS_IDLE, SERVER_ITEM_SS_SELECTED,
 )
 from .ui_titlebar import AppTitleBar
@@ -114,12 +114,11 @@ class _PingWorker(QThread):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class _ServerItemWidget(QFrame):
-    """Кликабельная карточка сервера: имя, хост, IP, пинг, кол-во участников.
-    FIX #5: одиночный клик = выбор + подключение (как кнопка «Подключиться»).
-            hover = стеклянный попап со списком участников.
+    """Карточка сервера: имя, кол-во участников, пинг, дерево ников.
+    Одиночный клик = подключение.
     """
     clicked        = pyqtSignal()
-    double_clicked = pyqtSignal()   # зарезервировано; клик уже подключает
+    double_clicked = pyqtSignal()
 
     def __init__(self, info: dict, parent=None):
         super().__init__(parent)
@@ -128,35 +127,21 @@ class _ServerItemWidget(QFrame):
         self.setObjectName("serverItem")
         self._apply_style()
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setFixedHeight(56)
-        self.setMouseTracking(True)
 
-        lay = QHBoxLayout(self)
-        lay.setContentsMargins(12, 8, 12, 8)
-        lay.setSpacing(8)
+        main_lay = QVBoxLayout(self)
+        main_lay.setContentsMargins(12, 8, 12, 8)
+        main_lay.setSpacing(4)
 
-        ico = QLabel("🖥")
-        ico.setFixedWidth(22)
-        ico.setStyleSheet("background: transparent; border: none; font-size: 18px;")
-        lay.addWidget(ico)
-
-        info_col = QVBoxLayout()
-        info_col.setSpacing(1)
+        # ── Верхняя строка: название + кол-во + пинг ──────────────────────────
+        top_row = QHBoxLayout()
+        top_row.setSpacing(8)
 
         lbl_name = QLabel(info.get('server_name', 'InPulse Server'))
         lbl_name.setStyleSheet(
             "font-size: 14px; font-weight: bold; color: #eaeef8;"
             "background: transparent; border: none;"
         )
-        info_col.addWidget(lbl_name)
-
-        lbl_sub = QLabel(f"Хост: {info.get('host_nick', '?')}  •  {info.get('ip', '')}")
-        lbl_sub.setStyleSheet(
-            "font-size: 11px; color: rgba(180,190,210,0.70);"
-            "background: transparent; border: none;"
-        )
-        info_col.addWidget(lbl_sub)
-        lay.addLayout(info_col, stretch=1)
+        top_row.addWidget(lbl_name, stretch=1)
 
         cnt = info.get('user_count', 0)
         lbl_cnt = QLabel(f"👤 {cnt}")
@@ -166,9 +151,8 @@ class _ServerItemWidget(QFrame):
         )
         lbl_cnt.setFixedWidth(50)
         lbl_cnt.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        lay.addWidget(lbl_cnt)
+        top_row.addWidget(lbl_cnt)
 
-        # Пинг
         self._lbl_ping = QLabel("…")
         self._lbl_ping.setStyleSheet(
             "font-size: 11px; color: rgba(180,190,210,0.55); font-weight: normal;"
@@ -176,16 +160,29 @@ class _ServerItemWidget(QFrame):
         )
         self._lbl_ping.setFixedWidth(52)
         self._lbl_ping.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        lay.addWidget(self._lbl_ping)
+        top_row.addWidget(self._lbl_ping)
 
+        main_lay.addLayout(top_row)
+
+        # ── Список участников (дерево ников) ──────────────────────────────────
+        nicks = info.get('user_nicks', [])
+        if nicks:
+            nicks_text = "  •  ".join(nicks[:20])
+            lbl_nicks = QLabel(nicks_text)
+            lbl_nicks.setWordWrap(True)
+            lbl_nicks.setStyleSheet(
+                "font-size: 11px; color: rgba(180,195,220,0.60);"
+                "background: transparent; border: none;"
+                "padding-left: 2px;"
+            )
+            main_lay.addWidget(lbl_nicks)
+
+        # ── Пинг ──────────────────────────────────────────────────────────────
         ip = info.get('ip', '')
         if ip:
             self._ping_worker = _PingWorker(ip)
             self._ping_worker.result.connect(self._on_ping)
             self._ping_worker.start()
-
-        # ── Hover-попап с участниками (стеклянный стиль) ──────────────────────
-        self._hover_popup: QLabel | None = None
 
     def _on_ping(self, ms: int):
         if ms < 0:
@@ -210,61 +207,6 @@ class _ServerItemWidget(QFrame):
     def set_selected(self, selected: bool):
         self._selected = selected
         self._apply_style()
-
-    # ── Hover-попап ───────────────────────────────────────────────────────────
-    def _show_hover_popup(self):
-        """Создаёт стеклянный попап со списком участников сервера."""
-        nicks = self.info.get('user_nicks', [])
-        if not nicks:
-            return
-
-        # Строим текст участников
-        lines = [f"  👤  {n}" for n in nicks[:30]]
-        body  = "\n".join(lines) if lines else "  (нет участников)"
-
-        self._hover_popup = QLabel(
-            f"<b>Участники сервера:</b><br>" +
-            "<br>".join(f"👤 {n}" for n in nicks[:30]),
-            self.window(),
-        )
-        self._hover_popup.setTextFormat(Qt.TextFormat.RichText)
-        self._hover_popup.setWordWrap(False)
-        self._hover_popup.setStyleSheet("""
-            QLabel {
-                background-color: rgba(18, 20, 32, 235);
-                border: 1px solid rgba(91,142,245,0.40);
-                border-radius: 10px;
-                color: #c8d0e0;
-                font-size: 12px;
-                padding: 10px 14px;
-            }
-        """)
-        self._hover_popup.adjustSize()
-
-        # Позиция: справа от карточки, прижата к правому краю окна
-        pos = self.mapTo(self.window(), self.rect().topRight())
-        popup_w = self._hover_popup.width()
-        popup_h = self._hover_popup.height()
-        win_w   = self.window().width()
-        x = min(pos.x() + 8, win_w - popup_w - 8)
-        y = max(4, pos.y() - popup_h // 4)
-        self._hover_popup.move(x, y)
-        self._hover_popup.raise_()
-        self._hover_popup.show()
-
-    def _hide_hover_popup(self):
-        if self._hover_popup is not None:
-            self._hover_popup.hide()
-            self._hover_popup.deleteLater()
-            self._hover_popup = None
-
-    def enterEvent(self, event):
-        self._show_hover_popup()
-        super().enterEvent(event)
-
-    def leaveEvent(self, event):
-        self._hide_hover_popup()
-        super().leaveEvent(event)
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:
@@ -425,14 +367,15 @@ class MultiServerScreen(QWidget):
         )
         header_row.addWidget(self.lbl_status, stretch=1)
 
-        self.btn_retry = QPushButton("Обновить")
+        self.btn_retry = QPushButton(" Обновить")
         self.btn_retry.setFixedSize(90, 30)
         self.btn_retry.setToolTip("Обновить список серверов")
         self.btn_retry.setStyleSheet(
-            "QPushButton { background: rgba(255,255,255,0.06); color: #8899aa;"
-            " border: 1px solid rgba(255,255,255,0.10); border-radius: 6px;"
+            "QPushButton { background: rgba(52,152,219,0.25); color: #7ec8e3;"
+            " border: 1px solid rgba(52,152,219,0.50); border-radius: 6px;"
             " font-size: 12px; padding: 0; }"
-            "QPushButton:hover { background: rgba(255,255,255,0.14); color: #fff; }"
+            "QPushButton:hover { background: rgba(52,152,219,0.45);"
+            " border-color: rgba(52,152,219,0.80); color: #fff; }"
         )
         self.btn_retry.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_retry.clicked.connect(self._start_discovery)
@@ -463,25 +406,37 @@ class MultiServerScreen(QWidget):
         self._list_layout.setContentsMargins(0, 0, 0, 0)
         self._list_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
 
-        self._lbl_empty = QLabel("Нет серверов в сети\nНикто ещё не создал комнату")
+        self._lbl_empty = QLabel("Нет серверов в сети")
         self._lbl_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._lbl_empty.setStyleSheet(
             "font-size: 14px; color: rgba(200,210,224,0.55);"
-            "background: transparent; border: none; padding: 20px;"
+            "background: transparent; border: none; padding: 20px 20px 4px 20px;"
         )
         self._lbl_empty.hide()
         self._list_layout.addWidget(self._lbl_empty)
 
+        # Картинка empty.png — заполняет пустоту когда серверов нет
+        self._img_empty = QLabel()
+        self._img_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._img_empty.setStyleSheet("background: transparent; border: none;")
+        _empty_pix = QPixmap(resource_path("assets/icon/empty.png"))
+        if not _empty_pix.isNull():
+            self._img_empty.setPixmap(
+                _empty_pix.scaled(180, 180, Qt.AspectRatioMode.KeepAspectRatio,
+                                  Qt.TransformationMode.SmoothTransformation)
+            )
+        self._img_empty.hide()
+        self._list_layout.addWidget(self._img_empty)
+
         scroll.setWidget(self._list_container)
         root.addWidget(scroll, stretch=1)
 
-        # Кнопка «Подключиться»
-        self.btn_connect = QPushButton("🔗  Подключиться")
-        self.btn_connect.setStyleSheet(BTN_CONNECT_SS)
-        self.btn_connect.setEnabled(False)
-        self.btn_connect.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_connect.clicked.connect(self._on_connect_selected)
-        root.addWidget(self.btn_connect)
+        # Кнопка «Создать сервер» — полная ширина (на месте бывшей «Подключиться»)
+        self.btn_create = QPushButton("➕  Создать сервер")
+        self.btn_create.setStyleSheet(BTN_CREATE_SS)
+        self.btn_create.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_create.clicked.connect(self._on_create_server)
+        root.addWidget(self.btn_create)
 
         sep2 = QFrame()
         sep2.setFrameShape(QFrame.Shape.HLine)
@@ -491,12 +446,6 @@ class MultiServerScreen(QWidget):
 
         bot_row = QHBoxLayout()
         bot_row.setSpacing(8)
-
-        self.btn_create = QPushButton("➕  Создать сервер")
-        self.btn_create.setStyleSheet(BTN_CREATE_SS)
-        self.btn_create.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_create.clicked.connect(self._on_create_server)
-        bot_row.addWidget(self.btn_create, stretch=1)
 
         self.btn_manual = QPushButton("✏️  Ввести вручную")
         self.btn_manual.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -509,13 +458,19 @@ class MultiServerScreen(QWidget):
         self.btn_manual.clicked.connect(self._on_manual_ip)
         bot_row.addWidget(self.btn_manual, stretch=1)
 
+        # Кнопка «Выйти» — полное завершение приложения (справа)
+        self.btn_exit = QPushButton("✖  Выйти")
+        self.btn_exit.setStyleSheet(BTN_EXIT_SS)
+        self.btn_exit.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_exit.clicked.connect(self._on_exit_app)
+        bot_row.addWidget(self.btn_exit, stretch=1)
+
         root.addLayout(bot_row)
 
     # ── Discovery ─────────────────────────────────────────────────────────────
 
     def _start_discovery(self):
         self._selected_info = None
-        self.btn_connect.setEnabled(False)
         self.lbl_status.setText("Поиск серверов в сети...")
         self.lbl_status.setStyleSheet(
             "font-size: 15px; font-weight: bold; color: #cdd6f4;"
@@ -541,18 +496,16 @@ class MultiServerScreen(QWidget):
                 pass
         self._item_widgets.clear()
         self._lbl_empty.hide()
+        self._img_empty.hide()
 
     def _on_discovery_done(self, servers: list):
         if not servers:
-            self.lbl_status.setText("Нет серверов в сети")
-            self.lbl_status.setStyleSheet(
-                "font-size: 15px; font-weight: bold; color: #e0b060;"
-                "background: transparent; border: none;"
-            )
+            self.lbl_status.setText("")
             self._lbl_empty.show()
+            self._img_empty.show()
             return
 
-        self.lbl_status.setText(f"Найдено серверов: {len(servers)}  •  выберите для подключения")
+        self.lbl_status.setText(f"Найдено: {len(servers)}")
         self.lbl_status.setStyleSheet(
             "font-size: 14px; font-weight: bold; color: #82e0aa;"
             "background: transparent; border: none;"
@@ -576,7 +529,6 @@ class MultiServerScreen(QWidget):
         except RuntimeError:
             pass
         self._selected_info = info
-        self.btn_connect.setEnabled(True)
         # Подключаемся сразу при клике
         ip = info.get('ip', '')
         if ip:
@@ -698,6 +650,29 @@ class MultiServerScreen(QWidget):
         else:
             self.open_login.emit(ip, nick, avatar)
             self.hide()
+
+    def _on_exit_app(self):
+        """
+        Полное завершение приложения — убиваем все процессы.
+        Вызывается по кнопке «Выйти» на экране выбора сервера.
+        """
+        import sys, os, signal
+        # Останавливаем встроенный сервер если запущен
+        try:
+            from server import EmbeddedServerManager
+            mgr = EmbeddedServerManager.get()
+            if mgr.is_running():
+                mgr.stop()
+        except Exception:
+            pass
+        # Завершаем Qt
+        from PyQt6.QtWidgets import QApplication
+        QApplication.quit()
+        # Гарантированно убиваем процесс
+        try:
+            os.kill(os.getpid(), signal.SIGTERM)
+        except Exception:
+            sys.exit(0)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

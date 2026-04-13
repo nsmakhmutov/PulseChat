@@ -829,7 +829,7 @@ class VideoOverlay(QFrame):
         self.btn_deafen.clicked.connect(self._on_deafen_clicked)
 
         # --- Прекратить просмотр ---
-        self.btn_stop = self._make_btn("assets/icon/stream_off.svg", "Прекратить просмотр")
+        self.btn_stop = self._make_btn("assets/icon/monitor_off.svg", "Прекратить просмотр")
         self.btn_stop.clicked.connect(self.stop_watch_clicked)
 
         # --- Громкость стрима ---

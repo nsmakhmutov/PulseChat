@@ -592,6 +592,11 @@ class SettingsDialog(QDialog):
 
         btn_clear_cache = NudgeHoldButton("🗑  Удерживайте 3 сек — очистить кеш")
         btn_clear_cache.setToolTip("Удаляет локальную историю чата (SQLite)")
+        try:
+            from config import resource_path
+            btn_clear_cache.set_hold_sound(resource_path("assets/music/bubble_progress.wav"))
+        except Exception:
+            pass
         btn_clear_cache.setStyleSheet("""
             QPushButton {
                 background-color: rgba(231,76,60,0.15);
