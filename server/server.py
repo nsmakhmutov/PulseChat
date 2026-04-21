@@ -1,8 +1,39 @@
 # server.py — SFUServer + EmbeddedServerManager
+#
+# ── Полный список исправлений v2 ────────────────────────────────────────────
+#
+#   FIX #1 (КРИТИЧНО): stream_watch_start — UnboundLocalError при гонке
+#     "клиент отключился во время обработки". w_uid/watcher_nick/watcher_avatar
+#     защищены проверкой conn in clients.
+#
+#   FIX #2 (ВАЖНО): stats атомарность — отдельный stats_lock вместо ложной
+#     надежды на GIL. `dict[key] += n` НЕ атомарно в CPython (три байткода).
+#
+#   FIX #3 (ВАЖНО): аннотация _media_cache исправлена на 5-элементный тупл.
+#
+#   FIX #4 (ВАЖНО): UTF-8 incremental decoder для TCP stream. Раньше
+#     errors='ignore' обрезал байты эмоджи/кириллицы на границе chunk.
+#
+#   FIX #5 (ВАЖНО): _state_dirty под локом (clients_lock). Раньше два потока
+#     могли потерять dirty-флаг.
+#
+#   FIX #6 (ВАЖНО): _channel_auth очищается при rename_channel.
+#
+#   FIX #7 (ВАЖНО): сравнение с _general_channel_name вместо хардкод 'General'.
+#
+#   FIX #8 (СТИЛЬ): `except Exception` вместо `except (ValueError, Exception)`.
+#
+#   FIX #9 (СТИЛЬ): math.isfinite() для ping_ms (защита от nan/inf).
+#
+#   FIX #10 (СТИЛЬ): структурированный except в start_embedded SFU-бриджа.
+
 import asyncio
-import json
+import codecs
 import hashlib
+import json
+import math
 import os
+import queue as _queue
 import secrets
 import socket
 import threading
@@ -12,8 +43,9 @@ from config import (
     DEFAULT_PORT_TCP, DEFAULT_PORT_UDP, BUFFER_SIZE,
     UDP_RECV_BUFFER_SIZE, UDP_SEND_BUFFER_SIZE,
     UDP_HEADER_STRUCT, UDP_HEADER_SIZE,
-    FLAG_STREAM_VOICES, FLAG_WHISPER,
+    FLAG_STREAM_VOICES, FLAG_WHISPER, FLAG_ANONYMOUS,
     STREAM_VOICE_HEADER_STRUCT, STREAM_VOICE_HEADER_SIZE,
+    ANONYMOUS_UID,
     CMD_LOGIN, CMD_JOIN_ROOM, CMD_STREAM_START, CMD_STREAM_STOP,
     CMD_SYNC_USERS, CMD_SOUNDBOARD,
     CMD_UPDATE_PRESENCE,
@@ -21,6 +53,7 @@ from config import (
     CMD_FILE_OFFER, CMD_FILE_OFFER_ROOM,
     CMD_WEBRTC_OFFER, CMD_WEBRTC_ANSWER, CMD_WEBRTC_ICE,
     CMD_SERVER_TRANSFER, CMD_SERVER_MIGRATE,
+    CMD_MIGRATE_PREPARE, CMD_MIGRATE_READY, MIGRATE_PREPARE_TIMEOUT_SEC,
     CMD_QUICK_MSG, QUICK_MSG_MAX_LEN,
     CMD_CREATE_CHANNEL, CMD_CHANNEL_CREATED, CMD_CHANNEL_DELETED,
     CMD_JOIN_CHANNEL_AUTH, CHANNEL_NAME_MAX_LEN, CHANNEL_PASS_MAX_LEN,
@@ -35,6 +68,12 @@ from .chat_db import ChatDB
 from .server_webrtc import PionSfuProxy
 
 
+# FIX #4: максимальный размер входного буфера на одного клиента.
+# При CHAT_MEDIA до 10 MB в base64 + overhead JSON, 16 MB — безопасный потолок.
+# Если буфер растёт сверх этого — клиент либо атакует, либо что-то сломано.
+_TCP_BUFFER_MAX = 16 * 1024 * 1024
+
+
 # =============================================================================
 # SFUServer — основной сервер
 # =============================================================================
@@ -47,95 +86,68 @@ class SFUServer:
         self.tcp_sock.bind((host, DEFAULT_PORT_TCP))
         self.tcp_sock.listen()
 
-        # --- UDP (только голос комнаты + ping) ---
+        # --- UDP ---
         self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # SO_RCVBUF 2MB: голосовые пакеты не дропаются пока handler занят.
-        # SO_SNDBUF 2MB: исходящая очередь не блокирует recv-путь.
         self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, UDP_RECV_BUFFER_SIZE)
         self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, UDP_SEND_BUFFER_SIZE)
         self.udp_sock.bind((host, DEFAULT_PORT_UDP))
 
         # -------------------------------------------------------------------
-        # Разделение локов (FIX #1):
+        # Разделение локов:
         #   clients_lock  — self.clients (TCP-потоки)
         #   udp_lock      — self.udp_map (UDP-поток)
         #   watchers_lock — self.watchers (stream-события)
-        # UDP-поток никогда не ждёт TCP sendall().
         # -------------------------------------------------------------------
         self.clients_lock  = threading.Lock()
         self.udp_lock      = threading.Lock()
         self.watchers_lock = threading.Lock()
 
-        # conn → {nick, room, uid, avatar, ip, mute, deaf, is_streaming,
-        #          status_icon, status_text}
         self.clients = {}
-
-        # uid → addr  (UDP-адрес клиента)
         self.udp_map = {}
-
-        # uid → room  (кэш для O(1) поиска в UDP-маршрутизации)
         self.uid_to_room = {}
-
-        # streamer_uid → {watcher_uid: {nick, avatar, uid}}
         self.watchers = {}
 
+        # FIX #2: stats не атомарны через GIL, нужен отдельный лок.
+        # `self.stats["packets"] += 1` = LOAD + ADD + STORE — три байткода.
+        # Между ними GIL может переключиться → потери счётчика.
         self.stats      = {"packets": 0, "bytes": 0}
+        self.stats_lock = threading.Lock()
         self.start_time = time.time()
 
         # --- Голосование «Пнуть» (Nudge) ---
-        # { room_name → { target_uid → { voter_uid → vote_timestamp } } }
         self.nudge_votes = {}
         self.nudge_lock  = threading.Lock()
 
-        # --- WebRTC SFU (создаётся в start()) ---
+        # --- WebRTC SFU ---
         self.sfu: PionSfuProxy | None = None
 
-        # ── Кэш payload send_global_state (FIX 8) ───────────────────────────
-        # send_global_state сериализует всех юзеров в JSON и шлёт всем клиентам.
-        # При 20 юзерах: ~4 KB × 11+ вызовов/сек × 20 клиентов = ~880 KB/сек зря.
-        # Решение: кэшируем bytes-payload и пересобираем только при реальных
-        # изменениях состояния (_state_dirty=True).
-        # Грязный флаг выставляется при каждом изменении clients/watchers/channels.
-        # После сборки payload флаг сбрасывается — повторные вызовы отдают кэш.
+        # ── Кэш payload send_global_state ───────────────────────────────────
         self._cached_payload: bytes | None = None
-        self._state_dirty: bool = True   # True при старте → первый вызов всегда строит
+        self._state_dirty: bool = True
 
         # ── Встроенный сервер: host_order ────────────────────────────────────
-        # Упорядоченный список UID в порядке первого входа на сервер.
-        # host_order[0] = потенциальный новый хост при падении текущего.
-        # Рассылается клиентам в каждом sync_users — хранится локально
-        # для авто-переключения при потере соединения.
-        self._host_order: list[int]   = []
-        self._host_order_lock         = threading.Lock()
+        self._host_order:      list[int] = []
+        self._host_order_lock            = threading.Lock()
 
         # ── Встроенный сервер: управление ────────────────────────────────────
-        # _is_embedded=True: сервер запущен внутри процесса клиента (start_embedded).
-        # _accepting: False → accept-цикл завершится после следующего accept().
-        # _owner_ip: RadminVPN IP владельца сервера (кто вызвал start_embedded).
-        #   При CMD_LOGIN клиент с этим IP вставляется в host_order[0] независимо
-        #   от порядка подключения. Исправляет гонку: 150мс QTimer в _on_become_host
-        #   даёт другим клиентам (Client3 через _migrate_reconnect) подключиться
-        #   раньше владельца и захватить host_order[0] → права передачи улетают.
-        self._is_embedded: bool       = False
-        self._accepting:   bool       = True
-        self._announcer               = None   # ServerAnnouncer | None
-        self._owner_ip:    str        = ''     # IP создателя встроенного сервера
+        self._is_embedded: bool = False
+        self._accepting:   bool = True
+        self._announcer         = None
+        self._owner_ip:    str  = ''
 
-        # ── Имя сервера (отображается в списке серверов у клиентов) ──────────
+        # ── Имя сервера ──────────────────────────────────────────────────────
         self._server_name = server_name or SERVER_NAME_DEFAULT
 
-        # ── Пинги клиентов (для выбора следующего хоста по min RTT) ────────────
-        # uid → ping_ms (EWMA RTT клиента к серверу, самостоятельно измеренный)
-        # Обновляется при получении action='report_ping' от клиента.
-        # Используется _pick_best_host() при передаче/миграции сервера.
+        # ── Пинги клиентов ────────────────────────────────────────────────────
         self._client_pings: dict[int, int] = {}
         self._client_pings_lock = threading.Lock()
 
+        # ── 2-шаговая ручная передача сервера ──
+        self._pending_migrate_target: int | None             = None
+        self._pending_migrate_ready:  threading.Event | None = None
+        self._pending_migrate_lock:   threading.Lock         = threading.Lock()
+
         # ── Временные каналы ─────────────────────────────────────────────────
-        # channel_name → {'password': str|None, 'permanent': bool}
-        # FIX #4: имя главного канала читается из USER_CONFIG_PATH.
-        # Хост может переименовать его через контекстное меню;
-        # имя сохраняется в конфиге и применяется при каждом старте сервера.
         _general_name = 'General'
         try:
             import json as _json_cfg
@@ -151,27 +163,21 @@ class SFUServer:
         }
         self._channels_lock = threading.Lock()
 
-        # Кэш авторизованных клиентов для защищённых каналов
-        # conn → set[channel_name]
+        # Кэш авторизованных клиентов
         self._channel_auth: dict = {}
         self._channel_auth_lock = threading.Lock()
 
-        # ── Кэш медиа-пейлоадов (FIX #1) ────────────────────────────────────
-        # json.dumps({'file_data_b64': <10MB>}) занимает ~50 мс на CPython.
-        # При пересылке одного файла 10 получателям = 500 мс задержки в TCP-потоке.
-        # Решение: кэшируем готовые bytes-пейлоады по MD5(file_data_b64).
-        # Ключ: md5_hex строки. Значение: (expire_ts, payload_bytes_without_ts).
-        # TTL = 300 сек, макс 30 записей — при 20 юзерах этого с запасом хватит.
-        # ts подставляется при каждой отправке, поэтому кэш хранит payload без ts,
-        # а финальные bytes строятся за O(len(ts_str)) вместо O(len(10MB)).
-        self._media_cache: dict[str, tuple[float, bytes, bytes]] = {}
-        # (expire_ts, prefix_bytes, suffix_bytes)
-        # prefix = всё до "ts": в JSON, suffix = всё после значения ts
+        # ── Кэш медиа-пейлоадов ──────────────────────────────────────────────
+        # SENIOR FIX: раньше хранили prefix/suffix разрезанный по байтам ts,
+        # что было хрупко (зависело от float-repr). Теперь prefix — полный JSON
+        # без закрывающей '}', suffix всегда пустой (legacy slot — чтобы
+        # не менять 5-tuple схему). При отправке дописываем ',"ts":<ts>}'.
+        self._media_cache: dict[str, tuple[float, bytes, bytes, int, str]] = {}
         self._media_cache_lock = threading.Lock()
         self._media_cache_max  = 30
-        self._media_cache_ttl  = 300.0  # секунд
+        self._media_cache_ttl  = 300.0
 
-        # ── SQLite чат (хост хранит историю на диске) ────────────────────────
+        # ── SQLite чат ────────────────────────────────────────────────────────
         self._chat_db: ChatDB | None = None
         try:
             self._chat_db = ChatDB()
@@ -180,34 +186,80 @@ class SFUServer:
             print(f"[Server] ChatDB init error: {e}")
             self._chat_db = None
 
+        # FIX: send_global_state broadcast queue.
+        # Раньше sync_users рассылался в цикле СИНХРОННО из tcp_handler-потока.
+        # Если у одного клиента заполнен TCP send-буфер, sendall блокируется и
+        # задерживает рассылку всем остальным (и сам tcp_handler тоже встаёт).
+        # Решение: выделенный поток-broadcaster с очередью.
+        # tcp_handler только кладёт (payload, conns) в очередь и немедленно
+        # возвращается — медленный клиент изолирован в broadcaster-потоке.
+        self._bcast_queue: _queue.Queue = _queue.Queue(maxsize=64)
+        self._bcast_thread = threading.Thread(
+            target=self._bcast_loop, daemon=True, name="srv-bcast"
+        )
+        self._bcast_thread.start()
+
+    # ------------------------------------------------------------------
+    # Broadcaster loop
+    # ------------------------------------------------------------------
+    def _bcast_loop(self) -> None:
+        """
+        Выделенный поток рассылки sync_users.
+
+        Берёт (payload, conns) из очереди и отправляет каждому клиенту.
+        Медленный клиент замедляет только свою отправку; остальные не ждут.
+
+        SO_SNDTIMEO = 500 мс: если TCP send-буфер клиента не освобождается
+        за 500 мс — sendall завершается с ошибкой (не с зависанием).
+        Следующий вызов send_global_state обновит состояние повторно.
+        Только для sendall-вызовов из broadcaster — recv в tcp_handler
+        использует отдельный таймаут и не затронут.
+        """
+        from .server_webrtc import _get_conn_lock
+        while self._accepting:
+            try:
+                item = self._bcast_queue.get(timeout=1.0)
+            except _queue.Empty:
+                continue
+            payload, conns = item
+            for conn in conns:
+                try:
+                    lock = _get_conn_lock(conn)
+                    with lock:
+                        # SO_SNDTIMEO: на Windows принимает int (миллисекунды).
+                        # На других ОС — struct timeval, но приложение Windows-only.
+                        try:
+                            conn.setsockopt(
+                                socket.SOL_SOCKET, socket.SO_SNDTIMEO, 500
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            conn.sendall(payload)
+                        except Exception:
+                            pass
+                        try:
+                            conn.setsockopt(
+                                socket.SOL_SOCKET, socket.SO_SNDTIMEO, 0
+                            )
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
     # ------------------------------------------------------------------
     # Управление каналами
     # ------------------------------------------------------------------
     def get_client_count(self) -> int:
-        """Возвращает текущее число подключённых клиентов. Используется ServerAnnouncer."""
         with self.clients_lock:
             return len(self.clients)
 
     def _get_user_nicks_list(self) -> list:
-        """Возвращает список никнеймов подключённых клиентов. Используется ServerAnnouncer
-        для включения в UDP-broadcast, чтобы клиенты показывали hover-попап с участниками."""
         with self.clients_lock:
             return [c.get('nick', '') for c in self.clients.values() if c.get('nick')]
 
     def _pick_best_host(self, exclude_uid: int = 0) -> tuple[int, str]:
-        """
-        Выбирает лучшего кандидата в новые хосты по критерию минимального RTT.
-
-        Алгоритм:
-          1. Берём всех подключённых клиентов кроме exclude_uid (текущий хост).
-          2. Сортируем по self._client_pings[uid] (чем меньше — тем лучше).
-          3. Если у клиента нет данных о пинге — считаем его пинг = 999ms
-             (хуже любого реального, но лучше "вообще нет кандидатов").
-          4. При равенстве пинга приоритет отдаётся первому в host_order
-             (они пришли раньше, сеть скорее всего надёжнее).
-
-        Возвращает (uid, ip) лучшего кандидата или (0, '') если нет кандидатов.
-        """
+        """Выбирает лучшего кандидата в новые хосты по минимальному RTT."""
         with self.clients_lock:
             candidates = [
                 (c['uid'], c.get('ip', ''))
@@ -227,7 +279,6 @@ class SFUServer:
         def _sort_key(item):
             uid, _ = item
             ping = pings_snapshot.get(uid, 999)
-            # Вторичная сортировка по позиции в host_order (меньше = раньше пришёл)
             try:
                 pos = order_snapshot.index(uid)
             except ValueError:
@@ -243,7 +294,6 @@ class SFUServer:
         return best_uid, best_ip
 
     def _get_channel_list(self) -> list:
-        """Снимок списка каналов для включения в sync_users."""
         with self._channels_lock:
             return [
                 {
@@ -255,7 +305,6 @@ class SFUServer:
             ]
 
     def _create_temp_channel(self, name: str, password) -> bool:
-        """Создаёт временный канал. True если создан, False если уже существует."""
         with self._channels_lock:
             if name in self._channels:
                 return False
@@ -264,24 +313,22 @@ class SFUServer:
         return True
 
     def _cleanup_temp_channels(self, leaving_room: str):
-        """Удаляет пустой временный канал и рассылает CMD_CHANNEL_DELETED."""
-        # FIX #6: исправлен дедлок вложенных локов.
-        # Было: with _channels_lock → with clients_lock (порядок A→B).
-        # tcp_handler держит clients_lock и берёт _channels_lock (порядок B→A).
-        # Два потока = классический deadlock.
-        #
-        # Решение: трёхфазный подход без вложенности:
-        #   1. Читаем канал под _channels_lock (не трогаем clients_lock).
-        #   2. Считаем occupants под clients_lock (не трогаем _channels_lock).
-        #   3. Удаляем и рассылаем под _channels_lock, затем clients_lock — строго по очереди.
+        """Удаляет пустой временный канал и рассылает CMD_CHANNEL_DELETED.
 
-        # Фаза 1: проверяем что канал существует и не постоянный
+        SENIOR FIX: TOCTOU-гонка. Раньше occupants-проверка и pop() были
+        в разных lock-секциях: между ними новый клиент мог войти в канал,
+        попадая в "фантомный" канал (удалённый, но кто-то внутри).
+
+        Решение: финальная проверка occupants под ОБОИМИ локами одновременно
+        перед pop(). Порядок локов: channels_lock → clients_lock (согласован
+        с другими местами в коде).
+        """
+        # Быстрый exit: канал постоянный или не существует
         with self._channels_lock:
             ch = self._channels.get(leaving_room)
             if not ch or ch['permanent']:
                 return
 
-        # Фаза 2: считаем occupants БЕЗ _channels_lock
         with self.clients_lock:
             occupants = sum(
                 1 for c in self.clients.values()
@@ -290,12 +337,25 @@ class SFUServer:
         if occupants > 0:
             return
 
-        # Фаза 3: удаляем канал (проверяем снова — канал мог измениться)
+        # SENIOR FIX: атомарная финальная проверка + pop под channels_lock+clients_lock
         with self._channels_lock:
             ch = self._channels.get(leaving_room)
             if not ch or ch['permanent']:
-                return  # уже удалён или стал постоянным между фазами
-            self._channels.pop(leaving_room, None)
+                return
+            # Перепроверяем occupants — если кто-то вошёл между двумя проверками
+            with self.clients_lock:
+                occupants_final = sum(
+                    1 for c in self.clients.values()
+                    if c.get('room') == leaving_room
+                )
+                if occupants_final > 0:
+                    return
+                self._channels.pop(leaving_room, None)
+
+        # FIX #6: чистим _channel_auth для удалённого канала у всех клиентов.
+        with self._channel_auth_lock:
+            for auth_set in self._channel_auth.values():
+                auth_set.discard(leaving_room)
 
         print(f"[Server] 🗑 Временный канал '{leaving_room}' удалён (пустой)")
         payload = json.dumps({
@@ -304,14 +364,12 @@ class SFUServer:
         }).encode('utf-8')
         with self.clients_lock:
             conns = list(self.clients.keys())
+        # SENIOR FIX: _safe_send вместо прямого sendall — защита от гонки
+        # с broadcaster-потоком (_bcast_loop шлёт sync_users параллельно).
         for c in conns:
-            try:
-                c.sendall(payload)
-            except Exception:
-                pass
+            self._safe_send(c, payload)
 
     def _check_channel_auth(self, conn, channel_name: str) -> bool:
-        """True если conn авторизован для входа в channel_name."""
         with self._channels_lock:
             ch = self._channels.get(channel_name)
         if ch is None:
@@ -321,19 +379,25 @@ class SFUServer:
         with self._channel_auth_lock:
             return channel_name in self._channel_auth.get(conn, set())
 
-    # ------------------------------------------------------------------
-    # Вспомогательный метод: отправка JSON клиенту из любого потока
-    # ------------------------------------------------------------------
     def send_to_conn(self, conn, msg: dict) -> None:
+        """Синхронная отправка JSON клиенту."""
+        self._safe_send(conn, json.dumps(msg).encode('utf-8'))
+
+    def _safe_send(self, conn, payload: bytes) -> None:
         """
-        Синхронная отправка JSON клиенту.
-        Используется из tcp_handler (threading-контекст).
-        Для вызова из asyncio-контекста — используй SFU._send_async().
+        Потокобезопасная отправка байтов клиенту.
+
+        FIX #47 (серверная сторона): sendall() на один socket из разных потоков
+        (например, broadcast из tcp_handler и ответ на команду из другого) мог
+        перемешать байты JSON. Используем per-conn lock из server_webrtc.
         """
-        try:
-            conn.sendall(json.dumps(msg).encode('utf-8'))
-        except Exception:
-            pass
+        from .server_webrtc import _get_conn_lock
+        lock = _get_conn_lock(conn)
+        with lock:
+            try:
+                conn.sendall(payload)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Мониторинг
@@ -346,29 +410,18 @@ class SFUServer:
                 break
             with self.clients_lock:
                 active = len(self.clients)
-            curr_bytes = self.stats["bytes"]   # int — атомарное чтение
+            # FIX #2: читаем под локом для консистентности.
+            with self.stats_lock:
+                curr_bytes = self.stats["bytes"]
             diff = (curr_bytes - last_bytes) / 1024 / 5
             print(f"[Stats] Active: {active} | Traffic: {diff:.1f} KB/s")
             last_bytes = curr_bytes
 
     # ------------------------------------------------------------------
-    # UDP-маршрутизация (только голос + ping)
+    # UDP-маршрутизация
     # ------------------------------------------------------------------
     def udp_handler(self):
-        """
-        FIX #1 + FIX #2: UDP-поток держит лок только на минимальное время.
-        Все sendto() выполняются после освобождения лока.
-
-        После рефакторинга обрабатывает только:
-          — Ping (flags=254): echo без локов.
-          — Голос комнаты: broadcast всем в комнате кроме отправителя.
-          — Whisper (FLAG_WHISPER): доставка конкретному получателю.
-          — FLAG_STREAM_VOICES: голоса участников для зрителей стрима.
-              (Mix Minus UDP — сохранён для первой итерации, WebRTC аудио позже)
-
-        Видеопакеты (FLAG_VIDEO, FLAG_STREAM_AUDIO) больше не приходят через UDP —
-        стрим передаётся через WebRTC.
-        """
+        """UDP-поток держит лок только на минимальное время."""
         while self._accepting:
             try:
                 data, addr = self.udp_sock.recvfrom(BUFFER_SIZE)
@@ -379,18 +432,18 @@ class SFUServer:
                     data[:UDP_HEADER_SIZE]
                 )
 
-                # Ping: отвечаем немедленно, без локов
+                # Ping: отвечаем немедленно
                 if flags == 254:
                     self.udp_sock.sendto(data, addr)
                     continue
 
-                # Обновляем UDP-адрес отправителя.
-                # stats обновляем ВНЕ лока — int-запись атомарна через GIL.
                 with self.udp_lock:
                     self.udp_map[sender_uid] = addr
                     sender_room = self.uid_to_room.get(sender_uid)
-                self.stats["packets"] += 1
-                self.stats["bytes"]   += len(data)
+                # FIX #2: stats_lock защищает от race
+                with self.stats_lock:
+                    self.stats["packets"] += 1
+                    self.stats["bytes"]   += len(data)
 
                 if not sender_room:
                     continue
@@ -399,8 +452,6 @@ class SFUServer:
                 is_whisper       = bool(flags & FLAG_WHISPER)
 
                 if is_whisper:
-                    # ШЁПОТ → только target_uid.
-                    # Payload: [target_uid: 4 байта big-endian] + [opus].
                     if len(data) < UDP_HEADER_SIZE + STREAM_VOICE_HEADER_SIZE:
                         continue
                     (target_uid,) = STREAM_VOICE_HEADER_STRUCT.unpack(
@@ -409,24 +460,31 @@ class SFUServer:
                     with self.udp_lock:
                         target_addr = self.udp_map.get(target_uid)
                     if target_addr:
+                        # ── Анонимный шёпот ──────────────────────────────────
+                        # Клиент-отправитель не может сам подменить sender_uid
+                        # в header (иначе сервер не найдёт sender_room и дропнет
+                        # пакет). Поэтому подмену делает сервер: сохраняем
+                        # keepalive по реальному sender_uid, но на wire к
+                        # получателю отправляем пакет с ANONYMOUS_UID в header.
+                        # Реальный uid отправителя остаётся известен ТОЛЬКО
+                        # серверу — получатель физически его не видит.
+                        if flags & FLAG_ANONYMOUS:
+                            new_header = UDP_HEADER_STRUCT.pack(
+                                ANONYMOUS_UID, msg_ts, seq, flags
+                            )
+                            out_data = new_header + data[UDP_HEADER_SIZE:]
+                        else:
+                            out_data = data
                         try:
-                            self.udp_sock.sendto(data, target_addr)
+                            self.udp_sock.sendto(out_data, target_addr)
                         except Exception:
                             pass
 
                 elif is_stream_voices:
-                    # ГОЛОСОВОЙ ПОТОК СТРИМА (Mix Minus) → зрители стримера.
-                    # Payload: [speaker_uid: 4 байта] + [opus].
-                    # Зритель получает полный пакет, отбрасывает свой speaker_uid.
-                    # UDP-путь сохранён для первой итерации (план рекомендация В).
                     self._send_to_watchers(sender_uid, data)
 
                 else:
-                    # АУДИО КОМНАТЫ → все в той же комнате, кроме отправителя.
-                    # FIX: без вложенных локов (clients_lock → udp_lock).
-                    # 1. Под clients_lock собираем uid получателей.
-                    # 2. Под udp_lock разрешаем uid → addr.
-                    # 3. sendto() — без любых локов.
+                    # АУДИО КОМНАТЫ
                     with self.clients_lock:
                         target_uids = [
                             c_data['uid']
@@ -449,7 +507,7 @@ class SFUServer:
                             pass
 
             except OSError:
-                break   # сокет закрыт — выходим
+                break
             except Exception:
                 if not self._accepting:
                     break
@@ -458,18 +516,27 @@ class SFUServer:
     # TCP-обработчик одного клиента
     # ------------------------------------------------------------------
     def tcp_handler(self, conn, addr):
-        uid       = secrets.randbelow(10**9) + 1  # криптографически уникальный
+        uid       = secrets.randbelow(10**9) + 1
         client_ip = addr[0]
-        buffer    = ""
-        # JSONDecoder создаём ОДИН РАЗ на соединение — он stateless.
         _decoder  = json.JSONDecoder()
+
+        # FIX #4: инкрементальный UTF-8 декодер корректно обрабатывает байты
+        # на границах chunk. Раньше `bytes.decode(errors='ignore')` съедал
+        # частичные последовательности эмоджи/кириллицы на границе recv(4096).
+        utf8_decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+        buffer = ""
 
         try:
             while True:
                 chunk_bytes = conn.recv(4096)
                 if not chunk_bytes:
                     break
-                buffer += chunk_bytes.decode('utf-8', errors='ignore')
+                buffer += utf8_decoder.decode(chunk_bytes, final=False)
+
+                # FIX #4: защита от переполнения буфера (медленный клиент / атака)
+                if len(buffer) > _TCP_BUFFER_MAX:
+                    print(f"[Server] Клиент uid={uid}: буфер превысил {_TCP_BUFFER_MAX}, отключаем")
+                    break
 
                 while True:
                     try:
@@ -494,12 +561,6 @@ class SFUServer:
                                 }
                             with self.udp_lock:
                                 self.uid_to_room[uid] = _gcn
-                            # Добавляем в очередь потенциальных хостов.
-                            # FIX (Bug G): в embedded-режиме владелец сервера (_owner_ip)
-                            # всегда вставляется в host_order[0], независимо от порядка
-                            # подключения. 150мс QTimer в _on_become_host даёт другим
-                            # клиентам подключиться раньше — без этого они захватывали
-                            # host_order[0] и получали права передачи сервера.
                             with self._host_order_lock:
                                 if uid not in self._host_order:
                                     if self._is_embedded and client_ip == self._owner_ip:
@@ -508,7 +569,8 @@ class SFUServer:
                                               f"(uid={uid}) → position 0 (приоритет по IP)")
                                     else:
                                         self._host_order.append(uid)
-                            conn.sendall(
+                            self._safe_send(
+                                conn,
                                 json.dumps({'action': 'login_success', 'uid': uid}).encode('utf-8')
                             )
                             with self.clients_lock:
@@ -525,18 +587,17 @@ class SFUServer:
                             _gcn_jr = self._general_channel_name
                             new_room = msg.get('room', _gcn_jr)[:CHANNEL_NAME_MAX_LEN]
 
-                            # Проверяем существование и пароль канала
                             with self._channels_lock:
                                 ch = self._channels.get(new_room)
 
                             if new_room != _gcn_jr and ch is None:
-                                conn.sendall(json.dumps({
+                                self._safe_send(conn, json.dumps({
                                     'action': 'join_room_denied',
                                     'reason': 'not_found',
                                     'room':   new_room,
                                 }).encode('utf-8'))
                             elif ch and ch['password'] is not None and not self._check_channel_auth(conn, new_room):
-                                conn.sendall(json.dumps({
+                                self._safe_send(conn, json.dumps({
                                     'action': 'join_room_denied',
                                     'reason': 'channel_auth_required',
                                     'room':   new_room,
@@ -563,7 +624,7 @@ class SFUServer:
                                 ch = self._channels.get(ch_name)
 
                             if ch is None:
-                                conn.sendall(json.dumps({
+                                self._safe_send(conn, json.dumps({
                                     'action': 'channel_auth_result',
                                     'ok': False, 'reason': 'not_found',
                                     'channel_name': ch_name,
@@ -571,24 +632,24 @@ class SFUServer:
                             elif ch['password'] is None or ch['password'] == ch_pass:
                                 with self._channel_auth_lock:
                                     self._channel_auth.setdefault(conn, set()).add(ch_name)
-                                conn.sendall(json.dumps({
+                                self._safe_send(conn, json.dumps({
                                     'action': 'channel_auth_result',
                                     'ok': True,
                                     'channel_name': ch_name,
                                 }).encode('utf-8'))
                             else:
-                                conn.sendall(json.dumps({
+                                self._safe_send(conn, json.dumps({
                                     'action': 'channel_auth_result',
                                     'ok': False, 'reason': 'wrong_password',
                                     'channel_name': ch_name,
                                 }).encode('utf-8'))
 
-                        # ── Создание временного канала (только хост) ──────────
+                        # ── Создание временного канала ──────────
                         elif action == CMD_CREATE_CHANNEL:
                             with self._host_order_lock:
                                 is_host = bool(self._host_order and self._host_order[0] == uid)
                             if not is_host:
-                                conn.sendall(json.dumps({
+                                self._safe_send(conn, json.dumps({
                                     'action': 'create_channel_result',
                                     'ok': False, 'reason': 'not_host',
                                 }).encode('utf-8'))
@@ -596,24 +657,24 @@ class SFUServer:
                                 ch_name = msg.get('channel_name', '').strip()[:CHANNEL_NAME_MAX_LEN]
                                 ch_pass = msg.get('password', '').strip()[:CHANNEL_PASS_MAX_LEN] or None
                                 if not ch_name or ch_name.lower() == 'general':
-                                    conn.sendall(json.dumps({
+                                    self._safe_send(conn, json.dumps({
                                         'action': 'create_channel_result',
                                         'ok': False, 'reason': 'invalid_name',
                                     }).encode('utf-8'))
                                 elif self._create_temp_channel(ch_name, ch_pass):
-                                    conn.sendall(json.dumps({
+                                    self._safe_send(conn, json.dumps({
                                         'action': 'create_channel_result',
                                         'ok': True, 'channel_name': ch_name,
                                     }).encode('utf-8'))
                                     self._mark_dirty()
                                     self.send_global_state()
                                 else:
-                                    conn.sendall(json.dumps({
+                                    self._safe_send(conn, json.dumps({
                                         'action': 'create_channel_result',
                                         'ok': False, 'reason': 'already_exists',
                                     }).encode('utf-8'))
 
-                        # ── FIX #4: Переименование постоянного канала (только хост) ──
+                        # ── Переименование постоянного канала ──
                         elif action == 'rename_channel':
                             with self._host_order_lock:
                                 is_host = bool(self._host_order and self._host_order[0] == uid)
@@ -625,7 +686,6 @@ class SFUServer:
                                         ch_data = self._channels.pop(old_nm, None)
                                         if ch_data is not None:
                                             self._channels[new_nm] = ch_data
-                                            # Переводим всех клиентов из старого имени в новое
                                             with self.clients_lock:
                                                 for cdata in self.clients.values():
                                                     if cdata.get('room') == old_nm:
@@ -635,6 +695,12 @@ class SFUServer:
                                                     if v == old_nm:
                                                         self.uid_to_room[k] = new_nm
                                             self._general_channel_name = new_nm
+                                            # FIX #6: переносим записи в _channel_auth
+                                            with self._channel_auth_lock:
+                                                for auth_set in self._channel_auth.values():
+                                                    if old_nm in auth_set:
+                                                        auth_set.discard(old_nm)
+                                                        auth_set.add(new_nm)
                                             print(f"[Server] Канал переименован: '{old_nm}' → '{new_nm}'")
                                     self._mark_dirty()
                                     self.send_global_state()
@@ -650,12 +716,6 @@ class SFUServer:
 
                         # ── Update Status ─────────────────────────────────────
                         elif action == 'update_status':
-                            # FIX #10: UDP-keepalive шлёт update_status каждую секунду
-                            # на каждого пользователя — даже если mute/deaf не менялись.
-                            # С 20 юзерами: 20 send_global_state/сек × (сериализация всех
-                            # + 20 sendall) = 400 sendall/сек зря.
-                            # Решение: сравниваем старое и новое значения; broadcast
-                            # только если что-то реально изменилось.
                             new_mute = msg.get('mute', False)
                             new_deaf = msg.get('deaf', False)
                             _status_changed = False
@@ -670,12 +730,14 @@ class SFUServer:
                             if _status_changed:
                                 self._mark_dirty()
                                 self.send_global_state()
-                        # ── Ping Report (тихий — без send_global_state) ────────
-                        # Клиент шлёт свой текущий RTT раз в ~3 сек из ping_loop.
-                        # Сервер сохраняет для _pick_best_host (выбор нового хоста).
+
+                        # ── Ping Report ────────
                         elif action == 'report_ping':
                             ping_ms = msg.get('ping_ms', 0)
-                            if isinstance(ping_ms, (int, float)) and ping_ms >= 0:
+                            # FIX #9: защита от nan/inf (int(nan) → ValueError)
+                            if (isinstance(ping_ms, (int, float))
+                                    and math.isfinite(ping_ms)
+                                    and ping_ms >= 0 and ping_ms < 60000):
                                 with self._client_pings_lock:
                                     self._client_pings[uid] = int(ping_ms)
 
@@ -696,19 +758,11 @@ class SFUServer:
                             with self.clients_lock:
                                 if conn in self.clients:
                                     self.clients[conn]['is_streaming'] = True
-                                    # Сохраняем реальный порт SFU стримера.
-                                    # Клиент передаёт его в сообщении (динамический порт).
                                     self.clients[conn]['sfu_port'] = msg.get('sfu_port', 7788)
                                     started_uid = self.clients[conn]['uid']
                                     print(f"[Server] {self.clients[conn]['nick']} запустил стрим (SFU порт={self.clients[conn]['sfu_port']})")
 
-                            # FIX: если у стримера были зрители от предыдущей сессии —
-                            # уведомляем их о возврате через 'streamer_reconnected'.
-                            # Без этого зрители навсегда остаются в "Ожидание видео...":
-                            # их _viewer_pc привязан к старому мёртвому ICE-соединению,
-                            # и они не знают что нужно заново делать WebRTC handshake.
                             if started_uid is not None:
-                                existing_watchers: dict = {}
                                 with self.watchers_lock:
                                     existing_watchers = dict(self.watchers.get(started_uid, {}))
 
@@ -719,13 +773,15 @@ class SFUServer:
                                     }).encode('utf-8')
                                     notified = 0
                                     with self.clients_lock:
-                                        for c, info in list(self.clients.items()):
-                                            if info.get('uid') in existing_watchers:
-                                                try:
-                                                    c.sendall(notify)
-                                                    notified += 1
-                                                except Exception:
-                                                    pass
+                                        _watchers_to_notify = [
+                                            c for c, info in self.clients.items()
+                                            if info.get('uid') in existing_watchers
+                                        ]
+                                    # SENIOR FIX: вышли из-под clients_lock перед I/O
+                                    # (sendall может блокироваться на медленном клиенте)
+                                    for c in _watchers_to_notify:
+                                        self._safe_send(c, notify)
+                                        notified += 1
                                     print(f"[Server] streamer_reconnected uid={started_uid} → {notified} зрителей")
 
                             self._mark_dirty()
@@ -742,7 +798,6 @@ class SFUServer:
                             if stopped_uid is not None:
                                 with self.watchers_lock:
                                     self.watchers.pop(stopped_uid, None)
-                                # Закрываем WebRTC сессию стримера и всех его зрителей
                                 _sfu = self.sfu
                                 if _sfu:
                                     _sfu.close_streamer(stopped_uid)
@@ -753,51 +808,49 @@ class SFUServer:
                         elif action == 'stream_watch_start':
                             streamer_uid = msg.get('streamer_uid')
                             if streamer_uid is not None:
+                                # FIX #1: все w_uid/watcher_nick/watcher_avatar
+                                # защищены проверкой conn in clients.
+                                w_uid = watcher_nick = watcher_avatar = None
                                 with self.clients_lock:
                                     if conn in self.clients:
                                         watcher        = self.clients[conn]
                                         w_uid          = watcher['uid']
                                         watcher_nick   = watcher['nick']
                                         watcher_avatar = watcher.get('avatar', '1.svg')
-                                with self.watchers_lock:
-                                    if streamer_uid not in self.watchers:
-                                        self.watchers[streamer_uid] = {}
-                                    self.watchers[streamer_uid][w_uid] = {
-                                        'uid':    w_uid,
-                                        'nick':   watcher_nick,
-                                        'avatar': watcher_avatar,
-                                    }
-                                print(
-                                    f"[Server] {watcher_nick} "
-                                    f"начал смотреть стрим uid={streamer_uid}"
-                                )
-                                # WebRTC v3: посылаем зрителю триггер → он создаёт offer
-                                _sfu = self.sfu
-                                if _sfu:
-                                    quality = msg.get('quality', 'hq')
-                                    # Находим RadminVPN IP стримера для роутинга
-                                    # viewer-оффера к его sidecar.exe (не-хост стримеры).
-                                    streamer_ip = '127.0.0.1'
-                                    with self.clients_lock:
-                                        for _c in self.clients.values():
-                                            if _c.get('uid') == streamer_uid:
-                                                raw_ip = _c.get('ip', '127.0.0.1')
-                                                # FIX БАГ 3: стример — владелец
-                                                # embedded-сервера. Его IP хранится как
-                                                # RadminVPN-адрес (26.x.x.x), но SFU
-                                                # слушает только на localhost.
-                                                # Если IP == _owner_ip → 127.0.0.1.
-                                                if self._is_embedded and raw_ip == self._owner_ip:
-                                                    streamer_ip = '127.0.0.1'
-                                                else:
-                                                    streamer_ip = raw_ip
-                                                streamer_sfu_port = _c.get('sfu_port', 7788)
-                                                break
-                                    _sfu.trigger_viewer_connect(
-                                        w_uid, streamer_uid, conn, quality,
-                                        streamer_ip=streamer_ip,
-                                        streamer_sfu_port=streamer_sfu_port,
+
+                                if w_uid is not None:
+                                    with self.watchers_lock:
+                                        if streamer_uid not in self.watchers:
+                                            self.watchers[streamer_uid] = {}
+                                        self.watchers[streamer_uid][w_uid] = {
+                                            'uid':    w_uid,
+                                            'nick':   watcher_nick,
+                                            'avatar': watcher_avatar,
+                                        }
+                                    print(
+                                        f"[Server] {watcher_nick} "
+                                        f"начал смотреть стрим uid={streamer_uid}"
                                     )
+                                    _sfu = self.sfu
+                                    if _sfu:
+                                        quality = msg.get('quality', 'hq')
+                                        streamer_ip = '127.0.0.1'
+                                        streamer_sfu_port = 7788
+                                        with self.clients_lock:
+                                            for _c in self.clients.values():
+                                                if _c.get('uid') == streamer_uid:
+                                                    raw_ip = _c.get('ip', '127.0.0.1')
+                                                    if self._is_embedded and raw_ip == self._owner_ip:
+                                                        streamer_ip = '127.0.0.1'
+                                                    else:
+                                                        streamer_ip = raw_ip
+                                                    streamer_sfu_port = _c.get('sfu_port', 7788)
+                                                    break
+                                        _sfu.trigger_viewer_connect(
+                                            w_uid, streamer_uid, conn, quality,
+                                            streamer_ip=streamer_ip,
+                                            streamer_sfu_port=streamer_sfu_port,
+                                        )
                             self._mark_dirty()
                             self.send_global_state()
 
@@ -814,7 +867,6 @@ class SFUServer:
                                     with self.clients_lock:
                                         nick = self.clients[conn]['nick'] if conn in self.clients else '?'
                                     print(f"[Server] {nick} перестал смотреть стрим uid={streamer_uid}")
-                                    # Закрываем WebRTC PC зрителя
                                     _sfu = self.sfu
                                     if _sfu:
                                         _sfu.close_viewer(w_uid)
@@ -830,84 +882,39 @@ class SFUServer:
                             if not self.sfu:
                                 continue
 
-                            print(f"[Server] CMD_WEBRTC_OFFER: role={role!r}, uid={uid}, sdp_len={len(sdp) if sdp else 0}, sfu={bool(self.sfu)}")
+                            print(f"[Server] CMD_WEBRTC_OFFER: role={role!r}, uid={uid}, sdp_len={len(sdp) if sdp else 0}")
                             if role == 'viewer_offer':
-                                # v3: зритель прислал свой offer → прокси в Pion SFU
                                 if sdp:
-                                    print(f"[Server] → handle_viewer_offer(uid={uid})")
                                     self.sfu.handle_viewer_offer(uid, sdp, conn)
                                 else:
                                     print(f"[Server] ❌ viewer_offer с пустым SDP от uid={uid}")
                             elif role == 'streamer':
                                 print(f"[Server] CMD_WEBRTC_OFFER role=streamer uid={uid}: ignored in v3")
                             elif role == 'viewer':
-                                print(f"[Server] CMD_WEBRTC_OFFER role=viewer uid={uid}: триггер от старого клиента (без v3 offer)")
+                                print(f"[Server] CMD_WEBRTC_OFFER role=viewer uid={uid}: триггер старого клиента")
                             else:
                                 print(f"[Server] CMD_WEBRTC_OFFER неизвестный role={role!r} uid={uid}")
 
-                        # ── WebRTC Answer (v3: не используется — сервер сам отвечает) ──
                         elif action == CMD_WEBRTC_ANSWER:
-                            pass  # v3: answer идёт server→viewer, не viewer→server
+                            pass  # v3: answer идёт server→viewer
 
-                        # ── WebRTC ICE Candidate (v3: gather-complete — trickle не используется)
                         elif action == CMD_WEBRTC_ICE:
-                            pass  # v3: gather-complete ICE, кандидаты в SDP
+                            pass  # v3: gather-complete ICE
 
-                        # ── Передача сервера другому участнику ────────────────
+                        # ── Передача сервера (2-шаговая) ────
                         elif action == CMD_SERVER_TRANSFER:
                             target_uid_st = msg.get('target_uid')
                             if not isinstance(target_uid_st, int):
                                 continue
-                            # Только хост (host_order[0]) может передать сервер
-                            with self._host_order_lock:
-                                is_host = bool(
-                                    self._host_order and self._host_order[0] == uid
-                                )
-                            if not is_host:
-                                print(
-                                    f"[Server] server_transfer от uid={uid}: "
-                                    f"не является хостом — отклонено"
-                                )
-                                continue
+                            with self.clients_lock:
+                                snap = dict(self.clients)
+                            self._handle_server_transfer_v2(
+                                uid, target_uid_st, snap, conn
+                            )
 
-                            # target_uid == 0 → авто-выбор по минимальному пингу
-                            if target_uid_st == 0:
-                                target_uid_st, target_ip_st = self._pick_best_host(
-                                    exclude_uid=uid
-                                )
-                                if not target_uid_st:
-                                    print("[Server] server_transfer auto: нет кандидатов")
-                                    continue
-                                target_nick_st = '?'
-                                with self.clients_lock:
-                                    for c_data in self.clients.values():
-                                        if c_data['uid'] == target_uid_st:
-                                            target_nick_st = c_data.get('nick', '?')
-                                            break
-                            else:
-                                # Конкретный uid — ищем его IP
-                                target_ip_st   = None
-                                target_nick_st = '?'
-                                with self.clients_lock:
-                                    for c_data in self.clients.values():
-                                        if c_data['uid'] == target_uid_st:
-                                            target_ip_st   = c_data.get('ip')
-                                            target_nick_st = c_data.get('nick', '?')
-                                            break
-                                if not target_ip_st:
-                                    print(
-                                        f"[Server] server_transfer: "
-                                        f"uid={target_uid_st} не найден"
-                                    )
-                                    continue
-                            print(
-                                f"[Server] 🔀 Передача сервера: "
-                                f"uid={uid} → {target_nick_st} (uid={target_uid_st}, "
-                                f"IP={target_ip_st})"
-                            )
-                            self._broadcast_server_migrate(
-                                target_uid_st, target_ip_st
-                            )
+                        # ── Целевой клиент подтверждает готовность ─────────────
+                        elif action == CMD_MIGRATE_READY:
+                            self._handle_migrate_ready(uid)
 
                         # ── Soundboard ────────────────────────────────────────
                         elif action == CMD_SOUNDBOARD:
@@ -916,114 +923,18 @@ class SFUServer:
                                 conns = list(self.clients.keys())
                             msg['from_nick'] = sender_nick
                             payload = json.dumps(msg).encode('utf-8')
-                            # FIX #2: sendall вне clients_lock
+                            # SENIOR FIX: _safe_send вместо прямого sendall
                             for c in conns:
-                                try:
-                                    c.sendall(payload)
-                                except Exception:
-                                    pass
+                                self._safe_send(c, payload)
 
                         # ── Nudge Vote ────────────────────────────────────────
                         elif action == CMD_NUDGE_VOTE:
-                            target_uid = msg.get('target_uid')
-                            if not isinstance(target_uid, int):
-                                continue
-
-                            now  = time.time()
-                            fire = False
-                            t_conn            = None
-                            broadcaster_conns = []
-                            voter_nick   = '?'
-                            target_nick  = '?'
-                            voter_uid_v  = None
-                            voter_room   = None
-
-                            with self.clients_lock:
-                                if conn not in self.clients:
-                                    continue
-                                voter_info  = self.clients[conn]
-                                voter_uid_v = voter_info['uid']
-                                voter_room  = voter_info['room']
-                                voter_nick  = voter_info['nick']
-
-                                room_uids = [
-                                    c['uid'] for c in self.clients.values()
-                                    if c['room'] == voter_room
-                                ]
-                                # Большинство голосующих (все кроме цели).
-                                # 5 чел → 2 голоса, 4 → 2, 3 → 1, 2 → 1.
-                                voters_count = max(1, len(room_uids) - 1)
-                                threshold = max(1, (voters_count + 1) // 2)
-
-                                for c_conn, c_data in self.clients.items():
-                                    if (c_data['uid'] == target_uid
-                                            and c_data['room'] == voter_room):
-                                        t_conn      = c_conn
-                                        target_nick = c_data['nick']
-                                        break
-
-                                broadcaster_conns = [
-                                    c_conn for c_conn, c_data in self.clients.items()
-                                    if c_data['room'] == voter_room
-                                ]
-
-                            if t_conn is None:
-                                continue
-
-                            with self.nudge_lock:
-                                room_votes   = self.nudge_votes.setdefault(voter_room, {})
-                                target_votes = room_votes.setdefault(target_uid, {})
-
-                                last = target_votes.get(voter_uid_v, 0)
-                                if now - last < NUDGE_COOLDOWN_SEC:
-                                    remaining = int(NUDGE_COOLDOWN_SEC - (now - last))
-                                    print(
-                                        f"[Server] 👟 {voter_nick} → Пнуть {target_nick}"
-                                        f" — кулдаун ещё {remaining} с"
-                                    )
-                                    continue
-
-                                target_votes[voter_uid_v] = now
-
-                                active = sum(
-                                    1 for _, ts in target_votes.items()
-                                    if now - ts < NUDGE_COOLDOWN_SEC
-                                )
-                                print(
-                                    f"[Server] 👟 {voter_nick} → Пнуть {target_nick}"
-                                    f" ({active}/{threshold} голосов)"
-                                )
-
-                                if active >= threshold:
-                                    room_votes.pop(target_uid, None)
-                                    fire = True
-
-                            if fire:
-                                try:
-                                    t_conn.sendall(
-                                        json.dumps({'action': CMD_PLAY_NUDGE}).encode('utf-8')
-                                    )
-                                    print(f"[Server] 👟 NUDGE FIRED → {target_nick}")
-                                except Exception:
-                                    pass
-
-                                broadcast_payload = json.dumps({
-                                    'action':      CMD_NUDGE_TRIGGERED,
-                                    'target_nick': target_nick,
-                                    'voter_nick':  voter_nick,
-                                }).encode('utf-8')
-                                for bc in broadcaster_conns:
-                                    try:
-                                        bc.sendall(broadcast_payload)
-                                    except Exception:
-                                        pass
+                            self._process_nudge_vote(conn, uid, msg)
 
                         # ── Файловая передача P2P ─────────────────────────────
                         elif action == CMD_FILE_OFFER:
                             target_uid_fo = msg.get('target_uid')
-                            if not isinstance(target_uid_fo, int):
-                                pass
-                            else:
+                            if isinstance(target_uid_fo, int):
                                 msg['sender_ip'] = client_ip
                                 payload_fo = json.dumps(msg).encode('utf-8')
                                 target_conn_fo = None
@@ -1033,14 +944,9 @@ class SFUServer:
                                             target_conn_fo = c_conn
                                             break
                                 if target_conn_fo:
-                                    try:
-                                        target_conn_fo.sendall(payload_fo)
-                                        print(
-                                            f"[Server] 📁 file_offer: "
-                                            f"uid={uid} → uid={target_uid_fo}"
-                                        )
-                                    except Exception:
-                                        pass
+                                    # SENIOR FIX: _safe_send — гонка с broadcaster-потоком
+                                    self._safe_send(target_conn_fo, payload_fo)
+                                    print(f"[Server] 📁 file_offer: uid={uid} → uid={target_uid_fo}")
 
                         elif action == CMD_FILE_OFFER_ROOM:
                             msg['sender_ip'] = client_ip
@@ -1057,125 +963,27 @@ class SFUServer:
                                         if c_data['room'] == sender_room_fo
                                         and c_data['uid'] != uid
                                     ]
+                            # SENIOR FIX: _safe_send вместо прямого sendall
                             for rc in room_conns:
-                                try:
-                                    rc.sendall(payload_for)
-                                except Exception:
-                                    pass
+                                self._safe_send(rc, payload_for)
                             if room_conns:
-                                print(
-                                    f"[Server] 📁 file_offer_room: "
-                                    f"uid={uid} → {len(room_conns)} получателей"
-                                )
+                                print(f"[Server] 📁 file_offer_room: uid={uid} → {len(room_conns)} получателей")
 
                         # ── Быстрый чат ───────────────────────────────────────
                         elif action == CMD_QUICK_MSG:
                             text = str(msg.get('text', '')).strip()[:QUICK_MSG_MAX_LEN]
-                            if not text:
-                                pass
-                            else:
-                                with self.clients_lock:
-                                    sender_nick = (
-                                        self.clients[conn]['nick']
-                                        if conn in self.clients else '?'
-                                    )
-                                    sender_uid_qm = (
-                                        self.clients[conn]['uid']
-                                        if conn in self.clients else 0
-                                    )
-                                    sender_room_qm = (
-                                        self.clients[conn]['room']
-                                        if conn in self.clients else None
-                                    )
-                                    room_conns_qm = []
-                                    if sender_room_qm:
-                                        room_conns_qm = [
-                                            c_conn
-                                            for c_conn, c_data in self.clients.items()
-                                            if c_data['room'] == sender_room_qm
-                                        ]
-                                broadcast_qm = json.dumps({
-                                    'action':     CMD_QUICK_MSG,
-                                    'uid':        sender_uid_qm,
-                                    'from_nick':  sender_nick,
-                                    'text':       text,
-                                }).encode('utf-8')
-                                for bc in room_conns_qm:
-                                    try:
-                                        bc.sendall(broadcast_qm)
-                                    except Exception:
-                                        pass
+                            if text:
+                                self._process_quick_msg(conn, uid, text)
 
                         # ── Постоянный чат: новое сообщение ───────────────────
-                        # Сервер добавляет nick/uid/avatar/ts и рассылает всем
-                        # в комнате включая отправителя (единый порядок у всех).
                         elif action == CMD_CHAT_MSG:
                             text_cm = str(msg.get('text', '')).strip()[:CHAT_MSG_MAX_LEN]
                             if text_cm:
-                                with self.clients_lock:
-                                    if conn in self.clients:
-                                        c = self.clients[conn]
-                                        sender_nick_cm   = c['nick']
-                                        sender_uid_cm    = c['uid']
-                                        sender_avatar_cm = c.get('avatar', '')
-                                        sender_room_cm   = c.get('room')
-                                    else:
-                                        sender_nick_cm = sender_uid_cm = sender_room_cm = None
-                                        sender_avatar_cm = ''
-                                    if sender_room_cm:
-                                        room_conns_cm = [
-                                            c_conn
-                                            for c_conn, c_data in self.clients.items()
-                                            if c_data.get('room') == sender_room_cm
-                                        ]
-                                    else:
-                                        room_conns_cm = []
-                                if sender_uid_cm:
-                                    ts_cm = time.time()
-                                    broadcast_cm = json.dumps({
-                                        'action':    CMD_CHAT_MSG,
-                                        'uid':       sender_uid_cm,
-                                        'from_nick': sender_nick_cm,
-                                        'avatar':    sender_avatar_cm,
-                                        'text':      text_cm,
-                                        'ts':        ts_cm,
-                                        'room':      sender_room_cm or '',
-                                    }).encode('utf-8')
-                                    # SQLite: сохраняем на диске
-                                    if self._chat_db:
-                                        self._chat_db.add_message({
-                                            'uid': sender_uid_cm, 'nick': sender_nick_cm,
-                                            'avatar': sender_avatar_cm, 'text': text_cm,
-                                            'room': sender_room_cm or '', 'ts': ts_cm,
-                                        })
-                                    for bc in room_conns_cm:
-                                        try:
-                                            bc.sendall(broadcast_cm)
-                                        except Exception:
-                                            pass
+                                self._process_chat_msg(conn, uid, text_cm)
 
-                        # ── Постоянный чат: запрос истории (SQLite) ──────────
-                        # Сервер читает из SQLite напрямую, не relay к хосту.
                         elif action == CMD_CHAT_HISTORY_REQ:
-                            requester_room = None
-                            with self.clients_lock:
-                                if conn in self.clients:
-                                    requester_room = self.clients[conn].get('room', '')
-                            if requester_room:
-                                messages_db = (
-                                    self._chat_db.get_history(requester_room, CHAT_HISTORY_MAX)
-                                    if self._chat_db else []
-                                )
-                                if messages_db:
-                                    try:
-                                        conn.sendall(json.dumps({
-                                            'action':   CMD_CHAT_HISTORY,
-                                            'messages': messages_db,
-                                        }).encode('utf-8'))
-                                    except Exception:
-                                        pass
+                            self._process_chat_history_req(conn)
 
-                        # ── Постоянный чат: relay истории (совместимость) ─────
                         elif action == CMD_CHAT_HISTORY:
                             target_uid_ch = int(msg.get('target_uid', 0))
                             messages_ch   = msg.get('messages', [])
@@ -1187,152 +995,22 @@ class SFUServer:
                                         None
                                     )
                                 if target_conn_ch:
-                                    try:
-                                        target_conn_ch.sendall(json.dumps({
-                                            'action':   CMD_CHAT_HISTORY,
-                                            'messages': messages_ch,
-                                        }).encode('utf-8'))
-                                    except Exception:
-                                        pass
+                                    # SENIOR FIX: _safe_send вместо прямого sendall
+                                    self._safe_send(target_conn_ch, json.dumps({
+                                        'action':   CMD_CHAT_HISTORY,
+                                        'messages': messages_ch,
+                                    }).encode('utf-8'))
 
-                        # ── Typing indicator ──────────────────────────────────
                         elif action == CMD_TYPING:
-                            with self.clients_lock:
-                                if conn in self.clients:
-                                    c_t = self.clients[conn]
-                                    t_uid  = c_t['uid']
-                                    t_nick = c_t['nick']
-                                    t_room = c_t.get('room')
-                                    if t_room:
-                                        t_payload = json.dumps({
-                                            'action': CMD_TYPING,
-                                            'uid':    t_uid,
-                                            'nick':   t_nick,
-                                        }).encode('utf-8')
-                                        t_conns = [
-                                            cc for cc, cd in self.clients.items()
-                                            if cd.get('room') == t_room and cc is not conn
-                                        ]
-                                else:
-                                    t_conns = []
-                            for tc in t_conns:
-                                try:
-                                    tc.sendall(t_payload)
-                                except Exception:
-                                    pass
+                            self._process_typing(conn)
 
-                        # ── Постоянный чат: медиа-вложение (фото/файл) ────────
-                        # FIX #1: кэш пейлоадов по MD5(file_data_b64).
-                        # json.dumps 10 MB base64 = ~50 мс на CPython.
-                        # Тот же файл, пересланный снова (или при ретрансляции),
-                        # отдаётся из кэша за ~0.1 мс.
-                        # Кэш хранит (prefix_bytes, suffix_bytes):
-                        #   prefix = JSON до поля "ts"
-                        #   suffix = JSON после значения "ts"
-                        # При отправке: prefix + str(ts).encode() + suffix
-                        # → аллокация O(len(ts)) вместо O(10 MB).
                         elif action == CMD_CHAT_MEDIA:
                             file_data_b64 = msg.get('file_data_b64', '')
                             if (file_data_b64
                                     and len(file_data_b64) <= CHAT_MEDIA_MAX_B64):
-                                with self.clients_lock:
-                                    if conn in self.clients:
-                                        c = self.clients[conn]
-                                        s_nick_md   = c['nick']
-                                        s_uid_md    = c['uid']
-                                        s_avatar_md = c.get('avatar', '')
-                                        s_room_md   = c.get('room')
-                                    else:
-                                        s_nick_md = s_uid_md = s_room_md = None
-                                        s_avatar_md = ''
-                                    if s_room_md:
-                                        room_conns_md = [
-                                            c_conn
-                                            for c_conn, c_data in self.clients.items()
-                                            if c_data.get('room') == s_room_md
-                                        ]
-                                    else:
-                                        room_conns_md = []
-                                if s_uid_md:
-                                    now_ts = time.time()
-                                    # ── Кэш: строим или берём готовый пейлоад ──
-                                    md5_key = hashlib.md5(
-                                        file_data_b64.encode('utf-8'), usedforsecurity=False
-                                    ).hexdigest()
-                                    with self._media_cache_lock:
-                                        cached = self._media_cache.get(md5_key)
-                                        hit = (cached is not None
-                                               and cached[0] > now_ts
-                                               and cached[3] == s_uid_md
-                                               and cached[4] == s_nick_md)
-                                    if hit:
-                                        _, prefix_b, suffix_b, _, _ = cached
-                                        broadcast_md = (
-                                            prefix_b
-                                            + f'{now_ts}'.encode('ascii')
-                                            + suffix_b
-                                        )
-                                    else:
-                                        # Полная сборка: строим payload и кэшируем части
-                                        full_dict = {
-                                            'action':        CMD_CHAT_MEDIA,
-                                            'uid':           s_uid_md,
-                                            'from_nick':     s_nick_md,
-                                            'avatar':        s_avatar_md,
-                                            'ts':            now_ts,
-                                            'room':          s_room_md or '',
-                                            'file_name':     msg.get('file_name', 'file'),
-                                            'file_type':     msg.get('file_type', ''),
-                                            'file_data_b64': file_data_b64,
-                                        }
-                                        broadcast_md = json.dumps(full_dict).encode('utf-8')
-                                        # Разбиваем на prefix/suffix по полю "ts"
-                                        # Формат json.dumps гарантирован: "ts": <float>
-                                        try:
-                                            ts_marker = f'"ts": {now_ts}'.encode('ascii')
-                                            split_idx = broadcast_md.index(ts_marker)
-                                            prefix_b = broadcast_md[:split_idx + 6]  # до числа
-                                            suffix_b = broadcast_md[split_idx + 6 + len(f'{now_ts}'.encode('ascii')):]
-                                            with self._media_cache_lock:
-                                                # Вытесняем истёкшие записи если кэш полный
-                                                if len(self._media_cache) >= self._media_cache_max:
-                                                    expired = [k for k, v in self._media_cache.items()
-                                                               if v[0] <= now_ts]
-                                                    for k in expired:
-                                                        del self._media_cache[k]
-                                                    # Если всё ещё полный — удаляем самый старый
-                                                    if len(self._media_cache) >= self._media_cache_max:
-                                                        oldest = min(self._media_cache,
-                                                                     key=lambda k: self._media_cache[k][0])
-                                                        del self._media_cache[oldest]
-                                                self._media_cache[md5_key] = (
-                                                    now_ts + self._media_cache_ttl,
-                                                    prefix_b, suffix_b,
-                                                    s_uid_md, s_nick_md,
-                                                )
-                                        except (ValueError, Exception):
-                                            pass  # кэш не удался — broadcast_md уже готов
-                                    for bc in room_conns_md:
-                                        try:
-                                            bc.sendall(broadcast_md)
-                                        except Exception:
-                                            pass
-                                    # SQLite: сохраняем медиа на диске
-                                    if self._chat_db:
-                                        self._chat_db.add_media({
-                                            'uid': s_uid_md, 'nick': s_nick_md,
-                                            'avatar': s_avatar_md,
-                                            'room': s_room_md or '', 'ts': now_ts,
-                                            'file_name': msg.get('file_name', 'file'),
-                                            'file_type': msg.get('file_type', ''),
-                                            'file_data_b64': file_data_b64,
-                                        })
+                                self._process_chat_media(conn, msg, file_data_b64)
 
                         # ── Хост выключает микрофон участника ─────────────────
-                        # Только mic off — уши не трогаются.
-                        # Участник может включить mic обратно сам в любой момент.
-                        # Сервер не меняет clients[conn]['mute'] — клиент сам
-                        # отправит update_status после применения mute.
                         elif action == CMD_HOST_MUTE:
                             with self._host_order_lock:
                                 is_host = bool(
@@ -1348,85 +1026,25 @@ class SFUServer:
                                             None
                                         )
                                     if target_conn_hm:
-                                        try:
-                                            target_conn_hm.sendall(json.dumps({
-                                                'action': CMD_FORCE_MUTED,
-                                            }).encode('utf-8'))
-                                        except Exception:
-                                            pass
+                                        # SENIOR FIX: _safe_send
+                                        self._safe_send(target_conn_hm, json.dumps({
+                                            'action': CMD_FORCE_MUTED,
+                                        }).encode('utf-8'))
 
-                        # ── Draw Stroke: ретрансляция зрителям + стримеру ────────
-                        # Зритель нарисовал мазок → сервер рассылает его всем
-                        # остальным зрителям этого стрима и самому стримеру.
-                        # points — нормализованные (0.0–1.0) координаты кадра.
-                        # width зажат в [1,8], число точек ограничено DRAW_MAX_POINTS.
                         elif action == CMD_DRAW_STROKE:
-                            streamer_uid_dr = msg.get('streamer_uid')
-                            points_dr       = msg.get('points', [])
-                            color_dr        = str(msg.get('color', '#FF6B6B'))[:16]
-                            width_dr        = max(1, min(8, int(msg.get('width', 3))))
-                            nick_dr         = str(msg.get('nick', '?'))[:32]
-
-                            if streamer_uid_dr and isinstance(points_dr, list) and points_dr:
-                                if len(points_dr) > DRAW_MAX_POINTS:
-                                    points_dr = points_dr[:DRAW_MAX_POINTS]
-
-                                with self.clients_lock:
-                                    sender_uid_dr = (
-                                        self.clients[conn]['uid']
-                                        if conn in self.clients else 0
-                                    )
-
-                                relay_dr = json.dumps({
-                                    'action':       CMD_DRAW_STROKE,
-                                    'streamer_uid': streamer_uid_dr,
-                                    'sender_uid':   sender_uid_dr,
-                                    'nick':         nick_dr,
-                                    'color':        color_dr,
-                                    'points':       points_dr,
-                                    'width':        width_dr,
-                                }).encode('utf-8')
-
-                                # Все зрители данного стрима
-                                with self.watchers_lock:
-                                    watcher_uids_dr = set(
-                                        self.watchers.get(streamer_uid_dr, {}).keys()
-                                    )
-
-                                with self.clients_lock:
-                                    # Зрители (включая отправителя для эха)
-                                    target_conns_dr = [
-                                        c for c, d in self.clients.items()
-                                        if d.get('uid') in watcher_uids_dr
-                                    ]
-                                    # Стример — видит мазки у себя на экране
-                                    streamer_conn_dr = next(
-                                        (c for c, d in self.clients.items()
-                                         if d.get('uid') == streamer_uid_dr),
-                                        None,
-                                    )
-                                    if streamer_conn_dr:
-                                        target_conns_dr.append(streamer_conn_dr)
-
-                                for tc in target_conns_dr:
-                                    try:
-                                        tc.sendall(relay_dr)
-                                    except Exception:
-                                        pass
+                            self._process_draw_stroke(conn, msg)
 
                     except json.JSONDecodeError:
                         break
 
         except Exception as e:
-            # OSError (10054/10053 — разрыв соединения) — штатно, не логируем.
-            # Остальные исключения логируем для диагностики.
             err_code = getattr(e, 'winerror', None) or getattr(e, 'errno', None)
             is_disconnect = err_code in (10054, 10053, 104, 32)
             if not is_disconnect:
                 print(f"[Server] TCP ошибка: {e}")
 
         finally:
-            # ── Очистка при отключении ────────────────────────────────────
+            # Очистка при отключении
             u_id = None
             nick = 'Unknown'
             room = '?'
@@ -1446,53 +1064,36 @@ class SFUServer:
                     self.udp_map.pop(u_id, None)
                     self.uid_to_room.pop(u_id, None)
 
-                # Удаляем из очереди хостов
                 with self._host_order_lock:
                     if u_id in self._host_order:
                         self._host_order.remove(u_id)
 
-                # Очищаем auth-кэш отключившегося клиента
                 with self._channel_auth_lock:
                     self._channel_auth.pop(conn, None)
 
-                # FIX #11: очищаем RTT-пинг отключившегося клиента.
-                # _client_pings[uid] никогда не удалялся при дисконнекте —
-                # при 20 пользователях, которые периодически входят/выходят,
-                # словарь рос бесконечно. Для приложения с максимум 20 юзерами
-                # это незначительно по объёму, но семантически некорректно:
-                # _pick_best_host мог учитывать RTT давно отключившегося клиента.
                 with self._client_pings_lock:
                     self._client_pings.pop(u_id, None)
 
-                # FIX 10: удаляем голоса отключившегося из nudge_votes.
-                # Без этого voter_uid записи и target_uid-цели накапливались вечно.
-                # Голоса хранятся внутри: {room → {target_uid → {voter_uid → ts}}}.
-                # Удаляем u_id как voter и как target во всех комнатах.
                 with self.nudge_lock:
                     for r_votes in self.nudge_votes.values():
-                        # Как target — удаляем всю группу голосов за него
                         r_votes.pop(u_id, None)
-                        # Как voter — удаляем его голос у каждой цели
                         for target_votes in r_votes.values():
                             target_votes.pop(u_id, None)
 
-                # Удаляем временные каналы если они опустели
-                if room and room != 'General':
+                # FIX #7: сравнение с _general_channel_name вместо хардкод 'General'
+                if room and room != self._general_channel_name:
                     self._cleanup_temp_channels(room)
 
-                # Убираем пользователя из списков зрителей всех стримеров
                 with self.watchers_lock:
                     for s_uid in list(self.watchers.keys()):
                         if u_id in self.watchers[s_uid]:
                             self.watchers[s_uid].pop(u_id, None)
                     self.watchers.pop(u_id, None)
 
-                # Закрываем WebRTC сессии отключившегося пользователя
                 _sfu = self.sfu
                 if _sfu:
-                    # v3: PionSfuProxy — синхронные вызовы, нет call_async
-                    _sfu.close_streamer(u_id)   # no-op если не был стримером
-                    _sfu.close_viewer(u_id)     # no-op если не был зрителем
+                    _sfu.close_streamer(u_id)
+                    _sfu.close_viewer(u_id)
 
                 print(
                     f"[Server] ✖ {nick} (комната: {room}) "
@@ -1501,19 +1102,383 @@ class SFUServer:
             else:
                 print(f"[Server] ✖ Незарегистрированный клиент {addr[0]} отключился")
 
-            conn.close()
+            try:
+                conn.close()
+            except Exception:
+                pass
+            # FIX #47: очищаем per-conn lock чтобы не накапливались dict ключей
+            try:
+                from .server_webrtc import _drop_conn_lock
+                _drop_conn_lock(conn)
+            except Exception:
+                pass
             self._mark_dirty()
             self.send_global_state()
 
     # ------------------------------------------------------------------
-    # Вспомогательный метод: отправка пакета всем зрителям стримера (UDP)
+    # Вспомогательные методы — вынесены из tcp_handler для читаемости
+    # ------------------------------------------------------------------
+
+    def _process_nudge_vote(self, conn, uid: int, msg: dict) -> None:
+        """Обработка голосования «Пнуть»."""
+        target_uid = msg.get('target_uid')
+        if not isinstance(target_uid, int):
+            return
+
+        now  = time.time()
+        fire = False
+        t_conn            = None
+        broadcaster_conns = []
+        voter_nick   = '?'
+        target_nick  = '?'
+        voter_uid_v  = None
+        voter_room   = None
+
+        with self.clients_lock:
+            if conn not in self.clients:
+                return
+            voter_info  = self.clients[conn]
+            voter_uid_v = voter_info['uid']
+            voter_room  = voter_info['room']
+            voter_nick  = voter_info['nick']
+
+            room_uids = [
+                c['uid'] for c in self.clients.values()
+                if c['room'] == voter_room
+            ]
+            voters_count = max(1, len(room_uids) - 1)
+            threshold = max(1, (voters_count + 1) // 2)
+
+            for c_conn, c_data in self.clients.items():
+                if (c_data['uid'] == target_uid
+                        and c_data['room'] == voter_room):
+                    t_conn      = c_conn
+                    target_nick = c_data['nick']
+                    break
+
+            broadcaster_conns = [
+                c_conn for c_conn, c_data in self.clients.items()
+                if c_data['room'] == voter_room
+            ]
+
+        if t_conn is None:
+            return
+
+        with self.nudge_lock:
+            room_votes   = self.nudge_votes.setdefault(voter_room, {})
+            target_votes = room_votes.setdefault(target_uid, {})
+
+            last = target_votes.get(voter_uid_v, 0)
+            if now - last < NUDGE_COOLDOWN_SEC:
+                remaining = int(NUDGE_COOLDOWN_SEC - (now - last))
+                print(
+                    f"[Server] 👟 {voter_nick} → Пнуть {target_nick}"
+                    f" — кулдаун ещё {remaining} с"
+                )
+                return
+
+            target_votes[voter_uid_v] = now
+
+            active = sum(
+                1 for _, ts in target_votes.items()
+                if now - ts < NUDGE_COOLDOWN_SEC
+            )
+            print(
+                f"[Server] 👟 {voter_nick} → Пнуть {target_nick}"
+                f" ({active}/{threshold} голосов)"
+            )
+
+            if active >= threshold:
+                room_votes.pop(target_uid, None)
+                fire = True
+
+        if fire:
+            # SENIOR FIX: _safe_send вместо прямого sendall
+            self._safe_send(
+                t_conn,
+                json.dumps({'action': CMD_PLAY_NUDGE}).encode('utf-8')
+            )
+            print(f"[Server] 👟 NUDGE FIRED → {target_nick}")
+
+            broadcast_payload = json.dumps({
+                'action':      CMD_NUDGE_TRIGGERED,
+                'target_nick': target_nick,
+                'voter_nick':  voter_nick,
+            }).encode('utf-8')
+            for bc in broadcaster_conns:
+                self._safe_send(bc, broadcast_payload)
+
+    def _process_quick_msg(self, conn, uid: int, text: str) -> None:
+        with self.clients_lock:
+            sender_nick = (
+                self.clients[conn]['nick']
+                if conn in self.clients else '?'
+            )
+            sender_uid_qm = (
+                self.clients[conn]['uid']
+                if conn in self.clients else 0
+            )
+            sender_room_qm = (
+                self.clients[conn]['room']
+                if conn in self.clients else None
+            )
+            room_conns_qm = []
+            if sender_room_qm:
+                room_conns_qm = [
+                    c_conn
+                    for c_conn, c_data in self.clients.items()
+                    if c_data['room'] == sender_room_qm
+                ]
+        if sender_uid_qm:
+            broadcast_qm = json.dumps({
+                'action':     CMD_QUICK_MSG,
+                'uid':        sender_uid_qm,
+                'from_nick':  sender_nick,
+                'text':       text,
+            }).encode('utf-8')
+            # SENIOR FIX: _safe_send
+            for bc in room_conns_qm:
+                self._safe_send(bc, broadcast_qm)
+
+    def _process_chat_msg(self, conn, uid: int, text_cm: str) -> None:
+        sender_nick_cm = sender_uid_cm = sender_room_cm = None
+        sender_avatar_cm = ''
+        room_conns_cm = []
+        with self.clients_lock:
+            if conn in self.clients:
+                c = self.clients[conn]
+                sender_nick_cm   = c['nick']
+                sender_uid_cm    = c['uid']
+                sender_avatar_cm = c.get('avatar', '')
+                sender_room_cm   = c.get('room')
+            if sender_room_cm:
+                room_conns_cm = [
+                    c_conn
+                    for c_conn, c_data in self.clients.items()
+                    if c_data.get('room') == sender_room_cm
+                ]
+        if sender_uid_cm:
+            ts_cm = time.time()
+            broadcast_cm = json.dumps({
+                'action':    CMD_CHAT_MSG,
+                'uid':       sender_uid_cm,
+                'from_nick': sender_nick_cm,
+                'avatar':    sender_avatar_cm,
+                'text':      text_cm,
+                'ts':        ts_cm,
+                'room':      sender_room_cm or '',
+            }).encode('utf-8')
+            if self._chat_db:
+                self._chat_db.add_message({
+                    'uid': sender_uid_cm, 'nick': sender_nick_cm,
+                    'avatar': sender_avatar_cm, 'text': text_cm,
+                    'room': sender_room_cm or '', 'ts': ts_cm,
+                })
+            # SENIOR FIX: _safe_send
+            for bc in room_conns_cm:
+                self._safe_send(bc, broadcast_cm)
+
+    def _process_chat_history_req(self, conn) -> None:
+        requester_room = None
+        with self.clients_lock:
+            if conn in self.clients:
+                requester_room = self.clients[conn].get('room', '')
+        if requester_room:
+            messages_db = (
+                self._chat_db.get_history(requester_room, CHAT_HISTORY_MAX)
+                if self._chat_db else []
+            )
+            if messages_db:
+                # SENIOR FIX: _safe_send
+                self._safe_send(conn, json.dumps({
+                    'action':   CMD_CHAT_HISTORY,
+                    'messages': messages_db,
+                }).encode('utf-8'))
+
+    def _process_typing(self, conn) -> None:
+        t_conns: list = []
+        t_payload: bytes | None = None
+        with self.clients_lock:
+            if conn in self.clients:
+                c_t = self.clients[conn]
+                t_uid  = c_t['uid']
+                t_nick = c_t['nick']
+                t_room = c_t.get('room')
+                if t_room:
+                    t_payload = json.dumps({
+                        'action': CMD_TYPING,
+                        'uid':    t_uid,
+                        'nick':   t_nick,
+                    }).encode('utf-8')
+                    t_conns = [
+                        cc for cc, cd in self.clients.items()
+                        if cd.get('room') == t_room and cc is not conn
+                    ]
+        if t_payload is not None:
+            # SENIOR FIX: _safe_send
+            for tc in t_conns:
+                self._safe_send(tc, t_payload)
+
+    def _process_chat_media(self, conn, msg: dict, file_data_b64: str) -> None:
+        """Медиа-вложение в постоянный чат. Использует MD5-кэш для сериализации."""
+        s_nick_md = s_uid_md = s_room_md = None
+        s_avatar_md = ''
+        room_conns_md: list = []
+        with self.clients_lock:
+            if conn in self.clients:
+                c = self.clients[conn]
+                s_nick_md   = c['nick']
+                s_uid_md    = c['uid']
+                s_avatar_md = c.get('avatar', '')
+                s_room_md   = c.get('room')
+            if s_room_md:
+                room_conns_md = [
+                    c_conn
+                    for c_conn, c_data in self.clients.items()
+                    if c_data.get('room') == s_room_md
+                ]
+        if not s_uid_md:
+            return
+
+        now_ts = time.time()
+        md5_key = hashlib.md5(
+            file_data_b64.encode('utf-8'), usedforsecurity=False
+        ).hexdigest()
+
+        broadcast_md: bytes | None = None
+
+        with self._media_cache_lock:
+            cached = self._media_cache.get(md5_key)
+            # FIX #3: тупл 5-элементный (ts, prefix, suffix, uid, nick)
+            hit = (cached is not None
+                   and cached[0] > now_ts
+                   and cached[3] == s_uid_md
+                   and cached[4] == s_nick_md)
+
+        # SENIOR FIX: раньше кэш пытался разрезать готовый JSON по байтам
+        # "ts": <number>, что зависело от того, что Python `f"{float}"`
+        # и `json.dumps(float)` дадут одинаковую репрезентацию. Для
+        # большинства float это правда, но для пограничных значений
+        # (NaN, субнормальные, миллисекундные тики с точным float64-repr)
+        # порядок записи float мог расходиться → cache miss после первого
+        # удачного кэширования или KeyError на index().
+        #
+        # Новый подход: кэшируем JSON-объект БЕЗ поля 'ts' (всегда новое),
+        # храним как bytes без закрывающей '}'. При отправке добавляем
+        # ',"ts":<now_ts>}' — это всегда валидный JSON.
+        if hit:
+            cached_prefix: bytes = cached[1]  # JSON без '}' и без ts
+            broadcast_md = cached_prefix + f',"ts":{now_ts}}}'.encode('ascii')
+        else:
+            full_dict = {
+                'action':        CMD_CHAT_MEDIA,
+                'uid':           s_uid_md,
+                'from_nick':     s_nick_md,
+                'avatar':        s_avatar_md,
+                'room':          s_room_md or '',
+                'file_name':     msg.get('file_name', 'file'),
+                'file_type':     msg.get('file_type', ''),
+                'file_data_b64': file_data_b64,
+            }
+            # Кэшируем JSON без '}' в конце — потом дописываем ",ts":... и "}"
+            prefix_bytes = json.dumps(full_dict, ensure_ascii=False).encode('utf-8')
+            assert prefix_bytes.endswith(b'}'), "json.dumps должен заканчиваться на }"
+            cached_prefix = prefix_bytes[:-1]  # без закрывающей скобки
+
+            # Итоговый broadcast — сразу с ts
+            broadcast_md = cached_prefix + f',"ts":{now_ts}}}'.encode('ascii')
+
+            # Сохраняем в кэш (с эвикшеном по TTL/size)
+            try:
+                with self._media_cache_lock:
+                    if len(self._media_cache) >= self._media_cache_max:
+                        expired = [k for k, v in self._media_cache.items()
+                                   if v[0] <= now_ts]
+                        for k in expired:
+                            del self._media_cache[k]
+                        if len(self._media_cache) >= self._media_cache_max:
+                            oldest = min(self._media_cache,
+                                         key=lambda k: self._media_cache[k][0])
+                            del self._media_cache[oldest]
+                    # 5-tuple совместимый с существующей аннотацией:
+                    # (expire_ts, prefix_bytes, empty_suffix, uid, nick)
+                    self._media_cache[md5_key] = (
+                        now_ts + self._media_cache_ttl,
+                        cached_prefix, b'',  # suffix пустой — legacy slot
+                        s_uid_md, s_nick_md,
+                    )
+            except Exception:
+                pass  # кэш не удался — broadcast_md уже готов
+
+        # SENIOR FIX: _safe_send
+        for bc in room_conns_md:
+            self._safe_send(bc, broadcast_md)
+
+        if self._chat_db:
+            self._chat_db.add_message({
+                'uid': s_uid_md, 'nick': s_nick_md,
+                'avatar': s_avatar_md,
+                'room': s_room_md or '', 'ts': now_ts,
+                'file_name': msg.get('file_name', 'file'),
+                'file_type': msg.get('file_type', ''),
+                'file_data_b64': file_data_b64,
+            })
+
+    def _process_draw_stroke(self, conn, msg: dict) -> None:
+        streamer_uid_dr = msg.get('streamer_uid')
+        points_dr       = msg.get('points', [])
+        color_dr        = str(msg.get('color', '#FF6B6B'))[:16]
+        width_dr        = max(1, min(8, int(msg.get('width', 3))))
+        nick_dr         = str(msg.get('nick', '?'))[:32]
+
+        if not (streamer_uid_dr and isinstance(points_dr, list) and points_dr):
+            return
+
+        if len(points_dr) > DRAW_MAX_POINTS:
+            points_dr = points_dr[:DRAW_MAX_POINTS]
+
+        with self.clients_lock:
+            sender_uid_dr = (
+                self.clients[conn]['uid']
+                if conn in self.clients else 0
+            )
+
+        relay_dr = json.dumps({
+            'action':       CMD_DRAW_STROKE,
+            'streamer_uid': streamer_uid_dr,
+            'sender_uid':   sender_uid_dr,
+            'nick':         nick_dr,
+            'color':        color_dr,
+            'points':       points_dr,
+            'width':        width_dr,
+        }).encode('utf-8')
+
+        with self.watchers_lock:
+            watcher_uids_dr = set(
+                self.watchers.get(streamer_uid_dr, {}).keys()
+            )
+
+        with self.clients_lock:
+            target_conns_dr = [
+                c for c, d in self.clients.items()
+                if d.get('uid') in watcher_uids_dr
+            ]
+            streamer_conn_dr = next(
+                (c for c, d in self.clients.items()
+                 if d.get('uid') == streamer_uid_dr),
+                None,
+            )
+            if streamer_conn_dr:
+                target_conns_dr.append(streamer_conn_dr)
+
+        # SENIOR FIX: _safe_send
+        for tc in target_conns_dr:
+            self._safe_send(tc, relay_dr)
+
+    # ------------------------------------------------------------------
+    # Отправка пакета зрителям стримера (UDP)
     # ------------------------------------------------------------------
     def _send_to_watchers(self, sender_uid: int, data: bytes):
-        """
-        Отправляет UDP-пакет всем зрителям стримера sender_uid.
-        Используется для FLAG_STREAM_VOICES (Mix Minus, UDP-путь).
-        Порядок локов: watchers_lock → udp_lock. sendto() вне любых локов.
-        """
         with self.watchers_lock:
             watcher_uids = list(self.watchers.get(sender_uid, {}).keys())
 
@@ -1531,31 +1496,47 @@ class SFUServer:
                 pass
 
     # ------------------------------------------------------------------
-    # Рассылка глобального состояния по TCP
-    # ------------------------------------------------------------------
-    # ------------------------------------------------------------------
-    # Кэш состояния
+    # Рассылка глобального состояния (FIX #5)
     # ------------------------------------------------------------------
     def _mark_dirty(self) -> None:
-        """Помечает кэш payload как устаревший. Вызывать при каждом изменении состояния."""
+        """Помечает кэш payload как устаревший."""
+        # FIX #5: эта операция простая bool-запись, атомарна через GIL.
+        # Проблема была в том, что ОЧИСТКА флага после сборки payload
+        # не была атомарной относительно mark_dirty. Теперь сборка + сброс
+        # защищены clients_lock (см. send_global_state).
         self._state_dirty = True
 
-    # ------------------------------------------------------------------
-    # Рассылка глобального состояния по TCP
-    # ------------------------------------------------------------------
     def send_global_state(self):
         """
-        FIX 8: кэшированная версия — payload пересобирается только при изменениях.
+        Кэшированная версия — payload пересобирается только при изменениях.
 
-        Было: json.dumps(~4KB) × 11+ вызовов/сек × 20 клиентов = ~880 KB/сек сериализации.
-        Стало: при отсутствии изменений (update_status без реального изменения,
-        повторные вызовы) — используем bytes-кэш без аллокации и сериализации.
+        FIX #5: check-and-clear защищён clients_lock. Раньше было race:
+        1. send_global_state прочитал dirty=True
+        2. начал сборку
+        3. ДРУГОЙ поток изменил state + вызвал _mark_dirty() (dirty=True)
+        4. send_global_state закончил сборку и поставил dirty=False
+        → изменение из шага 3 потеряно, новый payload содержит старое состояние.
 
-        _state_dirty выставляется через _mark_dirty() при каждом реальном изменении
-        clients / watchers / channels / host_order.
+        Решение: захват dirty и очистка выполняются под clients_lock
+        одновременно со сбором snapshot'а clients.
         """
-        # ── Шаг 1: строим payload только если состояние изменилось ───────────
-        if self._state_dirty:
+        payload = None
+
+        with self.clients_lock:
+            dirty_now = self._state_dirty
+            if dirty_now:
+                self._state_dirty = False  # сбрасываем ПЕРЕД сборкой
+                # Собираем snapshot всего нужного под одним локом
+                clients_snap = {
+                    c_conn: dict(c_data)
+                    for c_conn, c_data in self.clients.items()
+                }
+                conns_snapshot = list(self.clients.keys())
+            else:
+                conns_snapshot = list(self.clients.keys())
+                clients_snap = None
+
+        if dirty_now and clients_snap is not None:
             with self.watchers_lock:
                 watchers_snapshot = {uid: dict(ws) for uid, ws in self.watchers.items()}
 
@@ -1563,26 +1544,23 @@ class SFUServer:
                 host_order_snapshot = list(self._host_order)
                 server_host_uid = self._host_order[0] if self._host_order else 0
 
-            with self.clients_lock:
-                state = {}
-                conns_snapshot = []
-                for c_conn, c in self.clients.items():
-                    c_uid = c['uid']
-                    watchers_list = list(watchers_snapshot.get(c_uid, {}).values())
-                    state.setdefault(c['room'], []).append({
-                        'nick':         c['nick'],
-                        'uid':          c_uid,
-                        'avatar':       c.get('avatar', '1.svg'),
-                        'mute':         c.get('mute', False),
-                        'deaf':         c.get('deaf', False),
-                        'ip':           c.get('ip', ''),
-                        'is_streaming': c.get('is_streaming', False),
-                        'sfu_port':     c.get('sfu_port', 7788),
-                        'watchers':     watchers_list,
-                        'status_icon':  c.get('status_icon', ''),
-                        'status_text':  c.get('status_text', ''),
-                    })
-                    conns_snapshot.append(c_conn)
+            state = {}
+            for c_conn, c in clients_snap.items():
+                c_uid = c['uid']
+                watchers_list = list(watchers_snapshot.get(c_uid, {}).values())
+                state.setdefault(c['room'], []).append({
+                    'nick':         c['nick'],
+                    'uid':          c_uid,
+                    'avatar':       c.get('avatar', '1.svg'),
+                    'mute':         c.get('mute', False),
+                    'deaf':         c.get('deaf', False),
+                    'ip':           c.get('ip', ''),
+                    'is_streaming': c.get('is_streaming', False),
+                    'sfu_port':     c.get('sfu_port', 7788),
+                    'watchers':     watchers_list,
+                    'status_icon':  c.get('status_icon', ''),
+                    'status_text':  c.get('status_text', ''),
+                })
 
             self._cached_payload = json.dumps(
                 {'action': CMD_SYNC_USERS, 'all_users': state,
@@ -1590,72 +1568,56 @@ class SFUServer:
                  'server_host_uid': server_host_uid,
                  'channel_list': self._get_channel_list()}
             ).encode('utf-8')
-            self._state_dirty = False
-
-        else:
-            # Кэш актуален — только снимаем список соединений
-            with self.clients_lock:
-                conns_snapshot = list(self.clients.keys())
 
         payload = self._cached_payload
         if payload is None:
             return
 
-        # ── Шаг 2: рассылаем (всегда, даже при кэше) ─────────────────────────
-        for c_conn in conns_snapshot:
-            try:
-                c_conn.sendall(payload)
-            except Exception:
-                pass
+        # FIX: кладём в broadcaster-очередь вместо синхронного sendall.
+        # Если очередь переполнена (64 слота) — drop: клиенты обновятся
+        # при следующем изменении состояния.
+        try:
+            self._bcast_queue.put_nowait((payload, conns_snapshot))
+        except _queue.Full:
+            pass
 
     # ------------------------------------------------------------------
-    # Встроенный сервер: запуск внутри процесса клиента
+    # Встроенный сервер: запуск
     # ------------------------------------------------------------------
     def start_embedded(self, host_ip: str, host_nick: str) -> None:
-        """
-        Запускает сервер в фоновых потоках (не блокирует вызывающий поток).
-
-        Отличие от start():
-          — Возвращает управление немедленно после запуска потоков.
-          — TCP accept-цикл работает в отдельном daemon-потоке.
-          — Запускает ServerAnnouncer: broadcast в RadminVPN каждые
-            DISCOVERY_INTERVAL секунд, чтобы другие клиенты нашли нас.
-
-        Используется DiscoveryScreen и _on_become_host() в MainWindow.
-
-        host_ip   — RadminVPN IP этого клиента (26.x.x.x), объявляется через broadcast.
-        host_nick — ник пользователя, отображается в DiscoveryScreen других.
-        """
+        """Запускает сервер в фоновых потоках."""
         self._is_embedded = True
         self._accepting   = True
 
-        # Инициализируем SQLite чат при запуске встроенного сервера
         if self._chat_db is None:
             try:
                 self._chat_db = ChatDB()
                 print("[Server] ChatDB инициализирован")
             except Exception as e:
                 print(f"[Server] ChatDB init error: {e}")
-        self._owner_ip    = host_ip   # FIX: сохраняем IP владельца для приоритета в host_order
+        self._owner_ip = host_ip
 
-        # Pion SFU Proxy (v3) — используем singleton чтобы не плодить sidecar.exe
+        # FIX #10: более точная обработка ошибок SFU-инициализации.
         try:
-            from sfu_bridge import get_shared as _get_sfu
-            _sfu_bridge = _get_sfu(
-                on_log=lambda s: print(f"[SFU] {s}"),
-                on_exit=lambda c: print(f"[SFU] завершён (code={c})"),
-            )
-            if not _sfu_bridge.is_running():
-                _sfu_bridge.start()
-            if _sfu_bridge.is_running():
-                self.sfu = PionSfuProxy(sfu_bridge=_sfu_bridge)
-                print("[Server] Pion SFU подключён (встроенный режим)")
-            else:
-                print("[Server] Pion SFU не запустился — WebRTC недоступен")
+            from network_engine.sfu_bridge import get_shared as _get_sfu
         except ImportError:
-            print("[Server] SfuBridge не найден — WebRTC недоступен")
+            print("[Server] SfuBridge модуль не найден — WebRTC недоступен")
+        else:
+            try:
+                _sfu_bridge = _get_sfu(
+                    on_log=lambda s: print(f"[SFU] {s}"),
+                    on_exit=lambda c: print(f"[SFU] завершён (code={c})"),
+                )
+                if not _sfu_bridge.is_running():
+                    _sfu_bridge.start()
+                if _sfu_bridge.is_running():
+                    self.sfu = PionSfuProxy(sfu_bridge=_sfu_bridge)
+                    print("[Server] Pion SFU подключён (встроенный режим)")
+                else:
+                    print("[Server] Pion SFU не запустился — WebRTC недоступен")
+            except Exception as e:
+                print(f"[Server] SFU init error: {e}")
 
-        # Фоновые потоки сервера
         threading.Thread(target=self.udp_handler,   daemon=True, name="srv-udp").start()
         threading.Thread(target=self.stats_monitor, daemon=True, name="srv-stats").start()
         threading.Thread(
@@ -1664,9 +1626,8 @@ class SFUServer:
             name="srv-accept",
         ).start()
 
-        # Запускаем broadcast-анонс
         try:
-            from server_discovery import ServerAnnouncer
+            from network_engine.server_discovery import ServerAnnouncer
             self._announcer = ServerAnnouncer(
                 server_ip      = host_ip,
                 server_port    = DEFAULT_PORT_TCP,
@@ -1685,11 +1646,7 @@ class SFUServer:
         )
 
     def _embedded_accept_loop(self) -> None:
-        """
-        TCP accept-цикл для встроенного режима (неблокирующий вариант start()).
-        Проверяет self._accepting после каждого accept() для корректного завершения.
-        """
-        self.tcp_sock.settimeout(1.0)   # таймаут чтобы иногда проверять _accepting
+        self.tcp_sock.settimeout(1.0)
         while self._accepting:
             try:
                 conn, addr = self.tcp_sock.accept()
@@ -1700,26 +1657,12 @@ class SFUServer:
                     daemon=True,
                 ).start()
             except socket.timeout:
-                continue   # проверяем _accepting снова
+                continue
             except OSError:
-                break      # сокет закрыт — завершаем
+                break
 
     def stop_gracefully(self) -> None:
-        """
-        Корректная остановка встроенного сервера с передачей хостинга.
-
-        Алгоритм:
-          1. Выбираем лучшего кандидата по RTT (_pick_best_host).
-          2. Если нет никого — просто закрываемся.
-          3. Broadcast CMD_SERVER_MIGRATE.
-          4. sleep(0.35с) — TCP_NODELAY: пакет улетает за < 10мс, 350мс запас.
-          5. shutdown(SHUT_WR) на каждый клиентский сокет — посылает TCP FIN.
-             Клиент дочитывает CMD_SERVER_MIGRATE из буфера, затем получает EOF.
-             БЕЗ этого: process-exit → ОС посылает TCP RST → Windows стирает
-             непрочитанный буфер → клиент не видит CMD_SERVER_MIGRATE →
-             _on_connection_lost → 4×3с=12с ожидания (Bug C).
-          6. Закрываем listening-сокеты.
-        """
+        """Корректная остановка с передачей хостинга."""
         if not self._is_embedded:
             return
 
@@ -1736,18 +1679,21 @@ class SFUServer:
 
         if not next_uid:
             print("[Server] stop_gracefully: нет других участников, закрываемся")
-            self.tcp_sock.close()
-            self.udp_sock.close()
+            try:
+                self.tcp_sock.close()
+            except Exception:
+                pass
+            try:
+                self.udp_sock.close()
+            except Exception:
+                pass
             return
 
         print(f"[Server] stop_gracefully: передаём хостинг uid={next_uid} ({next_ip})")
         self._broadcast_server_migrate(next_uid, next_ip)
 
-        import time as _time
-        _time.sleep(0.35)
+        time.sleep(0.35)
 
-        # FIX: SHUT_WR посылает FIN (graceful half-close) вместо RST при выходе.
-        # Клиент успевает прочитать CMD_SERVER_MIGRATE из recv-буфера.
         with self.clients_lock:
             conns = list(self.clients.keys())
         for c in conns:
@@ -1756,10 +1702,15 @@ class SFUServer:
             except Exception:
                 pass
 
-        self.tcp_sock.close()
-        self.udp_sock.close()
+        try:
+            self.tcp_sock.close()
+        except Exception:
+            pass
+        try:
+            self.udp_sock.close()
+        except Exception:
+            pass
 
-        # Останавливаем WebRTC SFU (закрывает все PC и asyncio loop)
         if self.sfu is not None:
             try:
                 self.sfu.shutdown()
@@ -1770,23 +1721,7 @@ class SFUServer:
         print("[Server] Встроенный сервер остановлен")
 
     def stop_silent(self) -> None:
-        """
-        Немедленная тихая остановка без broadcast CMD_SERVER_MIGRATE.
-
-        Используется в двух случаях:
-          1. _on_server_migrating: мы (как хост) уже разослали CMD_SERVER_MIGRATE
-             через сервер, теперь надо закрыть свой embedded server.
-          2. Когда мы сами получили CMD_SERVER_MIGRATE и нужно освободить порты
-             до того как новый хост захочет стать хостом снова.
-
-        НЕ вызывает _broadcast_server_migrate — миграция уже обработана.
-        НЕ спит — мгновенная операция.
-
-        Закрывает ВСЕ сокеты (Bug E: stop_announcer_only оставлял их открытыми):
-          - listening TCP/UDP → порты 5000/5001 освобождены для нового SFUServer
-          - принятые клиентские сокеты → _accepting цикл выходит
-        Устанавливает mgr._server=None → is_running()=False → start() сработает.
-        """
+        """Немедленная тихая остановка без broadcast."""
         if not self._is_embedded:
             return
         print("[Server] stop_silent: освобождаем сокеты")
@@ -1817,7 +1752,6 @@ class SFUServer:
         except Exception:
             pass
 
-        # Останавливаем WebRTC SFU
         if self.sfu is not None:
             try:
                 self.sfu.shutdown()
@@ -1827,13 +1761,148 @@ class SFUServer:
 
         print("[Server] stop_silent: готово")
 
-    def _broadcast_server_migrate(self, new_host_uid: int, new_host_ip: str) -> None:
-        """
-        Рассылает CMD_SERVER_MIGRATE всем подключённым клиентам.
+    # ------------------------------------------------------------------
+    # 2-шаговая ручная передача
+    # ------------------------------------------------------------------
+    def _handle_server_transfer_v2(self, uid: int, target_uid: int,
+                                    clients_snapshot: dict,
+                                    initiator_conn) -> None:
+        with self._host_order_lock:
+            is_host = bool(self._host_order and self._host_order[0] == uid)
+        if not is_host:
+            print(f"[Server] server_transfer от uid={uid}: не хост — отклонено")
+            return
 
-        Клиенты-не-хосты reconnect к new_host_ip.
-        Клиент с new_host_uid стартует встроенный сервер у себя.
-        """
+        if target_uid == 0:
+            target_uid, target_ip = self._pick_best_host(exclude_uid=uid)
+            if not target_uid:
+                print("[Server] server_transfer auto: нет кандидатов")
+                return
+        else:
+            target_ip = None
+            for c_data in clients_snapshot.values():
+                if c_data['uid'] == target_uid:
+                    target_ip = c_data.get('ip')
+                    break
+            if not target_ip:
+                print(f"[Server] server_transfer: uid={target_uid} не найден")
+                return
+
+        target_conn = None
+        for conn_key, c_data in clients_snapshot.items():
+            if c_data['uid'] == target_uid:
+                target_conn = conn_key
+                break
+        if target_conn is None:
+            print(f"[Server] server_transfer: conn для uid={target_uid} не найден")
+            return
+
+        with self._pending_migrate_lock:
+            if self._pending_migrate_target is not None:
+                print(f"[Server] server_transfer: уже идёт передача к "
+                      f"{self._pending_migrate_target} — отклонено")
+                return
+            self._pending_migrate_target = target_uid
+            self._pending_migrate_ready  = threading.Event()
+
+        target_nick = '?'
+        for c_data in clients_snapshot.values():
+            if c_data['uid'] == target_uid:
+                target_nick = c_data.get('nick', '?')
+                break
+
+        print(f"[Server] 🔀 Передача сервера: {uid} → {target_nick} "
+              f"(uid={target_uid}, IP={target_ip})")
+
+        try:
+            with self._host_order_lock:
+                order_snap = list(self._host_order)
+            # SENIOR FIX: _safe_send — per-conn lock защищает от гонки с broadcaster
+            self._safe_send(target_conn, json.dumps({
+                'action':     CMD_MIGRATE_PREPARE,
+                'host_order': order_snap,
+            }).encode('utf-8'))
+        except Exception as e:
+            print(f"[Server] migrate_prepare send failed: {e}")
+            with self._pending_migrate_lock:
+                self._pending_migrate_target = None
+                self._pending_migrate_ready  = None
+            return
+
+        threading.Thread(
+            target=self._wait_migrate_ready_and_broadcast,
+            args=(target_uid, target_ip),
+            daemon=True,
+            name="migrate-wait-ready",
+        ).start()
+
+    def _wait_migrate_ready_and_broadcast(self, target_uid: int,
+                                           target_ip: str) -> None:
+        evt = self._pending_migrate_ready
+        if evt is None:
+            return
+
+        got_ready = evt.wait(timeout=MIGRATE_PREPARE_TIMEOUT_SEC)
+
+        with self._pending_migrate_lock:
+            self._pending_migrate_target = None
+            self._pending_migrate_ready  = None
+
+        if got_ready:
+            print(f"[Server] migrate: target uid={target_uid} READY — broadcast")
+        else:
+            print(f"[Server] migrate: TIMEOUT ожидания READY от uid={target_uid}")
+
+        self._broadcast_server_migrate(target_uid, target_ip)
+
+        time.sleep(0.35)
+
+        with self.clients_lock:
+            conns = list(self.clients.keys())
+        for c in conns:
+            try:
+                c.shutdown(socket.SHUT_WR)
+            except Exception:
+                pass
+
+        self._accepting = False
+        try:
+            self.tcp_sock.close()
+        except Exception:
+            pass
+        try:
+            self.udp_sock.close()
+        except Exception:
+            pass
+        if self._announcer:
+            try:
+                self._announcer.stop()
+            except Exception:
+                pass
+            self._announcer = None
+        if self.sfu is not None:
+            try:
+                self.sfu.shutdown()
+            except Exception:
+                pass
+            self.sfu = None
+
+        print("[Server] migrate: сервер остановлен после передачи")
+
+    def _handle_migrate_ready(self, uid: int) -> None:
+        with self._pending_migrate_lock:
+            pending = self._pending_migrate_target
+            evt     = self._pending_migrate_ready
+
+        if pending is None or pending != uid:
+            print(f"[Server] migrate_ready от uid={uid} но "
+                  f"pending_target={pending} — игнорируем")
+            return
+        if evt is not None:
+            print(f"[Server] migrate_ready от uid={uid} — зелёный свет")
+            evt.set()
+
+    def _broadcast_server_migrate(self, new_host_uid: int, new_host_ip: str) -> None:
         payload = json.dumps({
             'action':       CMD_SERVER_MIGRATE,
             'new_host_uid': new_host_uid,
@@ -1843,28 +1912,28 @@ class SFUServer:
         with self.clients_lock:
             conns = list(self.clients.keys())
 
+        # SENIOR FIX: _safe_send — при миграции broadcaster ещё активен,
+        # иначе байты CMD_SERVER_MIGRATE могут перемешаться с sync_users.
         for c in conns:
-            try:
-                c.sendall(payload)
-            except Exception:
-                pass
+            self._safe_send(c, payload)
 
     # ------------------------------------------------------------------
-    # Запуск сервера (standalone режим — без изменений)
+    # Запуск сервера (standalone режим)
     # ------------------------------------------------------------------
     def start(self):
-        # Pion SFU Proxy (v3) — переподключение (singleton)
         if self.sfu is None:
             try:
-                from sfu_bridge import get_shared as _get_sfu
+                from network_engine.sfu_bridge import get_shared as _get_sfu
                 _sfu_bridge = _get_sfu()
                 if not _sfu_bridge.is_running():
                     _sfu_bridge.start()
                 if _sfu_bridge.is_running():
                     self.sfu = PionSfuProxy(sfu_bridge=_sfu_bridge)
-                    print("[Server] Pion SFU подключён (переподключение)")
+                    print("[Server] Pion SFU подключён (standalone)")
             except ImportError:
                 pass
+            except Exception as e:
+                print(f"[Server] SFU init error: {e}")
 
         threading.Thread(target=self.udp_handler,   daemon=True).start()
         threading.Thread(target=self.stats_monitor, daemon=True).start()
@@ -1872,8 +1941,6 @@ class SFUServer:
 
         while True:
             conn, addr = self.tcp_sock.accept()
-            # Отключаем алгоритм Нейгла: мелкие команды (nudge, stream events)
-            # отправляются немедленно без буферизации.
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             threading.Thread(
                 target=self.tcp_handler,
@@ -1886,24 +1953,15 @@ class SFUServer:
 # EmbeddedServerManager — менеджер встроенного сервера
 # =============================================================================
 class EmbeddedServerManager:
-    """
-    Singleton-менеджер встроенного SFUServer внутри процесса клиента.
-    Вынесен сюда для предотвращения двойного импорта (__main__ vs module).
-    """
+    """Singleton-менеджер встроенного SFUServer."""
     _instance: 'EmbeddedServerManager | None' = None
-    # FIX #12: лок для потокобезопасного singleton.
-    # Без него два потока (например auto-host и UI) могут одновременно
-    # войти в get() при _instance is None и создать два экземпляра.
-    # При 20 юзерах вероятность невысока, но последствия — двойной bind
-    # на один и тот же TCP/UDP порт → OSError: address already in use.
     _lock: threading.Lock = threading.Lock()
 
     def __init__(self):
-        self._server = None  # SFUServer | None
+        self._server = None
 
     @classmethod
     def get(cls) -> 'EmbeddedServerManager':
-        # FIX #12: double-checked locking — быстрый путь без лока если уже создан.
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:
@@ -1916,7 +1974,6 @@ class EmbeddedServerManager:
             return
 
         if not server_name:
-            import os, json
             from config import USER_CONFIG_PATH
             try:
                 if os.path.exists(USER_CONFIG_PATH):
@@ -1961,6 +2018,7 @@ class EmbeddedServerManager:
 
     def is_running(self) -> bool:
         return self._server is not None
+
 
 if __name__ == "__main__":
     SFUServer().start()

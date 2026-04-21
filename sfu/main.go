@@ -1,44 +1,37 @@
-// main.go — InPulse Pion SFU sidecar v1.0
+// main.go — InPulse Pion SFU sidecar v1.1
 //
 // Запуск: sidecar.exe [--port 7788]
 //
 // При старте печатает в stdout (Python читает построчно):
 //   {"event":"READY","port":7788}
 //
-// После этого слушает HTTP на 127.0.0.1:<port>.
+// После этого слушает HTTP на 0.0.0.0:<port> (для стримеров в RadminVPN LAN).
 //
-// ── Архитектура ────────────────────────────────────────────────────────────
+// ── Исправления v1.1 ────────────────────────────────────────────────────────
 //
-//   Rust streamer (webrtc-rs)                 aiortc viewer
-//        │ WebRTC offer/answer                     │ WebRTC offer/answer
-//        ▼   (через Python HTTP клиент)            ▼
-//   ┌─────────────────────────────────────────────────────┐
-//   │  POST /streamer/offer  → SDP answer                 │
-//   │  POST /viewer/{id}/offer → SDP answer               │
-//   │  DELETE /streamer / DELETE /viewer/{id}             │
-//   │  GET  /health / GET /status                         │
-//   │                                                     │
-//   │  SFU: TrackRemote (от Rust) → TrackLocalStaticRTP   │
-//   │       → WriteRTP в каждый viewer PC                 │
-//   └─────────────────────────────────────────────────────┘
-//
-// ICE-стратегия: gather-complete (нет trickle ICE).
-//   Обе стороны собирают всех кандидатов ПЕРЕД отправкой offer/answer.
-//   Это даёт синхронный запрос/ответ без дополнительных round-trips.
+//   FIX #31: http.Server с таймаутами (ReadTimeout, WriteTimeout, IdleTimeout).
+//     Без них slow-loris атака или зависший клиент могли удерживать
+//     соединение бесконечно, постепенно исчерпывая goroutines.
+//     В LAN-режиме (RadminVPN) это не атака, а может быть просто зависший
+//     клиент или временный сетевой глитч — таймауты нужны всё равно.
 
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 )
 
 var (
-	Version = "1.0.0"
+	Version = "1.1.0"
 )
 
 func main() {
@@ -48,10 +41,8 @@ func main() {
 	sfu := NewSFU()
 	api := NewAPI(sfu)
 
-	// 0.0.0.0 — SFU доступен извне (для стримеров не на хост-машине, RadminVPN)
 	addr := fmt.Sprintf("0.0.0.0:%d", *port)
 
-	// Сигнал готовности для Python-хоста (читается из stdout построчно)
 	readyMsg, _ := json.Marshal(map[string]interface{}{
 		"event":   "READY",
 		"version": Version,
@@ -61,11 +52,40 @@ func main() {
 
 	log.Printf("[SFU] InPulse Pion SFU v%s слушает %s", Version, addr)
 
+	// FIX #31: таймауты защищают от зависших соединений.
+	//
+	// ReadTimeout: 30 сек — запрос с SDP (может быть до 16 KB) должен
+	//   прочитаться целиком за это время.
+	// WriteTimeout: 30 сек — ответ с SDP тоже должен уложиться.
+	// IdleTimeout: 90 сек — для Keep-Alive соединений.
+	// ReadHeaderTimeout: 10 сек — защита от slow-loris на заголовках.
 	srv := &http.Server{
-		Addr:    addr,
-		Handler: api.Handler(),
+		Addr:              addr,
+		Handler:           api.Handler(),
+		ReadTimeout:       30 * time.Second,
+		ReadHeaderTimeout: 10 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       90 * time.Second,
 	}
-	if err := srv.ListenAndServe(); err != nil {
+
+	// Graceful shutdown при получении SIGINT/SIGTERM.
+	// Позволяет завершить текущие запросы до выхода.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-sigCh
+		log.Printf("[SFU] получен сигнал завершения — graceful shutdown")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			log.Printf("[SFU] shutdown error: %v", err)
+		}
+		sfu.Close()
+		os.Exit(0)
+	}()
+
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("[SFU] HTTP server error: %v", err)
 	}
 }

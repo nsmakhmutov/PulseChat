@@ -3,24 +3,32 @@
 # Точка входа приложения InPulse.
 #
 # ПОРЯДОК ИМПОРТОВ КРИТИЧЕН:
-#   1. app_init  — UTF-8, faulthandler, DLL-загрузка (ДО всего остального)
-#   2. PyQt6     — после DLL
-#   3. остальное — после PyQt6
-#
-# ИЗМЕНЕНИЕ ДЛЯ PYINSTALLER:
-#   Вся логика вынесена в main() — run.py вызывает её напрямую через
-#   "from client_main.client_main import main; main()".
-#   PyInstaller видит явный import → включает модуль в сборку.
-#   Относительные импорты (from . import app_init) работают потому что
-#   client_main.client_main загружается как часть пакета (__package__='client_main').
+#   1. multiprocessing.freeze_support() — ДО всего, требование Windows spawn
+#   2. app_init  — UTF-8, faulthandler, DLL-загрузка
+#   3. PyQt6     — после DLL
+#   4. остальное — после PyQt6
 # ──────────────────────────────────────────────────────────────────────────────
 
-# ── 1. Инициализация (должна быть первой!) ────────────────────────────────────
+# ── 0. multiprocessing freeze_support — ПЕРВЫЙ вызов в __main__ ───────────────
+# Windows spawn-режим: подпроцессы re-импортируют main module и должны
+# завершиться до возврата из freeze_support(). Вызов в main() уже поздно.
+import multiprocessing as _mp
+import sys as _sys
+
+if __name__ == "__main__" or getattr(_sys, 'frozen', False):
+    _mp.freeze_support()
+    # Если это дочерний multiprocessing-процесс — завершиться немедленно.
+    # current_process().name == 'MainProcess' только в главном.
+    if _mp.current_process().name != 'MainProcess':
+        _sys.exit(0)
+
+del _mp, _sys
+
+# ── 1. Инициализация (должна быть первой после freeze_support!) ───────────────
 from . import app_init
 
 # ── 2. Стандартная библиотека ─────────────────────────────────────────────────
 import sys
-import multiprocessing
 
 # ── 3. Qt ─────────────────────────────────────────────────────────────────────
 from PyQt6.QtWidgets import QApplication
@@ -44,17 +52,15 @@ def main():
       • run.py (PyInstaller exe): from client_main.client_main import main; main()
       • dev-режим: python -m client_main.client_main → if __name__ == '__main__'
     """
-    # ── Защита от форк-бомб и subprocess-вызовов ──────────────────────────────
-    # Сторонние библиотеки (aiortc, ffmpeg) могут вызывать .exe с аргументами
-    # для проверки кодеков. Завершаем тихо — не плодим новые окна GUI.
-    multiprocessing.freeze_support()
-    if len(sys.argv) > 1:
-        sys.exit(0)
-    if multiprocessing.current_process().name != 'MainProcess':
-        sys.exit(0)
+    # ── Защита от subprocess-вызовов ffmpeg/aiortc проверкой кодеков ──────────
+    # FIX: Раньше было `if len(sys.argv) > 1: sys.exit(0)` — слишком грубо,
+    # блокировало любые CLI-флаги. Теперь проверяем только известные маркеры
+    # multiprocessing. Обычные CLI флаги (--debug, --log-level) пройдут.
+    for _arg in sys.argv[1:]:
+        if _arg.startswith('--multiprocessing') or _arg == '--freeze':
+            sys.exit(0)
 
     # ── Дамп аудио-устройств до создания QApplication ─────────────────────────
-    # Если PortAudio крашится при query_devices() — увидим это в логе.
     try:
         import sounddevice as _sd
         print("[DEBUG] Аудио-устройства системы:", flush=True)
@@ -98,14 +104,13 @@ def main():
     # ── QApplication ──────────────────────────────────────────────────────────
     app = QApplication(sys.argv)
 
-    # ✅ Держим глобальные ссылки — GC не уничтожит окна после выхода из if/else.
+    # Держим глобальные ссылки — GC не уничтожит окна после выхода из if/else.
     _login_window:   LoginWindow        | None = None
     _connect_screen: MultiServerScreen  | None = None
 
     config = load_config()
 
     if config:
-        # Конфиг найден → мульти-серверный экран
         nick        = config.get("nick",        "User")
         avatar      = config.get("avatar",      "1.svg")
         server_name = config.get("server_name", "InPulse Server")
@@ -114,10 +119,6 @@ def main():
         _connect_screen.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
 
         def _fallback_to_login(f_ip: str, f_nick: str, f_avatar: str):
-            """
-            ✅ LoginWindow сохраняется в глобальную переменную —
-            иначе GC убьёт объект после выхода из функции.
-            """
             nonlocal _login_window
             _login_window = LoginWindow(
                 ip=f_ip, nick=f_nick, avatar=f_avatar,
@@ -142,7 +143,6 @@ def main():
         _connect_screen.show()
 
     else:
-        # Первый запуск → форма логина
         _login_window = LoginWindow()
         _login_window.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
         _login_window.show()
@@ -151,5 +151,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # Dev-режим: python -m client_main.client_main
     main()

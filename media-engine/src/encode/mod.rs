@@ -1,16 +1,18 @@
 // src/encode/mod.rs — H.264 аппаратное кодирование через FFmpeg
 //
-// ── ОПТИМИЗАЦИИ ДЛЯ 360p/480p ───────────────────────────────────────────────
+// ── ОПТИМИЗАЦИИ v0.3.1 ─────────────────────────────────────────────────────
 //
-//   1. VBR+CQ вместо CBR для ≤480p:
-//      Статика → ~200 kbps. Движение → до maxrate. Перцепция ЗНАЧИТЕЛЬНО лучше.
+//   FIX #34 (части):
+//     1. BGRA AvFrame переиспользуется вместо AvFrame::new() на каждый кадр.
+//        Раньше: 30 fps × 3.7MB = 110 MB/сек аллокации мусора.
+//        Стало: одна аллокация на всю жизнь encoder'а, переиспользуется.
+//     2. sharpen_y_plane buffers (prev_row, curr_orig) — предаллоцированы
+//        как поля структуры, не аллоцируются на каждую строку × каждый кадр.
+//        Раньше: 720p × 30 fps = 21600 allocs/sec.
+//        Стало: 2 Vec<u8> аллокации за всю жизнь.
 //
-//   2. Y-plane Unsharp Mask после swscale (только для ≤480p):
-//      Текст на 360p читается как на 480p. Стоимость: ~0.1ms.
-//
-//   3. Resolution-adaptive: aq-strength, lookahead, GOP.
-//
-//   4. frame_changed() — быстрое сравнение для frame dedup в pipeline.
+//   FIX #35: защита от fps=0. Rational::new(1, 0) → FFmpeg panic.
+//     Теперь валидируем fps >= 1 при создании энкодера.
 
 use anyhow::{anyhow, Context, Result};
 use tracing::{debug, info};
@@ -55,11 +57,22 @@ pub struct HwEncoder {
     src_height: u32,
     is_low_res: bool,
     sharpen_strength: i16,
+
+    // FIX #34: переиспользуемые буферы для sharpen (избегаем аллокаций на hot path)
+    sharpen_prev_row: Vec<u8>,
+    sharpen_curr_row: Vec<u8>,
+
+    // FIX #34: переиспользуемый BGRA AvFrame
+    bgra_frame: Option<AvFrame>,
+    bgra_frame_dims: (u32, u32),
 }
 
 impl HwEncoder {
     pub fn new(width: u32, height: u32, fps: u32, bitrate: u32) -> Result<Self> {
         ffmpeg::init().context("FFmpeg init")?;
+
+        // FIX #35: валидация fps
+        let fps = fps.max(1);
 
         let profiles = [
             EncoderProfile { codec_name: "h264_nvenc".into(), display_name: "NVIDIA NVENC".into(), is_hardware: true },
@@ -100,94 +113,71 @@ impl HwEncoder {
         video.set_bit_rate(bitrate as usize);
         video.set_max_bit_rate(bitrate as usize);
 
-        // GOP: ≤480p → 1 сек (быстрое восстановление), >480p → 2 сек
         video.set_gop(if is_low_res { fps } else { fps * 2 });
 
         let mut opts = ffmpeg::Dictionary::new();
         match profile.codec_name.as_str() {
 
             // ── NVENC ────────────────────────────────────────────────────────
-            // p1 = fastest (минимальная encoder latency).
-            // tune=ull + zerolatency убирает внутренний буфер энкодера.
-            // rc-lookahead=0 / no-scenecut — нет lookahead анализа → кадры
-            // выходят сразу, не ждут следующих для принятия решения.
-            // bf=0 — нет B-frames: каждый P-кадр декодируется независимо.
             "h264_nvenc" => {
-                opts.set("preset",      "p1");    // было p4 — на 2 ступени быстрее
-                opts.set("tune",        "ull");   // ultra-low-latency
-                opts.set("zerolatency", "1");     // убирает encoder pipeline buffer
+                opts.set("preset",      "p1");
+                opts.set("tune",        "ull");
+                opts.set("zerolatency", "1");
                 opts.set("forced-idr",  "1");
                 opts.set("bf",          "0");
                 opts.set("profile",     "high");
-                opts.set("rc-lookahead","0");     // было 4/8 — отключаем полностью
-                opts.set("no-scenecut", "1");     // scene-cut detection = лишние задержки
+                opts.set("rc-lookahead","0");
+                opts.set("no-scenecut", "1");
 
                 if is_low_res {
-                    // VBR+CQ: статика → экономия, движение → I-кадры.
-                    // bufsize уменьшен до 2× (было 4×) — строже держим задержку.
                     let cq = if height <= 360 { "24" } else { "22" };
                     opts.set("rc",         "vbr");
                     opts.set("cq",         cq);
                     opts.set("maxrate",    &bitrate.to_string());
-                    opts.set("bufsize",    &(bitrate * 2).to_string()); // было *4
+                    opts.set("bufsize",    &(bitrate * 2).to_string());
                     opts.set("spatial-aq", "1");
                     opts.set("temporal-aq","1");
                     opts.set("aq-strength","8");
                 } else {
-                    // CBR строгий: bufsize = 1× → максимально предсказуемый поток.
                     opts.set("rc",         "cbr");
-                    opts.set("bufsize",    &bitrate.to_string()); // было *2
+                    opts.set("bufsize",    &bitrate.to_string());
                     opts.set("maxrate",    &bitrate.to_string());
                     opts.set("spatial-aq", "1");
                     opts.set("temporal-aq","1");
-                    opts.set("aq-strength","8");  // было 15 — снижаем: меньше анализа
+                    opts.set("aq-strength","8");
                 }
             }
 
             // ── AMF ──────────────────────────────────────────────────────────
-            // ultralowlatency: отключает B-frames, включает строгий CBR с HRD.
-            // filler_data держит CBR точно (заполняет неиспользуемые биты).
-            // quality=speed — был "quality" что добавляло ~30–60ms encoder delay.
             "h264_amf" => {
-                opts.set("usage",        "ultralowlatency"); // было "transcoding"
-                opts.set("quality",      "speed");           // было "quality"
+                opts.set("usage",        "ultralowlatency");
+                opts.set("quality",      "speed");
                 opts.set("profile",      "high");
-                opts.set("rc",           "cbr");             // было "vbr_peak"
-                opts.set("enforce_hrd",  "1");               // строгое соблюдение HRD
-                opts.set("filler_data",  "1");               // CBR filler
+                opts.set("rc",           "cbr");
+                opts.set("enforce_hrd",  "1");
+                opts.set("filler_data",  "1");
                 opts.set("max_b_frames", "0");
                 opts.set("bf_ref",       "0");
-                opts.set("vbaq",         "1");               // AQ оставляем
+                opts.set("vbaq",         "1");
             }
 
             // ── QSV ──────────────────────────────────────────────────────────
-            // low_power=1: Intel Low Power encoding — специальный HW блок
-            // с меньшей задержкой (EU-based вместо PAK).
-            // async_depth=1: минимальный pipeline глубины (было default=4).
             "h264_qsv" => {
-                opts.set("preset",      "veryfast"); // было "medium"
+                opts.set("preset",      "veryfast");
                 opts.set("profile",     "high");
-                opts.set("low_power",   "1");        // Low Power mode
-                opts.set("async_depth", "1");        // минимальный pipeline
+                opts.set("low_power",   "1");
+                opts.set("async_depth", "1");
                 opts.set("bf",          "0");
             }
 
             // ── libx264 ──────────────────────────────────────────────────────
-            // CBR вместо CRF: для стриминга CRF опасен — при сложной сцене
-            // битрейт может взлететь в 3–5x выше лимита, переполняя буфер канала.
-            // CBR (nal-hrd=cbr + force-cfr=1) держит поток строго в рамках bitrate.
-            // ultrafast вместо veryfast: ~30% меньше CPU нагрузки.
             "libx264" => {
                 opts.set("profile",  "high");
                 opts.set("tune",     "zerolatency");
-                opts.set("preset",   "ultrafast"); // было "veryfast"
+                opts.set("preset",   "ultrafast");
 
-                // ── CBR режим ────────────────────────────────────────────────
-                // Убираем crf (переменный битрейт) и устанавливаем CBR.
-                // b/maxrate/bufsize задают "железный потолок" потока.
-                // nal-hrd=cbr + force-cfr=1 → фактический CBR на уровне NAL.
                 let br_kbps  = bitrate / 1000;
-                let buf_kbps = br_kbps * 2;                   // 2s VBV буфер
+                let buf_kbps = br_kbps * 2;
                 opts.set("x264opts", &format!(
                     "nal-hrd=cbr:force-cfr=1:rc-lookahead=0:\
                      scenecut=0:bframes=0:ref=1:\
@@ -196,7 +186,6 @@ impl HwEncoder {
                 opts.set("b",       &bitrate.to_string());
                 opts.set("maxrate", &bitrate.to_string());
                 opts.set("bufsize", &(bitrate * 2).to_string());
-                // crf — убрана.
             }
 
             _ => {}
@@ -212,11 +201,17 @@ impl HwEncoder {
 
         let sharpen_strength = if !is_low_res { 0 } else if height <= 360 { 5 } else { 3 };
 
+        // Предаллоцируем буферы для sharpen (максимальная ширина = width энкодера)
+        let sharpen_prev_row = if sharpen_strength > 0 { vec![0u8; width as usize] } else { Vec::new() };
+        let sharpen_curr_row = if sharpen_strength > 0 { vec![0u8; width as usize] } else { Vec::new() };
+
         Ok(Self {
             encoder, scaler, profile: profile.clone(),
             frame_index: 0, width, height, fps, bitrate,
             force_keyframe: false, src_width: 0, src_height: 0,
             is_low_res, sharpen_strength,
+            sharpen_prev_row, sharpen_curr_row,
+            bgra_frame: None, bgra_frame_dims: (0, 0),
         })
     }
 
@@ -234,25 +229,35 @@ impl HwEncoder {
             self.force_keyframe = true;
         }
 
-        let mut bgra_frame = AvFrame::new(Pixel::BGRA, src_w, src_h);
-        let stride = bgra_frame.stride(0);
-        let plane = bgra_frame.data_mut(0);
-        for row in 0..src_h as usize {
-            let ss = row * frame.stride as usize;
-            let se = ss + (src_w * 4) as usize;
-            let ds = row * stride;
-            let de = ds + (src_w * 4) as usize;
-            if se <= frame.data.len() && de <= plane.len() {
-                plane[ds..de].copy_from_slice(&frame.data[ss..se]);
+        // FIX #34: переиспользуем BGRA AvFrame если размер не изменился
+        if self.bgra_frame.is_none() || self.bgra_frame_dims != (src_w, src_h) {
+            self.bgra_frame = Some(AvFrame::new(Pixel::BGRA, src_w, src_h));
+            self.bgra_frame_dims = (src_w, src_h);
+        }
+
+        let bgra_frame = self.bgra_frame.as_mut().unwrap();
+        {
+            let stride = bgra_frame.stride(0);
+            let plane = bgra_frame.data_mut(0);
+            for row in 0..src_h as usize {
+                let ss = row * frame.stride as usize;
+                let se = ss + (src_w * 4) as usize;
+                let ds = row * stride;
+                let de = ds + (src_w * 4) as usize;
+                if se <= frame.data.len() && de <= plane.len() {
+                    plane[ds..de].copy_from_slice(&frame.data[ss..se]);
+                }
             }
         }
 
         let mut yuv_frame = AvFrame::empty();
-        self.scaler.run(&bgra_frame, &mut yuv_frame)?;
+        self.scaler.run(bgra_frame, &mut yuv_frame)?;
 
-        // ── ТРЮК 3: Y-plane Unsharp Mask (только ≤480p) ─────────────────
         if self.sharpen_strength > 0 {
-            Self::sharpen_y_plane(&mut yuv_frame, dst_w, dst_h, self.sharpen_strength);
+            Self::sharpen_y_plane_inplace(
+                &mut yuv_frame, dst_w, dst_h, self.sharpen_strength,
+                &mut self.sharpen_prev_row, &mut self.sharpen_curr_row,
+            );
         }
 
         yuv_frame.set_pts(Some(self.frame_index));
@@ -275,17 +280,20 @@ impl HwEncoder {
         Ok(packets)
     }
 
-    /// Y-plane Unsharp Mask (4-connected Laplacian), in-place.
-    /// Ядро:  [0,-s,0] [-s,1+4s,-s] [0,-s,0],  s = strength/10.
-    /// Обрабатывает только Y (яркость). Хрома U/V не тронуты → 0 лишних бит.
-    fn sharpen_y_plane(frame: &mut AvFrame, w: u32, h: u32, strength: i16) {
+    /// FIX #34: Y-plane Unsharp Mask БЕЗ аллокаций — буферы prev_row/curr_row
+    /// передаются извне (из self) и переиспользуются между вызовами.
+    fn sharpen_y_plane_inplace(
+        frame: &mut AvFrame, w: u32, h: u32, strength: i16,
+        prev_row: &mut Vec<u8>, curr_orig: &mut Vec<u8>,
+    ) {
         let y_stride = frame.stride(0);
         let y_plane  = frame.data_mut(0);
         let (w, h) = (w as usize, h as usize);
 
-        // prev_row хранит ОРИГИНАЛЬНЫЕ значения, чтобы sharpening
-        // не читал уже изменённые пиксели (cascade artifact).
-        let mut prev_row = vec![0u8; w];
+        // Подготовим буферы нужного размера (resize никогда не уменьшает capacity)
+        if prev_row.len() < w { prev_row.resize(w, 0); }
+        if curr_orig.len() < w { curr_orig.resize(w, 0); }
+
         prev_row[..w].copy_from_slice(&y_plane[..w]);
 
         for y in 1..h - 1 {
@@ -293,8 +301,7 @@ impl HwEncoder {
             let below_off = (y + 1) * y_stride;
 
             // Копия текущей строки ДО модификации
-            let mut curr_orig = vec![0u8; w];
-            curr_orig.copy_from_slice(&y_plane[row_off..row_off + w]);
+            curr_orig[..w].copy_from_slice(&y_plane[row_off..row_off + w]);
 
             for x in 1..w - 1 {
                 let c = curr_orig[x] as i16;
@@ -305,7 +312,7 @@ impl HwEncoder {
                 let sharp = c + (c - blur) * strength / 10;
                 y_plane[row_off + x] = sharp.clamp(0, 255) as u8;
             }
-            prev_row[..w].copy_from_slice(&curr_orig);
+            prev_row[..w].copy_from_slice(&curr_orig[..w]);
         }
     }
 
@@ -325,22 +332,6 @@ impl HwEncoder {
 
     pub fn request_keyframe(&mut self) { self.force_keyframe = true; }
 
-    // ── set_bitrate: три уровня агрессивности ────────────────────────────────
-    //
-    //  ≤ 20% изменение:  только IDR. Энкодер продолжает с теми же RC
-    //                    параметрами — зритель принимает поток чисто,
-    //                    видимой паузы нет. Реальный битрейт «дрейфует»
-    //                    к новому значению в течение ~1 сек.
-    //
-    //  > 20%, NVENC/AMF: in-place обновление AVCodecContext + IDR.
-    //                    Нет пересоздания контекста → нет «чёрной дыры».
-    //                    Работает потому что NVENC/AMF читают bit_rate /
-    //                    rc_max_rate из AVCodecContext динамически.
-    //
-    //  > 20%, libx264/QSV: полное пересоздание (они не поддерживают
-    //                    динамический RC). Форсируем IDR в текущем потоке
-    //                    ДО пересоздания — зрители получают последний
-    //                    чистый кадр перед паузой.
     pub fn set_bitrate(&mut self, bitrate: u32) -> Result<()> {
         if bitrate == self.bitrate {
             return Ok(());
@@ -355,7 +346,6 @@ impl HwEncoder {
             (ratio - 1.0) * 100.0
         );
 
-        // ── Уровень 1: мягкое изменение ≤20% ────────────────────────────────
         if pct_change <= 20.0 {
             self.bitrate = bitrate;
             self.force_keyframe = true;
@@ -363,7 +353,6 @@ impl HwEncoder {
             return Ok(());
         }
 
-        // ── Уровень 2: in-place через AVCodecContext (NVENC / AMF) ───────────
         if self.try_apply_bitrate_inplace(bitrate) {
             self.bitrate = bitrate;
             self.force_keyframe = true;
@@ -371,9 +360,6 @@ impl HwEncoder {
             return Ok(());
         }
 
-        // ── Уровень 3: полное пересоздание (libx264 / QSV) ──────────────────
-        // Форсируем IDR в текущем потоке — зрители получают чистый кадр,
-        // пока ещё есть активный encoder.
         self.force_keyframe = true;
 
         let new = Self::try_create(
@@ -387,19 +373,15 @@ impl HwEncoder {
         self.frame_index = 0;
         self.src_width   = 0;
         self.src_height  = 0;
-        self.force_keyframe = true;  // IDR в новом потоке
+        self.force_keyframe = true;
+        // Также сбрасываем кэшированный BGRA buffer — после пересоздания
+        // swscale первое сравнение size пройдёт заново.
+        self.bgra_frame = None;
+        self.bgra_frame_dims = (0, 0);
         info!("[ABR] rebuild: новый энкодер {} kbps", bitrate / 1000);
         Ok(())
     }
 
-    // ── In-place обновление битрейта через FFmpeg FFI ────────────────────────
-    //
-    // NVENC и AMF читают bit_rate / rc_max_rate / rc_buffer_size
-    // непосредственно из AVCodecContext при кодировании каждого кадра.
-    // Изменение этих полей без пересоздания контекста = мгновенная реакция.
-    //
-    // libx264 и QSV кэшируют параметры при открытии — возвращаем false,
-    // вызывающий код перейдёт к полному пересозданию.
     fn try_apply_bitrate_inplace(&mut self, bitrate: u32) -> bool {
         match self.profile.codec_name.as_str() {
             "libx264" | "h264_qsv" => return false,
@@ -417,20 +399,19 @@ impl HwEncoder {
         true
     }
 
-    // ── encode_yuv: принимает готовый YUV420P фрейм ──────────────────────────
-    // Используется LqEncoder для single-pass scaling (BGRA→YUV за один проход).
-    // Обходит внутренний scaler HwEncoder — не делает лишнего BGRA→YUV.
     pub fn encode_yuv(
         &mut self,
         mut yuv_frame: AvFrame,
         timestamp_ns: u64,
     ) -> Result<Vec<EncodedPacket>> {
         if self.sharpen_strength > 0 {
-            Self::sharpen_y_plane(
+            Self::sharpen_y_plane_inplace(
                 &mut yuv_frame,
                 self.width,
                 self.height,
                 self.sharpen_strength,
+                &mut self.sharpen_prev_row,
+                &mut self.sharpen_curr_row,
             );
         }
 
@@ -462,13 +443,11 @@ impl HwEncoder {
 
 // ─── Frame Dedup ─────────────────────────────────────────────────────────────
 /// Сравнивает два BGRA-кадра по сэмплированным пикселям.
-/// true = кадр изменился, нужно кодировать.
-/// false = статичен, можно пропустить encode.
 pub fn frame_changed(prev: &[u8], curr: &[u8], width: u32, height: u32, stride: u32) -> bool {
     let total = (width * height) as usize;
     let step: usize = 16;
     let thresh: u8 = 8;
-    let limit = total / step / 300; // 0.3% порог
+    let limit = total / step / 300;
 
     let (w, s) = (width as usize, stride as usize);
     let mut changed: usize = 0;
@@ -489,27 +468,17 @@ pub fn frame_changed(prev: &[u8], curr: &[u8], width: u32, height: u32, stride: 
 }
 
 // ─── LQ Encoder (Simulcast) ──────────────────────────────────────────────────
-//
-// ОПТИМИЗАЦИЯ: single-pass scaler
-//
-//   Было (2 прохода, 2 scaler):
-//     [1] BGRA src_w×src_h → BGRA lq_w×lq_h   (resize_scaler, LANCZOS)
-//     [2] BGRA lq_w×lq_h   → YUV420P lq_w×lq_h (HwEncoder.scaler, LANCZOS)
-//
-//   Стало (1 проход, 1 scaler):
-//     [1] BGRA src_w×src_h → YUV420P lq_w×lq_h (combined_scaler, AREA)
-//
-//   AREA быстрее LANCZOS для downscale экранного контента (~2×),
-//   при этом резкость на тексте не хуже (LANCZOS даёт ringing-артефакты).
-//   Экономия: ~1–2 ms на кадр при 60 fps = 60–120 ms/сек CPU времени.
 
 pub struct LqEncoder {
     inner:           HwEncoder,
-    combined_scaler: scaling::Context, // BGRA src → YUV420P lq (один проход)
+    combined_scaler: scaling::Context,
     src_width:       u32,
     src_height:      u32,
     lq_width:        u32,
     lq_height:       u32,
+    // FIX #34: переиспользуемый BGRA AvFrame
+    bgra_frame:      Option<AvFrame>,
+    bgra_frame_dims: (u32, u32),
 }
 
 impl LqEncoder {
@@ -539,11 +508,12 @@ impl LqEncoder {
             src_height: src_h,
             lq_width:   lq_w,
             lq_height:  lq_h,
+            bgra_frame: None,
+            bgra_frame_dims: (0, 0),
         })
     }
 
     pub fn encode(&mut self, frame: &CapturedFrame) -> Result<Vec<EncodedPacket>> {
-        // Пересоздаём scaler при изменении разрешения источника
         if frame.width != self.src_width || frame.height != self.src_height {
             self.combined_scaler = scaling::Context::get(
                 Pixel::BGRA,    frame.width,  frame.height,
@@ -555,6 +525,9 @@ impl LqEncoder {
             self.src_width  = frame.width;
             self.src_height = frame.height;
             self.inner.request_keyframe();
+            // сбрасываем кэшированный BGRA buffer
+            self.bgra_frame = None;
+            self.bgra_frame_dims = (0, 0);
 
             info!(
                 "LQ scaler пересоздан: {}×{} → {}×{}",
@@ -562,8 +535,13 @@ impl LqEncoder {
             );
         }
 
-        // ── Шаг 1: строим BGRA AvFrame из входного CapturedFrame ────────────
-        let mut bgra_frame = AvFrame::new(Pixel::BGRA, frame.width, frame.height);
+        // FIX #34: переиспользуем BGRA AvFrame
+        if self.bgra_frame.is_none() || self.bgra_frame_dims != (frame.width, frame.height) {
+            self.bgra_frame = Some(AvFrame::new(Pixel::BGRA, frame.width, frame.height));
+            self.bgra_frame_dims = (frame.width, frame.height);
+        }
+
+        let bgra_frame = self.bgra_frame.as_mut().unwrap();
         {
             let stride = bgra_frame.stride(0);
             let plane  = bgra_frame.data_mut(0);
@@ -578,11 +556,9 @@ impl LqEncoder {
             }
         }
 
-        // ── Шаг 2: один проход — resize + BGRA→YUV420P ──────────────────────
         let mut yuv_frame = AvFrame::empty();
-        self.combined_scaler.run(&bgra_frame, &mut yuv_frame)?;
+        self.combined_scaler.run(bgra_frame, &mut yuv_frame)?;
 
-        // ── Шаг 3: передаём готовый YUV напрямую в HwEncoder.encode_yuv() ───
         self.inner.encode_yuv(yuv_frame, frame.timestamp_ns)
     }
 

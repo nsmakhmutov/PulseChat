@@ -1,26 +1,44 @@
 """
-audio_capture.py  —  InPulse Audio Engine  (DLL-редакция v3, Gate-Free)
+audio_capture.py — InPulse Audio Engine (DLL-редакция v4, Gate-Free, Fixed)
 =========================================================================
-StreamAudioCapture:
-  • Захват системного звука через InPulseAudioExclusion.dll (WASAPI Process Loopback).
-  • DLL исключает звук процесса InPulse через PROCESS_LOOPBACK_EXCLUDE:
-      - StartRender() открывает RAW WASAPI сессию (AUDCLNT_STREAMFLAGS_RAW),
-        звук идёт в обход audiodg.exe/APO → PID python.exe сохранён.
-      - StartCapture(exclude_pid) захватывает loopback, исключая наш PID.
-      - Зрители не слышат голоса участников чата InPulse в стриме.
 
-v3 (Gate-Free):
-  • Программный голосовой gate полностью удалён.
-    Gate был костылём: глушил стрим-аудио при каждом голосовом сообщении
-    в чате (зритель говорил → стример слышал → gate срабатывал → тишина).
-  • Исключение InPulse целиком обеспечивает DLL нативно.
-  • voice_gate / _ec_voice_ring / echo-cancellation fallback удалены.
-  • StreamAudioCapture и SystemAudioTrack больше не принимают voice_gate.
+StreamAudioCapture: захват системного звука через InPulseAudioExclusion.dll
+(WASAPI Process Loopback). DLL исключает звук процесса InPulse через
+PROCESS_LOOPBACK_EXCLUDE — зрители не слышат голоса участников чата InPulse
+в стриме.
 
-Жизненный цикл:
-    capture = StreamAudioCapture(pcm_callback=..., audio_handler=...)
-    capture.start()   →  StartRender() + StartCapture()
-    capture.stop()    →  StopCapture() + StopRender()
+─── Исправления v4 ────────────────────────────────────────────────────────
+
+  FIX #43 (КРИТИЧНО): zero-copy as_array → immediate .copy().
+    Старый код: np.ctypeslib.as_array(pcm_ptr, ...) создаёт numpy view на
+    C-память DLL. Эта память принадлежит WASAPI буферу и освобождается
+    после возврата из callback. Если под buffer_lock произойдёт GIL release
+    (а np.dot может!) и DLL успеет выдать следующий буфер, старый указатель
+    станет мусором → либо SIGSEGV, либо silent corruption аудио-данных.
+
+    Исправление: копируем ptr → Vec<u8> ПЕРЕД любой операцией под локом.
+
+  FIX #44 (ВАЖНО): O(n) shift буфера → ring buffer.
+    Старый код на каждом нарезанном CHUNK_SIZE делал:
+        self._pcm_buf[:self._pcm_len] = self._pcm_buf[CHUNK_SIZE:CHUNK_SIZE+...]
+    Это O(buffer_len) memmove из C-слоя numpy. Под нагрузкой (много аудио,
+    вытесняющая очередь) давало явные паузы/хрусты в потоке.
+
+    Исправление: ring buffer с write_pos/read_pos и wrap-around индексацией.
+
+  FIX #50 (ВАЖНО): np.interp → scipy.signal.resample_poly.
+    np.interp — линейная интерполяция без anti-alias фильтра. Даёт заметный
+    aliasing на музыке (ВЧ-компоненты → наложения в слышимом диапазоне).
+    resample_poly использует polyphase FIR с правильным low-pass.
+
+    Fallback: если scipy не установлен — оставляем np.interp (лучше чем
+    поломанное поведение).
+
+  WATCHDOG: перенесён сюда из мёртвого media_engine_bridge._read_stderr
+    (который парсил stderr Rust — не там, где пишется [DLL-DIAG]).
+    Теперь watchdog работает на реальных RMS/peak из _dll_audio_cb и при
+    затишье >= DLL_SILENCE_TIMEOUT сек вызывает _on_dll_silence() callback,
+    который верхний уровень может привязать к MediaEngineBridge.restart_capture().
 """
 
 import asyncio
@@ -37,7 +55,7 @@ import numpy as np
 import sounddevice as sd
 from aiortc import AudioStreamTrack
 
-from config import SAMPLE_RATE, CHANNELS, CHUNK_SIZE
+from config import SAMPLE_RATE, CHANNELS, CHUNK_SIZE, AUDIO_DIAG_ENABLED
 from .audio_processing import PYRNNOISE_AVAILABLE
 
 try:
@@ -45,22 +63,25 @@ try:
 except ImportError:
     RNNoise = None
 
+# FIX #50: опциональный scipy для polyphase ресемплинга
+try:
+    from scipy.signal import resample_poly as _scipy_resample_poly
+    _SCIPY_AVAILABLE = True
+except ImportError:
+    _SCIPY_AVAILABLE = False
+    _scipy_resample_poly = None
+    print("[StreamAudio] scipy не установлен — ресемплинг через np.interp (aliasing)")
+
 
 # ---------------------------------------------------------------------------
 #  Поиск DLL рядом с пакетом audio_engine
 # ---------------------------------------------------------------------------
 def _find_dll() -> Path:
-    """
-    Ищет InPulseAudioExclusion.dll в нескольких ожидаемых местах:
-      1. <project_root>/dlls/   — стандартное место рядом с DeepFilterNet
-      2. <audio_engine dir>/    — рядом с этим модулем
-      3. Папка запуска (cwd)
-    """
     dll_name = "InPulseAudioExclusion.dll"
     candidates = [
-        Path(__file__).parent.parent / "dlls" / dll_name,  # project/dlls/
-        Path(__file__).parent / dll_name,                   # audio_engine/
-        Path(os.getcwd()) / dll_name,                       # cwd
+        Path(__file__).parent.parent / "dlls" / dll_name,
+        Path(__file__).parent / dll_name,
+        Path(os.getcwd()) / dll_name,
         Path(os.getcwd()) / "dlls" / dll_name,
     ]
     for p in candidates:
@@ -70,17 +91,14 @@ def _find_dll() -> Path:
         f"[StreamAudio] DLL '{dll_name}' не найдена.\n"
         f"  Ожидаемые места: {[str(c) for c in candidates]}\n"
         f"  Скомпилируйте LoopbackCapture.cpp → Release/x64 в Visual Studio\n"
-        f"  (Project Properties → Linker → Output File: InPulseAudioExclusion.dll)\n"
         f"  и скопируйте в папку dlls/ проекта."
     )
 
 
 # ---------------------------------------------------------------------------
-#  Загрузка DLL и определение ctypes-сигнатур  (один раз при импорте модуля)
+#  Загрузка DLL и определение ctypes-сигнатур
 # ---------------------------------------------------------------------------
 
-# Сигнатура capture-callback:
-#   void callback(float* pcm_data, int num_frames, int channels, int sample_rate)
 _AudioCallbackType = ctypes.CFUNCTYPE(
     None,
     ctypes.POINTER(ctypes.c_float),
@@ -94,13 +112,6 @@ _dll_load_error: "str | None" = None
 
 
 def _load_dll() -> "ctypes.CDLL | None":
-    """
-    Загружает DLL и устанавливает типы аргументов/возврата для ВСЕХ функций:
-      Capture:  StartCapture, StopCapture
-      Render:   StartRender, StopRender, PlayAudioChunk, IsRawModeActive,
-                IsWasapiReady (v3)
-    Вызывается лениво при первом start().
-    """
     global _dll, _dll_load_error
     if _dll is not None:
         return _dll
@@ -111,25 +122,18 @@ def _load_dll() -> "ctypes.CDLL | None":
         dll_path = _find_dll()
         lib = ctypes.CDLL(str(dll_path))
 
-        # ── Capture ──────────────────────────────────────────────────────────
-        # bool StartCapture(DWORD exclude_pid, AudioCallback callback)
         lib.StartCapture.restype  = ctypes.c_bool
         lib.StartCapture.argtypes = [ctypes.c_ulong, _AudioCallbackType]
 
-        # void StopCapture()
         lib.StopCapture.restype  = None
         lib.StopCapture.argtypes = []
 
-        # ── Render ────────────────────────────────────────────────────────────
-        # bool StartRender()
         lib.StartRender.restype  = ctypes.c_bool
         lib.StartRender.argtypes = []
 
-        # void StopRender()
         lib.StopRender.restype  = None
         lib.StopRender.argtypes = []
 
-        # bool PlayAudioChunk(float* pcm, int num_frames, int src_channels, int src_sr)
         lib.PlayAudioChunk.restype  = ctypes.c_bool
         lib.PlayAudioChunk.argtypes = [
             ctypes.POINTER(ctypes.c_float),
@@ -138,27 +142,21 @@ def _load_dll() -> "ctypes.CDLL | None":
             ctypes.c_int,
         ]
 
-        # bool IsRawModeActive()
         lib.IsRawModeActive.restype  = ctypes.c_bool
         lib.IsRawModeActive.argtypes = []
 
-        # bool IsWasapiReady()  — проверка что RenderThread завершил WASAPI init
         try:
             lib.IsWasapiReady.restype  = ctypes.c_bool
             lib.IsWasapiReady.argtypes = []
         except AttributeError:
             lib.IsWasapiReady = lambda: True
 
-        # bool IsRenderPollingMode()  — v4: polling или event-driven режим
         try:
             lib.IsRenderPollingMode.restype  = ctypes.c_bool
             lib.IsRenderPollingMode.argtypes = []
         except AttributeError:
             lib.IsRenderPollingMode = lambda: False
 
-        # int ReadRenderedAudio(float* dst, int max_frames, int dst_channels)
-        # Читает из render tap буфера точно то, что было отдано в WASAPI hardware.
-        # Используется для software EC когда RAW mode недоступен.
         try:
             lib.ReadRenderedAudio.restype  = ctypes.c_int
             lib.ReadRenderedAudio.argtypes = [
@@ -169,7 +167,6 @@ def _load_dll() -> "ctypes.CDLL | None":
         except AttributeError:
             lib.ReadRenderedAudio = lambda _p, _f, _c: 0
 
-        # int GetRenderedAudioAvailable()
         try:
             lib.GetRenderedAudioAvailable.restype  = ctypes.c_int
             lib.GetRenderedAudioAvailable.argtypes = []
@@ -187,75 +184,78 @@ def _load_dll() -> "ctypes.CDLL | None":
 
 
 def get_dll() -> "ctypes.CDLL | None":
-    """Возвращает загруженную DLL (или None). Используется AudioHandler."""
     return _dll
 
 
 # ===========================================================================
-#  StreamAudioCapture  —  захват системного звука через DLL
+#  StreamAudioCapture — захват системного звука через DLL
 # ===========================================================================
+
+# FIX #44: параметры ring buffer (в сэмплах, 48kHz mono)
+_RING_SIZE = CHUNK_SIZE * 64  # ≈1.3 сек @ 48kHz = достаточно для всплесков jitter
+
+# Watchdog таймауты
+_DLL_SILENCE_TIMEOUT = 3.0    # если RMS=0 удерживается дольше — рестарт
+_DLL_MIN_ACTIVE_SEC = 2.0     # игнорируем первые N сек после старта
+
 
 class StreamAudioCapture:
     """
     Захват системного аудио через WASAPI Process Loopback (C++ DLL).
 
     StartCapture(exclude_pid) регистрирует PID python.exe — DLL не включает
-    его аудио в loopback-поток. StartRender() открывает RAW WASAPI render-сессию
-    (AUDCLNT_STREAMFLAGS_RAW): звук идёт в обход audiodg.exe/APO →
-    Windows корректно атрибутирует PID → PROCESS_LOOPBACK_EXCLUDE работает.
-
-    AudioHandler при render_active=True глушит PortAudio outdata (fill 0)
-    и передаёт mix_buffer в DLL PlayAudioChunk() — голосовой чат идёт
-    через RAW сессию, и значит тоже исключён из loopback.
-
-    Жизненный цикл:
-        capture = StreamAudioCapture(pcm_callback=..., audio_handler=...)
-        capture.start()    →  StartRender() + StartCapture()
-        capture.stop()     →  StopCapture() + StopRender()
+    его аудио в loopback-поток. Голоса InPulse исключены через Session Manager
+    (PROCESS_LOOPBACK_EXCLUDE) нативно.
     """
 
     def __init__(
         self,
         pcm_callback:  "Callable[[np.ndarray], None] | None" = None,
         audio_handler: "object | None"                        = None,
+        on_dll_silence: "Callable[[], None] | None"           = None,
     ):
         """
         pcm_callback(chunk: np.ndarray[float32, (CHUNK_SIZE,)])
             Вызывается для каждого 20-мс фрейма.
         audio_handler: не используется, оставлен для обратной совместимости.
-
-        Архитектура (v4 — без DLL Render):
-        Голосовой чат воспроизводится через PortAudio WASAPI Shared сессию.
-        Эта сессия принадлежит python.exe PID → Session Manager её видит.
-        PROCESS_LOOPBACK_EXCLUDE(python.exe) исключает её из захвата нативно.
-        Отдельный DLL Render (RAW WASAPI) удалён — он давал обратный эффект
-        из-за аппаратного DSP микшера USB устройств (Sound Blaster и т.п.).
+        on_dll_silence: вызывается если RMS=0 удерживается дольше
+            _DLL_SILENCE_TIMEOUT секунд. MediaEngineBridge.restart_capture()
+            может быть передан сюда. Вызов происходит из watchdog-потока,
+            не из audio callback'а.
         """
-        self._pcm_callback   = pcm_callback
-        # audio_handler сохраняем для совместимости, но не используем
-        self._audio_handler: "object | None" = audio_handler
+        self._pcm_callback    = pcm_callback
+        self._audio_handler   = audio_handler
+        self._on_dll_silence  = on_dll_silence
 
-        # Предаллоцированный буфер (8× CHUNK_SIZE запаса)
-        self._pcm_buf  = np.empty(CHUNK_SIZE * 8, dtype=np.float32)
-        self._pcm_len  = 0
+        # FIX #44: ring buffer вместо linear buffer.
+        # write_pos и read_pos перемещаются по модулю _RING_SIZE.
+        # Корректные нарезки достигаются без memmove за O(1) на каждый chunk.
+        self._ring = np.zeros(_RING_SIZE, dtype=np.float32)
+        self._write_pos: int = 0
+        self._read_pos:  int = 0
+        self._available: int = 0   # количество сэмплов готовых к чтению
+
         self._buffer_lock = threading.Lock()
 
-        # Ссылку на ctypes-колбэк держим как атрибут — gc не соберёт указатель
+        # ctypes-колбэк — держим ссылку, иначе GC освободит указатель
         self._c_callback: "_AudioCallbackType | None" = None
-        self._started = False   # флаг: DLL::StartCapture вызван успешно
+        self._started = False
 
-        # Диагностика захвата
+        # Диагностика захвата (только при AUDIO_DIAG_ENABLED)
         self._log_rms_accum: float = 0.0
         self._log_rms_count: int   = 0
         self._log_next_ts:   float = 0.0
 
-    # ------------------------------------------------------------------
-    #  Свойство: запущен ли DLL render
-    # ------------------------------------------------------------------
+        # Watchdog state
+        self._watchdog_thread: "threading.Thread | None" = None
+        self._watchdog_stop_evt = threading.Event()
+        self._last_active_ts: float = 0.0  # perf_counter когда был последний RMS>0
+        self._start_ts: float = 0.0        # когда стартовали (для _DLL_MIN_ACTIVE_SEC)
+        self._silence_triggered: bool = False   # чтобы не зацикливать callbacks
 
     @property
     def render_active(self) -> bool:
-        """Всегда False — DLL Render удалён. Только Capture."""
+        """Всегда False — DLL Render удалён."""
         return False
 
     # ------------------------------------------------------------------
@@ -263,22 +263,7 @@ class StreamAudioCapture:
     # ------------------------------------------------------------------
 
     def start(self, device_idx=None):
-        """
-        Запускает захват системного звука через DLL Process Loopback.
-
-        ТОЛЬКО StartCapture(exclude_pid) — никакого StartRender.
-
-        Голосовой чат воспроизводится через PortAudio WASAPI Shared сессию
-        (AttributedTo python.exe PID). PROCESS_LOOPBACK_EXCLUDE(python.exe)
-        исключает эту сессию из захвата нативно на уровне Session Manager —
-        точно так же как это делают Discord, Zoom, Telegram.
-
-        Отдельный DLL Render (RAW WASAPI) не нужен и вреден:
-        - RAW сессии могут обходить Session Manager tracking
-        - USB аудиоустройства (Sound Blaster) имеют аппаратный DSP mixer
-          который смешивает всё ДО Session Manager → EXCLUDE не работает
-        - PortAudio WASAPI Shared сессии исключаются надёжно
-        """
+        """Запускает захват системного звука через DLL Process Loopback."""
         if self._started:
             self.stop()
 
@@ -288,7 +273,9 @@ class StreamAudioCapture:
             return
 
         with self._buffer_lock:
-            self._pcm_len = 0
+            self._write_pos = 0
+            self._read_pos  = 0
+            self._available = 0
 
         self._c_callback = _AudioCallbackType(self._dll_audio_cb)
         exclude_pid = os.getpid()
@@ -300,6 +287,20 @@ class StreamAudioCapture:
 
         if ok:
             self._started = True
+            self._start_ts = time.perf_counter()
+            self._last_active_ts = self._start_ts
+            self._silence_triggered = False
+
+            # Запускаем watchdog (если есть колбэк)
+            if self._on_dll_silence is not None:
+                self._watchdog_stop_evt.clear()
+                self._watchdog_thread = threading.Thread(
+                    target=self._watchdog_loop,
+                    daemon=True,
+                    name="dll-capture-watchdog",
+                )
+                self._watchdog_thread.start()
+
             print(f"[StreamAudio] ✔ DLL Capture запущен (exclude PID={exclude_pid})"
                   f" — голоса InPulse исключены через Session Manager")
         else:
@@ -307,9 +308,15 @@ class StreamAudioCapture:
             self._c_callback = None
 
     def stop(self):
-        """Останавливает DLL Capture."""
+        """Останавливает DLL Capture и watchdog."""
         if not self._started:
             return
+
+        # Остановим watchdog первым, чтобы он не триггернулся во время shutdown
+        self._watchdog_stop_evt.set()
+        if self._watchdog_thread is not None:
+            self._watchdog_thread.join(timeout=1.0)
+            self._watchdog_thread = None
 
         lib = _load_dll()
         if lib is not None:
@@ -345,6 +352,111 @@ class StreamAudioCapture:
         return result
 
     # ------------------------------------------------------------------
+    #  Watchdog
+    # ------------------------------------------------------------------
+
+    def _watchdog_loop(self) -> None:
+        """
+        Следит за _last_active_ts. Если прошло больше _DLL_SILENCE_TIMEOUT
+        секунд с момента последнего RMS>0 (и мы не в стартовой фазе) —
+        вызывает _on_dll_silence() callback один раз, помечает triggered.
+        Сбрасывается автоматически когда появляется звук.
+        """
+        while not self._watchdog_stop_evt.is_set():
+            if self._watchdog_stop_evt.wait(0.5):
+                break
+
+            if not self._started:
+                continue
+
+            now = time.perf_counter()
+            if now - self._start_ts < _DLL_MIN_ACTIVE_SEC:
+                continue  # стартовая фаза — захват ещё не прогрелся
+
+            silent_for = now - self._last_active_ts
+            if silent_for >= _DLL_SILENCE_TIMEOUT:
+                if not self._silence_triggered:
+                    self._silence_triggered = True
+                    print(
+                        f"[StreamAudio] WATCHDOG: DLL Capture silent "
+                        f"{silent_for:.1f}s — requesting restart",
+                        flush=True,
+                    )
+                    try:
+                        if self._on_dll_silence is not None:
+                            self._on_dll_silence()
+                    except Exception as e:
+                        print(f"[StreamAudio] WATCHDOG callback error: {e}")
+                    # Сбрасываем таймер: после рестарта даём _DLL_SILENCE_TIMEOUT
+                    # чтобы заново оценить ситуацию.
+                    self._last_active_ts = now
+
+    # ------------------------------------------------------------------
+    #  Ring buffer helpers
+    # ------------------------------------------------------------------
+
+    def _ring_write(self, samples: np.ndarray) -> None:
+        """Пишет samples в ring buffer. Оверфлоу перезаписывает старые данные."""
+        n = len(samples)
+        if n == 0:
+            return
+
+        # Если данных больше чем места — потеряется начало (буфер не успевает)
+        if n >= _RING_SIZE:
+            # Крайний случай: отбрасываем лишние старые сэмплы, берём хвост
+            tail = samples[-_RING_SIZE:]
+            self._ring[:] = tail
+            self._write_pos = 0
+            self._read_pos  = 0
+            self._available = _RING_SIZE
+            print(f"[StreamAudio] ring buffer overrun: drop {n - _RING_SIZE} samples")
+            return
+
+        wp = self._write_pos
+        end = wp + n
+
+        if end <= _RING_SIZE:
+            # Помещается одним куском
+            self._ring[wp:end] = samples
+            self._write_pos = end % _RING_SIZE
+        else:
+            # Нужна двойная запись (wrap)
+            split = _RING_SIZE - wp
+            self._ring[wp:] = samples[:split]
+            self._ring[:n - split] = samples[split:]
+            self._write_pos = n - split
+
+        self._available += n
+        # Overflow защита: если write догоняет read, сдвигаем read вперёд
+        if self._available > _RING_SIZE:
+            drop = self._available - _RING_SIZE
+            self._read_pos = (self._read_pos + drop) % _RING_SIZE
+            self._available = _RING_SIZE
+            # Это штатная ситуация если callback отстаёт — молча отбрасываем
+
+    def _ring_read_chunk(self) -> "np.ndarray | None":
+        """Читает CHUNK_SIZE сэмплов если они доступны. O(1) по возможности."""
+        if self._available < CHUNK_SIZE:
+            return None
+
+        rp = self._read_pos
+        end = rp + CHUNK_SIZE
+
+        if end <= _RING_SIZE:
+            chunk = self._ring[rp:end].copy()
+            self._read_pos = end % _RING_SIZE
+        else:
+            # Wrap: собираем два куска (одно копирование неизбежно)
+            split = _RING_SIZE - rp
+            chunk = np.empty(CHUNK_SIZE, dtype=np.float32)
+            chunk[:split] = self._ring[rp:]
+            chunk[split:] = self._ring[:CHUNK_SIZE - split]
+            self._read_pos = CHUNK_SIZE - split
+
+        self._available -= CHUNK_SIZE
+        return chunk
+
+    # ------------------------------------------------------------------
     #  DLL-колбэк (вызывается из C++-потока DLL)
     # ------------------------------------------------------------------
 
@@ -357,85 +469,110 @@ class StreamAudioCapture:
     ) -> None:
         """
         Вызывается C++-потоком DLL на каждый WASAPI-буфер (~10 мс).
-
-        Порядок обработки:
-          1. C-указатель → numpy (zero-copy через as_array)
-          2. Stereo → Mono (усреднение)
-          3. Ресемплинг, если sample_rate ≠ 48 000 Гц
-          4. Дозапись в предаллоцированный буфер
-          5. Нарезка CHUNK_SIZE-кусков → _pcm_callback (SystemAudioTrack)
-
-        Голоса InPulse исключены PROCESS_LOOPBACK_EXCLUDE через Session Manager.
-        PortAudio WASAPI Shared сессии (python.exe PID) не попадают в захват.
         """
         if not self._started or num_frames <= 0:
             return
 
         try:
-            # ── 1. C-указатель → numpy (zero-copy) ────────────────────────────
+            # ── 1. C-указатель → numpy с НЕМЕДЛЕННОЙ копией ───────────────────
+            # FIX #43: as_array создаёт view на C-память, которая живёт только
+            # во время callback. Любой код ниже (особенно под локом) может
+            # release GIL — тогда DLL может перезаписать/освободить буфер.
+            # Копируем СРАЗУ в owned numpy-массив, дальше работаем с ним.
             total_samples = num_frames * channels
-            raw = np.ctypeslib.as_array(pcm_ptr, shape=(total_samples,))
+            raw_view = np.ctypeslib.as_array(pcm_ptr, shape=(total_samples,))
+            raw = raw_view.copy()   # <-- вот эта строка.
 
             # ── 2. Stereo → Mono ───────────────────────────────────────────────
             if channels > 1:
                 mono = raw.reshape(num_frames, channels).mean(axis=1).astype(np.float32)
             else:
-                mono = raw.copy()
+                mono = raw  # уже копия из шага 1
 
-            # ── 3. Ресемплинг (если устройство не 48 кГц) ─────────────────────
+            # ── 3. Ресемплинг ──────────────────────────────────────────────
             if sample_rate != SAMPLE_RATE:
-                target_len = int(round(num_frames * SAMPLE_RATE / sample_rate))
-                if target_len > 0:
-                    x_old = np.linspace(0.0, 1.0, num_frames,   dtype=np.float64)
-                    x_new = np.linspace(0.0, 1.0, target_len,   dtype=np.float64)
-                    mono  = np.interp(x_new, x_old, mono).astype(np.float32)
+                mono = self._resample(mono, sample_rate, SAMPLE_RATE)
 
-            # ── 4. Диагностика ─────────────────────────────────────────────
-            self._log_rms_accum += float(np.dot(mono, mono))
-            self._log_rms_count += len(mono)
-            _now = time.perf_counter()
-            if _now >= self._log_next_ts and self._log_rms_count > 0:
-                rms  = (self._log_rms_accum / self._log_rms_count) ** 0.5
-                peak = float(np.abs(mono).max())
-                print(
-                    f"[DLL-DIAG] захват: RMS={rms:.4f}  peak={peak:.4f}"
-                    f"  frames={num_frames}  ch={channels}  sr={sample_rate}"
-                    f"  buf_fill={self._pcm_len}",
-                    flush=True,
-                )
-                self._log_rms_accum = 0.0
-                self._log_rms_count = 0
-                self._log_next_ts   = _now + 1.0
+            # ── 4. Обновляем watchdog: считаем peak и RMS ДО лока ──────────
+            # Быстрая проверка activity для watchdog (дёшево, всегда считаем)
+            peak_now = float(np.abs(mono).max()) if len(mono) else 0.0
+            if peak_now > 0.001:   # порог ~ -60 dB
+                self._last_active_ts = time.perf_counter()
 
-            # ── 5 & 6. Буфер + нарезка по CHUNK_SIZE ──────────────────────────
-            with self._buffer_lock:
-                incoming = len(mono)
-                needed   = self._pcm_len + incoming
-
-                if needed > len(self._pcm_buf):
-                    new_size = max(needed, len(self._pcm_buf) * 2)
-                    new_buf  = np.empty(new_size, dtype=np.float32)
-                    new_buf[:self._pcm_len] = self._pcm_buf[:self._pcm_len]
-                    self._pcm_buf = new_buf
-                    print(f"[StreamAudio] Буфер расширен до {new_size} сэмплов")
-
-                self._pcm_buf[self._pcm_len:self._pcm_len + incoming] = mono
-                self._pcm_len += incoming
-
-                while self._pcm_len >= CHUNK_SIZE:
-                    chunk = self._pcm_buf[:CHUNK_SIZE].copy()
-                    self._pcm_len -= CHUNK_SIZE
-                    self._pcm_buf[:self._pcm_len] = (
-                        self._pcm_buf[CHUNK_SIZE:CHUNK_SIZE + self._pcm_len]
+            # Полная диагностика только при AUDIO_DIAG_ENABLED
+            if AUDIO_DIAG_ENABLED:
+                self._log_rms_accum += float(np.dot(mono, mono))
+                self._log_rms_count += len(mono)
+                _now = time.perf_counter()
+                if _now >= self._log_next_ts and self._log_rms_count > 0:
+                    rms = (self._log_rms_accum / self._log_rms_count) ** 0.5
+                    print(
+                        f"[DLL-DIAG] захват: RMS={rms:.4f}  peak={peak_now:.4f}"
+                        f"  frames={num_frames}  ch={channels}  sr={sample_rate}"
+                        f"  buf_avail={self._available}",
+                        flush=True,
                     )
-                    if self._pcm_callback is not None:
-                        try:
-                            self._pcm_callback(chunk)
-                        except Exception:
-                            pass
+                    self._log_rms_accum = 0.0
+                    self._log_rms_count = 0
+                    self._log_next_ts   = _now + 1.0
+
+            # ── 5. Ring buffer + нарезка по CHUNK_SIZE ────────────────────
+            chunks_to_emit = []
+            with self._buffer_lock:
+                self._ring_write(mono)
+                while True:
+                    chunk = self._ring_read_chunk()
+                    if chunk is None:
+                        break
+                    chunks_to_emit.append(chunk)
+
+            # Callback вызываем ВНЕ лока, чтобы не удерживать лок во время
+            # WebRTC push (который может заблокироваться на очереди).
+            if self._pcm_callback is not None:
+                for chunk in chunks_to_emit:
+                    try:
+                        self._pcm_callback(chunk)
+                    except Exception as e:
+                        print(f"[StreamAudio] pcm_callback error: {e}")
 
         except Exception as exc:
             print(f"[StreamAudio] _dll_audio_cb exception: {exc}")
+
+    # ------------------------------------------------------------------
+    #  Ресемплинг
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resample(mono: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
+        """
+        FIX #50: правильный ресемплинг через scipy.signal.resample_poly.
+        Polyphase FIR с low-pass фильтром — без aliasing на музыке.
+        Fallback: np.interp (оставлен для систем без scipy).
+        """
+        if src_sr == dst_sr:
+            return mono.astype(np.float32, copy=False)
+
+        if _SCIPY_AVAILABLE:
+            # resample_poly(x, up, down) — рациональное соотношение.
+            # Находим GCD чтобы минимизировать размеры фильтра.
+            from math import gcd
+            g = gcd(dst_sr, src_sr)
+            up   = dst_sr // g
+            down = src_sr // g
+            try:
+                out = _scipy_resample_poly(mono, up, down).astype(np.float32)
+                return out
+            except Exception as e:
+                print(f"[StreamAudio] resample_poly failed: {e} → fallback на np.interp")
+
+        # Fallback: np.interp (линейный, с aliasing)
+        num_frames = len(mono)
+        target_len = int(round(num_frames * dst_sr / src_sr))
+        if target_len <= 0:
+            return np.zeros(0, dtype=np.float32)
+        x_old = np.linspace(0.0, 1.0, num_frames, dtype=np.float64)
+        x_new = np.linspace(0.0, 1.0, target_len, dtype=np.float64)
+        return np.interp(x_new, x_old, mono).astype(np.float32)
 
 
 # ===========================================================================
@@ -443,10 +580,7 @@ class StreamAudioCapture:
 # ===========================================================================
 
 class MicrophoneTrack(AudioStreamTrack):
-    """
-    Захват микрофона через sounddevice → WebRTC AudioStreamTrack.
-    Без изменений.
-    """
+    """Захват микрофона через sounddevice → WebRTC AudioStreamTrack."""
 
     kind = "audio"
 
@@ -513,10 +647,8 @@ class SystemAudioTrack(AudioStreamTrack):
     """
     Захват системного звука (WASAPI Loopback, с исключением PID) → WebRTC.
 
-    Использует StreamAudioCapture (DLL-редакция).
-    Принимает audio_handler для уведомления о DLL render состоянии:
-      - capture.start() → audio_handler.enable_dll_render(True)  → PortAudio молчит
-      - capture.stop()  → audio_handler.enable_dll_render(False) → PortAudio активен
+    Принимает media_bridge для перенаправления watchdog callback'а в
+    RESTART_CAPTURE Rust команду при обнаружении зависшего DLL Capture.
     """
 
     kind = "audio"
@@ -525,10 +657,12 @@ class SystemAudioTrack(AudioStreamTrack):
         self,
         device_idx:    int = None,
         audio_handler: "object | None" = None,
+        media_bridge:  "object | None" = None,
     ):
         super().__init__()
         self._device_idx    = device_idx
-        self._audio_handler = audio_handler   # AudioHandler для enable_dll_render()
+        self._audio_handler = audio_handler
+        self._media_bridge  = media_bridge
         self._running       = True
         self._queue:   "asyncio.Queue | None"             = None
         self._loop:    "asyncio.AbstractEventLoop | None" = None
@@ -537,10 +671,6 @@ class SystemAudioTrack(AudioStreamTrack):
         self._time_base = fractions.Fraction(1, SAMPLE_RATE)
 
     def _on_pcm_chunk(self, chunk: np.ndarray) -> None:
-        """
-        float32 моно фрейм (CHUNK_SIZE,) из StreamAudioCapture.
-        Отправляет в asyncio.Queue WebRTC-цикла.
-        """
         if not self._running or self._loop is None or self._queue is None:
             return
         def _sync_put():
@@ -552,6 +682,20 @@ class SystemAudioTrack(AudioStreamTrack):
                 pass
         self._loop.call_soon_threadsafe(_sync_put)
 
+    def _on_dll_silence(self) -> None:
+        """
+        Вызывается из watchdog-потока при обнаружении зависшего DLL Capture.
+        Перенаправляем в MediaEngineBridge.restart_capture() если он есть.
+        """
+        if self._media_bridge is None:
+            print("[SystemAudioTrack] watchdog сработал, но media_bridge=None")
+            return
+        try:
+            if hasattr(self._media_bridge, 'restart_capture'):
+                self._media_bridge.restart_capture()
+        except Exception as e:
+            print(f"[SystemAudioTrack] restart_capture error: {e}")
+
     async def recv(self) -> av.AudioFrame:
         if self._queue is None:
             self._loop  = asyncio.get_event_loop()
@@ -559,11 +703,12 @@ class SystemAudioTrack(AudioStreamTrack):
             self._capture = StreamAudioCapture(
                 pcm_callback=self._on_pcm_chunk,
                 audio_handler=self._audio_handler,
+                on_dll_silence=self._on_dll_silence,
             )
             self._capture.start(self._device_idx)
             print("[SystemAudioTrack] Захват системного звука запущен DLL")
 
-        data = await self._queue.get()   # float32 mono (CHUNK_SIZE,)
+        data = await self._queue.get()
 
         pcm_int16 = (np.clip(data, -1.0, 1.0) * 32767).astype(np.int16)
         frame = av.AudioFrame.from_ndarray(

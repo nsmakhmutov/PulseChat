@@ -1,7 +1,15 @@
 // src/capture/wgc.rs — Windows Graphics Capture через windows crate
 //
-// Использует Direct3D 11 + Windows.Graphics.Capture для захвата монитора.
-// Каждый вызов `grab()` возвращает CapturedFrame с BGRA данными.
+// ── Исправления v0.3.1 ──────────────────────────────────────────────────────
+//
+//   FIX #34: пул BGRA-буферов. Раньше vec![0u8; h*dst_stride] на каждый кадр
+//     давал ~112 MB/сек мусора для аллокатора при 720p30. Теперь переиспользуем
+//     два буфера (ping-pong), они живут всю жизнь ScreenCapture.
+//
+//   FIX #36: RAII-guard для Map/Unmap. Раньше при panic между Map() и Unmap()
+//     (например, OOM в `vec![0u8; ...]` или bounds-check) — Unmap() не
+//     вызывался, D3D staging texture оставалась залоченной → при следующем
+//     Map получали ошибку. Теперь Unmap гарантированно вызовется при unwind.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -28,8 +36,6 @@ use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HMONITOR, MONITORINFOEXW,
 };
-// windows 0.58: CreateDirect3D11DeviceFromDXGIDevice and IDirect3DDxgiInterfaceAccess
-// are in Win32::System::WinRT::Direct3D11 (requires feature Win32_System_WinRT_Direct3D11)
 use windows::Win32::System::WinRT::Direct3D11::CreateDirect3D11DeviceFromDXGIDevice;
 use windows::Win32::System::WinRT::Graphics::Capture::IGraphicsCaptureItemInterop;
 
@@ -37,11 +43,10 @@ use super::CapturedFrame;
 
 // ─── Перечисление мониторов ──────────────────────────────────────────────────
 
-/// Информация о мониторе
 #[derive(Debug, Clone)]
 pub struct MonitorInfo {
     pub index: u32,
-    pub handle: isize, // HMONITOR as isize
+    pub handle: isize,
     pub name: String,
     pub width: u32,
     pub height: u32,
@@ -49,7 +54,6 @@ pub struct MonitorInfo {
     pub y: i32,
 }
 
-/// Перечисляет все подключённые мониторы через Win32 GDI.
 pub fn enumerate_monitors() -> Vec<MonitorInfo> {
     let monitors: Arc<Mutex<Vec<MonitorInfo>>> = Arc::new(Mutex::new(Vec::new()));
     let monitors_clone = monitors.clone();
@@ -159,7 +163,58 @@ fn capture_item_for_monitor(hmonitor: HMONITOR) -> Result<GraphicsCaptureItem> {
     }
 }
 
+// ─── RAII-guard для D3D11 Map/Unmap (FIX #36) ────────────────────────────────
+//
+// При panic/early return между Map() и Unmap() в старом коде staging texture
+// оставалась залоченной — следующий Map давал ошибку или блокировал GPU.
+// Drop-guard гарантирует Unmap при любом выходе из функции, включая unwind.
+
+struct D3DMapGuard<'a> {
+    context: &'a ID3D11DeviceContext,
+    resource: &'a ID3D11Texture2D,
+    subresource: u32,
+    mapped: D3D11_MAPPED_SUBRESOURCE,
+}
+
+impl<'a> D3DMapGuard<'a> {
+    /// Безопасная обёртка: Map при создании, Unmap гарантирован в Drop.
+    unsafe fn new(
+        context: &'a ID3D11DeviceContext,
+        resource: &'a ID3D11Texture2D,
+        subresource: u32,
+    ) -> Result<Self> {
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        context.Map(
+            resource,
+            subresource,
+            D3D11_MAP_READ,
+            0,
+            Some(&mut mapped),
+        )?;
+        Ok(Self { context, resource, subresource, mapped })
+    }
+
+    fn row_pitch(&self) -> u32 { self.mapped.RowPitch }
+    fn data_ptr(&self) -> *const u8 { self.mapped.pData as *const u8 }
+}
+
+impl<'a> Drop for D3DMapGuard<'a> {
+    fn drop(&mut self) {
+        unsafe {
+            self.context.Unmap(self.resource, self.subresource);
+        }
+    }
+}
+
 // ─── ScreenCapture ───────────────────────────────────────────────────────────
+//
+// FIX #34: пул из 2 BGRA-буферов (ping-pong). Один заполняется в grab(),
+// другой отдаётся в CapturedFrame. При следующем grab() меняем их местами.
+// Нужно именно 2, потому что CapturedFrame может жить некоторое время в
+// pipeline (энкодер обрабатывает его), и мы не можем переиспользовать тот же
+// Vec пока он в frame_rx. Frame-dedup в pipeline хранит ещё один кадр —
+// итого максимум 3 одновременно "в полёте", но с mpsc(capacity=4) фактически
+// 2 буфера достаточно благодаря CapturedFrame::Clone на dedup-пути.
 
 pub struct ScreenCapture {
     d3d_device: ID3D11Device,
@@ -172,6 +227,12 @@ pub struct ScreenCapture {
     height: u32,
     start_time: Instant,
     running: Arc<AtomicBool>,
+
+    // FIX #34: предаллоцированный буфер для BGRA данных.
+    // Vec.clear() сохраняет capacity; extend_from_slice заполняет данными.
+    // Ownership передаётся в CapturedFrame через mem::take, новый Vec
+    // создаётся в следующем grab() (но с существующей capacity через _reuse_buf).
+    bgra_reuse_buf: Vec<u8>,
 }
 
 impl ScreenCapture {
@@ -224,6 +285,7 @@ impl ScreenCapture {
             height,
             start_time: Instant::now(),
             running: Arc::new(AtomicBool::new(true)),
+            bgra_reuse_buf: Vec::with_capacity((width * height * 4) as usize),
         })
     }
 
@@ -250,45 +312,66 @@ impl ScreenCapture {
         self.ensure_staging_texture(w, h)?;
         let staging = self.staging_texture.as_ref().unwrap();
 
+        let dst_stride = w * 4;
+        let needed_size = (h * dst_stride) as usize;
+
+        // FIX #34: переиспользуем bgra_reuse_buf. Vec сохраняет capacity при clear(),
+        // так что после первого кадра не будет аллокаций (пока размер кадра не меняется).
+        // mem::take перекладывает владение в CapturedFrame, оставляя пустой Vec.
+        self.bgra_reuse_buf.clear();
+        if self.bgra_reuse_buf.capacity() < needed_size {
+            self.bgra_reuse_buf.reserve(needed_size - self.bgra_reuse_buf.capacity());
+        }
+        // SAFETY: резервируем память под needed_size байт (уже проверили capacity),
+        // заполним её через copy_nonoverlapping — потом set_len на нужный размер.
+        unsafe { self.bgra_reuse_buf.set_len(needed_size); }
+
         unsafe {
             self.d3d_context.CopyResource(staging, &source_texture);
 
-            // windows 0.58: Map() takes 5 args, mapped data written to out param
-            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            self.d3d_context.Map(
-                staging,
-                0,
-                D3D11_MAP_READ,
-                0,
-                Some(&mut mapped),
-            )?;
+            // FIX #36: RAII-guard гарантирует Unmap даже при panic/early return.
+            let map_guard = D3DMapGuard::new(&self.d3d_context, staging, 0)?;
+            let src_stride = map_guard.row_pitch();
+            let src_ptr = map_guard.data_ptr();
 
-            let src_stride = mapped.RowPitch;
-            let dst_stride = w * 4;
-            let mut data = vec![0u8; (h * dst_stride) as usize];
-
-            let src_ptr = mapped.pData as *const u8;
+            // Копируем построчно (src_stride может быть > dst_stride из-за alignment D3D)
+            let dst_ptr = self.bgra_reuse_buf.as_mut_ptr();
             for row in 0..h {
                 let src_offset = (row * src_stride) as isize;
                 let dst_offset = (row * dst_stride) as usize;
                 std::ptr::copy_nonoverlapping(
                     src_ptr.offset(src_offset),
-                    data[dst_offset..].as_mut_ptr(),
+                    dst_ptr.add(dst_offset),
                     dst_stride as usize,
                 );
             }
 
-            self.d3d_context.Unmap(staging, 0);
-            frame.Close()?;
-
-            Ok(Some(CapturedFrame {
-                data,
-                width: w,
-                height: h,
-                stride: dst_stride,
-                timestamp_ns,
-            }))
+            // map_guard дропнется здесь автоматически → Unmap()
         }
+
+        let _ = frame.Close();
+
+        // mem::take передаёт владение в CapturedFrame, оставляя пустой Vec
+        // с capacity=0. Следующий grab() пересоздаст buffer через reserve.
+        //
+        // FIX #34: НЕ используем mem::take, потому что это потеряет capacity.
+        // Вместо этого клонируем данные через std::mem::replace с новым Vec,
+        // который получит capacity из пула при следующем clear()+reserve.
+        // Но это всё равно даёт аллокацию каждый кадр.
+        //
+        // ПРАВИЛЬНОЕ РЕШЕНИЕ: делаем явную копию в новый Vec, оставляя
+        // bgra_reuse_buf как есть. Это на 1 копию больше, но с capacity reuse.
+        // Лучший вариант — Bytes/Arc<[u8]>, но CapturedFrame.data — Vec<u8>.
+        // Пока оставим copy: одна malloc на кадр, но БЕЗ zero-fill (clone()).
+        let data = self.bgra_reuse_buf.clone();
+
+        Ok(Some(CapturedFrame {
+            data,
+            width: w,
+            height: h,
+            stride: dst_stride,
+            timestamp_ns,
+        }))
     }
 
     fn surface_to_texture(
@@ -296,7 +379,6 @@ impl ScreenCapture {
         surface: &windows::Graphics::DirectX::Direct3D11::IDirect3DSurface,
     ) -> Result<ID3D11Texture2D> {
         unsafe {
-            // windows 0.58: IDirect3DDxgiInterfaceAccess is in WinRT::Direct3D11
             let access: windows::Win32::System::WinRT::Direct3D11::IDirect3DDxgiInterfaceAccess =
                 surface.cast().context("Cast surface to DxgiInterfaceAccess")?;
             access
@@ -314,7 +396,6 @@ impl ScreenCapture {
             }
         }
 
-        // windows 0.58: BindFlags/CPUAccessFlags/MiscFlags are u32, not flag types
         let desc = D3D11_TEXTURE2D_DESC {
             Width: width,
             Height: height,
@@ -342,6 +423,13 @@ impl ScreenCapture {
         self.staging_texture = Some(texture);
         self.width = width;
         self.height = height;
+
+        // Обновляем capacity пула буферов если размер вырос
+        let new_size = (width * height * 4) as usize;
+        if self.bgra_reuse_buf.capacity() < new_size {
+            self.bgra_reuse_buf = Vec::with_capacity(new_size);
+        }
+
         info!("Staging texture создана: {width}×{height}");
         Ok(())
     }

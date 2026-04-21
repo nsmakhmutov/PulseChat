@@ -1,8 +1,14 @@
 // api.go — HTTP-обработчики сигнализации SFU
 //
-// ИЗМЕНЕНИЯ v2:
-//   Добавлен GET /stats/loss — возвращает агрегированную статистику потерь
-//   для ABR (Adaptive Bitrate). Python опрашивает этот эндпоинт каждые 3 сек.
+// ── Исправления v1.1 ────────────────────────────────────────────────────────
+//
+//   FIX #30: CORS теперь не ограничен 127.0.0.1. SFU слушает на 0.0.0.0
+//     (для стримеров в RadminVPN LAN), но старый CORS отдавал только
+//     "http://127.0.0.1" → браузерные клиенты с других машин получали
+//     CORS-ошибку. Поскольку это локальная VPN-сеть между друзьями,
+//     разрешаем "*" (любой origin). Для Python-клиента (aiortc) CORS
+//     вообще не применяется, но если кто-то захочет подключить браузер —
+//     будет работать.
 
 package main
 
@@ -35,7 +41,6 @@ func (a *API) Handler() http.Handler {
 	mux.HandleFunc("/health", a.handleHealth)
 	mux.HandleFunc("/status", a.handleStatus)
 
-	// ── ABR: статистика потерь для адаптивного битрейта ─────────────────
 	mux.HandleFunc("/stats/loss", a.handleLossStats)
 
 	return corsMiddleware(mux)
@@ -136,6 +141,15 @@ func (a *API) handleViewer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Простая валидация: только безопасные символы в ID
+	for _, c := range viewerID {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '_' || c == '-') {
+			http.Error(w, "Bad Request: invalid viewer id", http.StatusBadRequest)
+			return
+		}
+	}
+
 	action := ""
 	if len(parts) == 2 {
 		action = parts[1]
@@ -182,8 +196,6 @@ func (a *API) handleViewerOffer(w http.ResponseWriter, r *http.Request, viewerID
 
 // ─── ABR: Loss Stats ──────────────────────────────────────────────────────────
 
-// GET /stats/loss — агрегированная статистика потерь от RTCP Receiver Reports.
-// Python ABR поток опрашивает каждые 3 секунды для адаптации битрейта.
 func (a *API) handleLossStats(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -213,9 +225,11 @@ func writeJSON(w http.ResponseWriter, code int, v interface{}) {
 	}
 }
 
+// FIX #30: разрешаем любой origin. В LAN-сценарии это допустимо,
+// и позволяет веб-вьюверам с любой машины в сети подключаться.
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "http://127.0.0.1")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		if r.Method == http.MethodOptions {

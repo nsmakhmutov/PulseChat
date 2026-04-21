@@ -297,7 +297,7 @@ class ConnectingScreen(QWidget):
         self._set_status_style("#cdd6f4")
 
         sigs = self._upd_sigs
-        from updater import check_for_updates_async
+        from core.updater import check_for_updates_async
         check_for_updates_async(
             on_update_found=lambda v, n, b: sigs.update_found.emit(v, n, b),
             on_no_update=lambda: sigs.no_update.emit(),
@@ -326,7 +326,7 @@ class ConnectingScreen(QWidget):
         self.progress_bar.show()
 
         sigs = self._upd_sigs
-        from updater import download_and_apply
+        from core.updater import download_and_apply
         download_and_apply(
             on_progress=lambda pct, status: sigs.dl_progress.emit(pct, status),
             on_done=lambda: sigs.dl_done.emit(),

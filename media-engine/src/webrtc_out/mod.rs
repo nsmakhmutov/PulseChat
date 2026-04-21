@@ -1,31 +1,15 @@
 // src/webrtc_out/mod.rs — WebRTC sender: H.264 NAL → RTP → Pion SFU
 //
-// ── Исправления v3 ──────────────────────────────────────────────────────────
+// ── Исправления v0.3.1 ──────────────────────────────────────────────────────
 //
-//   FIX 1 (КРИТИЧНО): Убран мёртвый const RTP_MAX_PAYLOAD = 900.
-//     webrtc-rs 0.11 не имеет публичного API для установки MTU через
-//     TrackLocalStaticSample. Константа была, но нигде не применялась.
-//     Дефолтный payload 1200б даёт пакет 1240б < RadminVPN MTU (~1440б). OK.
+//   FIX #35: валидация fps. Раньше Duration::from_secs_f64(1.0 / fps as f64)
+//     при fps=0 давал inf → panic "non-finite value" при sleep.
+//     Теперь fps.max(1) в начале send_loop.
 //
-//   FIX 2 (КРИТИЧНО): H.264 Payload Types синхронизированы с исправленным sfu.go.
-//     Было: 3 профиля с одинаковым payload_type=96 → дублирующиеся a=rtpmap.
-//     После исправления sfu.go ожидает:
-//       PT 96 → High Profile 5.0 (640032)  ← NVENC/AMF кодируют именно сюда
-//       PT 97 → Constrained Baseline 3.1 (42e01f)
-//       PT 98 → Baseline 3.1 mode-1 (42001f)
-//       PT 99 → Baseline 3.1 mode-0 (42001f, pm=0)
-//     video_track также переведён на High Profile.
-//
-//   ОТКАТ (FIX 3 из v2 ОТМЕНЁН): NALU splitting убран полностью.
-//     write_sample() ожидает ПОЛНЫЙ Access Unit (SPS+PPS+IDR как один блок).
-//     webrtc-rs сам пакетизирует его по 1200б с единым RTP timestamp.
-//     Разбивка на отдельные write_sample() давала каждому NAL свой timestamp
-//     → декодер зрителя получал SPS, PPS, IDR как три разных кадра
-//     → зелёные артефакты и битые пиксели.
-//
-//     I-frame pacing: простой sleep(30ms) после write_sample() одного I-кадра.
-//     Это оригинальное рабочее решение. 30ms даёт RadminVPN время разгрузить
-//     очередь из ~67 RTP-пакетов до прихода следующих P-кадров.
+//   FIX #37: close() ждёт завершения send_loop. Раньше close() закрывал PC
+//     и возвращался, но spawned send_loop продолжал работать пока frame_tx
+//     не дропнется. При быстром stop()+start() Pipeline могло оказаться два
+//     send_loop на один PC. Теперь держим JoinHandle и awaitим в close().
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,6 +18,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
+use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use webrtc::api::interceptor_registry::register_default_interceptors;
@@ -52,24 +37,26 @@ use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSampl
 use webrtc::track::track_local::TrackLocal;
 
 // I-frame pacing: пауза после отправки полного I-кадра.
-// НЕ разбиваем I-кадр на части — весь Access Unit идёт одним write_sample().
 const KEYFRAME_PACE_DELAY: Duration = Duration::from_millis(30);
 
 pub struct WebRtcSender {
-    pc:            Arc<RTCPeerConnection>,
-    frame_tx:      mpsc::Sender<(Bytes, bool)>,
-    answer_tx:     AsyncMutex<Option<oneshot::Sender<String>>>,
-    offer_sdp:     String,
-    pli_requested: Arc<AtomicBool>,
+    pc:             Arc<RTCPeerConnection>,
+    frame_tx:       mpsc::Sender<(Bytes, bool)>,
+    answer_tx:      AsyncMutex<Option<oneshot::Sender<String>>>,
+    offer_sdp:      String,
+    pli_requested:  Arc<AtomicBool>,
+    send_loop_handle: AsyncMutex<Option<JoinHandle<()>>>,
+    rtcp_loop_handle: AsyncMutex<Option<JoinHandle<()>>>,
+    closed:         AtomicBool,
 }
 
 impl WebRtcSender {
     pub async fn new(fps: u32) -> Result<(Arc<Self>, String)> {
+        // FIX #35: валидация fps
+        let fps = fps.max(1).min(120);
+
         let mut me = MediaEngine::default();
 
-        // FIX 2: Уникальные PT, зеркально с исправленным sfu.go.
-        // Порядок регистрации = приоритет в SDP offer.
-        // PT=96 (High Profile) первым — NVENC/AMF кодируют именно в High.
         let h264_profiles: &[(u8, &str)] = &[
             (96, "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640032"),
             (97, "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"),
@@ -108,9 +95,6 @@ impl WebRtcSender {
 
         let setting_engine = {
             let mut s = webrtc::api::setting_engine::SettingEngine::default();
-            // DTLS replay window 512 вместо дефолта 64.
-            // При высоком битрейте + jitter в RadminVPN нормален out-of-order
-            // на 100+ пакетов. С маленьким окном SRTP дропает их как replay.
             s.set_dtls_replay_protection_window(512);
             s
         };
@@ -131,7 +115,6 @@ impl WebRtcSender {
                 .context("new_peer_connection")?,
         );
 
-        // FIX 2: video_track — High Profile (640032), согласовано с энкодером
         let video_track = Arc::new(TrackLocalStaticSample::new(
             RTCRtpCodecCapability {
                 mime_type:     MIME_TYPE_H264.to_owned(),
@@ -153,7 +136,7 @@ impl WebRtcSender {
         let pli_flag = Arc::new(AtomicBool::new(false));
 
         // RTCP drain loop: читает PLI от Pion SFU → форсируем IDR
-        {
+        let rtcp_loop = {
             let pli_flag_clone = Arc::clone(&pli_flag);
             tokio::spawn(async move {
                 loop {
@@ -176,8 +159,8 @@ impl WebRtcSender {
                         }
                     }
                 }
-            });
-        }
+            })
+        };
 
         let offer = pc.create_offer(None).await.context("create_offer")?;
         let mut gather_done = pc.gathering_complete_promise().await;
@@ -196,15 +179,20 @@ impl WebRtcSender {
         let (frame_tx, frame_rx) = mpsc::channel::<(Bytes, bool)>(4);
         let (answer_tx, answer_rx) = oneshot::channel::<String>();
 
-        let sender = Arc::new(Self {
-            pc:            Arc::clone(&pc),
-            frame_tx,
-            answer_tx:     AsyncMutex::new(Some(answer_tx)),
-            offer_sdp:     offer_sdp.clone(),
-            pli_requested: pli_flag,
-        });
+        let send_loop = tokio::spawn(send_loop(
+            Arc::clone(&pc), video_track, frame_rx, answer_rx, fps,
+        ));
 
-        tokio::spawn(send_loop(Arc::clone(&pc), video_track, frame_rx, answer_rx, fps));
+        let sender = Arc::new(Self {
+            pc:               Arc::clone(&pc),
+            frame_tx,
+            answer_tx:        AsyncMutex::new(Some(answer_tx)),
+            offer_sdp:        offer_sdp.clone(),
+            pli_requested:    pli_flag,
+            send_loop_handle: AsyncMutex::new(Some(send_loop)),
+            rtcp_loop_handle: AsyncMutex::new(Some(rtcp_loop)),
+            closed:           AtomicBool::new(false),
+        });
 
         Ok((sender, offer_sdp))
     }
@@ -225,6 +213,9 @@ impl WebRtcSender {
     }
 
     pub fn push_frame(&self, data: Bytes, is_keyframe: bool) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
         match self.frame_tx.try_send((data, is_keyframe)) {
             Ok(())                                    => {}
             Err(mpsc::error::TrySendError::Full(_))   => debug!("WebRTC frame queue full — drop"),
@@ -236,8 +227,34 @@ impl WebRtcSender {
         self.pli_requested.swap(false, Ordering::AcqRel)
     }
 
+    /// FIX #37: close() ждёт завершения внутренних задач.
     pub async fn close(&self) -> Result<()> {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return Ok(()); // уже закрыт
+        }
+
+        // Закрываем PC — это вызовет завершение read_rtcp и (через drop frame_tx)
+        // send_loop тоже завершится. frame_tx здесь не дропаем явно, он в self
+        // и разрушится вместе с Arc<Self> — но чтобы гарантировать, закрываем
+        // send_loop через JoinHandle.await.
         self.pc.close().await.context("pc.close")?;
+
+        // Ждём завершения send_loop и rtcp_loop с таймаутом.
+        if let Some(h) = self.send_loop_handle.lock().await.take() {
+            match tokio::time::timeout(Duration::from_secs(2), h).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("send_loop join error: {e:?}"),
+                Err(_) => warn!("send_loop не завершился за 2с — abort"),
+            }
+        }
+        if let Some(h) = self.rtcp_loop_handle.lock().await.take() {
+            match tokio::time::timeout(Duration::from_secs(2), h).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("rtcp_loop join error: {e:?}"),
+                Err(_) => warn!("rtcp_loop не завершился за 2с"),
+            }
+        }
+
         info!("WebRTC PeerConnection closed");
         Ok(())
     }
@@ -271,6 +288,7 @@ async fn send_loop(
     }
     info!("[WebRTC send_loop] Remote description set, ICE connecting...");
 
+    // FIX #35: fps гарантированно >= 1 (валидация в WebRtcSender::new)
     let frame_dur = Duration::from_secs_f64(1.0 / fps as f64);
 
     while let Some((data, is_key)) = rx.recv().await {
@@ -283,11 +301,6 @@ async fn send_loop(
             warn!("[WebRTC send_loop] write_sample: {e}");
         }
 
-        // Pacing после I-кадра: даём RadminVPN время разгрузить очередь.
-        // I-кадр 720p ≈ 80 KB = ~67 RTP-пакетов (по 1200б каждый).
-        // 30ms позволяет сети переварить burst до следующих P-кадров.
-        // write_sample() здесь уже завершён — задержка не блокирует кодирование,
-        // только отправку следующего кадра по сети.
         if is_key {
             tokio::time::sleep(KEYFRAME_PACE_DELAY).await;
         }

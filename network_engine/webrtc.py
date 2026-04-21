@@ -68,7 +68,7 @@ except ImportError:
     print("[Net] WARNING: SystemAudioTrack недоступен — системный звук в стриме отключён")
 
 try:
-    from media_engine_bridge import MediaEngineBridge
+    from .media_engine_bridge import MediaEngineBridge
     MEDIA_ENGINE_AVAILABLE = True
 except ImportError:
     MediaEngineBridge = None
@@ -153,7 +153,7 @@ class WebRTCMixin:
         # ── SFU и Media Engine bridges ─────────────────────────────────────
         self._sfu_bridge = None
         try:
-            from sfu_bridge import get_shared as _get_sfu
+            from .sfu_bridge import get_shared as _get_sfu
             self._sfu_bridge = _get_sfu(
                 on_log=lambda s: print(f"[SFU] {s}"),
                 on_exit=lambda c: print(f"[SFU] завершён (code={c})"),
@@ -483,8 +483,10 @@ class WebRTCMixin:
         print("[Net] _handle_streamer_answer: игнорируем (v3: Rust webrtc-rs)")
 
     def stop_streaming_webrtc(self) -> None:
+        """Останавливает стриминг. НЕ убивает SFU — он может быть нужен серверу."""
         self._stop_abr()
 
+        # 1. Останавливаем Rust capture
         if self._media_bridge is not None and self._media_bridge.is_running():
             self._media_bridge.stop_stream()
             print("[Net] Rust capture: STOP_STREAM отправлен")
@@ -492,25 +494,32 @@ class WebRTCMixin:
         import time as _t
         _t.sleep(0.1)
 
+        # 2. Отключаем стримера от SFU через HTTP (SFU жив, просто убираем треки)
+        #    ВАЖНО: делаем ДО stop() media-engine, пока SFU ещё работает
+        if self._sfu_bridge is not None and self._sfu_bridge.is_running():
+            try:
+                self._sfu_bridge.delete_streamer()
+                print("[Net] SFU: streamer отключён")
+            except Exception as e:
+                print(f"[Net] delete_streamer error: {e}")
+            try:
+                self._sfu_bridge.delete_audio_streamer()
+                print("[Net] SFU: audio streamer отключён")
+            except Exception as e:
+                print(f"[Net] delete_audio_streamer error: {e}")
+
+        # 3. Останавливаем media-engine.exe
         if self._media_bridge is not None and self._media_bridge.is_running():
             self._media_bridge.stop()
-            print("[Net] media-engine.exe: завершён принудительно")
+            print("[Net] media-engine.exe: завершён")
 
-        if self._sfu_bridge is not None:
-            self._sfu_bridge.stop()
-            print("[Net] sidecar.exe: завершён принудительно")
-
+        # 4. Закрываем audio streamer PC (aiortc)
         if self._audio_streamer_pc is not None:
             if self._webrtc_loop is not None and not self._webrtc_loop.is_closed():
                 self._run_in_webrtc_loop(self._close_pc_coro(self._audio_streamer_pc))
             self._audio_streamer_pc = None
 
-        if self._sfu_bridge is not None and self._sfu_bridge.is_running():
-            try:
-                self._sfu_bridge.delete_audio_streamer()
-            except Exception as e:
-                print(f"[Net] delete_audio_streamer error: {e}")
-
+        # 5. Останавливаем SystemAudioTrack
         if self._system_audio_track is not None:
             try:
                 self._system_audio_track.stop()
@@ -518,6 +527,7 @@ class WebRTCMixin:
                 print(f"[Net] SystemAudioTrack stop error: {e}")
             self._system_audio_track = None
 
+        # 6. VideoEngine cleanup
         if self.video:
             self.video.stop_streaming()
 
@@ -666,10 +676,23 @@ class WebRTCMixin:
             state = pc.connectionState
             ice   = pc.iceConnectionState
             print(f"[Viewer] PC state → {state}  ICE → {ice}")
-            if state in ("failed", "disconnected", "closed"):
+            # FIX #46: "disconnected" — ВРЕМЕННОЕ состояние (типично на
+            # RadminVPN 2-5 сек). Если сбросить _viewer_pc сразу, зрительский
+            # PC становится недоступным для следующего close() → утечка PC.
+            # Правильное поведение: обнулять ref только на "failed"/"closed".
+            # При disconnected aiortc сам восстановит связь, если сможет.
+            if state in ("failed", "closed"):
                 if self._viewer_pc is pc:
-                    print(f"[Viewer] PC потерян: {state}")
+                    print(f"[Viewer] PC потерян: {state} → закрываем")
+                    try:
+                        await pc.close()
+                    except Exception:
+                        pass
                     self._viewer_pc = None
+            elif state == "disconnected":
+                # Не трогаем _viewer_pc — это временное состояние.
+                # Если станет failed — попадём в ветку выше.
+                pass
 
         try:
             offer = await pc.createOffer()
@@ -737,7 +760,13 @@ class WebRTCMixin:
         _first = True
         _frame_count = 0
 
+        # FIX #45: диагностика RMS/peak под флагом AUDIO_DIAG_ENABLED.
+        # Ранее считалось на КАЖДОМ фрейме (np.dot(flat, flat) — O(n))
+        # в hot path приёма стрим-аудио. Даже в production это давало
+        # заметный CPU overhead.
+        from config import AUDIO_DIAG_ENABLED as _AUDIO_DIAG
         import time as _time_mod
+
         _diag_rms_sum: float = 0.0
         _diag_rms_cnt: int   = 0
         _diag_next_ts: float = _time_mod.perf_counter() + 1.0
@@ -762,6 +791,7 @@ class WebRTCMixin:
 
                     if _first:
                         _first = False
+                        # Первый фрейм логируем всегда (для диагностики старта)
                         peak = float(np.abs(arr).max())
                         print(
                             f"[VIEWER-DIAG] StreamAudio: ПЕРВЫЙ ФРЕЙМ uid={streamer_uid} "
@@ -770,26 +800,28 @@ class WebRTCMixin:
                         )
 
                     _frame_count += 1
-                    _diag_frames_per_sec += 1
 
-                    flat = arr.flatten().astype(np.float32)
-                    _diag_rms_sum += float(np.dot(flat, flat))
-                    _diag_rms_cnt += len(flat)
+                    # FIX #45: RMS-расчёт только при AUDIO_DIAG_ENABLED
+                    if _AUDIO_DIAG:
+                        _diag_frames_per_sec += 1
+                        flat = arr.flatten().astype(np.float32)
+                        _diag_rms_sum += float(np.dot(flat, flat))
+                        _diag_rms_cnt += len(flat)
 
-                    _now = _time_mod.perf_counter()
-                    if _now >= _diag_next_ts and _diag_rms_cnt > 0:
-                        rms  = (_diag_rms_sum / _diag_rms_cnt) ** 0.5
-                        peak = float(np.abs(flat).max())
-                        print(
-                            f"[VIEWER-DIAG] StreamAudio uid={streamer_uid}: "
-                            f"RMS={rms:.4f}  peak={peak:.4f}  "
-                            f"fps={_diag_frames_per_sec}  total={_frame_count}",
-                            flush=True,
-                        )
-                        _diag_rms_sum        = 0.0
-                        _diag_rms_cnt        = 0
-                        _diag_frames_per_sec = 0
-                        _diag_next_ts        = _now + 1.0
+                        _now = _time_mod.perf_counter()
+                        if _now >= _diag_next_ts and _diag_rms_cnt > 0:
+                            rms  = (_diag_rms_sum / _diag_rms_cnt) ** 0.5
+                            peak = float(np.abs(flat).max())
+                            print(
+                                f"[VIEWER-DIAG] StreamAudio uid={streamer_uid}: "
+                                f"RMS={rms:.4f}  peak={peak:.4f}  "
+                                f"fps={_diag_frames_per_sec}  total={_frame_count}",
+                                flush=True,
+                            )
+                            _diag_rms_sum        = 0.0
+                            _diag_rms_cnt        = 0
+                            _diag_frames_per_sec = 0
+                            _diag_next_ts        = _now + 1.0
 
                     if self.audio is not None and hasattr(self.audio, 'add_stream_audio'):
                         self.audio.add_stream_audio(arr, sr, vol=1.0)
@@ -875,28 +907,60 @@ class WebRTCMixin:
     # Остановка WebRTC при завершении
     # ------------------------------------------------------------------
     def _stop_webrtc(self) -> None:
-        """Вызывается из stop() NetworkClient."""
+        """Вызывается из stop() NetworkClient при отключении.
+
+        FIX: НЕ убиваем SFU singleton. SFU принадлежит EmbeddedServerManager
+        и должен быть остановлен через mgr.stop() → PionSfuProxy.shutdown().
+        Если мы стримили — stop_streaming_webrtc() уже вызван из UI.
+        Если нет — media_bridge не запущен, трогать нечего.
+
+        FIX: вместо time.sleep(0.2) ждём завершения close() через .result()
+        с таймаутом — это гарантирует что PC действительно закрылись прежде
+        чем мы убьём loop.
+        """
         self._stop_abr()
 
-        if self._media_bridge is not None:
+        # Останавливаем media-engine если запущен (мы были стримером)
+        if self._media_bridge is not None and self._media_bridge.is_running():
             try:
                 self._media_bridge.stop()
             except Exception as e:
                 print(f"[Net] media_bridge stop error: {e}")
 
-        if self._sfu_bridge is not None:
-            self._sfu_bridge.stop()
-
+        # Закрываем viewer PC и audio streamer PC
         if self._webrtc_loop is not None and not self._webrtc_loop.is_closed():
+            futures_to_wait = []
+
             if self._viewer_pc is not None:
-                asyncio.run_coroutine_threadsafe(
+                f = asyncio.run_coroutine_threadsafe(
                     self._close_pc_coro(self._viewer_pc), self._webrtc_loop
                 )
+                futures_to_wait.append(('viewer_pc', f))
                 self._viewer_pc = None
 
-            import time as _t
-            _t.sleep(0.2)
+            if self._audio_streamer_pc is not None:
+                f = asyncio.run_coroutine_threadsafe(
+                    self._close_pc_coro(self._audio_streamer_pc), self._webrtc_loop
+                )
+                futures_to_wait.append(('audio_streamer_pc', f))
+                self._audio_streamer_pc = None
+
+            # Ждём закрытия с таймаутом — лучше чем time.sleep(0.2)
+            for name, f in futures_to_wait:
+                try:
+                    f.result(timeout=2.0)
+                except Exception as e:
+                    print(f"[Net] {name} close error/timeout: {e}")
+
             try:
                 self._webrtc_loop.call_soon_threadsafe(self._webrtc_loop.stop)
             except Exception:
                 pass
+
+        # SystemAudioTrack
+        if self._system_audio_track is not None:
+            try:
+                self._system_audio_track.stop()
+            except Exception:
+                pass
+            self._system_audio_track = None

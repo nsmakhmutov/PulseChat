@@ -7,8 +7,8 @@ import soundfile as sf
 import winsound
 import keyboard
 import time
-from video_engine import VideoEngine
-from ui_video import VideoWindow, StreamerAnnotationOverlay
+from .video_engine import VideoEngine
+from .ui_video import VideoWindow, StreamerAnnotationOverlay
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QPushButton, QTreeWidget, QTreeWidgetItem,
                              QHeaderView, QMessageBox, QStackedWidget,
@@ -27,6 +27,7 @@ from config import (
     CMD_FORCE_MUTED,
     CHAT_MSG_MAX_LEN,
     CMD_DRAW_STROKE,
+    is_anonymous_uid,
 )
 from audio_engine import AudioHandler
 from network_engine import NetworkClient
@@ -63,6 +64,7 @@ class HoldToDisconnectButton(QPushButton):
         super().__init__(parent)
         self._callback = None
         self._progress = 0.0
+        self._hold_sound_path: str | None = None
 
         self._hold_timer = QTimer(self)
         self._hold_timer.setSingleShot(True)
@@ -75,6 +77,39 @@ class HoldToDisconnectButton(QPushButton):
     def set_hold_callback(self, callback):
         self._callback = callback
 
+    def set_hold_sound(self, path: str) -> None:
+        """Устанавливает .wav файл, который играет в цикле во время удержания."""
+        import os
+        resolved = os.path.normpath(os.path.abspath(path))
+        if os.path.isfile(resolved):
+            self._hold_sound_path = resolved
+        else:
+            print(f"[HoldToDisconnectButton] hold_sound НЕ НАЙДЕН: {resolved}")
+            self._hold_sound_path = None
+
+    def _start_hold_sound(self) -> None:
+        if not self._hold_sound_path:
+            return
+        try:
+            import winsound
+            winsound.PlaySound(
+                self._hold_sound_path,
+                winsound.SND_FILENAME | winsound.SND_ASYNC
+                | winsound.SND_LOOP | winsound.SND_NODEFAULT,
+            )
+        except Exception as ex:
+            print(f"[HoldToDisconnectButton] PlaySound error: {ex}")
+
+    def _stop_hold_sound(self) -> None:
+        if not self._hold_sound_path:
+            return
+        try:
+            import winsound
+            # FIX: SND_PURGE deprecated — используем PlaySound(None, 0)
+            winsound.PlaySound(None, 0)
+        except Exception:
+            pass
+
     # ── events ────────────────────────────────────────────────────────────────
 
     def mousePressEvent(self, event):
@@ -82,6 +117,7 @@ class HoldToDisconnectButton(QPushButton):
             self._progress = 0.0
             self._hold_timer.start(self.HOLD_MS)
             self._tick_timer.start()
+            self._start_hold_sound()
             self._apply_style()
         super().mousePressEvent(event)
 
@@ -105,11 +141,13 @@ class HoldToDisconnectButton(QPushButton):
         if self._hold_timer.isActive() or self._tick_timer.isActive():
             self._hold_timer.stop()
             self._tick_timer.stop()
+            self._stop_hold_sound()
             self._progress = 0.0
             self.setStyleSheet("")          # вернуть стиль из родительского QSS
 
     def _on_hold_complete(self):
         self._tick_timer.stop()
+        self._stop_hold_sound()
         self._progress = 1.0
         self._apply_style()
         if self._callback:
@@ -632,6 +670,7 @@ class MainWindow(QMainWindow):
         self.btn_lobby.setIcon(QIcon(resource_path("assets/icon/lobby.svg")))
         self.btn_lobby.setIconSize(QSize(26, 26))
         self.btn_lobby.set_hold_callback(self._disconnect_and_show_lobby)
+        self.btn_lobby.set_hold_sound(resource_path("assets/music/call_down_progress.wav"))
 
         # --- Индикатор качества соединения стримера ---
         # Маленький QLabel с иконкой connection_bad.svg, появляется рядом
@@ -766,6 +805,22 @@ class MainWindow(QMainWindow):
     # ── Встроенный сервер: стать хостом ──────────────────────────────────────
 
     def _on_become_host(self):
+        """
+        Нам нужно стать новым хостом.
+        Путь сюда:
+          • CMD_SERVER_MIGRATE с new_host_uid==my_uid (обрыв + мы pos=0, или
+            старый хост передал нам через _broadcast_server_migrate)
+          • CMD_MIGRATE_PREPARE (ручная передача, новая 2-шаговая схема)
+
+        Порядок:
+          1. UI: переключаем экран на "Переключение хоста".
+          2. Запускаем EmbeddedServerManager.start() — поднимает TCP/UDP/SFU/
+             ServerAnnouncer. После этого наш сервер уже принимает подключения.
+          3. ДО смены своего подключения: send_migrate_ready() — сообщаем
+             старому серверу что мы готовы. Он сделает broadcast MIGRATE.
+          4. Через короткую паузу: fast_switch_to(host_ip) — подключаемся к себе.
+             recovery-цикл сам переживёт если порт ещё занят (retry 10с).
+        """
         print("[UI] _on_become_host: запускаем встроенный сервер")
 
         self._lost_title_lbl.setText("Переключение хоста")
@@ -778,57 +833,62 @@ class MainWindow(QMainWindow):
         try:
             from server import EmbeddedServerManager
             from client_main.ui_login import load_server_name
-            from server_discovery import get_local_radmin_ip
+            from network_engine.server_discovery import get_local_radmin_ip
             host_ip     = get_local_radmin_ip()
             server_name = load_server_name()
             EmbeddedServerManager.get().start(host_ip, self.nick, server_name=server_name)
         except Exception as e:
             print(f"[UI] _on_become_host error: {e}")
-            self._lost_status_lbl.setText(f"Ошибка запуска сервера:\n{e}\n\nПопробуйте перезапустить.")
+            self._lost_status_lbl.setText(
+                f"Ошибка запуска сервера:\n{e}\n\nПопробуйте перезапустить."
+            )
             self._btn_reconnect.setEnabled(True)
+            # Сбрасываем recovery state чтобы будущие reconnect не заблокировались
+            try:
+                from network_engine.core import _PHASE_IDLE
+                with self.net._recovery_lock:
+                    self.net._recovery_state = _PHASE_IDLE
+            except Exception:
+                pass
             return
 
+        # 2-шаговая передача: сообщаем старому серверу что мы готовы.
+        # Старый сервер после получения migrate_ready сделает broadcast
+        # всем клиентам → они пойдут к нам. Если путь к нам был через
+        # classic CMD_SERVER_MIGRATE (не prepare), это будет no-op —
+        # сервер уже мёртв или проигнорирует сообщение.
+        try:
+            self.net.send_migrate_ready()
+        except Exception as e:
+            print(f"[UI] send_migrate_ready error (ok): {e}")
+
         def _reconnect_to_self():
-            # FIX (Bug F): сбрасываем _migration_pending (установлен в process_message
-            # вместе с running=False, чтобы tcp_listen не вызвал _on_connection_lost).
-            # Сбрасываем здесь — после того как сервер стартовал и мы готовы подключаться.
-            self.net._migration_pending = False
-            # Сбрасываем _reconnecting — fast_switch_to имеет guard "if _reconnecting: return"
-            self.net._reconnecting = False
+            # fast_switch_to в новой версии форсированно сбрасывает _recovery_state
+            # и стартует новый recovery phase=migrating с retry до 10 секунд.
+            # Никаких ручных сбросов _migration_pending/_reconnecting не нужно.
             self.net.fast_switch_to(host_ip)
 
-        # Было 700 мс + _reconnect_loop (3с первый sleep).
-        # 150 мс: достаточно для bind/listen локальных сокетов.
-        # fast_switch_to сам ретраится 8 × 0.35с если порт ещё не готов.
-        QTimer.singleShot(150, _reconnect_to_self)
+        # 200мс: accept() loop стартует мгновенно. recovery-цикл сам
+        # ретраит если порт ещё занят.
+        QTimer.singleShot(200, _reconnect_to_self)
 
     def _on_server_migrating(self, new_host_ip: str):
         """
         Вызывается когда сервер переезжает к другому хосту (мы — не новый хост).
-        Показываем индикатор. Сетевой движок сам переподключится через _migrate_reconnect().
-
-        ИСПРАВЛЕНИЕ — призрак сервера в лобби:
-        Если мы сами были хостом и только что передали сервер (CMD_SERVER_TRANSFER),
-        то CMD_SERVER_MIGRATE прилетает и нам тоже (broadcast всем).
-        Без явной остановки EmbeddedServerManager наш ServerAnnouncer продолжал
-        рассылать broadcast → в лобби висел старый сервер с 0 участников.
-        Теперь: если мы хост и видим миграцию к кому-то другому — останавливаемся.
+        Сетевой movок сам переподключится через _recovery_loop (запущен из
+        process_message → trigger_migration). Здесь только UI + остановка
+        нашего embedded сервера (если мы были старым хостом).
         """
         print(f"[UI] _on_server_migrating: новый хост {new_host_ip}")
 
-        # FIX (Bug E): stop_silent вместо stop_announcer_only.
-        # stop_announcer_only останавливал только UDP-broadcast, но оставлял
-        # TCP/UDP listening-сокеты связанными:
-        #   - Сервер продолжал принимать соединения (видно в списке)
-        #   - mgr._server != None → become_host → новый SFUServer → bind(5000)
-        #     → "адрес уже используется" (Bug #3)
-        # stop_silent закрывает ВСЕ сокеты и устанавливает mgr._server=None.
-        # Не вызывает _broadcast_server_migrate — миграция уже разослана сервером.
+        # Если мы были старым хостом — останавливаемся тихо. Без этого
+        # наш ServerAnnouncer продолжал рассылать broadcast → в лобби
+        # висел "призрак" старого сервера.
         try:
             from server import EmbeddedServerManager
             mgr = EmbeddedServerManager.get()
             if mgr.is_running():
-                print("[UI] _on_server_migrating: stop_silent (порты освобождаем)")
+                print("[UI] _on_server_migrating: stop_silent (освобождаем ресурсы)")
                 mgr.stop_silent()
         except Exception as e:
             print(f"[UI] _on_server_migrating stop error: {e}")
@@ -836,7 +896,7 @@ class MainWindow(QMainWindow):
         self._lost_title_lbl.setText("Смена хоста")
         self._lost_status_lbl.setText(
             f"Сервер переезжает...\nНовый хост: {new_host_ip}\n"
-            "Переподключение через несколько секунд."
+            "Переподключение автоматически (до 10 секунд)."
         )
         self._btn_reconnect.setEnabled(False)
         self._stack.setCurrentIndex(1)
@@ -1460,10 +1520,15 @@ class MainWindow(QMainWindow):
                 ip   = self.app_settings.value(f"whisper_slot_{i}_ip",   "")
                 nick = self.app_settings.value(f"whisper_slot_{i}_nick", "")
                 hk   = self.app_settings.value(f"whisper_slot_{i}_hk",   "")
+                # Флаг анонимного шёпота для данного PTT-слота.
+                # Сохраняется в настройках слота (см. ui_settings.py) —
+                # чекбокс "Анонимно" рядом с назначением хоткея.
+                anon = self.app_settings.value(f"whisper_slot_{i}_anon", "false") == "true"
                 if (not ip and not nick) or not hk:
                     continue
 
-                def _make_ptt(target_ip: str, target_nick: str, hotkey_str: str):
+                def _make_ptt(target_ip: str, target_nick: str, hotkey_str: str,
+                              anonymous: bool = False):
                     active = [False]
 
                     # Триггер-клавиша = последняя в комбо: "alt+1" → "1", "f8" → "f8"
@@ -1492,9 +1557,10 @@ class MainWindow(QMainWindow):
                                     pass
                         if uid is not None:
                             active[0] = True
-                            self.audio.start_whisper(uid)
+                            self.audio.start_whisper(uid, anonymous=anonymous)
                             display = target_nick or target_ip
-                            print(f"[HK] Whisper PTT START → {display} (uid={uid})")
+                            mark = " [anon]" if anonymous else ""
+                            print(f"[HK] Whisper PTT START → {display} (uid={uid}){mark}")
                         else:
                             display = target_nick or target_ip
                             print(f"[HK] Whisper PTT: '{display}' не найден онлайн")
@@ -1518,13 +1584,14 @@ class MainWindow(QMainWindow):
 
                     return _press, _raw_key_up
 
-                _press, _raw_key_up = _make_ptt(ip, nick, hk)
+                _press, _raw_key_up = _make_ptt(ip, nick, hk, anonymous=anon)
                 try:
                     # Только press через add_hotkey (обрабатывает модификаторы корректно)
                     keyboard.add_hotkey(hk, _press, trigger_on_release=False, suppress=False)
                     # Release через raw hook — надёжный физический key-up
                     keyboard.hook(_raw_key_up, suppress=False)
-                    print(f"[HK] Whisper slot {i}: ip='{ip}' nick='{nick}' → '{hk}' (trigger_key='{hk.replace(' ','').split('+')[-1].lower()}')")
+                    print(f"[HK] Whisper slot {i}: ip='{ip}' nick='{nick}' anon={anon} "
+                          f"→ '{hk}' (trigger_key='{hk.replace(' ','').split('+')[-1].lower()}')")
                 except Exception as e:
                     print(f"[HK] Whisper slot {i} error ({hk!r}): {e}")
 
@@ -1631,17 +1698,24 @@ class MainWindow(QMainWindow):
 
         self._current_whisper_uid = sender_uid
 
-        # Ищем ник шептуна среди активных пользователей
-        nick = "Кто-то"
-        for uid, data in self.known_uids.items():
-            if uid == sender_uid:
-                try:
-                    raw = data['item'].text(0).strip()
-                    if raw:
-                        nick = raw
-                except Exception:
-                    pass
-                break
+        # ── Анонимный шёпот ──────────────────────────────────────────────────
+        # Сервер переписал sender_uid в UDP-заголовке на ANONYMOUS_UID перед
+        # ретрансляцией. В known_uids такого uid не существует — поэтому резолв
+        # по дереву ников не нужен (и даже вреден, т.к. покажет "Кто-то").
+        if is_anonymous_uid(sender_uid):
+            nick = "Аноним"
+        else:
+            # Ищем ник шептуна среди активных пользователей
+            nick = "Кто-то"
+            for uid, data in self.known_uids.items():
+                if uid == sender_uid:
+                    try:
+                        raw = data['item'].text(0).strip()
+                        if raw:
+                            nick = raw
+                    except Exception:
+                        pass
+                    break
 
         # ── Баннер в главном окне ─────────────────────────────────────────────
         self._whisper_banner.setText(f"🤫  {nick} шепчет вам...")
@@ -2057,6 +2131,16 @@ class MainWindow(QMainWindow):
 
     def on_connected(self, msg):
         try:
+            # FIX: сбрасываем recovery state при успешном подключении.
+            # _finish_recovery() в core.py тоже это делает, но здесь — страховка
+            # на случай если recovery-поток упал до _finish_recovery (audio.start
+            # бросил исключение, и т.п.). Без этого будущие reconnect заблокированы.
+            try:
+                with self.net._recovery_lock:
+                    self.net._recovery_state = 'idle'
+            except Exception:
+                pass
+
             self.audio.my_uid = msg['uid']
             self.audio.start(
                 self.app_settings.value("device_in_name"),
@@ -3061,7 +3145,7 @@ class MainWindow(QMainWindow):
             return  # репо не настроено — молча пропускаем
 
         try:
-            from updater import check_for_updates_async
+            from core.updater import check_for_updates_async
         except ImportError:
             # updater.py не в sys.path (dev-режим без сборки PyInstaller) — пропускаем.
             print("[Update] updater module не найден — автопроверка отключена")
@@ -3293,17 +3377,10 @@ class MainWindow(QMainWindow):
         except Exception as ex:
             print(f"[UI] disconnect video.shutdown() error: {ex}")
 
-        # ── 6. NetworkClient.stop() ───────────────────────────────────────────
-        # ВАЖНО: ставим _reconnecting=True ДО stop(), чтобы tcp_listen при
-        # выходе не запустил _on_connection_lost → _reconnect_loop (CPU баг).
-        self.net._reconnecting = True
-        self.net._migration_pending = False
-        try:
-            self.net.stop()
-        except Exception as ex:
-            print(f"[UI] disconnect net.stop() error: {ex}")
-
-        # ── 7. EmbeddedServer — graceful миграция (как при резком отключении) ─
+        # ── 6. EmbeddedServer — ПЕРВЫМ (ему нужен живой SFU для миграции) ────
+        # FIX: был шаг 7, после net.stop(). Но net.stop() раньше убивал SFU
+        # singleton → stop_gracefully() не мог отправить CMD_SERVER_MIGRATE
+        # через SFU → клиенты не получали миграцию → висели 12 сек в reconnect.
         try:
             from server import EmbeddedServerManager
             mgr = EmbeddedServerManager.get()
@@ -3311,6 +3388,28 @@ class MainWindow(QMainWindow):
                 mgr.stop()
         except Exception as ex:
             print(f"[UI] disconnect EmbeddedServer stop error: {ex}")
+
+        # ── 7. NetworkClient.stop() — после сервера ───────────────────────────
+        # Блокируем _on_connection_lost: ставим recovery state != IDLE.
+        # tcp_listen проверяет _recovery_state перед вызовом _on_connection_lost.
+        with self.net._recovery_lock:
+            self.net._recovery_state = 'recovering'   # блокируем auto-recovery
+        try:
+            self.net.stop()
+        except Exception as ex:
+            print(f"[UI] disconnect net.stop() error: {ex}")
+        # Сбрасываем state обратно — мы уходим в лобби, recovery не нужен.
+        with self.net._recovery_lock:
+            self.net._recovery_state = 'idle'
+
+        # ── 7b. Финальная страховка: убиваем SFU если ещё жив ────────────────
+        try:
+            from network_engine.sfu_bridge import get_shared as _get_sfu_final
+            _sfu_final = _get_sfu_final()
+            if _sfu_final.is_running():
+                _sfu_final.stop()
+        except Exception:
+            pass
 
         # ── 8. Открываем свежий экран выбора серверов ─────────────────────────
         try:
@@ -3379,27 +3478,15 @@ class MainWindow(QMainWindow):
                 pass
             self._lobby_screen = None
 
-        # FIX #2: устанавливаем новый IP в network client ДО любых остановок.
-        # Если mgr.stop() → stop_gracefully() успеет прислать нам CMD_SERVER_MIGRATE
-        # раньше чем мы вызовем fast_switch_to, то _migrate_reconnect прочитает
-        # self._ip и должен получить ПРАВИЛЬНЫЙ (новый) адрес, а не старый.
+        # Устанавливаем новый IP в network client ДО любых остановок.
         self.net._ip = new_ip
-        # Снимаем migration_pending чтобы любой параллельный _migrate_reconnect
-        # от старого CMD_SERVER_MIGRATE не перехватил управление.
-        self.net._migration_pending = False
 
-        # FIX: net.running=False ПЕРВЫМ.
-        # stop_gracefully рассылает CMD_SERVER_MIGRATE всем клиентам, включая нас.
-        # Если running=True в момент получения CMD_SERVER_MIGRATE:
-        #   process_message → _migration_pending=True, _migrate_reconnect стартует
-        #   _migrate_reconnect: running=False, fast_switch_to(Client2.ip)
-        #   fast_switch_to видит _reconnecting=False → работает ✓
-        # НО: также server_migrating.emit → _on_server_migrating → stop_silent
-        # (наш сервер) — это лишнее, т.к. mgr.stop() ниже уже его остановит.
-        # Установив running=False сейчас, tcp_listen выйдет без _on_connection_lost,
-        # и _migration_pending-флаг тоже не успеет установиться (мы уходим сами).
-        self.net.running       = False
-        self.net._reconnecting = False   # сброс на случай зависшего флага
+        # Блокируем recovery: ставим state != IDLE чтобы tcp_listen при
+        # закрытии старого сокета не запустил _on_connection_lost.
+        # fast_switch_to ниже сам сбросит state=IDLE и стартует новый recovery.
+        with self.net._recovery_lock:
+            self.net._recovery_state = 'migrating'
+        self.net.running = False
 
         # Останавливаем/передаём встроенный сервер если мы хост.
         # stop_gracefully сам выбирает нового хоста по минимальному пингу
@@ -3548,15 +3635,9 @@ class MainWindow(QMainWindow):
         except Exception as ex:
             print(f"[UI] closeEvent video.shutdown() error: {ex}")
 
-        # ── 6. NetworkClient.stop() ───────────────────────────────────────────
-        # Закрывает RTCPeerConnection, asyncio loop, TCP/UDP сокеты.
-        # После этого все сетевые потоки выйдут из блокирующих recv().
-        try:
-            self.net.stop()
-        except Exception as ex:
-            print(f"[UI] closeEvent net.stop() error: {ex}")
-
-        # ── 7. EmbeddedServerManager — корректная передача хостинга ──────────
+        # ── 6. EmbeddedServer — ПЕРВЫМ (ему нужен живой SFU для миграции) ────
+        # FIX: был шаг 7, после net.stop(). Но net.stop() раньше убивал SFU
+        # singleton → stop_gracefully() не мог отправить CMD_SERVER_MIGRATE.
         # stop_gracefully(): broadcast CMD_SERVER_MIGRATE → 350мс → close сокеты.
         # Другие клиенты успевают получить команду и переподключиться.
         try:
@@ -3566,6 +3647,23 @@ class MainWindow(QMainWindow):
                 mgr.stop()
         except Exception as ex:
             print(f"[UI] closeEvent EmbeddedServer stop error: {ex}")
+
+        # ── 7. NetworkClient.stop() — после сервера ───────────────────────────
+        # Закрывает RTCPeerConnection, asyncio loop, TCP/UDP сокеты.
+        # После этого все сетевые потоки выйдут из блокирующих recv().
+        try:
+            self.net.stop()
+        except Exception as ex:
+            print(f"[UI] closeEvent net.stop() error: {ex}")
+
+        # ── 7b. Финальная страховка: убиваем SFU если ещё жив ────────────────
+        try:
+            from network_engine.sfu_bridge import get_shared as _get_sfu_final
+            _sfu_final = _get_sfu_final()
+            if _sfu_final.is_running():
+                _sfu_final.stop()
+        except Exception:
+            pass
 
         # ── 8. Убираем иконку из трея и завершаем Qt ────────────────────
         print("[UI] closeEvent: shutdown завершён")

@@ -1,51 +1,37 @@
 // sfu.go — Ядро Pion SFU: relay треков от стримера к зрителям
 //
-// v5 — Исправления критических и высокоприоритетных багов
+// v1.1 — Исправления критических и высокоприоритетных багов
 //
-// ── Что изменилось относительно v4 ──────────────────────────────────────────
+// ── Что изменилось относительно v1.0 ────────────────────────────────────────
 //
-//   FIX 1 (КРИТИЧНО): H.264 профили теперь имеют УНИКАЛЬНЫЕ Payload Type.
-//     Было: все 4 профиля с PT=96 → дублирующиеся a=rtpmap в SDP → невалидный
-//     SDP, Pion перезаписывал предыдущую запись, итоговый кодек непредсказуем.
-//     Стало: PT 96 (High 5.0), 97 (CB 3.1), 98 (Baseline mode-1), 99 (mode-0).
-//     Для screen sharing приоритетен High (96) — лучший compression для UI/текста.
+//   FIX #26 (КРИТИЧНО): ICE Disconnected больше НЕ триггерит RemoveViewer.
+//     Disconnected — ВРЕМЕННОЕ состояние, на RadminVPN типичны 2-5 сек лаги
+//     с автовосстановлением. Старый код убивал рабочий PC при каждом глитче.
+//     Теперь RemoveViewer только на Failed и Closed.
 //
-//   FIX 2 (КРИТИЧНО): Race condition в AddViewer на trackReadyCh.
-//     Было: AddViewer читал s.trackReadyCh БЕЗ мьютекса. SetStreamerOffer
-//     заменяет канал под Lock. При одновременном реконнекте стримера и
-//     подключении зрителя — зритель мог ждать на старом закрытом канале
-//     (мгновенный return без трека) или на новом (31s timeout), оба случая
-//     приводили к "Ожидание видео...".
-//     Стало: snapshot trackReadyCh под RLock перед select.
+//   FIX #27 (КРИТИЧНО): OnICEConnectionStateChange регистрируется ПОСЛЕ
+//     отпускания s.mu. Раньше callback мог вызвать s.RemoveViewer внутри
+//     удерживаемого Lock → deadlock. Pion обычно вызывает из отдельной
+//     горутины, но формально это была гонка.
 //
-//   FIX 3 (ВЫСОКИЙ): NACK Responder buffer 512 → 2048 пакетов.
-//     512 пакетов × 1300 байт (RadminVPN MTU) ≈ 665 KB.
-//     При 10 Mbps (1080p) это только 530 мс — мало при burst IDR-кадра.
-//     2048 пакетов ≈ 2.6 MB ≈ 2.1 сек при 10 Mbps — достаточно для RTT VPN.
+//   FIX #28: убран противоречивый комментарий "1 секунда vs 3 секунды" про PLI.
+//     Значение 3 секунды — актуальное, взято из v1.0 FIX 7. Старый комментарий
+//     FIX 5 противоречил коду.
 //
-//   FIX 4 (ВЫСОКИЙ): NACK Generator явный размер буфера 2048.
-//     Дефолт генератора — 512 записей. При 10+ Mbps дыры в seq теряются
-//     до того как генератор успевает послать NACK.
+//   FIX #33: RTCP-горутины закрываются через ctx.Done() при RemoveViewer.
+//     Раньше readViewerRTCP продолжал писать в lossStats после delete,
+//     создавая устаревшие записи.
 //
-//   FIX 5 (ВЫСОКИЙ): PLI interval — явный 1 секунда вместо дефолтных 3.
-//     При потере пакетов на RadminVPN и NACK failure зритель ждал до 3 сек
-//     артефактов/фриза до следующего PLI. 1 сек — хороший компромисс.
+//   FIX #38: SetAudioStreamerOffer НЕ трогает trackReadyCh.
+//     Раньше обработчик аудио-трека тоже закрывал trackReadyCh через Once,
+//     в результате зритель, ожидающий ВИДЕО, мог разбудиться на аудио-треке
+//     и уйти в AddViewer до того как появился видео-трек.
+//     Теперь trackReadyCh сигнализирует только о видео.
 //
-//   FIX 6 (ВЫСОКИЙ): broadcast() — drop-oldest вместо drop-newest.
-//     Было: канал переполнен → новый пакет дропался, зритель получал
-//     устаревшие данные из буфера.
-//     Стало: при переполнении сначала выбрасываем старый пакет (drain 1),
-//     затем кладём новый. Зритель всегда получает актуальный поток.
-//     Для видео свежий I-frame важнее чем старые P-frame.
+//   FIX #39: dropCount теперь реально инкрементируется в broadcast().
+//     Раньше поле было, но не использовалось.
 //
-//   FIX 7: mDNS отключён на ICE уровне (aiortc зависает на *.local).
-//     IP фильтр убран: вызывал рост пинга, принудительно пуская видео
-//     через RadminVPN relay вместо прямого LAN-пути.
-//     PLI interval: 3s (было 1s — слишком частые IDR-burst'ы).
-//
-//   БУФЕР: viewerPktBuf = 2048 пакетов ≈ 2.4 МБ при 6 Mbps (1200 байт/пкт).
-//   С drop-oldest стратегией большой буфер безопасен — свежие пакеты
-//   всегда вытесняют устаревшие.
+//   FIX #40: sync.Pool для RTP-пакетов — уменьшает GC pressure на hot path.
 
 package main
 
@@ -57,6 +43,7 @@ import (
 	"math"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -69,30 +56,52 @@ import (
 )
 
 // viewerPktBuf — размер канала пакетов на одного зрителя.
-// FIX 3: 2048 пакетов (было 1024).
-// 2048 × 1200 байт = ~2.4 MB ≈ 3.2 сек при 6 Mbps.
-// С drop-oldest стратегией (FIX 6) большой буфер безопасен:
-// при переполнении удаляется старый пакет, новый всегда входит.
 const viewerPktBuf = 2048
 
-// ─── broadcasterTrack ────────────────────────────────────────────────────────
+// FIX: sync.Pool для RTP-пакетов на hot path (relayBroadcast → viewerWriter).
 //
-// Хранит per-viewer каналы для изолированного fan-out.
+// RTP-пакеты в сети ≤ MTU = 1500 байт. Pool хранит срезы ровно по 1500 байт.
+// relayBroadcast берёт срез из пула, копирует n ≤ 1500 байт и отправляет
+// в channel как pooledPkt. viewerWriter после lt.Write() возвращает срез
+// в пул через pooledPkt.free().
+//
+// Эффект: ~60 аллокаций/сек (30fps × 2 трека) → ~0 аллокаций/сек на hot path.
+// Без Pool каждый RTP-пакет создаёт новый объект в GC heap.
+var rtpBufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, 1500)
+		return &b
+	},
+}
+
+// pooledPkt — RTP-пакет из sync.Pool. После использования вызвать free().
+type pooledPkt struct {
+	data []byte  // срез пула длиной n (реальный размер пакета)
+	ref  *[]byte // указатель на pool-объект для возврата; nil = не из пула
+}
+
+func (p pooledPkt) free() {
+	if p.ref != nil {
+		rtpBufPool.Put(p.ref)
+	}
+}
+
+// ─── broadcasterTrack ────────────────────────────────────────────────────────
 
 type viewerSub struct {
 	track *webrtc.TrackLocalStaticRTP
-	ch    chan []byte
+	ch    chan pooledPkt
 }
 
 type broadcasterTrack struct {
 	mu       sync.RWMutex
-	subs     map[string]*viewerSub // viewerID → подписка
+	subs     map[string]*viewerSub
 	codec    webrtc.RTPCodecCapability
 	id       string
 	streamID string
 
-	// FIX 6: счётчик дропов для диагностики (per-broadcaster)
-	dropCount uint64
+	// FIX #39: dropCount — атомарный счётчик для диагностики.
+	dropCount atomic.Uint64
 }
 
 func newBroadcasterTrack(
@@ -107,11 +116,10 @@ func newBroadcasterTrack(
 	}
 }
 
-// subscribe создаёт персональный TrackLocalStaticRTP для зрителя.
 func (b *broadcasterTrack) subscribe(
 	pc *webrtc.PeerConnection,
 	viewerID string,
-) (*webrtc.TrackLocalStaticRTP, chan []byte, error) {
+) (*webrtc.TrackLocalStaticRTP, chan pooledPkt, error) {
 	lt, err := webrtc.NewTrackLocalStaticRTP(
 		webrtc.RTPCodecCapability{
 			MimeType:     b.codec.MimeType,
@@ -130,7 +138,7 @@ func (b *broadcasterTrack) subscribe(
 		return nil, nil, fmt.Errorf("AddTrack: %w", err)
 	}
 
-	ch := make(chan []byte, viewerPktBuf)
+	ch := make(chan pooledPkt, viewerPktBuf)
 
 	b.mu.Lock()
 	b.subs[viewerID] = &viewerSub{track: lt, ch: ch}
@@ -139,67 +147,80 @@ func (b *broadcasterTrack) subscribe(
 	return lt, ch, nil
 }
 
-// unsubscribe удаляет зрителя и закрывает его канал.
-// viewerWriter() завершится автоматически когда канал закрыт.
 func (b *broadcasterTrack) unsubscribe(viewerID string) {
 	b.mu.Lock()
 	if sub, ok := b.subs[viewerID]; ok {
 		close(sub.ch)
+		// Drain оставшихся пакетов — возвращаем в пул.
+		for pkt := range sub.ch {
+			pkt.free()
+		}
 		delete(b.subs, viewerID)
 	}
 	b.mu.Unlock()
 }
 
-// unsubscribeAll закрывает каналы всех зрителей (при CloseStreamer).
 func (b *broadcasterTrack) unsubscribeAll() {
 	b.mu.Lock()
 	for id, sub := range b.subs {
 		close(sub.ch)
+		for pkt := range sub.ch {
+			pkt.free()
+		}
 		delete(b.subs, id)
 	}
 	b.mu.Unlock()
 }
 
-// broadcast рассылает пакет всем зрителям.
-//
-// FIX 6: drop-oldest стратегия вместо drop-newest.
-// Если канал зрителя переполнен — удаляем 1 старый пакет, кладём новый.
-// Для видео актуальный I-frame важнее устаревших P-frame в буфере.
-// Блокировка одного зрителя НЕ влияет на остальных.
-func (b *broadcasterTrack) broadcast(pkt []byte) {
+// broadcast: drop-oldest стратегия.
+// FIX #39: считаем дропы через atomic.
+// FIX pool: каждому зрителю отправляем КОПИЮ пакета из пула.
+// Нельзя отправить один pooledPkt нескольким — каждый viewerWriter должен
+// самостоятельно вернуть свой срез в пул после Write().
+func (b *broadcasterTrack) broadcast(src []byte) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	for _, sub := range b.subs {
+		// Берём срез из пула для каждого зрителя отдельно.
+		ref := rtpBufPool.Get().(*[]byte)
+		raw := (*ref)[:len(src)]
+		copy(raw, src)
+		pkt := pooledPkt{data: raw, ref: ref}
+
 		select {
 		case sub.ch <- pkt:
-			// Пакет доставлен без задержки
 		default:
-			// Канал переполнен: дропаем самый старый пакет,
-			// освобождаем место для нового (актуального).
+			// Канал переполнен: дропаем самый старый пакет, ставим новый.
 			select {
-			case <-sub.ch:
-				// Дроп одного старого пакета
+			case old := <-sub.ch:
+				old.free()
+				b.dropCount.Add(1)
 			default:
 			}
-			// Повторная попытка вставки нового пакета
 			select {
 			case sub.ch <- pkt:
 			default:
-				// Крайне редкий кейс: другой горутин успел занять слот.
-				// Пакет теряется — это нормально, NACK запросит повтор.
+				pkt.free()
+				b.dropCount.Add(1)
 			}
 		}
 	}
 }
 
-// viewerWriter — горутин на (viewer × track).
-// Читает из персонального канала и пишет в TrackLocalStaticRTP.
-// Завершается автоматически когда канал закрыт.
-func viewerWriter(viewerID string, lt *webrtc.TrackLocalStaticRTP, ch <-chan []byte) {
+// DropCount возвращает текущее число дропов (для /status или мониторинга).
+func (b *broadcasterTrack) DropCount() uint64 {
+	return b.dropCount.Load()
+}
+
+// viewerWriter — горутина на (viewer × track).
+// После lt.Write() возвращает пакет в pool — нулевые аллокации на hot path.
+func viewerWriter(viewerID string, lt *webrtc.TrackLocalStaticRTP, ch <-chan pooledPkt) {
 	written := 0
 	errors := 0
 	for pkt := range ch {
-		if _, err := lt.Write(pkt); err != nil {
+		_, err := lt.Write(pkt.data)
+		pkt.free() // возвращаем в пул сразу после Write, независимо от ошибки
+		if err != nil {
 			if errors == 0 {
 				log.Printf("[SFU] viewerWriter %s: first write error: %v", viewerID, err)
 			}
@@ -212,7 +233,7 @@ func viewerWriter(viewerID string, lt *webrtc.TrackLocalStaticRTP, ch <-chan []b
 		}
 		written++
 		if written == 1 {
-			log.Printf("[SFU] viewerWriter %s: first pkt written OK (len=%d)", viewerID, len(pkt))
+			log.Printf("[SFU] viewerWriter %s: first pkt written OK (len=%d)", viewerID, len(pkt.data))
 		}
 	}
 	log.Printf("[SFU] viewerWriter %s: channel closed (written=%d, errors=%d)", viewerID, written, errors)
@@ -231,9 +252,17 @@ type SFU struct {
 	videoBcs []*broadcasterTrack
 	audioBcs []*broadcasterTrack
 
-	// FIX 2: trackReadyCh защищён mu. Читать только под RLock (snapshot).
+	// FIX #38: trackReadyCh сигнализирует только о готовности ВИДЕО-трека.
+	// Аудио-трек не закрывает этот канал — зритель ждёт именно видео.
 	trackReadyCh chan struct{}
 	trackOnce    sync.Once
+
+	// SENIOR FIX: канал сигнализации о том, что стример отвалился.
+	// AddViewer ждёт trackReadyCh до 30 сек — если стример за это время
+	// отключился (CloseStreamer), мы закрываем streamerGoneCh и все
+	// ожидающие зрители немедленно уходят с ошибкой вместо таймаута.
+	streamerGoneCh   chan struct{}
+	streamerGoneOnce sync.Once
 
 	viewers map[string]*viewerConn
 
@@ -248,18 +277,55 @@ type viewerLossInfo struct {
 }
 
 type viewerConn struct {
-	id   string
-	pc   *webrtc.PeerConnection
-	done chan struct{}
+	id     string
+	pc     *webrtc.PeerConnection
+	done   chan struct{}
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 func NewSFU() *SFU {
 	return &SFU{
-		api:          buildWebRTCAPI(),
-		viewers:      make(map[string]*viewerConn),
-		trackReadyCh: make(chan struct{}),
-		lossStats:    make(map[string]*viewerLossInfo),
+		api:            buildWebRTCAPI(),
+		viewers:        make(map[string]*viewerConn),
+		trackReadyCh:   make(chan struct{}),
+		streamerGoneCh: make(chan struct{}),
+		lossStats:      make(map[string]*viewerLossInfo),
 	}
+}
+
+// Close корректно останавливает SFU: закрывает всех зрителей и стримеров.
+func (s *SFU) Close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.streamerPC != nil {
+		_ = s.streamerPC.Close()
+		s.streamerPC = nil
+	}
+	if s.audioStreamerPC != nil {
+		_ = s.audioStreamerPC.Close()
+		s.audioStreamerPC = nil
+	}
+
+	for _, bc := range s.videoBcs {
+		bc.unsubscribeAll()
+	}
+	s.videoBcs = nil
+	for _, bc := range s.audioBcs {
+		bc.unsubscribeAll()
+	}
+	s.audioBcs = nil
+
+	for id, v := range s.viewers {
+		_ = v.pc.Close()
+		v.cancel()
+		delete(s.viewers, id)
+	}
+
+	// SENIOR FIX: сигналим всем AddViewer'ам ждущим trackReadyCh —
+	// при graceful shutdown они не должны висеть до таймаута.
+	s.streamerGoneOnce.Do(func() { close(s.streamerGoneCh) })
 }
 
 func buildWebRTCAPI() *webrtc.API {
@@ -272,50 +338,15 @@ func buildWebRTCAPI() *webrtc.API {
 		{Type: "nack", Parameter: "pli"},
 	}
 
-	// FIX 1: Уникальные Payload Type для каждого H.264 профиля.
-	//
-	// Было: все профили с PT=96 → дублирующиеся a=rtpmap:96 в SDP.
-	// Pion перезаписывает предыдущую запись при одинаковом PT.
-	// Итоговый кодек зависел от порядка RegisterCodec — непредсказуемо.
-	//
-	// Стало: уникальные PT согласно RFC 3551 (динамический диапазон 96-127).
-	//
-	// PT 96 — High Profile Level 5.0 (640032):
-	//   Приоритетный кодек для screen sharing 1080p+.
-	//   NVENC/AMF кодируют в High Profile по умолчанию.
-	//   Лучший compression для UI-контента с большими плоскими областями.
-	//
-	// PT 97 — Constrained Baseline Level 3.1 (42e01f):
-	//   Максимальная совместимость (все декодеры включая мобильные).
-	//   Fallback если зритель не поддерживает High.
-	//
-	// PT 98 — Baseline Level 3.1 mode-1 (42001f, packetization-mode=1):
-	//   Для декодеров без поддержки Constrained Baseline.
-	//
-	// PT 99 — Baseline Level 3.1 mode-0 (42001f, packetization-mode=0):
-	//   Крайний fallback. Fragmentation Unit A (FU-A) не поддерживается —
-	//   большие NALUs должны влезать в один RTP-пакет.
 	type h264Profile struct {
 		pt   webrtc.PayloadType
 		fmtp string
 	}
 	h264Profiles := []h264Profile{
-		{
-			pt:   96,
-			fmtp: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640032",
-		},
-		{
-			pt:   97,
-			fmtp: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
-		},
-		{
-			pt:   98,
-			fmtp: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f",
-		},
-		{
-			pt:   99,
-			fmtp: "level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42001f",
-		},
+		{pt: 96, fmtp: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=640032"},
+		{pt: 97, fmtp: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f"},
+		{pt: 98, fmtp: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42001f"},
+		{pt: 99, fmtp: "level-asymmetry-allowed=1;packetization-mode=0;profile-level-id=42001f"},
 	}
 	for _, p := range h264Profiles {
 		if err := m.RegisterCodec(webrtc.RTPCodecParameters{
@@ -345,10 +376,8 @@ func buildWebRTCAPI() *webrtc.API {
 
 	ir := &interceptor.Registry{}
 
-	// FIX 5: PLI interval явный — 1 секунда вместо дефолтных 3.
-	// При потере пакетов и NACK failure зритель ждал до 3 сек артефактов.
-	// На RadminVPN с джиттером это ощутимо. 1 сек — хороший баланс
-	// между частотой PLI-трафика и временем восстановления картинки.
+	// FIX #28: PLI interval — 3 секунды. Слишком частые PLI приводили к
+	// постоянным IDR-burst'ам, которые тяжелы для RadminVPN.
 	if f, err := intervalpli.NewReceiverInterceptor(
 		intervalpli.GeneratorInterval(3 * time.Second),
 	); err != nil {
@@ -358,11 +387,6 @@ func buildWebRTCAPI() *webrtc.API {
 		log.Printf("[SFU] PLI interval: 3s")
 	}
 
-	// FIX 3: NACK Responder buffer 512 → 2048 пакетов.
-	// 512 × 1300 байт ≈ 665 KB — мало при 10 Mbps (530 мс).
-	// IDR-кадр может весить 200-400 KB burst'ом в начале GOP.
-	// 2048 × 1300 байт ≈ 2.6 MB ≈ 2.1 сек при 10 Mbps.
-	// Это покрывает несколько RTT RadminVPN с запасом.
 	if responder, err := nack.NewResponderInterceptor(
 		nack.ResponderSize(2048),
 	); err != nil {
@@ -372,10 +396,6 @@ func buildWebRTCAPI() *webrtc.API {
 		log.Printf("[SFU] NACK responder: buf=2048 pkt")
 	}
 
-	// FIX 4: NACK Generator с явным размером буфера 2048.
-	// Дефолтный генератор имеет фиксированный receiver queue.
-	// При высоком битрейте дыры в seq могут выпасть из окна
-	// до того как генератор успеет их задетектировать и послать NACK.
 	if generator, err := nack.NewGeneratorInterceptor(
 		nack.GeneratorSize(2048),
 	); err != nil {
@@ -389,19 +409,7 @@ func buildWebRTCAPI() *webrtc.API {
 		log.Printf("[SFU] RTCP reports error: %v", err)
 	}
 
-	// SettingEngine: отключаем только mDNS.
-	//
-	// mDNS ОТКЛЮЧЁН — aiortc на Windows зависает при резолве *.local имён.
-	//
-	// IP ФИЛЬТР УБРАН — он вызывал рост пинга у всех пользователей:
-	//   Фильтр разрешал только 26.x.x.x (RadminVPN) и loopback.
-	//   Если ноутбук и ПК на одном LAN/WiFi, SFU включал в ICE answer
-	//   только RadminVPN-кандидатов, игнорируя прямой LAN (192.168.x.x).
-	//   ICE выбирал RadminVPN. При relay через интернет — весь поток видео
-	//   5-6 Mbps шёл через интернет-канал → насыщал его → рос пинг.
-	//   Без фильтра ICE сам выбирает лучший путь: LAN или RadminVPN.
 	settingEngine := webrtc.SettingEngine{}
-
 	settingEngine.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
 	log.Printf("[SFU] ICE: mDNS disabled, no IP filter (ICE auto-selects best path)")
 
@@ -420,26 +428,34 @@ func localPeerConfig() webrtc.Configuration {
 
 func (s *SFU) SetStreamerOffer(sdpStr string) (string, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	// Закрываем старое соединение стримера
 	if s.streamerPC != nil {
 		_ = s.streamerPC.Close()
 		s.streamerPC = nil
 	}
-	// Отписываем всех зрителей от старых трансляций
 	for _, bc := range s.videoBcs {
 		bc.unsubscribeAll()
 	}
 	s.videoBcs = nil
 
-	// FIX 2: trackReadyCh меняется под мьютексом.
-	// AddViewer делает snapshot под RLock — они не пересекаются.
 	s.trackReadyCh = make(chan struct{})
 	s.trackOnce = sync.Once{}
 
+	// SENIOR FIX: если был активен streamerGoneCh (предыдущий стример ушёл) —
+	// пересоздаём его, чтобы новый AddViewer не получил моментальный fail
+	// из-за закрытого канала от прошлой сессии.
+	select {
+	case <-s.streamerGoneCh:
+		// уже закрыт — создаём новый
+		s.streamerGoneCh = make(chan struct{})
+		s.streamerGoneOnce = sync.Once{}
+	default:
+		// канал ещё открыт — ничего не делаем
+	}
+
 	pc, err := s.api.NewPeerConnection(localPeerConfig())
 	if err != nil {
+		s.mu.Unlock()
 		return "", fmt.Errorf("NewPeerConnection(streamer): %w", err)
 	}
 	s.streamerPC = pc
@@ -457,7 +473,6 @@ func (s *SFU) SetStreamerOffer(sdpStr string) (string, error) {
 		} else {
 			s.audioBcs = append(s.audioBcs, bc)
 		}
-		// Подписываем уже подключённых зрителей на новый трек
 		for _, v := range s.viewers {
 			lt, ch, err := bc.subscribe(v.pc, v.id)
 			if err != nil {
@@ -466,9 +481,13 @@ func (s *SFU) SetStreamerOffer(sdpStr string) (string, error) {
 			}
 			go viewerWriter(v.id, lt, ch)
 		}
+		// FIX #38: trackReadyCh закрываем ТОЛЬКО для видео.
+		isVideo := rt.Kind() == webrtc.RTPCodecTypeVideo
 		s.mu.Unlock()
 
-		s.trackOnce.Do(func() { close(s.trackReadyCh) })
+		if isVideo {
+			s.trackOnce.Do(func() { close(s.trackReadyCh) })
+		}
 		go s.relayBroadcast(rt, bc)
 	})
 
@@ -479,16 +498,27 @@ func (s *SFU) SetStreamerOffer(sdpStr string) (string, error) {
 	if err := pc.SetRemoteDescription(webrtc.SessionDescription{
 		Type: webrtc.SDPTypeOffer, SDP: sdpStr,
 	}); err != nil {
+		s.mu.Unlock()
 		return "", fmt.Errorf("SetRemoteDescription: %w", err)
 	}
 	ans, err := pc.CreateAnswer(nil)
 	if err != nil {
+		s.mu.Unlock()
 		return "", fmt.Errorf("CreateAnswer: %w", err)
 	}
 	gc := webrtc.GatheringCompletePromise(pc)
 	if err := pc.SetLocalDescription(ans); err != nil {
+		s.mu.Unlock()
 		return "", err
 	}
+
+	// FIX: unlock ПЕРЕД блокирующим <-gc (ICE gathering = UDP операции).
+	// Раньше стоял defer s.mu.Unlock(), и вся горутина ICE gathering
+	// (включая отправку/приём STUN) выполнялась под глобальным мьютексом SFU.
+	// Любой одновременный AddViewer или RemoveViewer вставал в очередь на
+	// всё время gather (десятки мс на LAN, секунды при проблемах с сетью).
+	s.mu.Unlock()
+
 	<-gc
 	ld := pc.LocalDescription()
 	log.Printf("[SFU] Streamer answer готов, SDP len=%d", len(ld.SDP))
@@ -506,7 +536,15 @@ func (s *SFU) CloseStreamer() {
 		bc.unsubscribeAll()
 	}
 	s.videoBcs = nil
-	// FIX 2: trackReadyCh сбрасывается под Lock — безопасно.
+
+	// SENIOR FIX: сигналим всем AddViewer'ам ждущим trackReadyCh чтобы они
+	// не сидели до таймаута 30 сек. Закрываем текущий streamerGoneCh
+	// (все ожидающие получают сигнал) и пересоздаём свежий под новые
+	// сессии стримера.
+	s.streamerGoneOnce.Do(func() { close(s.streamerGoneCh) })
+	s.streamerGoneCh = make(chan struct{})
+	s.streamerGoneOnce = sync.Once{}
+
 	s.trackReadyCh = make(chan struct{})
 	s.trackOnce = sync.Once{}
 }
@@ -515,7 +553,6 @@ func (s *SFU) CloseStreamer() {
 
 func (s *SFU) SetAudioStreamerOffer(sdpStr string) (string, error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	if s.audioStreamerPC != nil {
 		_ = s.audioStreamerPC.Close()
@@ -528,6 +565,7 @@ func (s *SFU) SetAudioStreamerOffer(sdpStr string) (string, error) {
 
 	pc, err := s.api.NewPeerConnection(localPeerConfig())
 	if err != nil {
+		s.mu.Unlock()
 		return "", err
 	}
 	s.audioStreamerPC = pc
@@ -547,7 +585,7 @@ func (s *SFU) SetAudioStreamerOffer(sdpStr string) (string, error) {
 			}
 			go viewerWriter(v.id, lt, ch)
 		}
-		s.trackOnce.Do(func() { close(s.trackReadyCh) })
+		// FIX #38: НЕ трогаем trackReadyCh здесь — это только для видео.
 		s.mu.Unlock()
 
 		go s.relayBroadcast(rt, bc)
@@ -560,16 +598,23 @@ func (s *SFU) SetAudioStreamerOffer(sdpStr string) (string, error) {
 	if err := pc.SetRemoteDescription(webrtc.SessionDescription{
 		Type: webrtc.SDPTypeOffer, SDP: sdpStr,
 	}); err != nil {
+		s.mu.Unlock()
 		return "", err
 	}
 	ans, err := pc.CreateAnswer(nil)
 	if err != nil {
+		s.mu.Unlock()
 		return "", err
 	}
 	gc := webrtc.GatheringCompletePromise(pc)
 	if err := pc.SetLocalDescription(ans); err != nil {
+		s.mu.Unlock()
 		return "", err
 	}
+
+	// FIX: аналогично SetStreamerOffer — unlock перед ICE gathering.
+	s.mu.Unlock()
+
 	<-gc
 	ld := pc.LocalDescription()
 	return ld.SDP, nil
@@ -590,12 +635,9 @@ func (s *SFU) CloseAudioStreamer() {
 
 // ─── relayBroadcast ──────────────────────────────────────────────────────────
 //
-// Читает RTP пакеты от стримера и рассылает через broadcasterTrack.broadcast().
-// Каждый зритель — свой буферизованный канал и свой горутин viewerWriter.
-// Медленный зритель не блокирует поток пакетов для остальных.
-//
-// Буфер 16384: keyframe NALU может прийти одним большим пакетом (8–32 KB
-// на loopback без MTU 1500). Меньший буфер → усечение → битый H264 → артефакт.
+// read buffer (16 KB) переиспользуется между итерациями — одна аллокация
+// на горутину за всё время жизни. Копии для зрителей берутся из sync.Pool
+// внутри broadcast() — нулевые heap-аллокации на hot path при наличии зрителей.
 func (s *SFU) relayBroadcast(remote *webrtc.TrackRemote, bc *broadcasterTrack) {
 	buf := make([]byte, 16384)
 	pktCount := 0
@@ -608,8 +650,8 @@ func (s *SFU) relayBroadcast(remote *webrtc.TrackRemote, bc *broadcasterTrack) {
 			if err != io.EOF {
 				log.Printf("[SFU] relay read: %v", err)
 			}
-			log.Printf("[SFU] relayBroadcast ended for %s/%s (total pkts: %d)",
-				bc.codec.MimeType, bc.id, pktCount)
+			log.Printf("[SFU] relayBroadcast ended for %s/%s (total pkts: %d, drops: %d)",
+				bc.codec.MimeType, bc.id, pktCount, bc.DropCount())
 			return
 		}
 		pktCount++
@@ -619,14 +661,15 @@ func (s *SFU) relayBroadcast(remote *webrtc.TrackRemote, bc *broadcasterTrack) {
 			bc.mu.RLock()
 			nSubs := len(bc.subs)
 			bc.mu.RUnlock()
-			log.Printf("[SFU] relay %s: %d pkts forwarded, %d viewers",
-				bc.codec.MimeType, pktCount, nSubs)
+			log.Printf("[SFU] relay %s: %d pkts forwarded, %d viewers, %d drops",
+				bc.codec.MimeType, pktCount, nSubs, bc.DropCount())
 		default:
 		}
 
-		pkt := make([]byte, n)
-		copy(pkt, buf[:n])
-		bc.broadcast(pkt)
+		// broadcast() копирует buf[:n] в pool-буфер для каждого зрителя.
+		// Сам buf переиспользуется на следующей итерации — безопасно,
+		// потому что копирование происходит внутри broadcast() до возврата.
+		bc.broadcast(buf[:n])
 	}
 }
 
@@ -637,35 +680,32 @@ func (s *SFU) AddViewer(viewerID, sdpStr string) (string, error) {
 		viewerID = uuid.NewString()
 	}
 
-	// FIX 2: Snapshot trackReadyCh под RLock перед ожиданием.
-	//
-	// ПРОБЛЕМА (было): s.trackReadyCh читался без мьютекса.
-	// SetStreamerOffer заменяет канал под полным Lock.
-	// Race: зритель мог получить ссылку на старый канал (уже закрытый →
-	// немедленный return без трека) или на момент замены — непредсказуемо.
-	// Симптом: "Ожидание видео..." при реконнекте стримера.
-	//
-	// РЕШЕНИЕ: берём RLock, копируем ссылку на текущий канал, отпускаем.
-	// SetStreamerOffer использует полный Lock — они не пересекаются.
-	// Зритель всегда ждёт на актуальной версии канала.
+	// Snapshot trackReadyCh и streamerGoneCh под RLock
 	s.mu.RLock()
 	readyCh := s.trackReadyCh
+	goneCh := s.streamerGoneCh
 	s.mu.RUnlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
+	// SENIOR FIX: добавлен select-case на streamerGoneCh.
+	// Если стример отвалился пока мы ждали — выходим немедленно
+	// вместо 30 сек таймаута.
 	select {
 	case <-readyCh:
+		// видео-трек готов — продолжаем подписку
+	case <-goneCh:
+		log.Printf("[SFU] AddViewer %s: streamer gone while waiting", viewerID)
+		return "", fmt.Errorf("streamer disconnected")
 	case <-ctx.Done():
 		log.Printf("[SFU] AddViewer %s: timeout waiting for streamer track", viewerID)
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
-	// Закрываем старое соединение если viewer переподключается
 	if old, ok := s.viewers[viewerID]; ok {
 		_ = old.pc.Close()
+		old.cancel() // FIX #33: отменяем старые RTCP-горутины
 		select {
 		case <-old.done:
 		default:
@@ -682,12 +722,18 @@ func (s *SFU) AddViewer(viewerID, sdpStr string) (string, error) {
 
 	pc, err := s.api.NewPeerConnection(localPeerConfig())
 	if err != nil {
+		s.mu.Unlock()
 		return "", err
 	}
-	conn := &viewerConn{id: viewerID, pc: pc, done: make(chan struct{})}
+	vCtx, vCancel := context.WithCancel(context.Background())
+	conn := &viewerConn{
+		id: viewerID, pc: pc,
+		done:   make(chan struct{}),
+		ctx:    vCtx,
+		cancel: vCancel,
+	}
 	s.viewers[viewerID] = conn
 
-	// Подписываем зрителя на все активные трансляции.
 	for _, bc := range s.videoBcs {
 		lt, ch, err := bc.subscribe(pc, viewerID)
 		if err != nil {
@@ -705,11 +751,46 @@ func (s *SFU) AddViewer(viewerID, sdpStr string) (string, error) {
 		go viewerWriter(viewerID, lt, ch)
 	}
 
+	// Собираем SDP под lock, чтобы никто не удалил viewer пока мы ещё не
+	// завершили offer/answer handshake.
+	if err := pc.SetRemoteDescription(webrtc.SessionDescription{
+		Type: webrtc.SDPTypeOffer, SDP: sdpStr,
+	}); err != nil {
+		delete(s.viewers, viewerID)
+		s.mu.Unlock()
+		pc.Close()
+		vCancel()
+		return "", err
+	}
+	ans, err := pc.CreateAnswer(nil)
+	if err != nil {
+		delete(s.viewers, viewerID)
+		s.mu.Unlock()
+		pc.Close()
+		vCancel()
+		return "", err
+	}
+	gc := webrtc.GatheringCompletePromise(pc)
+	if err := pc.SetLocalDescription(ans); err != nil {
+		delete(s.viewers, viewerID)
+		s.mu.Unlock()
+		pc.Close()
+		vCancel()
+		return "", err
+	}
+
+	// FIX #27: регистрируем callback ПОСЛЕ отпускания s.mu.
+	// Раньше callback мог быть вызван из горутины Pion и попытаться взять s.mu
+	// для RemoveViewer — пока мы его держим, это deadlock (хоть и
+	// редкий при Pion async-модели, но формально race).
+	s.mu.Unlock()
+
+	// Теперь безопасно устанавливаем callback: даже если он вызовется
+	// синхронно из SetRemoteDescription/etc — lock уже отпущен.
 	pc.OnICEConnectionStateChange(func(st webrtc.ICEConnectionState) {
 		log.Printf("[SFU] Viewer %s ICE: %s", viewerID, st)
 		switch st {
 		case webrtc.ICEConnectionStateConnected:
-			// Форсируем IDR 3 раза с паузой — зритель получит чистый первый кадр
 			go func() {
 				for i := 1; i <= 3; i++ {
 					if i > 1 {
@@ -727,34 +808,17 @@ func (s *SFU) AddViewer(viewerID, sdpStr string) (string, error) {
 					})
 				}
 			}()
-			go s.readViewerRTCP(viewerID, pc)
+			go s.readViewerRTCP(viewerID, pc, vCtx)
 
-		case webrtc.ICEConnectionStateDisconnected,
-			webrtc.ICEConnectionStateFailed,
+		// FIX #26: НЕ реагируем на Disconnected — это временное состояние,
+		// типично для RadminVPN при сетевом лаге. Только Failed/Closed
+		// означают окончательный разрыв.
+		case webrtc.ICEConnectionStateFailed,
 			webrtc.ICEConnectionStateClosed:
 			s.RemoveViewer(viewerID)
 		}
 	})
 
-	if err := pc.SetRemoteDescription(webrtc.SessionDescription{
-		Type: webrtc.SDPTypeOffer, SDP: sdpStr,
-	}); err != nil {
-		pc.Close()
-		delete(s.viewers, viewerID)
-		return "", err
-	}
-	ans, err := pc.CreateAnswer(nil)
-	if err != nil {
-		pc.Close()
-		delete(s.viewers, viewerID)
-		return "", err
-	}
-	gc := webrtc.GatheringCompletePromise(pc)
-	if err := pc.SetLocalDescription(ans); err != nil {
-		pc.Close()
-		delete(s.viewers, viewerID)
-		return "", err
-	}
 	<-gc
 	ld := pc.LocalDescription()
 	return stripMDNSCandidates(ld.SDP), nil
@@ -778,6 +842,7 @@ func (s *SFU) removeViewer(id string) {
 		bc.unsubscribe(id)
 	}
 	_ = v.pc.Close()
+	v.cancel() // FIX #33: отменяем RTCP-горутины
 	select {
 	case <-v.done:
 	default:
@@ -791,14 +856,27 @@ func (s *SFU) removeViewer(id string) {
 }
 
 // readViewerRTCP читает RTCP от зрителя (Receiver Reports для ABR).
-// NACK перехватывается nack.ResponderInterceptor раньше и сюда не доходит.
-func (s *SFU) readViewerRTCP(viewerID string, pc *webrtc.PeerConnection) {
+// FIX #33: принимает ctx и завершается при ctx.Done() — не пишет в
+// lossStats после RemoveViewer.
+func (s *SFU) readViewerRTCP(viewerID string, pc *webrtc.PeerConnection, ctx context.Context) {
 	for _, recv := range pc.GetReceivers() {
 		go func(r *webrtc.RTPReceiver) {
 			for {
+				// Проверяем ctx перед блокирующим ReadRTCP
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
 				pkts, _, err := r.ReadRTCP()
 				if err != nil {
 					return
+				}
+				// Ещё раз проверяем ctx — между ReadRTCP и записью в stats
+				select {
+				case <-ctx.Done():
+					return
+				default:
 				}
 				for _, pkt := range pkts {
 					if rr, ok := pkt.(*rtcp.ReceiverReport); ok {
@@ -860,11 +938,13 @@ func (s *SFU) LossStats() AggLossStats {
 
 type Status struct {
 	Streamer      string   `json:"streamer"`
-	AudioStreamer  string   `json:"audio_streamer"`
+	AudioStreamer string   `json:"audio_streamer"`
 	VideoBcs      int      `json:"video_broadcasters"`
 	AudioBcs      int      `json:"audio_broadcasters"`
 	Viewers       int      `json:"viewers"`
 	ViewerIDs     []string `json:"viewer_ids"`
+	VideoDrops    uint64   `json:"video_drops"`
+	AudioDrops    uint64   `json:"audio_drops"`
 }
 
 func (s *SFU) Status() Status {
@@ -882,13 +962,22 @@ func (s *SFU) Status() Status {
 	for id := range s.viewers {
 		ids = append(ids, id)
 	}
+	var videoDrops, audioDrops uint64
+	for _, bc := range s.videoBcs {
+		videoDrops += bc.DropCount()
+	}
+	for _, bc := range s.audioBcs {
+		audioDrops += bc.DropCount()
+	}
 	return Status{
-		Streamer:     ss,
+		Streamer:      ss,
 		AudioStreamer: as,
-		VideoBcs:     len(s.videoBcs),
-		AudioBcs:     len(s.audioBcs),
-		Viewers:      len(s.viewers),
-		ViewerIDs:    ids,
+		VideoBcs:      len(s.videoBcs),
+		AudioBcs:      len(s.audioBcs),
+		Viewers:       len(s.viewers),
+		ViewerIDs:     ids,
+		VideoDrops:    videoDrops,
+		AudioDrops:    audioDrops,
 	}
 }
 

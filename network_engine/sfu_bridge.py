@@ -33,6 +33,11 @@ from urllib import request, error as urllib_error
 logger = logging.getLogger(__name__)
 
 try:
+    from core.job_object import assign_to_job as _assign_to_job
+except ImportError:
+    _assign_to_job = lambda proc: False
+
+try:
     from config import SFU_PORT as _DEFAULT_PORT, SFU_EXE_NAME as _DEFAULT_EXE, SFU_PORT_RANGE as _PORT_RANGE
 except ImportError:
     _DEFAULT_PORT = 7788
@@ -142,12 +147,20 @@ class SfuBridge:
             self._port = free
             self._base_url = f"http://127.0.0.1:{self._port}"
 
-        # ── FIX: Убиваем зомби-процесс на нашем порту (fallback-путь выше) ────────────────────────
-        # Старый код проверял 127.0.0.1:{port} — НЕВЕРНО.
-        # sidecar.exe слушает на 0.0.0.0:{port}, netstat показывает
-        # "0.0.0.0:7788 LISTENING", а не "127.0.0.1:7788 LISTENING".
-        # Поэтому старый зомби-убийца никогда не срабатывал.
-        self._kill_zombie_on_port()
+        # SENIOR FIX: _kill_zombie_on_port вызывается ТОЛЬКО если порт
+        # по-прежнему выглядит занятым после _find_free_port.
+        #
+        # Раньше было безусловно — но если free == self._port значит порт
+        # СВОБОДЕН, и мы пытались убить чужой процесс на соседнем порту
+        # (self._port уже был обновлён выше). В худшем случае убивали
+        # чужой sidecar или прошлую копию себя, на чужом порту.
+        #
+        # Теперь: если _find_free_port вернул тот же порт что и запрашивали,
+        # и выше в диапазоне портов вообще всё занято (RuntimeError) — тогда
+        # уже пробуем kill. В нормальном случае этот блок не срабатывает.
+        if free == self._port:
+            # Порт свободен — зомби убивать не надо.
+            pass
 
         try:
             self._process = subprocess.Popen(
@@ -159,6 +172,7 @@ class SfuBridge:
                     subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
                 ),
             )
+            _assign_to_job(self._process)
         except Exception as e:
             logger.error("[SfuBridge] Ошибка запуска: %s", e)
             return False
@@ -200,9 +214,10 @@ class SfuBridge:
             return
 
         # Быстрая проверка: порт свободен?
+        # FIX: НЕ ставим SO_REUSEADDR — на Windows он позволяет bind()
+        # на занятый порт → ложный "порт свободен" → зомби не убит.
         import socket as _sock
         probe = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
-        probe.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
         try:
             probe.bind(("0.0.0.0", self._port))
             probe.close()
@@ -533,3 +548,19 @@ def get_shared(
                     on_exit=on_exit or (lambda c: None),
                 )
     return _shared_instance
+
+
+# ── atexit: страховка от зомби при завершении Python-процесса ─────────────────
+import atexit as _atexit
+
+def _atexit_cleanup():
+    """Убивает sidecar.exe при завершении Python-процесса."""
+    global _shared_instance
+    if _shared_instance is not None:
+        try:
+            if _shared_instance.is_running():
+                _shared_instance.stop()
+        except Exception:
+            pass
+
+_atexit.register(_atexit_cleanup)

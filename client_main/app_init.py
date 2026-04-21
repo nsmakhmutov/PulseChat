@@ -18,14 +18,6 @@ if _project_root not in sys.path:
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. UTF-8 консоль
 # ══════════════════════════════════════════════════════════════════════════════
-# На Windows кодировка консоли по умолчанию cp1251 (Russian) или cp866.
-# Символы за пределами кодировки (→, ✔, ✖, 🎵 и т.д.) вызывают
-# UnicodeEncodeError уже при первом print() с такими символами.
-#
-# Решение — переключить stdout/stderr на UTF-8 БЕЗ смены кодировки терминала.
-# io.TextIOWrapper(buffer, encoding='utf-8', errors='replace') безопасно:
-#   • errors='replace' гарантирует что print() никогда не бросит исключение
-#   • console=False в EXE (PyInstaller) → stdout/stderr = None: проверяем
 import io as _io
 
 for _stream_name in ('stdout', 'stderr'):
@@ -45,7 +37,7 @@ for _stream_name in ('stdout', 'stderr'):
                     )
                 )
             except Exception:
-                pass  # frozen без консоли (console=False): None — игнорируем
+                pass
 
 del _io, _stream_name, _stream
 
@@ -53,24 +45,46 @@ del _io, _stream_name, _stream
 # ══════════════════════════════════════════════════════════════════════════════
 # 2. Crash diagnostics
 # ══════════════════════════════════════════════════════════════════════════════
-# faulthandler пишет нативный C-стектрейс при SIGSEGV / STATUS_STACK_BUFFER_OVERRUN
-# прямо в файл — даже если Python уже не работает.
+# FIX: путь к crash_native.log вынесен в %APPDATA%\InPulse\logs\.
+#   Раньше файл создавался в CWD. Если приложение запущено из защищённой
+#   папки (Program Files без прав записи) — open() падал с PermissionError
+#   на самом старте, до вывода любого сообщения пользователю.
 
-_crash_log = open("crash_native.log", "w", buffering=1)
-faulthandler.enable(file=_crash_log)
+def _resolve_logs_dir() -> str:
+    appdata = os.environ.get('APPDATA') or os.path.expanduser('~')
+    logs_dir = os.path.join(appdata, 'InPulse', 'logs')
+    try:
+        os.makedirs(logs_dir, exist_ok=True)
+    except OSError:
+        import tempfile
+        logs_dir = tempfile.gettempdir()
+    return logs_dir
+
+
+_LOGS_DIR = _resolve_logs_dir()
+_crash_native_path = os.path.join(_LOGS_DIR, 'crash_native.log')
+try:
+    _crash_log = open(_crash_native_path, 'w', buffering=1, encoding='utf-8')
+    faulthandler.enable(file=_crash_log)
+except OSError as _e:
+    print(f"[DEBUG] Не удалось открыть {_crash_native_path}: {_e}", flush=True)
+    faulthandler.enable()
 
 
 def _global_excepthook(exc_type, exc_value, exc_tb):
-    """Глобальный перехват необработанных Python-исключений → в файл + консоль."""
     msg = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
     print(f"[CRASH] Необработанное исключение:\n{msg}", flush=True)
-    with open("crash_python.log", "a", encoding="utf-8") as f:
-        f.write(msg)
+    _crash_python_path = os.path.join(_LOGS_DIR, 'crash_python.log')
+    try:
+        with open(_crash_python_path, 'a', encoding='utf-8') as f:
+            f.write(msg)
+    except OSError:
+        pass
     sys.__excepthook__(exc_type, exc_value, exc_tb)
 
 
 sys.excepthook = _global_excepthook
-print("[DEBUG] faulthandler активирован → crash_native.log", flush=True)
+print(f"[DEBUG] faulthandler активирован → {_crash_native_path}", flush=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -78,7 +92,6 @@ print("[DEBUG] faulthandler активирован → crash_native.log", flush=
 # ══════════════════════════════════════════════════════════════════════════════
 
 def resource_path(relative_path: str) -> str:
-    """Получает абсолютный путь к ресурсам, работает для dev и для PyInstaller."""
     try:
         base_path = sys._MEIPASS
     except AttributeError:
@@ -89,39 +102,28 @@ def resource_path(relative_path: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 # 4. Загрузка DLL (opus, rnnoise, DeepFilterNet)
 # ══════════════════════════════════════════════════════════════════════════════
-# ПОЧЕМУ os.add_dll_directory НЕДОСТАТОЧНО ДЛЯ opuslib:
-#   opuslib использует ctypes.util.find_library('opus'), которая на Windows
-#   ищет через PATH (не через директории из add_dll_directory).
-#   Решение — два шага:
-#     1. Добавить dlls/ в PATH (для find_library).
-#     2. Предзагрузить opus.dll через ctypes.CDLL напрямую (гарантия).
-#   После предзагрузки DLL уже в памяти процесса → opuslib найдёт её
-#   при любом способе поиска.
-#
-# FIX RUST_LOG: deep_filter.dll (Rust) читает RUST_LOG при инициализации.
-#   PyCharm выставляет RUST_LOG="" → ParseLevelError → panic → abort.
 if not os.environ.get("RUST_LOG"):
     os.environ["RUST_LOG"] = "error"
 
-_package_dir = os.path.dirname(os.path.abspath(__file__))   # .../client_main/
-_project_dir = os.path.dirname(_package_dir)                # .../VoiceChat/  ← корень
+_package_dir = os.path.dirname(os.path.abspath(__file__))
+_project_dir = os.path.dirname(_package_dir)
 _dlls_dir    = os.path.join(_project_dir, "dlls")
 _dfn_dir     = os.path.join(_dlls_dir, "DeepFilterNet3")
 
-# ── 1. PATH — нужен для ctypes.util.find_library (opuslib) ──────────────────
 _extra_paths = [p for p in [_dlls_dir, _dfn_dir, _project_dir] if os.path.isdir(p)]
 if _extra_paths:
     os.environ["PATH"] = os.pathsep.join(_extra_paths) + os.pathsep + os.environ.get("PATH", "")
 
-# ── 2. os.add_dll_directory — нужен для ctypes.CDLL без абсолютного пути ────
 for _d in _extra_paths:
-    os.add_dll_directory(_d)
+    try:
+        os.add_dll_directory(_d)
+    except (OSError, AttributeError):
+        pass
 try:
-    os.add_dll_directory(sys._MEIPASS)   # PyInstaller frozen bundle
-except Exception:
+    os.add_dll_directory(sys._MEIPASS)
+except (AttributeError, OSError):
     pass
 
-# ── 3. Предзагрузка opus.dll через абсолютный путь ──────────────────────────
 _opus_candidates = [
     os.path.join(_dlls_dir, "opus.dll"),
     os.path.join(_dlls_dir, "libopus.dll"),
@@ -142,6 +144,10 @@ for _opus_path in _opus_candidates:
 if not _opus_loaded:
     print(f"[DLL] ВНИМАНИЕ: opus.dll не найдена в {_dlls_dir}", flush=True)
 
-# Чистим временные переменные из namespace
-del _opus_path, _opus_candidates, _opus_loaded, _d, _extra_paths
-del _project_dir, _dlls_dir, _dfn_dir
+# FIX: безопасная очистка namespace — удаляем только существующие переменные.
+# Раньше `del _opus_path` падал с NameError если _opus_candidates был пуст.
+for _v in ('_opus_path', '_opus_candidates', '_opus_loaded',
+           '_d', '_extra_paths', '_project_dir', '_dlls_dir', '_dfn_dir',
+           '_package_dir'):
+    globals().pop(_v, None)
+del _v

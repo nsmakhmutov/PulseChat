@@ -31,66 +31,41 @@ VIDEO_WIDTH   = 1280
 VIDEO_HEIGHT  = 720
 VIDEO_FPS     = 30
 
-# Jitter buffer для зрителя (мс). Сглаживает неравномерность доставки пакетов.
-# 0 = отключён (старое поведение), 500-700 = оптимально для просмотра стримов.
+# Jitter buffer для зрителя (мс).
 VIEWER_JITTER_BUFFER_MS = 700
 
 VIDEO_BITRATE = 4_500_000   # 4.5 Mbps (720p default, maxrate для CQ режима)
 
 # ── HQ битрейты по разрешению ─────────────────────────────────────────────────
-#
-# Расширена таблица — добавлены 1080p / 1440p / 4K для режима «Источник».
-# С CQ crf=20 реальный битрейт для статичного UI в 3–5× ниже maxrate.
-# Значение в таблице — потолок (maxrate), не цель.
 VIDEO_BITRATES: dict = {
-    (3840, 2160): 20_000_000,   # 4K     — 20 Mbps
-    (2560, 1440): 12_000_000,   # 1440p  — 12 Mbps
-    (1920, 1080): 10_000_000,   # 1080p  — 10 Mbps
-    (1280,  720):  5_500_000,   # 720p   —  5.5 Mbps
-    ( 854,  480):  3_000_000,   # 480p   —  3 Mbps (CQ экономит на статике)
-    ( 640,  360):  1_500_000,   # 360p   —  1,5 Mbps (CQ экономит на статике)
+    (3840, 2160): 20_000_000,
+    (2560, 1440): 12_000_000,
+    (1920, 1080): 10_000_000,
+    (1280,  720):  5_500_000,
+    ( 854,  480):  3_000_000,
+    ( 640,  360):  1_500_000,
 }
 
-# ── LQ (Simulcast) битрейты ──────────────────────────────────────────────────
-#
-# LQ-трек — второй WebRTC видеотрек на половинном разрешении.
-# Стример отправляет оба трека (HQ + LQ) в один RTCPeerConnection.
-# SFU маршрутизирует каждому зрителю нужный поток по полю quality=hq|lq
-# в команде stream_watch_start.
-#
-# Аудиотрек общий для обоих потоков — дублировать не нужно.
-#
-# Примеры разрешений LQ (= HQ / 2, выровнено до чётного):
-#   720p  (1280×720)  → LQ 360p  (640×360)
-#   1080p (1920×1080) → LQ 540p  (960×540)
 VIDEO_BITRATES_LQ: dict = {
-    (3840, 2160):  4_000_000,   # 4K     → LQ ~1920×1080, 4 Mbps
-    (2560, 1440):  3_000_000,   # 1440p  → LQ ~1280×720,  3 Mbps
-    (1920, 1080):  2_000_000,   # 1080p  → LQ ~960×540,   2 Mbps
-    (1280,  720):  1_000_000,   # 720p   → LQ ~640×360,   1 Mbps
-    ( 854,  480):    400_000,   # 480p   → LQ ~426×240, 400 kbps
-    ( 640,  360):    250_000,   # 360p   → LQ ~320×180, 250 kbps
+    (3840, 2160):  4_000_000,
+    (2560, 1440):  3_000_000,
+    (1920, 1080):  2_000_000,
+    (1280,  720):  1_000_000,
+    ( 854,  480):    400_000,
+    ( 640,  360):    250_000,
 }
-VIDEO_BITRATE_LQ_DEFAULT = 1_000_000  # fallback если разрешение не в таблице
+VIDEO_BITRATE_LQ_DEFAULT = 1_000_000
 
 
 def get_lq_resolution(hq_width: int, hq_height: int) -> tuple:
-    """
-    Вычисляет LQ-разрешение как HQ/2, выровненное до чётного числа.
-    Минимум 320×180 — кодек не принимает меньше.
-    """
+    """Вычисляет LQ-разрешение как HQ/2, выровненное до чётного числа."""
     lq_w = max(320, (hq_width  // 2) & ~1)
     lq_h = max(180, (hq_height // 2) & ~1)
     return lq_w, lq_h
 
 
 def get_bitrate_for_resolution(width: int, height: int, lq: bool = False) -> int:
-    """
-    Возвращает битрейт для заданного разрешения.
-    Если разрешение не в таблице — вычисляет пропорционально 720p
-    по сублинейной шкале (^0.75): большее разрешение не требует
-    линейного роста битрейта, т.к. большие блоки кодируются эффективнее.
-    """
+    """Возвращает битрейт для заданного разрешения."""
     table = VIDEO_BITRATES_LQ if lq else VIDEO_BITRATES
     if (width, height) in table:
         return table[(width, height)]
@@ -106,22 +81,44 @@ def get_bitrate_for_resolution(width: int, height: int, lq: bool = False) -> int
     return max(1_500_000, min(estimated, 20_000_000))
 
 
-# ── Opus (голос комнаты — без изменений) ─────────────────────────────────────
-OPUS_APPLICATION = 2048   # opuslib.APPLICATION_VOIP
-DEFAULT_BITRATE        = 64000   # битрейт голоса (Opus, моно, 64 kbps)
-STREAM_AUDIO_BITRATE   = 128000  # битрейт звука при демонстрации (стерео, 128 kbps — лучше качество)
+# ── Opus (голос комнаты) ─────────────────────────────────────────────────────
+OPUS_APPLICATION = 2048
+DEFAULT_BITRATE        = 64000
+STREAM_AUDIO_BITRATE   = 128000
 
 # ── UDP-заголовок ─────────────────────────────────────────────────────────────
 UDP_HEADER_STRUCT = struct.Struct("!IdIB")
 UDP_HEADER_SIZE   = UDP_HEADER_STRUCT.size
 
 # ── UDP Flags ─────────────────────────────────────────────────────────────────
+# Биты 1 (mute) и 2 (deaf) резервируются под базовое состояние участника в
+# обычных аудио-пакетах. 16/32/64/128 — режимные флаги пакета.
 FLAG_LOOPBACK_AUDIO = 16
 FLAG_STREAM_VOICES  = 32
 FLAG_WHISPER        = 64
+# Анонимный шёпот: устанавливается отправителем совместно с FLAG_WHISPER.
+# Сервер при ретрансляции переписывает sender_uid в UDP-заголовке на
+# ANONYMOUS_UID — получатель физически не видит реальный uid отправителя.
+FLAG_ANONYMOUS      = 128
 
 STREAM_VOICE_HEADER_STRUCT = struct.Struct("!I")
 STREAM_VOICE_HEADER_SIZE   = STREAM_VOICE_HEADER_STRUCT.size
+
+# ── Anonymous whisper ─────────────────────────────────────────────────────────
+# Зарезервированный «псевдо-uid» для анонимного шёпота. Реальные uid генерируются
+# как secrets.randbelow(10**9)+1 = 1..1_000_000_000, поэтому 0xFFFFFFFE
+# (4_294_967_294) гарантированно не пересекается с ними.
+# Используется:
+#   * сервером — подставляется в UDP-заголовок вместо реального sender_uid при
+#     ретрансляции пакета с FLAG_ANONYMOUS;
+#   * получателем — маркер в UI для отображения «Аноним» вместо ника;
+#   * audio_engine — ключ отдельного RemoteUser/JitterBuffer для анонимов.
+ANONYMOUS_UID = 0xFFFFFFFE
+
+
+def is_anonymous_uid(uid: int) -> bool:
+    """True если переданный uid — зарезервированный маркер анонимного шёпота."""
+    return uid == ANONYMOUS_UID
 
 # ── WebRTC ───────────────────────────────────────────────────────────────────
 CMD_WEBRTC_OFFER  = 'webrtc_offer'
@@ -130,6 +127,11 @@ CMD_WEBRTC_ICE    = 'webrtc_ice'
 
 WEBRTC_ICE_TIMEOUT  = 3.0
 WEBRTC_ICE_SERVERS: list = []
+
+# ── SFU (Go sidecar) ─────────────────────────────────────────────────────────
+SFU_PORT       = 7788
+SFU_EXE_NAME   = "sidecar.exe"
+SFU_PORT_RANGE = 20
 
 # ── TCP-команды ───────────────────────────────────────────────────────────────
 CMD_LOGIN           = 'login'
@@ -187,8 +189,8 @@ CMD_FORCE_MUTED = 'force_muted'
 
 # ── Typing indicator ──────────────────────────────────────────────────────────
 CMD_TYPING         = 'typing'
-TYPING_THROTTLE_MS = 3000    # клиент шлёт не чаще одного раза в 3 секунды
-TYPING_EXPIRE_SEC  = 5.0     # "печатает" гаснет через 5 секунд без обновления
+TYPING_THROTTLE_MS = 3000
+TYPING_EXPIRE_SEC  = 5.0
 
 # ── SQLite чат (хост хранит историю на диске) ────────────────────────────────
 CHAT_DB_PATH = os.path.join(get_appdata_dir(), "chat_history.db")
@@ -196,13 +198,10 @@ CHAT_DB_PATH = os.path.join(get_appdata_dir(), "chat_history.db")
 # ── Единый конфиг приложения ─────────────────────────────────────────────────
 APP_CONFIG_PATH = os.path.join(get_appdata_dir(), "inpulse_config.json")
 
-# ── Аннотации стрима: рисование зрителем поверх стрима ──────────────────────
-# Зритель рисует → клиент отправляет draw_stroke серверу.
-# Сервер ретранслирует всем зрителям + стримеру.
-# points: нормализованные координаты [[x,y], ...] 0.0–1.0 относительно кадра.
+# ── Аннотации стрима ────────────────────────────────────────────────────────
 CMD_DRAW_STROKE = 'draw_stroke'
-DRAW_MAX_POINTS = 300       # макс. точек в одном мазке
-DRAW_FADE_SEC   = 5.0       # мазок живёт 5 секунд, последние 1 с плавно гасится
+DRAW_MAX_POINTS = 300
+DRAW_FADE_SEC   = 5.0
 
 CMD_CREATE_CHANNEL    = 'create_channel'
 CMD_CHANNEL_CREATED   = 'channel_created'
@@ -214,3 +213,34 @@ CHANNEL_PASS_MAX_LEN  = 64
 
 SERVER_NAME_MAX_LEN = 40
 SERVER_NAME_DEFAULT = 'InPulse Server'
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Миграция сервера — таймауты и команды
+# ═══════════════════════════════════════════════════════════════════════════
+MIGRATION_ANNOUNCE_WAIT_SEC = 4.0
+MIGRATION_TCP_TIMEOUT_SEC   = 1.0
+MIGRATION_TCP_RETRY_SEC     = 0.3
+MIGRATION_TOTAL_DEADLINE    = 10.0
+
+# ── Обрыв связи с хостом (без CMD_SERVER_MIGRATE) ────────────────────────────
+RECONNECT_SAME_HOST_WINDOW_SEC = 8.0
+DISCOVERY_WINDOW_SEC           = 6.0
+BECOME_HOST_POS0_DELAY_SEC     = 0.5
+BECOME_HOST_POS_N_DELAY_SEC    = 1.2
+
+RECONNECT_SAME_HOST_TCP_ATTEMPTS = 20
+
+# ── Обратная совместимость со старым API ────────────────────────────────────
+MAX_SILENT_RECONNECT_ATTEMPTS = 2
+RECONNECT_DELAY               = 1.0
+
+# ── Команды 2-шаговой ручной передачи сервера ───────────────────────────────
+CMD_MIGRATE_PREPARE        = 'migrate_prepare'
+CMD_MIGRATE_READY          = 'migrate_ready'
+MIGRATE_PREPARE_TIMEOUT_SEC = 7.0
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Диагностические флаги (FIX: раньше RMS/peak считались всегда, даже если
+# не нужны для лога. Это O(n) на каждый audio-фрейм в hot path.)
+# ══════════════════════════════════════════════════════════════════════════════
+AUDIO_DIAG_ENABLED = False   # True → логи [VIEWER-DIAG], [OUT-DIAG], [DLL-DIAG]

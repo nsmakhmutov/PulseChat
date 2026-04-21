@@ -6,7 +6,7 @@ import socket
 import secrets
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QScrollArea,
                              QWidget, QGridLayout, QLabel, QSlider, QFrame,
-                             QSizePolicy, QProgressBar, QLineEdit,
+                             QSizePolicy, QProgressBar, QLineEdit, QCheckBox,
                              QFileDialog, QMessageBox)
 from PyQt6.QtCore import (Qt, QSize, QPoint, QTimer, pyqtSignal, QThread, QSettings)
 from PyQt6.QtGui import QIcon, QGuiApplication, QPainter, QColor, QPen, QPainterPath, QBrush
@@ -127,12 +127,16 @@ class NudgeHoldButton(QPushButton):
                 )
             except Exception as ex:
                 print(f"[NudgeHoldButton] PlaySound error: {ex}")
+        else:
+            print("[NudgeHoldButton] _start_hold_sound: путь не задан")
 
     def _stop_hold_sound(self) -> None:
         if self._hold_sound_path:
             try:
                 import winsound
-                winsound.PlaySound(None, winsound.SND_PURGE)
+                # FIX: SND_PURGE deprecated на современных Windows и может
+                # не останавливать звук. PlaySound(None, 0) — надёжная остановка.
+                winsound.PlaySound(None, 0)
             except Exception:
                 pass
 
@@ -716,6 +720,49 @@ class UserOverlayPanel(QFrame):
         self.btn_whisper.released.connect(self._on_whisper_release)
         card_lay.addWidget(self.btn_whisper)
 
+        # ── Чекбокс: анонимность шёпота ──────────────────────────────────────
+        # Состояние сохраняется per-target в QSettings: при следующем открытии
+        # панели для этого же собеседника чекбокс восстанавливается.
+        # При отмеченной галочке:
+        #   • sender ставит FLAG_WHISPER|FLAG_ANONYMOUS в пакете;
+        #   • сервер перезаписывает sender_uid в UDP-заголовке на ANONYMOUS_UID
+        #     перед ретрансляцией → получатель физически не видит, кто шептал;
+        #   • в UI/оверлее у получателя показывается «Аноним» вместо ника.
+        # Хост встроенного сервера по-прежнему знает реального отправителя —
+        # это архитектурное ограничение client-server модели.
+        _s_anon = QSettings("MyVoiceChat", "GlobalSettings")
+        self._anon_key = f"whisper_anonymous_{uid}"
+        self.chk_anonymous = QCheckBox("👤  Анонимно (получатель не увидит ник)")
+        self.chk_anonymous.setChecked(_s_anon.value(self._anon_key, "false") == "true")
+        self.chk_anonymous.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.chk_anonymous.setStyleSheet("""
+            QCheckBox {
+                color: #c8b0ff;
+                font-size: 11px;
+                padding: 2px 4px;
+                background: transparent;
+                border: none;
+                spacing: 6px;
+            }
+            QCheckBox:hover { color: #e0c8ff; }
+            QCheckBox::indicator {
+                width: 14px; height: 14px;
+                border: 1px solid rgba(130,100,220,0.60);
+                border-radius: 3px;
+                background: rgba(255,255,255,0.04);
+            }
+            QCheckBox::indicator:hover {
+                border-color: rgba(160,130,240,0.85);
+            }
+            QCheckBox::indicator:checked {
+                background: #7b52d4;
+                border-color: #9b72f4;
+                image: none;
+            }
+        """)
+        self.chk_anonymous.toggled.connect(self._on_anonymous_toggled)
+        card_lay.addWidget(self.chk_anonymous)
+
         # ── Кнопка: смотреть стрим (только если пользователь стримит) ────────
         if is_streaming and on_watch_stream is not None:
             sep2 = QFrame()
@@ -1034,8 +1081,12 @@ class UserOverlayPanel(QFrame):
         """Начинаем шёпот при нажатии."""
         if not self._whisper_active:
             self._whisper_active = True
-            self.audio.start_whisper(self.uid)
-            self.btn_whisper.setText("🤫  Шепчу...")
+            # Читаем состояние чекбокса в момент нажатия — если пользователь
+            # передумал и снял галочку после открытия панели, это сработает.
+            anon = (self.chk_anonymous.isChecked()
+                    if hasattr(self, 'chk_anonymous') else False)
+            self.audio.start_whisper(self.uid, anonymous=anon)
+            self.btn_whisper.setText("🤫  Шепчу анонимно..." if anon else "🤫  Шепчу...")
             # Показываем подсказку только цветом — размер панели не меняется
             self._lbl_whisper_hint.setStyleSheet(self._lbl_whisper_hint_active_style)
 
@@ -1046,6 +1097,31 @@ class UserOverlayPanel(QFrame):
             self.audio.stop_whisper()
             self.btn_whisper.setText("🤫  Шепнуть  (удерживай)")
             self._lbl_whisper_hint.setStyleSheet(self._lbl_whisper_hint_idle_style)
+
+    def _on_anonymous_toggled(self, checked: bool):
+        """
+        Сохраняем состояние чекбокса "Анонимно" в QSettings персонально для
+        этого собеседника (ключ whisper_anonymous_{uid}). Настройка пережидёт
+        перезапуск приложения — удобно для постоянных собеседников.
+        """
+        try:
+            QSettings("MyVoiceChat", "GlobalSettings").setValue(
+                self._anon_key, "true" if checked else "false"
+            )
+        except Exception:
+            pass
+        # Если пользователь переключил галочку ВО ВРЕМЯ активного шёпота —
+        # применяем новый режим «на лету» без отпускания кнопки. Для этого
+        # синхронизируем флаг в audio_engine напрямую: текущая PTT-сессия
+        # продолжится, но следующие пакеты уже пойдут с/без FLAG_ANONYMOUS.
+        if self._whisper_active:
+            try:
+                self.audio._whisper_anonymous = bool(checked)
+                self.btn_whisper.setText(
+                    "🤫  Шепчу анонимно..." if checked else "🤫  Шепчу..."
+                )
+            except Exception:
+                pass
 
     def _on_watch_clicked(self):
         """Открываем окно стрима и закрываем оверлей."""

@@ -211,7 +211,7 @@ LOGS_DIR: str = _setup_logging()
 # hiddenimports ненадёжен для локальных .py файлов: если PyInstaller не смог
 # импортировать модуль при анализе, он молча выпадает из бандла без ошибки.
 # Статический import здесь = модуль всегда виден через граф зависимостей.
-import updater  # noqa: F401
+import core.updater  # noqa: F401
 
 # ── Явный import — PyInstaller включает client_main.client_main в сборку ─────
 from client_main.client_main import main  # noqa: E402

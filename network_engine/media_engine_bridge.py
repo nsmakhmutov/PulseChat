@@ -23,6 +23,11 @@ from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
+try:
+    from core.job_object import assign_to_job as _assign_to_job
+except ImportError:
+    _assign_to_job = lambda proc: False
+
 
 class MediaEngineBridge:
     """
@@ -86,6 +91,7 @@ class MediaEngineBridge:
                     subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
                 ),
             )
+            _assign_to_job(self._process)
         except Exception as e:
             logger.error("[Bridge] Ошибка запуска: %s", e)
             return False
@@ -114,22 +120,51 @@ class MediaEngineBridge:
             return False
 
     def stop(self) -> None:
-        if not self._running:
-            return
+        """Останавливает media-engine.exe. Убивает процесс независимо от _running.
+
+        FIX: старый код начинался с `if not self._running: return`.
+        После EOF stdout (Rust закрывает stdout после READY) _running=False →
+        stop() немедленно возвращал, оставляя процесс живым.
+        Аналогичный баг был исправлен в SfuBridge.stop() — теперь исправлен и здесь.
+        """
         self._running = False
+
+        if self._process is None:
+            return
+
+        if self._process.poll() is not None:
+            # Уже мёртв — просто очищаем
+            code = self._process.returncode
+            self._process = None
+            self._on_exit(code if code is not None else -1)
+            return
+
+        # Процесс жив — шлём SHUTDOWN, потом terminate/kill
         try:
             self.send_command({"cmd": "SHUTDOWN"})
         except Exception:
             pass
-        if self._process is not None:
+
+        try:
+            self._process.wait(timeout=3.0)
+        except subprocess.TimeoutExpired:
             try:
-                self._process.wait(timeout=3.0)
-            except subprocess.TimeoutExpired:
-                self._process.kill()
+                self._process.terminate()
+            except Exception:
+                pass
+            try:
                 self._process.wait(timeout=2.0)
-            code = self._process.returncode
-            self._process = None
-            self._on_exit(code)
+            except subprocess.TimeoutExpired:
+                try:
+                    self._process.kill()
+                    self._process.wait(timeout=2.0)
+                except Exception:
+                    pass
+
+        code = self._process.returncode if self._process else -1
+        self._process = None
+        self._on_exit(code if code is not None else -1)
+        logger.info("[Bridge] media-engine завершён (code=%s)", code)
 
     def is_running(self) -> bool:
         return (
@@ -184,6 +219,19 @@ class MediaEngineBridge:
             "bitrate":    bitrate,
             "lq_bitrate": lq_bitrate or bitrate // 4,
         })
+
+    def restart_capture(self) -> None:
+        """
+        Шлёт RESTART_CAPTURE команду в Rust media-engine.
+        Используется audio_capture.py watchdog'ом при обнаружении зависшего
+        DLL Capture (RMS=0 timeout). Rust перезапускает ТОЛЬКО захват экрана,
+        WebRTC-соединение и энкодер остаются живыми — зритель не увидит
+        разрыва, только кратковременный стоп видео.
+        """
+        try:
+            self.send_command({"cmd": "RESTART_CAPTURE"})
+        except Exception as e:
+            logger.warning("[Bridge] RESTART_CAPTURE error: %s", e)
 
     # ── WebRTC сигнализация (внутреннее) ─────────────────────────────────────
 
@@ -280,20 +328,19 @@ class MediaEngineBridge:
     def _read_stderr(self) -> None:
         """
         Читает логи Rust media-engine из stderr.
-        Дополнительно парсит строки [DLL-DIAG] для watchdog аудио-захвата:
-        если RMS=0.0000 и peak=0.0000 удерживается > DLL_SILENCE_TIMEOUT секунд —
-        шлём RESTART_CAPTURE команду в Rust.
 
-        Устраняет баг из логов 03:16:25–03:17:08: DLL Capture завис,
-        RMS/peak упали в 0, что вызвало burst статичных кадров и PLI-шторм.
+        FIX #42: УДАЛЁН мёртвый watchdog на [DLL-DIAG] regex.
+        Причина: строки [DLL-DIAG] пишутся в Python audio_capture.py (другой
+        процесс!), а не в Rust media-engine. Regex в этом обработчике stderr
+        никогда не срабатывал → RESTART_CAPTURE никогда не вызывался.
+
+        Правильный watchdog живёт в audio_capture.py (Python) где действительно
+        доступны RMS/peak реальных аудио-данных. Если он решит, что DLL Capture
+        завис, он сам вызовет self._restart_dll_capture() — внутрипроцессный
+        вызов, без межпроцессного regex-парсинга.
+
+        Здесь остаётся только форвард лог-строк в _on_log callback.
         """
-        DLL_SILENCE_TIMEOUT = 3.0
-        _dll_zero_since: 'float | None' = None
-
-        import time as _time_mod
-        import re as _re
-        _dll_diag_re = _re.compile(r'\[DLL-DIAG\].*?RMS=([\d.]+).*?peak=([\d.]+)')
-
         try:
             for raw in iter(self._process.stderr.readline, b""):
                 if not self._running:
@@ -301,27 +348,5 @@ class MediaEngineBridge:
                 line = raw.decode("utf-8", errors="replace").rstrip()
                 if line:
                     self._on_log(line)
-
-                # ── DLL-DIAG watchdog ──────────────────────────────────────
-                m = _dll_diag_re.search(line)
-                if m:
-                    rms  = float(m.group(1))
-                    peak = float(m.group(2))
-                    now  = _time_mod.time()
-                    if rms == 0.0 and peak == 0.0:
-                        if _dll_zero_since is None:
-                            _dll_zero_since = now
-                        elif now - _dll_zero_since >= DLL_SILENCE_TIMEOUT:
-                            logger.warning(
-                                "[Bridge] DLL Capture RMS=0 уже %.1f сек — рестарт захвата",
-                                now - _dll_zero_since,
-                            )
-                            try:
-                                self.send_command({"cmd": "RESTART_CAPTURE"})
-                            except Exception as e:
-                                logger.warning("[Bridge] RESTART_CAPTURE error: %s", e)
-                            _dll_zero_since = now  # не спамим рестартами
-                    else:
-                        _dll_zero_since = None  # звук есть — сбрасываем
         except Exception:
             pass

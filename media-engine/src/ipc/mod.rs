@@ -5,21 +5,18 @@
 //   {"cmd": "STOP_STREAM"}
 //   {"cmd": "SET_BITRATE",   "bitrate":4000000, "lq_bitrate":1000000}
 //   {"cmd": "WEBRTC_ANSWER", "sdp":"<answer SDP от Pion SFU>"}
+//   {"cmd": "RESTART_CAPTURE"}
 //   {"cmd": "SHUTDOWN"}
 //
 // ─── Rust → Python (stdout) ──────────────────────────────────────────────────
-//   {"event": "READY",          "version": "0.3.0"}
+//   {"event": "READY",          "version": "0.3.1"}
 //   {"event": "WEBRTC_OFFER",   "sdp": "<offer SDP + все ICE кандидаты>"}
 //   {"event": "STREAM_STARTED", "encoder":"NVENC", "width":1280, "height":720, "fps":30}
 //   {"event": "STREAM_STOPPED"}
-//   {"event": "STATS",          "fps":30, "bitrate_kbps":6000, "encoder":"NVENC", "dropped_frames":0}
+//   {"event": "STATS",          "fps":30, "bitrate_kbps":6000, "encoder":"NVENC",
+//                               "dropped_frames":0, "capture_rms":0.001, "capture_peak":0.002}
+//   {"event": "CAPTURE_RESTARTED", "reason":"..."}
 //   {"event": "ERROR",          "message": "..."}
-//
-// ─── Сигнализация ────────────────────────────────────────────────────────────
-//   1. START_STREAM → Rust создаёт webrtc-rs PC, собирает ICE, эмитит WEBRTC_OFFER
-//   2. Python: POST /streamer/offer к Pion SFU → answer SDP
-//   3. Python: WEBRTC_ANSWER → Rust stdin
-//   4. Rust: set_remote_description(answer) → ICE connected → RTP → Pion SFU
 
 use serde::{Deserialize, Serialize};
 
@@ -56,12 +53,15 @@ pub enum Command {
         lq_bitrate: u32,
     },
 
-    /// Перезапустить только захват экрана/звука без остановки WebRTC.
+    /// Перезапустить только захват экрана без остановки WebRTC.
     ///
-    /// Посылается Python watchdog-ом из media_engine_bridge._read_stderr()
-    /// когда DLL-DIAG показывает RMS=0 и peak=0 дольше DLL_SILENCE_TIMEOUT секунд.
-    /// WebRTC-соединение, SFU-сессия и энкодер при этом остаются живыми —
-    /// зритель не видит разрыва, получает лишь кратковременный стоп видео.
+    /// FIX: раньше был watchdog в media_engine_bridge._read_stderr(), который
+    /// парсил [DLL-DIAG] из stderr Rust-процесса. Но [DLL-DIAG] пишется в
+    /// Python audio_capture.py (другой процесс!) — watchdog никогда не
+    /// срабатывал. Теперь watchdog перенесён в audio_capture.py на стороне
+    /// Python, где действительно доступны RMS/peak аудио.
+    ///
+    /// RESTART_CAPTURE может быть вызван вручную из Python через sidecar-команду.
     #[serde(rename = "RESTART_CAPTURE")]
     RestartCapture,
 
@@ -80,7 +80,6 @@ pub enum Event {
     Ready { version: String },
 
     /// WebRTC offer SDP (gather-complete: ICE кандидаты уже внутри SDP).
-    /// Python: POST .sdp к /streamer/offer → получить answer → прислать WEBRTC_ANSWER.
     #[serde(rename = "WEBRTC_OFFER")]
     WebrtcOffer { sdp: String },
 
@@ -96,7 +95,6 @@ pub enum Event {
     StreamStopped,
 
     /// DLL Capture был перезапущен по команде RESTART_CAPTURE.
-    /// Python может использовать для диагностики / сброса watchdog-таймера.
     #[serde(rename = "CAPTURE_RESTARTED")]
     CaptureRestarted { reason: String },
 

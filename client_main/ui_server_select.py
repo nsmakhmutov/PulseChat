@@ -49,7 +49,7 @@ class DiscoveryWorker(QThread):
 
     def run(self):
         try:
-            from server_discovery import ServerDiscovery
+            from network_engine.server_discovery import ServerDiscovery
             result = ServerDiscovery().discover(self._timeout)
             if result:
                 self.found.emit(result)
@@ -74,7 +74,7 @@ class DiscoveryAllWorker(QThread):
 
     def run(self):
         try:
-            from server_discovery import ServerDiscovery
+            from network_engine.server_discovery import ServerDiscovery
             results = ServerDiscovery().discover_all(self._timeout)
             self.done.emit(results)
         except Exception as e:
@@ -559,7 +559,7 @@ class MultiServerScreen(QWidget):
         )
 
         try:
-            from server_discovery import get_local_radmin_ip
+            from network_engine.server_discovery import get_local_radmin_ip
             from server import EmbeddedServerManager
             host_ip = get_local_radmin_ip()
             EmbeddedServerManager.get().start(host_ip, self.nick, server_name=server_name)
@@ -608,7 +608,7 @@ class MultiServerScreen(QWidget):
         # v3: encoder patch removed — Rust handles encoding, aiortc is decode-only
 
         try:
-            from server_discovery import get_local_radmin_ip
+            from network_engine.server_discovery import get_local_radmin_ip
             local_ip = get_local_radmin_ip()
         except Exception:
             local_ip = '127.0.0.1'
@@ -628,7 +628,7 @@ class MultiServerScreen(QWidget):
         self._connecting_in_progress = False
 
         try:
-            from server_discovery import get_local_radmin_ip
+            from network_engine.server_discovery import get_local_radmin_ip
             local_ip = get_local_radmin_ip()
         except Exception:
             local_ip = '127.0.0.1'
@@ -869,7 +869,7 @@ class DiscoveryScreen(QWidget):
         )
 
         try:
-            from server_discovery import get_local_radmin_ip
+            from network_engine.server_discovery import get_local_radmin_ip
             from server import EmbeddedServerManager
             host_ip = get_local_radmin_ip()
             EmbeddedServerManager.get().start(host_ip, self.nick)
@@ -922,7 +922,7 @@ class DiscoveryScreen(QWidget):
         # v3: encoder patch removed — Rust handles encoding, aiortc is decode-only
 
         try:
-            from server_discovery import get_local_radmin_ip
+            from network_engine.server_discovery import get_local_radmin_ip
             local_ip = get_local_radmin_ip()
         except Exception:
             local_ip = '127.0.0.1'
@@ -942,7 +942,7 @@ class DiscoveryScreen(QWidget):
         self._connecting_in_progress = False
 
         try:
-            from server_discovery import get_local_radmin_ip
+            from network_engine.server_discovery import get_local_radmin_ip
             local_ip = get_local_radmin_ip()
         except Exception:
             local_ip = '127.0.0.1'

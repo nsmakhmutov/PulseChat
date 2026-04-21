@@ -1,16 +1,7 @@
-// main.rs — InPulse Media Engine v0.3.0
+// main.rs — InPulse Media Engine v0.3.1
 //
 // v3: Rust сам делает WebRTC (webrtc-rs) прямо в Pion SFU.
 //     Named Pipe удалён. Python только сигнализация.
-//
-// Протокол запуска:
-//   1. Rust → stdout: {"event":"READY","version":"0.3.0"}
-//   2. Python → stdin: {"cmd":"START_STREAM",...}
-//   3. Rust → stdout: {"event":"WEBRTC_OFFER","sdp":"..."}
-//   4. Python: POST sdp к Pion SFU → answer
-//   5. Python → stdin: {"cmd":"WEBRTC_ANSWER","sdp":"<answer>"}
-//   6. RTP кадры текут в Pion SFU
-//   7. Python → stdin: {"cmd":"STOP_STREAM"} / {"cmd":"SHUTDOWN"}
 
 mod capture;
 mod encode;
@@ -51,6 +42,10 @@ async fn main() -> Result<()> {
     let mut line = String::new();
 
     loop {
+        // FIX: очищаем буфер в НАЧАЛЕ каждой итерации. Раньше очистка была
+        // внутри Ok(_)-ветки, что оставляло старые данные при Err-пути и
+        // при пустых строках — потенциально приводило к накоплению.
+        line.clear();
         match reader.read_line(&mut line).await {
             Ok(0) => {
                 info!("stdin EOF — завершаемся");
@@ -74,7 +69,6 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-                line.clear();
             }
             Err(e) => {
                 error!("stdin read error: {e}");
@@ -100,12 +94,19 @@ async fn handle_command(cmd: Command, pipeline: &mut Option<Pipeline>) -> Result
                 p.stop().await?;
             }
 
+            // FIX: валидация fps — раньше fps=0 вызывал division by zero panic
+            // в Duration::from_secs_f64(1.0/0.0) = inf и в Rational::new(1, 0).
+            let fps_safe = fps.max(1).min(120);
+            if fps != fps_safe {
+                warn!("fps={fps} некорректен, использую {fps_safe}");
+            }
+
             let config = StreamConfig {
                 monitor,
-                width:  width  & !1, // выравниваем до чётного
-                height: height & !1,
-                fps,
-                bitrate,
+                width:  (width & !1).max(2), // выравниваем до чётного, минимум 2
+                height: (height & !1).max(2),
+                fps: fps_safe,
+                bitrate: bitrate.max(100_000), // минимум 100 kbps
                 simulcast,
                 stream_audio,
             };
@@ -128,7 +129,6 @@ async fn handle_command(cmd: Command, pipeline: &mut Option<Pipeline>) -> Result
             }
         }
 
-        // Python форвардит SDP answer от Pion SFU обратно нам
         Command::WebrtcAnswer { sdp } => {
             if let Some(p) = pipeline.as_ref() {
                 info!("WEBRTC_ANSWER получен (len={})", sdp.len());
@@ -153,8 +153,6 @@ async fn handle_command(cmd: Command, pipeline: &mut Option<Pipeline>) -> Result
         }
 
         Command::RestartCapture => {
-            // Python watchdog обнаружил зависание DLL Capture (RMS=0 > 3 сек).
-            // Перезапускаем только захват — WebRTC и SFU-сессия остаются живыми.
             info!("RESTART_CAPTURE: получена команда от Python watchdog");
             if let Some(p) = pipeline.as_mut() {
                 if let Err(e) = p.restart_capture().await {

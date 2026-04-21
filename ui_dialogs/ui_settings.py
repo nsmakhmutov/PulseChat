@@ -892,8 +892,14 @@ class SettingsDialog(QDialog):
         return opts
 
     def _add_hk_row(self, func_type: str = "none", func_data: str = "",
-                    hotkey: str = "") -> None:
-        """Добавляет одну строку в таблицу горячих клавиш."""
+                    hotkey: str = "", anonymous: bool = False) -> None:
+        """Добавляет одну строку в таблицу горячих клавиш.
+
+        :param anonymous: применимо только для функции 'whisper' — если True,
+            при срабатывании PTT-хоткея включается анонимный режим
+            (получатель не видит имя отправителя). Игнорируется для других
+            типов функций.
+        """
         MAX_ROWS = 7
         if len(self._hk_rows) >= MAX_ROWS:
             self._btn_hk_add.setEnabled(False)
@@ -954,6 +960,54 @@ class SettingsDialog(QDialog):
         hk_edit = HotkeyCaptureEdit()
         hk_edit.set_hotkey(hotkey)
 
+        # Колонка 3: чекбокс «Анонимно» (виден только для функции whisper).
+        # Занимает фиксированное место в layout даже когда скрыт — чтобы
+        # столбцы не «прыгали» при смене типа функции в соседних строках.
+        chk_anon = QCheckBox("👤")
+        chk_anon.setChecked(bool(anonymous))
+        chk_anon.setCursor(Qt.CursorShape.PointingHandCursor)
+        chk_anon.setToolTip(
+            "Анонимный шёпот: получатель не увидит твой ник в баннере и оверлее.\n"
+            "Хост сервера знает отправителя — это ограничение client-server архитектуры."
+        )
+        chk_anon.setFixedWidth(38)
+        chk_anon.setStyleSheet("""
+            QCheckBox {
+                color: #c8b0ff;
+                font-size: 14px;
+                background: transparent;
+                border: none;
+                spacing: 2px;
+                padding: 0;
+            }
+            QCheckBox::indicator {
+                width: 13px; height: 13px;
+                border: 1px solid rgba(130,100,220,0.55);
+                border-radius: 3px;
+                background: rgba(255,255,255,0.04);
+            }
+            QCheckBox::indicator:hover {
+                border-color: rgba(160,130,240,0.85);
+            }
+            QCheckBox::indicator:checked {
+                background: #7b52d4;
+                border-color: #9b72f4;
+            }
+        """)
+
+        # Видимость чекбокса завязана на текущую функцию: только для whisper.
+        def _sync_anon_visibility(_ignored=None, _combo=cb, _chk=chk_anon):
+            data = _combo.currentData()
+            is_whisper = bool(data and data[0] == "whisper")
+            _chk.setVisible(is_whisper)
+            if not is_whisper and _chk.isChecked():
+                # Снимаем галочку если функция больше не whisper — настройка
+                # для других функций бессмысленна, и это предотвратит утечку
+                # whisper_slot_{i}_anon=true при сохранении.
+                _chk.setChecked(False)
+        _sync_anon_visibility()
+        cb.currentIndexChanged.connect(_sync_anon_visibility)
+
         # Кнопка удаления
         btn_del = QPushButton("✕")
         btn_del.setFixedSize(28, 28)
@@ -975,9 +1029,10 @@ class SettingsDialog(QDialog):
 
         row_lay.addWidget(cb, stretch=4)
         row_lay.addWidget(hk_edit, stretch=5)
+        row_lay.addWidget(chk_anon)
         row_lay.addWidget(btn_del)
 
-        slot = {"cb": cb, "hk": hk_edit, "frame": frame}
+        slot = {"cb": cb, "hk": hk_edit, "anon": chk_anon, "frame": frame}
         self._hk_rows.append(slot)
 
         # Вставляем перед последним stretch
@@ -1020,7 +1075,10 @@ class SettingsDialog(QDialog):
             ftype = s.value(f"hk_table_{i}_type", "none")
             fdata = s.value(f"hk_table_{i}_data", "")
             fhk   = s.value(f"hk_table_{i}_key",  "")
-            self._add_hk_row(ftype, fdata, fhk)
+            # Флаг анонимного шёпота — бэк-совместим: для старых сохранений ключа
+            # нет → чекбокс будет снят по умолчанию.
+            fanon = s.value(f"hk_table_{i}_anon", "false") == "true"
+            self._add_hk_row(ftype, fdata, fhk, anonymous=fanon)
 
     # ── Старая вкладка «Шёпот» — удалена (логика перенесена в Персонализацию) ─
     # setup_whisper_tab — метод намеренно отсутствует.
@@ -1397,7 +1455,7 @@ class SettingsDialog(QDialog):
             )
 
     def _on_check_update_clicked(self):
-        from updater import check_for_updates_async
+        from core.updater import check_for_updates_async
         self._btn_check_update.setEnabled(False)
         self._btn_install_update.setVisible(False)
         self._ver_progress.setVisible(False)
@@ -1410,7 +1468,7 @@ class SettingsDialog(QDialog):
         )
 
     def _on_install_update_clicked(self):
-        from updater import download_and_apply
+        from core.updater import download_and_apply
         self._btn_install_update.setEnabled(False)
         self._btn_check_update.setEnabled(False)
         self._ver_progress.setVisible(True)
@@ -1554,16 +1612,27 @@ class SettingsDialog(QDialog):
             s.setValue(f"whisper_slot_{i}_nick", "")
             s.setValue(f"whisper_slot_{i}_ip",   "")
             s.setValue(f"whisper_slot_{i}_hk",   "")
+            s.setValue(f"whisper_slot_{i}_anon", "false")
 
         for i, row in enumerate(self._hk_rows):
             data = row["cb"].currentData()   # (func_type, func_data)
             hk   = row["hk"].get_hotkey()
+            # Флаг анонимного шёпота: читаем состояние чекбокса ряда; валиден
+            # только для whisper — для остальных функций _sync_anon_visibility
+            # гарантирует что чекбокс снят, поэтому данные не протекут.
+            anon_checked = False
+            try:
+                anon_checked = bool(row["anon"].isChecked())
+            except Exception:
+                pass
             ftype = data[0] if data else "none"
             fdata = data[1] if data else ""
 
             s.setValue(f"hk_table_{i}_type", ftype)
             s.setValue(f"hk_table_{i}_data", fdata)
             s.setValue(f"hk_table_{i}_key",  hk)
+            s.setValue(f"hk_table_{i}_anon",
+                       "true" if (anon_checked and ftype == "whisper") else "false")
 
             # Обратносовместимые ключи для остального кода приложения
             if ftype == "mute_mic" and not s.value("hk_mute", ""):
@@ -1583,6 +1652,10 @@ class SettingsDialog(QDialog):
                 s.setValue(f"whisper_slot_{whisper_slot_idx}_ip",   fdata)
                 s.setValue(f"whisper_slot_{whisper_slot_idx}_nick", nick)
                 s.setValue(f"whisper_slot_{whisper_slot_idx}_hk",   hk)
+                # Пишем отдельный ключ whisper_slot_{idx}_anon —
+                # его читает ui_main.py при регистрации PTT-хоткеев шёпота.
+                s.setValue(f"whisper_slot_{whisper_slot_idx}_anon",
+                           "true" if anon_checked else "false")
                 whisper_slot_idx += 1
 
         self.mw.nick = self.ed_nick.text()

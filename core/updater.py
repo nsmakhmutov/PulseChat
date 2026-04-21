@@ -446,3 +446,18 @@ def download_and_install(download_url: str, on_progress=None, on_done=None, on_e
                 on_error(f"Ошибка загрузки: {e}")
 
     threading.Thread(target=_download, daemon=True, name="DownloadThread").start()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SENIOR FIX v4.9: alias для обратной совместимости
+# ══════════════════════════════════════════════════════════════════════════════
+# core/__init__.py импортирует `download_and_apply`, вызывающий код в
+# client_main/ui_connecting.py и ui_dialogs/ui_settings.py тоже ожидает
+# имя `download_and_apply`, но исходная функция здесь названа
+# `download_and_install`. В dev-режиме это могло не всплывать (лениво), но
+# PyInstaller при импорте `core.updater` через `core/__init__.py` падает
+# с ImportError на старте.
+#
+# Добавляем alias вместо переименования — чтобы не трогать логику функции
+# и сохранить оба имени рабочими.
+download_and_apply = download_and_install

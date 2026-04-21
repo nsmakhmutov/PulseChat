@@ -19,8 +19,10 @@ from config import (
     SAMPLE_RATE, CHANNELS, CHUNK_SIZE, FRAME_DURATION,
     OPUS_APPLICATION, DEFAULT_BITRATE,
     UDP_HEADER_STRUCT, UDP_HEADER_SIZE,
-    FLAG_STREAM_VOICES, FLAG_WHISPER,
+    FLAG_STREAM_VOICES, FLAG_WHISPER, FLAG_ANONYMOUS,
     STREAM_VOICE_HEADER_STRUCT, STREAM_VOICE_HEADER_SIZE,
+    ANONYMOUS_UID,
+    AUDIO_DIAG_ENABLED,
 )
 from .audio_processing import (
     DeepFilterEngine,
@@ -35,6 +37,28 @@ except ImportError:
 
 
 class JitterBuffer:
+    """
+    Буфер джиттера с защитой от устаревшего состояния после (пере)подключения.
+
+    НОВОЕ (FIX миграция):
+      - SEQ_JUMP_RESET_BACK: если прилетел пакет со seq значительно МЕНЬШЕ
+        last_seq, считаем что sender пере-инициализировал свой seq-счётчик
+        (на практике — другой клиент сделал полный reconnect) → сбрасываем
+        состояние буфера и начинаем заново. Без этой защиты все пакеты
+        после сбросившейся сессии тихо отбрасываются.
+
+      - SEQ_JUMP_RESET_FORWARD: если прилетел пакет с seq >> last_seq
+        (скачок вперёд на очень большое значение), тоже сбрасываем — так
+        мы не застрянем с гигантским last_seq, если новая сессия начала
+        с seq=0.
+
+      - reset(): публичный метод для ручного сброса (вызывается из
+        AudioHandler.reset_voice_state при миграции сервера).
+    """
+
+    SEQ_JUMP_RESET_BACK    = 200     # seq уменьшился > чем на 200 (= 4с звука)
+    SEQ_JUMP_RESET_FORWARD = 10000   # seq подскочил на 10000 (= 200с)
+
     def __init__(self, target_delay=4):
         self.buffer = []
         self.target_delay = target_delay
@@ -43,21 +67,60 @@ class JitterBuffer:
         self.is_buffering = True
         self.max_size = 50
 
+    def _reset_locked(self):
+        """Сброс под уже взятым _lock."""
+        self.buffer.clear()
+        self.last_seq = -1
+        self.is_buffering = True
+
+    def reset(self):
+        """Публичный сброс — для вызова при миграции сервера."""
+        with self._lock:
+            self._reset_locked()
+
     def add(self, seq, data):
         with self._lock:
+            # ── Защита от stale-сессии ──────────────────────────────────────
+            if self.last_seq != -1:
+                # seq откатился назад на большую величину → sender пере-создал счётчик
+                if seq + self.SEQ_JUMP_RESET_BACK < self.last_seq:
+                    print(f"[JB] seq reset (was last={self.last_seq}, got={seq}) — "
+                          f"смена сессии, сброс буфера", flush=True)
+                    self._reset_locked()
+                # seq подскочил слишком далеко вперёд — тоже reinit-сигнал
+                elif seq > self.last_seq + self.SEQ_JUMP_RESET_FORWARD:
+                    print(f"[JB] seq jump forward (last={self.last_seq}, got={seq}) — "
+                          f"reset", flush=True)
+                    self._reset_locked()
+
             if seq <= self.last_seq and self.last_seq != -1:
                 return
             heapq.heappush(self.buffer, (seq, data))
             if len(self.buffer) > self.max_size:
-                # FIX: дропаем НАИБОЛЬШИЙ seq (самый новый), а не наименьший.
-                # heappop() на min-heap дропает наименьший — то есть именно тот
-                # пакет, который должен играть следующим. Это гарантированный треск.
-                # Правильно: убираем самый новый пакет — он пришёл из сети раньше
-                # времени и буфер слишком большой. Используем nlargest+remove.
-                # O(n) — но вызывается крайне редко (только при шторме пакетов).
-                largest = max(self.buffer, key=lambda x: x[0])
-                self.buffer.remove(largest)
-                heapq.heapify(self.buffer)
+                # FIX: дропаем самый новый пакет (максимальный seq).
+                # heappop() на min-heap забирает самый маленький — именно тот,
+                # который должен играть следующим → гарантированный треск.
+                #
+                # Раньше было: max() + list.remove() + heapify() = три O(n) прохода.
+                # Оптимизация: итерируемся один раз, находим индекс max,
+                # делаем pop по индексу через swap с последним + heapify.
+                #
+                # Всё ещё O(n), но 1 проход вместо 3, и это запускается редко
+                # (только при шторме пакетов).
+                max_idx = 0
+                max_seq = self.buffer[0][0]
+                for i in range(1, len(self.buffer)):
+                    if self.buffer[i][0] > max_seq:
+                        max_seq = self.buffer[i][0]
+                        max_idx = i
+                # Swap с последним и pop — избегает сдвига на O(n)
+                last_idx = len(self.buffer) - 1
+                if max_idx != last_idx:
+                    self.buffer[max_idx] = self.buffer[last_idx]
+                self.buffer.pop()
+                # Heapify только если мы сломали heap-invariant
+                if max_idx != last_idx:
+                    heapq.heapify(self.buffer)
 
     def get(self):
         with self._lock:
@@ -74,6 +137,7 @@ class JitterBuffer:
             seq, data = heapq.heappop(self.buffer)
             self.last_seq = seq
             return data
+
 
 
 class RemoteUser:
@@ -298,6 +362,16 @@ class AudioHandler(QObject):
         # остальные участники комнаты отправителя не слышат.
         self.whisper_target_uid: int = 0
         self._whisper_sequence: int = 0
+        # Флаг анонимного шёпота — выставляется start_whisper(anonymous=True).
+        # При True в исходящем пакете помимо FLAG_WHISPER выставляется
+        # FLAG_ANONYMOUS; сервер переписывает sender_uid в UDP-заголовке на
+        # ANONYMOUS_UID перед ретрансляцией получателю.
+        self._whisper_anonymous: bool = False
+        # Время последнего входящего анонимного whisper-пакета (perf_counter).
+        # Используется для резета jitter-buffer общего ANONYMOUS_UID при смене
+        # «говорящего» анонима — иначе два подряд идущих анонима с разными
+        # seq-последовательностями будут бить друг другу звук в одном JB.
+        self._anon_last_incoming_ts: float = 0.0
 
         # ── IIR-фильтр для whisper-эффекта (4-й порядок Butterworth LP, fc=1200 Гц) ──
         # SOS-матрица предвычислена как модульная константа _WLP_SOS (один раз при импорте).
@@ -762,6 +836,56 @@ class AudioHandler(QObject):
             self._audio_users_snapshot = dict(self.remote_users)
         # stream_remote_users удалён: стрим-аудио теперь через WebRTC (RTCPeerConnection).
 
+    def reset_voice_state(self):
+        """
+        Полный сброс приёмной части голоса.
+        Вызывается ПЕРЕД сменой my_uid при миграции сервера.
+
+        Что делает:
+          1. Дренирует очередь incoming_packets — там могут лежать пакеты со
+             старыми uid, которые после смены my_uid будут неверно
+             интерпретированы (в т.ч. как "свои" пакеты если новый my_uid
+             совпадёт с чьим-то старым).
+          2. Удаляет всех RemoteUser — их uid устарели после выдачи новых
+             uid новым сервером. Новые RemoteUser создадутся автоматически
+             в _packet_processor_loop при первом пакете от каждого нового uid.
+          3. Чистит uid_to_ip, pending_volumes, whisper-состояния.
+          4. ВАЖНО: НЕ трогает my_sequence — свой sender-seq оставляем
+             монотонным. Другие клиенты на своей стороне тоже вызовут этот
+             метод и сбросят СВОИ приёмники. JitterBuffer.add теперь
+             умеет ловить seq-скачок как страховку.
+          5. Обновляет COW-снимок для audio_callback.
+
+        Безопасно вызывать в любом состоянии: не зависит от _is_running,
+        не требует остановки потоков. _packet_processor_loop может доложить
+        новый RemoteUser сразу после — это нормально (он будет уже с новым uid).
+        """
+        import queue as _q
+        drained = 0
+        try:
+            while True:
+                self.incoming_packets.get_nowait()
+                drained += 1
+        except _q.Empty:
+            pass
+
+        with self.users_lock:
+            n_users = len(self.remote_users)
+            self.remote_users.clear()
+            self.uid_to_ip.clear()
+            self.pending_volumes.clear()
+
+            # Whisper-состояния per-uid — тоже сбрасываем
+            if hasattr(self, '_whisper_states'):
+                self._whisper_states.clear()
+            if hasattr(self, '_active_whispers'):
+                self._active_whispers.clear()
+
+            self._audio_users_snapshot = {}
+
+        print(f"[Audio] reset_voice_state: drained={drained} пакетов, "
+              f"удалено {n_users} RemoteUser", flush=True)
+
     def _packet_processor_loop(self):
         while self._is_running.is_set():
             try:
@@ -879,7 +1003,12 @@ class AudioHandler(QObject):
                                 casting='unsafe')
                     encoded = self.encoder.encode(self._pcm_int16_buf.tobytes(), CHUNK_SIZE)
                     self._whisper_sequence += 1
+                    # FLAG_WHISPER обязателен для роутинга на стороне сервера;
+                    # FLAG_ANONYMOUS триггерит перезапись sender_uid в заголовке
+                    # сервером на ANONYMOUS_UID — получатель не узнает, кто шептал.
                     w_flags = FLAG_WHISPER
+                    if self._whisper_anonymous:
+                        w_flags |= FLAG_ANONYMOUS
                     w_header = UDP_HEADER_STRUCT.pack(self.my_uid, curr_time,
                                                       self._whisper_sequence, w_flags)
                     w_payload = struct.pack('!I', whisper_uid) + encoded
@@ -995,7 +1124,9 @@ class AudioHandler(QObject):
 
                                 self.mix_buffer += s * (user.volume * _speaker_gain)
                                 # Диагностика: накапливаем вклад этого голоса
-                                _diag_voice_frame += float(np.dot(s, s)) / CHUNK_SIZE
+                                # FIX: np.dot под флагом — hot path
+                                if AUDIO_DIAG_ENABLED:
+                                    _diag_voice_frame += float(np.dot(s, s)) / CHUNK_SIZE
                             else:
                                 # FIX PLC: сохраняем состояние декодера при потере пакета.
                                 try:
@@ -1031,8 +1162,10 @@ class AudioHandler(QObject):
                     _current_vol = self._stream_vol   # FIX: убрано * 0.4
                     self.mix_buffer += self._stream_buf[:CHUNK_SIZE] * _current_vol
                     # Диагностика: RMS стрим-аудио до масштабирования
-                    _sb = self._stream_buf[:CHUNK_SIZE]
-                    _diag_stream_frame = float(np.dot(_sb, _sb)) / CHUNK_SIZE
+                    # FIX: под флагом — hot path
+                    if AUDIO_DIAG_ENABLED:
+                        _sb = self._stream_buf[:CHUNK_SIZE]
+                        _diag_stream_frame = float(np.dot(_sb, _sb)) / CHUNK_SIZE
                     remaining = avail - CHUNK_SIZE
                     if remaining > 0:
                         self._stream_buf[:remaining] = self._stream_buf[CHUNK_SIZE:avail]
@@ -1058,27 +1191,44 @@ class AudioHandler(QObject):
         np.clip(self.mix_buffer, -1.0, 1.0, out=self.mix_buffer)
 
         # ── Диагностика: накапливаем и логируем раз в секунду ──────────────
-        _mix_rms_sq = float(np.dot(self.mix_buffer, self.mix_buffer)) / CHUNK_SIZE
-        self._diag_voice_sum  += _diag_voice_frame
-        self._diag_stream_sum += _diag_stream_frame
-        self._diag_mix_sum    += _mix_rms_sq
-        self._diag_cnt        += 1
+        # FIX: под флагом AUDIO_DIAG_ENABLED — np.dot на каждый фрейм это hot path
+        if AUDIO_DIAG_ENABLED:
+            _mix_rms_sq = float(np.dot(self.mix_buffer, self.mix_buffer)) / CHUNK_SIZE
+            self._diag_voice_sum  += _diag_voice_frame
+            self._diag_stream_sum += _diag_stream_frame
+            self._diag_mix_sum    += _mix_rms_sq
+            self._diag_cnt        += 1
 
-        if curr_time >= self._diag_next_ts and self._diag_cnt > 0:
-            self._diag_voice_sum  = 0.0
-            self._diag_stream_sum = 0.0
-            self._diag_mix_sum    = 0.0
-            self._diag_cnt        = 0
-            self._diag_next_ts    = curr_time + 1.0
+            if curr_time >= self._diag_next_ts and self._diag_cnt > 0:
+                self._diag_voice_sum  = 0.0
+                self._diag_stream_sum = 0.0
+                self._diag_mix_sum    = 0.0
+                self._diag_cnt        = 0
+                self._diag_next_ts    = curr_time + 1.0
 
         # ── Вывод через PortAudio (всегда) ──────────────────────────────────
         # PortAudio WASAPI Shared сессия python.exe атрибутируется нашему PID.
         # DLL Capture PROCESS_LOOPBACK_EXCLUDE(python.exe) исключает её
         # на уровне Session Manager до hardware микшера — эхо не возникает.
+        #
+        # SENIOR FIX: для устройств с частотой дискретизации ≠ 48kHz
+        # используем scipy.signal.resample_poly вместо np.interp.
+        # np.interp — линейная интерполяция без low-pass фильтрации →
+        # aliasing на музыке и стримах (FIX #50 уже применил то же самое
+        # в audio_capture.py, здесь симметрично).
         if self._out_sr != SAMPLE_RATE:
-            x_old = np.linspace(0.0, 1.0, CHUNK_SIZE,         dtype=np.float64)
-            x_new = np.linspace(0.0, 1.0, self._out_blocksize, dtype=np.float64)
-            resampled = np.interp(x_new, x_old, self.mix_buffer).astype(np.float32)
+            resampled = None
+            try:
+                from scipy.signal import resample_poly as _rp
+                g = math.gcd(int(self._out_sr), int(SAMPLE_RATE))
+                up   = int(self._out_sr) // g
+                down = int(SAMPLE_RATE)  // g
+                resampled = _rp(self.mix_buffer, up, down).astype(np.float32)
+            except Exception:
+                # Fallback: линейная интерполяция (если scipy недоступен).
+                x_old = np.linspace(0.0, 1.0, CHUNK_SIZE,         dtype=np.float64)
+                x_new = np.linspace(0.0, 1.0, self._out_blocksize, dtype=np.float64)
+                resampled = np.interp(x_new, x_old, self.mix_buffer).astype(np.float32)
             outdata[:] = resampled[:frames].reshape(-1, 1)
         else:
             outdata[:] = self.mix_buffer.reshape(-1, 1)
@@ -1133,17 +1283,25 @@ class AudioHandler(QObject):
 
     # ── Шёпот ────────────────────────────────────────────────────────────────
 
-    def start_whisper(self, target_uid: int):
+    def start_whisper(self, target_uid: int, anonymous: bool = False):
         """
         Начинает шёпот к конкретному пользователю.
         Пока активно — голос кодируется и отправляется только ему (FLAG_WHISPER).
         Нормальные аудио-пакеты в комнату НЕ отправляются, остальные не слышат.
+
+        :param target_uid: uid адресата (0 означает «нет шёпота»).
+        :param anonymous: если True — пакет помечается FLAG_ANONYMOUS, сервер
+            переписывает sender_uid в UDP-заголовке на ANONYMOUS_UID, и
+            получатель видит «Аноним» вместо реального ника. Хост сервера
+            по-прежнему видит реального отправителя — это ограничение
+            client-server модели (см. FLAG_ANONYMOUS в config.py).
 
         ВАЖНО: _whisper_sequence инициализируется от my_sequence, а НЕ от 0.
         JitterBuffer получателя уже видел seq из нормального потока (my_sequence).
         Сброс в 0 → все шёпот-пакеты отбрасывались бы как seq <= last_seq.
         """
         self.whisper_target_uid = target_uid
+        self._whisper_anonymous = bool(anonymous)
         self._whisper_sequence = self.my_sequence  # продолжаем seq без разрыва
         # Сбрасываем состояние sosfilt-фильтра чтобы шёпот каждого нового собеседника
         # начинался с чистого состояния (без «хвоста» от предыдущего шёпота).
@@ -1153,7 +1311,8 @@ class AudioHandler(QObject):
         # с audio_callback (PortAudio thread). numpy снимает GIL → torn read/write →
         # щелчки. Флаг — атомарный bool, audio_callback сбросит состояние сам.
         self._whisper_effect_reset = True
-        print(f"[Audio] Whisper START → uid={target_uid}, seq_from={self._whisper_sequence}")
+        print(f"[Audio] Whisper START → uid={target_uid}, anon={self._whisper_anonymous}, "
+              f"seq_from={self._whisper_sequence}")
 
     def stop_whisper(self):
         """Останавливает шёпот, возвращает нормальную передачу в комнату.
@@ -1163,8 +1322,10 @@ class AudioHandler(QObject):
         # увидят резкий откат seq и часть пакетов будет отброшена JitterBuffer.
         if self._whisper_sequence > self.my_sequence:
             self.my_sequence = self._whisper_sequence
-        print(f"[Audio] Whisper STOP  (was → uid={self.whisper_target_uid}), seq_sync={self.my_sequence}")
+        print(f"[Audio] Whisper STOP  (was → uid={self.whisper_target_uid}, "
+              f"anon={self._whisper_anonymous}), seq_sync={self.my_sequence}")
         self.whisper_target_uid = 0
+        self._whisper_anonymous = False
 
     def add_incoming_packet(self, uid, seq, data, flags=0):
         try:

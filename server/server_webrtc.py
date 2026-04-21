@@ -5,46 +5,31 @@ server_webrtc.py — Pion SFU Proxy v3
 
 ─── FIX: remote streamer viewer connect ───────────────────────────────────────
   Старый trigger_viewer_connect() проверял self._sfu.is_running() для ВСЕХ
-  стримеров — включая удалённых (другая машина, другой SFU).
-
-  Новый код: локальный SFU нужен ТОЛЬКО когда стример на той же машине.
-  Для удалённых стримеров (streamer_ip != 127.0.0.1):
+  стримеров — включая удалённых. Новый код: локальный SFU нужен ТОЛЬКО
+  когда стример на той же машине. Для удалённых:
     - Триггер отправляем сразу, локальный SFU не нужен.
     - Offer зрителя пойдёт напрямую к remote SFU (26.x.x.x:7788).
 
-─── Поток сигнализации ────────────────────────────────────────────────────────
+─── FIX thread-safe _send ─────────────────────────────────────────────────
+  _send() вызывается из нескольких потоков (trigger_viewer_connect и
+  handle_viewer_offer могут выполняться параллельно, так как серверный
+  tcp_handler создаёт отдельный поток на каждого клиента). Без лока
+  sendall() для одного и того же conn мог перемешаться с sendall()
+  из другого потока → битый JSON у клиента.
 
-  Стример (любой участник):
-    Rust webrtc-rs → свой sidecar.exe (на машине стримера).
-    Сервер только отслеживает is_streaming=True.
-
-  Зритель:
-    1. Зритель: stream_watch_start → сервер
-    2. Сервер → зрителю: CMD_WEBRTC_OFFER role='viewer' (пустой триггер)
-    3. Зритель создаёт aiortc PC (recvonly), createOffer, ICE gathering
-    4. Зритель → сервер: CMD_WEBRTC_OFFER role='viewer_offer' sdp=<offer>
-    5a. Стример локальный: POST /viewer/{uid}/offer → localhost SFU → answer
-    5b. Стример удалённый: POST /viewer/{uid}/offer → streamer_ip:7788 → answer
-    6. Сервер → зрителю: CMD_WEBRTC_ANSWER sdp=<answer>
-    7. Зритель: setRemoteDescription(answer) → ICE → RTP от SFU стримера
+  Используем _per_conn_locks: dict[conn, Lock] — лок на сокет.
+  После закрытия клиента очистка в close_viewer.
 """
 
 import json
 import threading
 from typing import Optional
 
-from config import CMD_WEBRTC_OFFER, CMD_WEBRTC_ANSWER
+from config import CMD_WEBRTC_OFFER, CMD_WEBRTC_ANSWER, SFU_PORT
 
 
 def _strip_mdns_candidates(sdp: str) -> str:
-    """
-    Убираем mDNS *.local кандидаты из SDP answer Pion SFU.
-
-    Rust webrtc-rs регистрирует mDNS агент (0.0.0.0:5353).
-    Pion SFU включает *.local кандидаты в answer для зрителя.
-    aiortc на Windows пытается резолвить их через multicast mDNS —
-    это зависает навсегда (Bonjour/Avahi не установлен).
-    """
+    """Убирает mDNS *.local кандидаты из SDP answer (aiortc не резолвит)."""
     sep = "\r\n" if "\r\n" in sdp else "\n"
     lines = sdp.split(sep)
     filtered = [
@@ -59,46 +44,63 @@ def _strip_mdns_candidates(sdp: str) -> str:
 
 
 def _is_local_ip(ip: str) -> bool:
-    """Возвращает True если IP — это localhost (стример на той же машине)."""
     return ip in ('127.0.0.1', '::1', '', 'localhost')
 
 
-class PionSfuProxy:
-    """
-    Тонкий прокси к Go Pion SFU (sidecar.exe).
+# Global table of per-connection send locks.
+# Используется вместо атрибута на сокете (сокет — C-объект).
+_conn_send_locks: "dict[int, threading.Lock]" = {}
+_conn_send_locks_guard = threading.Lock()
 
-    Не держит WebRTC-состояние — всё в SFU.
-    Не нужен asyncio event loop — HTTP запросы синхронные (короткие, localhost).
-    Потокобезопасен.
-    """
+
+def _get_conn_lock(conn) -> threading.Lock:
+    """Возвращает лок для данного conn. Ленивое создание."""
+    key = id(conn)
+    with _conn_send_locks_guard:
+        lk = _conn_send_locks.get(key)
+        if lk is None:
+            lk = threading.Lock()
+            _conn_send_locks[key] = lk
+        return lk
+
+
+def _drop_conn_lock(conn) -> None:
+    """Удаляет лок после закрытия conn (избегаем утечки памяти)."""
+    key = id(conn)
+    with _conn_send_locks_guard:
+        _conn_send_locks.pop(key, None)
+
+
+class PionSfuProxy:
+    """Тонкий прокси к Go Pion SFU (sidecar.exe)."""
 
     def __init__(self, sfu_bridge=None):
-        """
-        sfu_bridge — экземпляр SfuBridge (уже запущенный).
-        Если None — режим без WebRTC (fallback).
-        """
         self._sfu = sfu_bridge
         self._lock = threading.Lock()
-        # viewer_uid (int) → conn (socket)
         self._viewer_conns: dict[int, object] = {}
-        # viewer_uid (int) → RadminVPN IP стримера
         self._viewer_streamer_ip: dict[int, str] = {}
-        # viewer_uid (int) → реальный порт SFU стримера (динамический)
         self._viewer_streamer_sfu_port: dict[int, int] = {}
-
-    # ── Утилита отправки ─────────────────────────────────────────────────────
 
     @staticmethod
     def _send(conn, msg: dict) -> None:
+        """Thread-safe отправка JSON клиенту."""
         try:
-            conn.sendall(json.dumps(msg).encode('utf-8'))
+            payload = json.dumps(msg).encode('utf-8')
         except Exception as e:
-            print(f"[SFU-Proxy] send error: {e}")
+            print(f"[SFU-Proxy] _send encode: {e}")
+            return
 
-    # ── Совместимость call_async ──────────────────────────────────────────────
+        # Берём лок на конкретный conn — сериализует только отправки
+        # на этот сокет, не блокируя остальные.
+        lock = _get_conn_lock(conn)
+        with lock:
+            try:
+                conn.sendall(payload)
+            except Exception as e:
+                print(f"[SFU-Proxy] send error: {e}")
 
     def call_async(self, coro_or_whatever):
-        pass  # server.py вызывает методы напрямую
+        pass
 
     # ── Viewer connect ────────────────────────────────────────────────────────
 
@@ -109,20 +111,11 @@ class PionSfuProxy:
         conn,
         quality: str = 'hq',
         streamer_ip: str = '127.0.0.1',
-        streamer_sfu_port: int = 7788,
+        streamer_sfu_port: int = SFU_PORT,
     ) -> None:
-        """
-        Шаг 2: посылаем зрителю пустой CMD_WEBRTC_OFFER (триггер).
-        Зритель создаст offer и пришлёт нам через handle_viewer_offer.
-
-        FIX: локальный SFU нужен ТОЛЬКО когда стример локальный.
-        Для удалённых стримеров (IP не localhost) локальный SFU не участвует —
-        offer зрителя пойдёт напрямую к sidecar.exe стримера по RadminVPN.
-        """
         is_local_streamer = _is_local_ip(streamer_ip)
 
         if is_local_streamer:
-            # Стример на нашей машине — нужен локальный SFU
             if self._sfu is None:
                 print(
                     f"[SFU-Proxy] ❌ локальный SFU не инициализирован — "
@@ -130,7 +123,6 @@ class PionSfuProxy:
                 )
                 return
             if not self._sfu.is_running():
-                # FIX #3: Пробуем перезапустить SFU перед тем как отказать зрителю
                 print(f"[SFU-Proxy] SFU не запущен — пробуем restart для viewer {viewer_uid}...")
                 ok = self._sfu.start()
                 if not ok:
@@ -140,7 +132,6 @@ class PionSfuProxy:
                     )
                     return
                 print(f"[SFU-Proxy] ✅ SFU перезапущен, продолжаем для viewer {viewer_uid}")
-        # Для удалённых стримеров пропускаем проверку: локальный SFU не нужен
 
         with self._lock:
             self._viewer_conns[viewer_uid] = conn
@@ -166,12 +157,6 @@ class PionSfuProxy:
         sdp: str,
         conn,
     ) -> None:
-        """
-        Шаг 4-6: получаем offer от зрителя → POST в SFU → answer → viewer.
-
-        FIX: для локального стримера используем self._sfu (localhost HTTP).
-             для удалённого стримера — POST напрямую к streamer_ip:7788.
-        """
         print(f"[SFU-Proxy] handle_viewer_offer: viewer={viewer_uid}, sdp_len={len(sdp) if sdp else 0}")
 
         if not sdp:
@@ -183,7 +168,6 @@ class PionSfuProxy:
 
         try:
             if is_local:
-                # ── Локальный стример ────────────────────────────────────────
                 if self._sfu is None:
                     print(f"[SFU-Proxy] ❌ _sfu is None — SfuBridge не инициализирован")
                     self._send(conn, {'action': 'error', 'message': 'SFU not initialized'})
@@ -198,10 +182,9 @@ class PionSfuProxy:
                 answer_sdp = self._sfu.post_viewer_offer(str(viewer_uid), sdp)
 
             else:
-                # ── Удалённый стример (RadminVPN) ────────────────────────────
                 import urllib.request
                 import json as _json
-                sfu_port = self._viewer_streamer_sfu_port.get(viewer_uid, 7788)
+                sfu_port = self._viewer_streamer_sfu_port.get(viewer_uid, SFU_PORT)
                 url  = f"http://{streamer_ip}:{sfu_port}/viewer/{viewer_uid}/offer"
                 body = _json.dumps({'sdp': sdp}).encode('utf-8')
                 req  = urllib.request.Request(
@@ -223,7 +206,6 @@ class PionSfuProxy:
             import traceback; print(traceback.format_exc())
             return
 
-        # Фильтруем mDNS *.local кандидаты
         answer_sdp = _strip_mdns_candidates(answer_sdp)
 
         print(f"[SFU-Proxy] viewer={viewer_uid}: → CMD_WEBRTC_ANSWER (len={len(answer_sdp)})")
@@ -237,13 +219,15 @@ class PionSfuProxy:
     # ── Viewer disconnect ─────────────────────────────────────────────────────
 
     def close_viewer(self, viewer_uid: int) -> None:
-        """DELETE /viewer/{viewer_uid} в Pion SFU (локальном)."""
+        """DELETE /viewer/{viewer_uid} в Pion SFU."""
         with self._lock:
             streamer_ip = self._viewer_streamer_ip.pop(viewer_uid, '127.0.0.1')
-            self._viewer_conns.pop(viewer_uid, None)
+            old_conn = self._viewer_conns.pop(viewer_uid, None)
             self._viewer_streamer_sfu_port.pop(viewer_uid, None)
 
-        # Для удалённого стримера — не трогаем его SFU (он сам закроет)
+        if old_conn is not None:
+            _drop_conn_lock(old_conn)
+
         if _is_local_ip(streamer_ip) and self._sfu is not None and self._sfu.is_running():
             self._sfu.delete_viewer(str(viewer_uid))
             print(f"[SFU-Proxy] close_viewer: viewer={viewer_uid}")
@@ -257,7 +241,6 @@ class PionSfuProxy:
     # ── Streamer disconnect ───────────────────────────────────────────────────
 
     def close_streamer(self, streamer_uid: int) -> None:
-        """DELETE /streamer в Pion SFU."""
         if self._sfu is not None and self._sfu.is_running():
             self._sfu.delete_streamer()
             print(f"[SFU-Proxy] close_streamer: streamer={streamer_uid}")
@@ -275,5 +258,13 @@ class PionSfuProxy:
     def shutdown(self) -> None:
         self.close_all_viewers()
         if self._sfu is not None and self._sfu.is_running():
-            self._sfu.delete_streamer()
-        print("[SFU-Proxy] shutdown")
+            try:
+                self._sfu.delete_streamer()
+            except Exception as e:
+                print(f"[SFU-Proxy] delete_streamer error: {e}")
+            try:
+                self._sfu.delete_audio_streamer()
+            except Exception:
+                pass
+            self._sfu.stop()
+        print("[SFU-Proxy] shutdown complete")
