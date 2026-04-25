@@ -327,6 +327,10 @@ class MainWindow(QMainWindow):
         # Хост выключил наш микрофон
         self.net.force_muted.connect(self._on_force_muted)
 
+        # Нас кикнули/забанили сервером — вернуться на экран выбора сервера
+        self.net.kicked.connect(self._on_kicked_by_host)
+        self.net.banned.connect(self._on_banned_by_host)
+
         # ABR-сигнал (bitrate_adjusted) удалён: WebRTC управляет битрейтом через TWCC.
         # _stream_conn_lbl оставлен в UI — будет подключён к WebRTC getStats() позже.
 
@@ -2129,6 +2133,53 @@ class MainWindow(QMainWindow):
         self._sb_toast.setVisible(True)
         self._sb_toast_timer.start()
 
+    def _on_kicked_by_host(self, reason: str):
+        """
+        Сервер нас кикнул (CMD_KICKED). Reconnect заблокирован в features.py
+        сразу при получении команды (running=False + shutdown_event.set).
+
+        При кике — просто уходим в лобби с коротким тостом. Не показываем
+        modal-диалог: он перехватывает фокус и блокирует возврат, а
+        _disconnect_and_show_lobby сам делает полный teardown.
+        """
+        reason_txt = (reason or '').strip()
+        print(f"[UI] kicked by host. reason={reason_txt!r}")
+        # Короткий тост — пользователь увидит его на фоне нового экрана лобби
+        try:
+            self._sb_toast.setText(
+                f"👢  Хост отключил вас от сервера"
+                + (f":\n{reason_txt}" if reason_txt else "")
+            )
+            self._sb_toast.adjustSize()
+            self._sb_toast.raise_()
+            self._sb_toast.setVisible(True)
+            self._sb_toast_timer.start()
+        except Exception:
+            pass
+        self._disconnect_and_show_lobby()
+
+    def _on_banned_by_host(self, reason: str):
+        """
+        Сервер нас забанил (CMD_BANNED): либо по команде хоста в сессии,
+        либо на логине если наш IP+ник уже в bans.json сервера.
+
+        Отличается от _on_kicked тем что:
+          • Показываем BannedScreen вместо MultiServerScreen (картинка
+            banned.png + причина + кнопка «Назад»).
+          • Клик «Назад» на BannedScreen открывает MultiServerScreen,
+            который делает live-query бан-статуса к каждому серверу
+            (see _ServerItemWidget). То есть если хост уже успел нас
+            разбанить — 🚫 не появится.
+
+        НЕ пишем локальный маркер бана на клиенте: source of truth
+        только серверный bans.json, иначе разбан хоста не синхронизируется
+        к клиенту и 🚫 висит вечно (см. инцидент v3→v4).
+        """
+        reason_txt = (reason or '').strip()
+        banned_ip = getattr(self, 'ip', '') or ''
+        print(f"[UI] banned by host. ip={banned_ip!r} reason={reason_txt!r}")
+        self._disconnect_and_show_banned(banned_ip, reason_txt)
+
     def on_connected(self, msg):
         try:
             # FIX: сбрасываем recovery state при успешном подключении.
@@ -2621,6 +2672,18 @@ class MainWindow(QMainWindow):
                 if self._is_server_host() and uid != self.audio.my_uid
                 else None
             ),
+            # Кикнуть: только хост. Подтверждение показывает MainWindow.
+            on_host_kick=(
+                (lambda _uid=uid, _nk=nick: self._on_request_host_kick(_uid, _nk))
+                if self._is_server_host() and uid != self.audio.my_uid
+                else None
+            ),
+            # Забанить (кик + IP в банлист): только хост.
+            on_host_ban=(
+                (lambda _uid=uid, _nk=nick: self._on_request_host_ban(_uid, _nk))
+                if self._is_server_host() and uid != self.audio.my_uid
+                else None
+            ),
         ).show()
 
     def _is_server_host(self) -> bool:
@@ -2651,6 +2714,47 @@ class MainWindow(QMainWindow):
         if reply == QMessageBox.StandardButton.Yes:
             self.net.send_server_transfer(target_uid)
             print(f"[UI] Запрошена передача сервера → {target_nick} (uid={target_uid})")
+
+    # ── Хост: kick / ban с подтверждением ────────────────────────────────────
+    def _on_request_host_kick(self, target_uid: int, target_nick: str):
+        """
+        Подтверждение и отправка CMD_HOST_KICK. Права проверяет сервер
+        (только первый в _host_order). Если UI-проверка устарела (например,
+        хост сменился прямо перед кликом) — сервер просто молча проигнорирует.
+        """
+        nick = (target_nick or '').strip() or f'uid={target_uid}'
+        reply = QMessageBox.question(
+            self,
+            "Кикнуть участника",
+            f"Отключить участника {nick!r} от сервера?\n\n"
+            "Он сможет снова подключиться вручную.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.net.send_host_kick(target_uid)
+            print(f"[UI] Kick → {nick} (uid={target_uid})")
+
+    def _on_request_host_ban(self, target_uid: int, target_nick: str):
+        """
+        Подтверждение и отправка CMD_HOST_BAN. Бан остаётся до ручного
+        разбана через «Главное → Сервер → Забаненные участники» и живёт
+        в bans.json текущего владельца сервера. После передачи сервера
+        другому — новый хост использует свой файл.
+        """
+        nick = (target_nick or '').strip() or f'uid={target_uid}'
+        reply = QMessageBox.question(
+            self,
+            "Забанить участника",
+            f"Забанить участника {nick!r}?\n\n"
+            "Он будет отключён и не сможет подключиться к вашему серверу "
+            "до ручного разбана.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.net.send_host_ban(target_uid, '')
+            print(f"[UI] Ban → {nick} (uid={target_uid})")
 
     def open_video_window(self, uid, nick):
         if uid not in self.stream_windows or not self.stream_windows[uid].isVisible():
@@ -3450,6 +3554,196 @@ class MainWindow(QMainWindow):
         self.close()
 
         print("[UI] _disconnect_and_show_lobby: завершено")
+
+    def _disconnect_and_show_banned(self, server_ip: str, reason: str):
+        """
+        Disconnect + открыть BannedScreen вместо MultiServerScreen.
+
+        Логика полностью повторяет _disconnect_and_show_lobby до шага 8.
+        На шаге 8 вместо списка серверов открывается экран «Вы забанены».
+        Кнопка «Назад» на нём открывает обычный MultiServerScreen —
+        забаненный сервер в списке будет помечен иконкой «стоп».
+
+        Мы НЕ делаем рефакторинг _disconnect_and_show_lobby в общую
+        teardown-функцию намеренно: метод работающий, в нём много нюансов
+        с порядком (EmbeddedServer → net.stop → SFU-страховка), и любое
+        изменение порядка ломает миграцию хоста. Копируем шаги 1–7b
+        буквально, расходимся только на шаге 8.
+        """
+        print(f"[UI] _disconnect_and_show_banned: ip={server_ip!r}")
+
+        # ── 1. UI-таймеры ─────────────────────────────────────────────────────
+        try:
+            self.ui_timer.stop()
+        except Exception:
+            pass
+
+        # ── 2. keyboard-хуки ──────────────────────────────────────────────────
+        try:
+            import keyboard as _kb
+            _kb.unhook_all()
+        except Exception:
+            pass
+
+        # ── 3. Вспомогательные окна ───────────────────────────────────────────
+        if hasattr(self, '_lobby_screen') and self._lobby_screen is not None:
+            try:
+                self._lobby_screen.close()
+            except Exception:
+                pass
+            self._lobby_screen = None
+
+        try:
+            self._whisper_overlay.hide_overlay()
+        except Exception:
+            pass
+
+        try:
+            if self._streamer_draw_overlay is not None:
+                self._streamer_draw_overlay.close()
+                self._streamer_draw_overlay = None
+        except Exception:
+            pass
+
+        for uid, w in list(self.stream_windows.items()):
+            try:
+                w.close()
+            except Exception:
+                pass
+        self.stream_windows.clear()
+
+        try:
+            from .ui_widgets import clear_media_cache
+            clear_media_cache()
+        except Exception:
+            pass
+
+        # ── 4. Audio ──────────────────────────────────────────────────────────
+        try:
+            self.audio.stop()
+        except Exception as ex:
+            print(f"[UI] banned-teardown audio.stop() error: {ex}")
+
+        # ── 5. Video ──────────────────────────────────────────────────────────
+        try:
+            self.video.shutdown()
+        except Exception as ex:
+            print(f"[UI] banned-teardown video.shutdown() error: {ex}")
+
+        # ── 6. EmbeddedServer ────────────────────────────────────────────────
+        # Нас забанили как клиента — но мы могли сами держать свой сервер
+        # параллельно (такое возможно, если мы хостим ОДИН сервер, а к
+        # другому подключались как клиент). stop() на всякий случай.
+        try:
+            from server import EmbeddedServerManager
+            mgr = EmbeddedServerManager.get()
+            if mgr.is_running():
+                mgr.stop()
+        except Exception as ex:
+            print(f"[UI] banned-teardown EmbeddedServer stop error: {ex}")
+
+        # ── 7. NetworkClient.stop() ──────────────────────────────────────────
+        # Reconnect уже заблокирован (_kicked_flag=True + running=False в
+        # features.py). Но для надёжности блокируем recovery через state.
+        with self.net._recovery_lock:
+            self.net._recovery_state = 'recovering'
+        try:
+            self.net.stop()
+        except Exception as ex:
+            print(f"[UI] banned-teardown net.stop() error: {ex}")
+        with self.net._recovery_lock:
+            self.net._recovery_state = 'idle'
+
+        # ── 7b. SFU-страховка ─────────────────────────────────────────────────
+        try:
+            from network_engine.sfu_bridge import get_shared as _get_sfu_final
+            _sfu_final = _get_sfu_final()
+            if _sfu_final.is_running():
+                _sfu_final.stop()
+        except Exception:
+            pass
+
+        # ── 8. Открываем BannedScreen вместо лобби ───────────────────────────
+        try:
+            from client_main.ui_banned import BannedScreen
+            from client_main.ui_server_select import MultiServerScreen
+            from client_main.ui_login import load_server_name, LoginWindow
+
+            # Имя сервера для красивого заголовка: берём то, что отдавал
+            # announcer при последнем sync_users. Если не знаем — IP.
+            srv_name_display = getattr(self, '_connected_server_name', '') or server_ip
+            server_name = load_server_name()
+
+            banned = BannedScreen(
+                server_ip=server_ip,
+                reason=reason or '',
+                server_name=srv_name_display,
+            )
+            banned.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
+
+            # Фабрика перехода «Назад» → MultiServerScreen с fallback на LoginWindow.
+            # Ровно повторяем связку что в _disconnect_and_show_lobby — чтобы
+            # поведение было предсказуемым и пользователь не видел разницы.
+            def _open_server_list(_ip: str = ''):
+                screen = MultiServerScreen(self.nick, self.avatar,
+                                           server_name=server_name)
+                screen.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
+
+                def _fallback_to_login(f_ip: str, f_nick: str, f_avatar: str):
+                    login_win = LoginWindow(
+                        ip=f_ip, nick=f_nick, avatar=f_avatar,
+                        error_msg=(
+                            f"⚠️  Сервер недоступен: {f_ip}\n"
+                            "Измените адрес и нажмите «Войти»."
+                        ) if f_ip else "",
+                    )
+                    login_win.setWindowIcon(
+                        QIcon(resource_path("assets/icon/logo.ico"))
+                    )
+                    def _back_to_servers():
+                        s2 = MultiServerScreen(self.nick, self.avatar,
+                                               server_name=server_name)
+                        s2.setWindowIcon(
+                            QIcon(resource_path("assets/icon/logo.ico"))
+                        )
+                        s2.open_login.connect(_fallback_to_login)
+                        s2.show()
+                    login_win.go_back.connect(_back_to_servers)
+                    login_win.show()
+
+                screen.open_login.connect(_fallback_to_login)
+                screen.show()
+                # Закрываем banned screen ПОСЛЕ того как список появился —
+                # иначе event loop может завершиться (если нет других окон).
+                try:
+                    banned.close()
+                except Exception:
+                    pass
+
+            banned.back_clicked.connect(_open_server_list)
+            banned.show()
+        except Exception as e:
+            print(f"[UI] _disconnect_and_show_banned screen error: {e}")
+            # Fallback: если BannedScreen почему-то упал — показываем лобби
+            try:
+                from client_main.ui_server_select import MultiServerScreen
+                from client_main.ui_login import load_server_name
+                screen = MultiServerScreen(
+                    self.nick, self.avatar,
+                    server_name=load_server_name(),
+                )
+                screen.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
+                screen.show()
+            except Exception as e2:
+                print(f"[UI] fallback lobby error: {e2}")
+
+        # ── 9. Закрываем MainWindow ──────────────────────────────────────────
+        self._tray_icon.hide()
+        self._returning_to_lobby = True
+        self._force_quit = True
+        self.close()
+
+        print("[UI] _disconnect_and_show_banned: завершено")
 
     def _on_switch_server(self, info: dict):
         """

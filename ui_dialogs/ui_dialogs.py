@@ -594,7 +594,8 @@ class UserOverlayPanel(QFrame):
 
     def __init__(self, nick: str, current_vol: float, uid: int, audio_handler, global_pos,
                  parent=None, is_streaming: bool = False, on_watch_stream=None,
-                 net=None, on_transfer_server=None, on_host_mute=None):
+                 net=None, on_transfer_server=None, on_host_mute=None,
+                 on_host_kick=None, on_host_ban=None):
         super().__init__(
             parent,
             Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint
@@ -607,6 +608,8 @@ class UserOverlayPanel(QFrame):
         self._net = net
         self._on_transfer_server = on_transfer_server
         self._on_host_mute = on_host_mute
+        self._on_host_kick = on_host_kick
+        self._on_host_ban  = on_host_ban
 
         # ── Прозрачность окна + рисуем фон сами в paintEvent ─────────────────
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -972,6 +975,59 @@ class UserOverlayPanel(QFrame):
             self.btn_host_mute.clicked.connect(self._on_host_mute_clicked)
             card_lay.addWidget(self.btn_host_mute)
 
+        # ── Кнопка: Кикнуть (только хост) ─────────────────────────────────────
+        # Кик разрывает соединение, но пользователь может снова подключиться.
+        if self._on_host_kick is not None:
+            sep_hk = QFrame()
+            sep_hk.setFrameShape(QFrame.Shape.HLine)
+            sep_hk.setStyleSheet(
+                "background: rgba(255,255,255,0.08); border: none; max-height: 1px;"
+            )
+            sep_hk.setMaximumHeight(1)
+            card_lay.addWidget(sep_hk)
+
+            self.btn_host_kick = self._make_btn("👢  Кикнуть")
+            self.btn_host_kick.setStyleSheet(self.btn_host_kick.styleSheet() + """
+                QPushButton { border-color: rgba(230,140,50,0.45); color: #f4b266; }
+                QPushButton:hover {
+                    background-color: rgba(230,140,50,0.18);
+                    border-color: rgba(230,140,50,0.85);
+                }
+                QPushButton:pressed {
+                    background-color: rgba(230,140,50,0.35);
+                    color: #ffffff;
+                }
+            """)
+            self.btn_host_kick.clicked.connect(self._on_host_kick_clicked)
+            card_lay.addWidget(self.btn_host_kick)
+
+        # ── Кнопка: Забанить (только хост) ────────────────────────────────────
+        # Бан = кик + запись IP в bans.json. Снять можно через
+        # «Главное → Сервер → Забаненные участники».
+        if self._on_host_ban is not None:
+            sep_hb = QFrame()
+            sep_hb.setFrameShape(QFrame.Shape.HLine)
+            sep_hb.setStyleSheet(
+                "background: rgba(255,255,255,0.08); border: none; max-height: 1px;"
+            )
+            sep_hb.setMaximumHeight(1)
+            card_lay.addWidget(sep_hb)
+
+            self.btn_host_ban = self._make_btn("⛔  Забанить")
+            self.btn_host_ban.setStyleSheet(self.btn_host_ban.styleSheet() + """
+                QPushButton { border-color: rgba(220,50,50,0.55); color: #ff7a7a; }
+                QPushButton:hover {
+                    background-color: rgba(220,50,50,0.22);
+                    border-color: rgba(220,50,50,0.90);
+                }
+                QPushButton:pressed {
+                    background-color: rgba(220,50,50,0.40);
+                    color: #ffffff;
+                }
+            """)
+            self.btn_host_ban.clicked.connect(self._on_host_ban_clicked)
+            card_lay.addWidget(self.btn_host_ban)
+
         # Это гарантирует, что место под hint уже учтено и панель
         # не будет прыгать при появлении текста.
         self.adjustSize()
@@ -1260,6 +1316,19 @@ class UserOverlayPanel(QFrame):
         self.close()
         if self._on_host_mute is not None:
             self._on_host_mute()
+
+    def _on_host_kick_clicked(self):
+        """Хост нажал «👢 Кикнуть». Закрываем popup и зовём callback —
+        подтверждение показывает MainWindow (ближе к корневому окну)."""
+        self.close()
+        if self._on_host_kick is not None:
+            self._on_host_kick()
+
+    def _on_host_ban_clicked(self):
+        """Хост нажал «⛔ Забанить». Аналогично — подтверждение в MainWindow."""
+        self.close()
+        if self._on_host_ban is not None:
+            self._on_host_ban()
 
     def hideEvent(self, event):
         """Если панель закрылась пока шептали — останавливаем шёпот."""

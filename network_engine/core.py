@@ -106,6 +106,13 @@ class NetworkClient(WebRTCMixin, ChatMixin, FeaturesMixin, QObject):
 
     force_muted = pyqtSignal()
 
+    # ── Хост: кик / бан / обновление банлиста ─────────────────────────
+    # kicked/banned — сервер выгнал этого клиента. Строка — reason (UI).
+    # ban_list_updated — снимок банлиста для хоста (UI во вкладке «Главное»).
+    kicked            = pyqtSignal(str)
+    banned            = pyqtSignal(str)
+    ban_list_updated  = pyqtSignal(list)
+
     draw_stroke_received = pyqtSignal(int, str, str, list, int)
 
     typing_received = pyqtSignal(int, str)
@@ -128,6 +135,11 @@ class NetworkClient(WebRTCMixin, ChatMixin, FeaturesMixin, QObject):
         self._is_connected       = False
         self._reconnecting       = False
         self._reconnect_attempts = 0
+
+        # Флаг «нас кикнули/забанили сервером» — блокирует авто-reconnect.
+        # Устанавливается в features._process_features_message при CMD_KICKED
+        # или CMD_BANNED. Проверяется в reconnect-логике.
+        self._kicked_flag: bool = False
 
         # FIX #47: сериализация TCP-отправок между потоками.
         # Вызывающие send_json потоки: UI (главный), ping_loop, chat mixin,
@@ -204,6 +216,9 @@ class NetworkClient(WebRTCMixin, ChatMixin, FeaturesMixin, QObject):
         self._avatar = avatar
         self._reconnect_attempts = 0
         self._reconnecting       = False
+        # Свежий коннект — снимаем флаг кика (пользователь явно идёт на
+        # новый сервер либо повторно на тот же — решение за UI).
+        self._kicked_flag        = False
         self._shutdown_event.clear()  # FIX #48: сбрасываем событие при старте
         threading.Thread(target=self._connect_initial, daemon=True).start()
 
@@ -258,6 +273,13 @@ class NetworkClient(WebRTCMixin, ChatMixin, FeaturesMixin, QObject):
     # Recovery
     # ------------------------------------------------------------------
     def _start_recovery(self, phase: str, target_ip: str = '') -> bool:
+        # Если нас кикнули/забанили — блокируем ЛЮБОЙ recovery на корню.
+        # Проверка стоит здесь (а не только в _on_connection_lost) потому что
+        # trigger_migration / fast_switch_to зовут _start_recovery напрямую,
+        # минуя _on_connection_lost.
+        if self._kicked_flag:
+            print(f"[Recovery] skip {phase}: _kicked_flag активен")
+            return False
         with self._recovery_lock:
             if self._recovery_state != _PHASE_IDLE:
                 print(f"[Recovery] skip {phase}: уже идёт {self._recovery_state}")
@@ -286,10 +308,18 @@ class NetworkClient(WebRTCMixin, ChatMixin, FeaturesMixin, QObject):
         self._recovery_event.set()
 
     def _on_connection_lost(self) -> None:
+        # Если нас кикнули/забанили — никаких reconnect-попыток.
+        # UI получит сигнал kicked/banned и покажет экран выбора сервера.
+        if self._kicked_flag:
+            print("[Net] connection lost после kick/ban — reconnect заблокирован")
+            return
         self._start_recovery(_PHASE_RECOVERING, target_ip=self._ip)
 
     def manual_reconnect(self) -> None:
         if not self._ip:
+            return
+        if self._kicked_flag:
+            print("[Net] manual_reconnect заблокирован: kicked/banned")
             return
         self._start_recovery(_PHASE_RECOVERING, target_ip=self._ip)
 
@@ -300,6 +330,9 @@ class NetworkClient(WebRTCMixin, ChatMixin, FeaturesMixin, QObject):
 
     def fast_switch_to(self, new_ip: str) -> None:
         if not new_ip:
+            return
+        if self._kicked_flag:
+            print(f"[Net] fast_switch_to({new_ip}) заблокирован: kicked/banned")
             return
         with self._recovery_lock:
             self._recovery_state     = _PHASE_IDLE

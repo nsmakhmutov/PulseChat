@@ -59,7 +59,7 @@ class JitterBuffer:
     SEQ_JUMP_RESET_BACK    = 200     # seq уменьшился > чем на 200 (= 4с звука)
     SEQ_JUMP_RESET_FORWARD = 10000   # seq подскочил на 10000 (= 200с)
 
-    def __init__(self, target_delay=4):
+    def __init__(self, target_delay=2):
         self.buffer = []
         self.target_delay = target_delay
         self.last_seq = -1
@@ -894,7 +894,8 @@ class AudioHandler(QObject):
                 if uid == self.my_uid: continue
 
                 with self.users_lock:
-                    if uid not in self.remote_users:
+                    is_new_user = uid not in self.remote_users
+                    if is_new_user:
                         self.remote_users[uid] = RemoteUser(uid)
                         # Исправление 1.2: убрано чтение QSettings(диск) из high-priority ловушки
                         if uid in self.pending_volumes:
@@ -913,11 +914,15 @@ class AudioHandler(QObject):
                         user.jitter_buffer.add(seq, data)
                         user.last_packet_time = time.perf_counter()  # FIX: perf_counter точнее time.time() на Windows (15.6ms vs мкс)
 
-                    # FIX #1: обновляем COW-снимок внутри лока — согласованное состояние.
-                    # dict() копирует только ссылки (не RemoteUser объекты) — это быстро.
-                    # audio_callback читает снимок без лока, опираясь на GIL-атомарность
-                    # присваивания ссылки.
-                    self._audio_users_snapshot = dict(self.remote_users)
+                    # FIX: обновляем COW-снимок ТОЛЬКО при появлении нового пользователя.
+                    # Для существующих пользователей last_packet_time и jitter_buffer
+                    # доступны через ссылку в снимке напрямую — COW копирует ссылки
+                    # на объекты, а не сами объекты, поэтому audio_callback видит
+                    # изменения без пересоздания dict.
+                    # Это устраняет конкуренцию с cleanup_users: раньше каждый пакет
+                    # держал users_lock на dict() — теперь только при новом участнике.
+                    if is_new_user:
+                        self._audio_users_snapshot = dict(self.remote_users)
 
             except queue.Empty:
                 continue

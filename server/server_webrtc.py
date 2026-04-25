@@ -241,10 +241,35 @@ class PionSfuProxy:
     # ── Streamer disconnect ───────────────────────────────────────────────────
 
     def close_streamer(self, streamer_uid: int) -> None:
-        if self._sfu is not None and self._sfu.is_running():
+        """
+        ВАЖНО: этот метод НЕ должен вызывать delete_streamer() на локальном SFU.
+
+        Исторический баг: раньше вызов шёл по любому disconnect клиента в
+        tcp_handler finally. Внутри было безусловное:
             self._sfu.delete_streamer()
-            print(f"[SFU-Proxy] close_streamer: streamer={streamer_uid}")
-        self.close_all_viewers()
+            self.close_all_viewers()
+        Игнорировался сам параметр streamer_uid — удалялся ЕДИНСТВЕННЫЙ
+        стример локального SFU независимо от того, чей uid отключился.
+        В сценарии «хост стримит экран + ещё один клиент уходит» это
+        убивало стрим хоста → у всех пропадал звук/видео до передачи
+        сервера другому (тогда новый SFU запускался с нуля и стрим
+        переконнекчивался).
+
+        Почему метод теперь ничего не делает:
+        • Если стример — удалённый клиент: его Go-SFU крутится на его
+          машине, мы не можем им управлять отсюда. Viewer-PC'и умрут
+          сами по ICE timeout + клиенты получат is_streaming=false в
+          следующем sync_users и почистят свои view-PC'и.
+        • Если стример — сам хост: его стоп идёт через
+          network_engine/webrtc.stop_streaming_webrtc() которая сама
+          делает delete_streamer() на своём же SFU. Этот путь работает
+          правильно и в этом методе дублировать его не нужно.
+
+        Метод оставлен с сигнатурой чтобы не ломать вызовы из
+        server.py (CMD_STREAM_STOP и finally).
+        """
+        # Ничего не делаем. См. docstring.
+        pass
 
     # ── Status ────────────────────────────────────────────────────────────────
 

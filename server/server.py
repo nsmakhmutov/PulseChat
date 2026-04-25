@@ -59,6 +59,10 @@ from config import (
     CMD_JOIN_CHANNEL_AUTH, CHANNEL_NAME_MAX_LEN, CHANNEL_PASS_MAX_LEN,
     SERVER_NAME_DEFAULT,
     CMD_HOST_MUTE, CMD_FORCE_MUTED,
+    CMD_HOST_KICK, CMD_HOST_BAN, CMD_HOST_UNBAN,
+    CMD_BAN_LIST_REQ, CMD_BAN_LIST,
+    CMD_KICKED, CMD_BANNED, BAN_LIST_PATH,
+    CMD_QUERY_BAN, CMD_QUERY_BAN_RESP,
     CMD_CHAT_MSG, CMD_CHAT_HISTORY, CMD_CHAT_HISTORY_REQ, CHAT_MSG_MAX_LEN,
     CMD_CHAT_MEDIA, CHAT_MEDIA_MAX_B64,
     CMD_DRAW_STROKE, DRAW_MAX_POINTS,
@@ -186,6 +190,17 @@ class SFUServer:
             print(f"[Server] ChatDB init error: {e}")
             self._chat_db = None
 
+        # ── Банлист (per-host JSON) ──────────────────────────────────────────
+        # Формат: { "<ip>": {"nick": str, "banned_at": float, "reason": str} }
+        # Ключ — IP, потому что это единственное что сервер видит при
+        # CMD_LOGIN и может использовать для блокировки. Ник — только для UI.
+        # Файл живёт у текущего владельца сервера. После передачи хостинга
+        # новый хост поднимает СВОЙ SFUServer с СВОИМ bans.json — права
+        # автоматически обнуляются для предыдущего владельца.
+        self._bans: dict = {}
+        self._bans_lock = threading.Lock()
+        self._load_bans()
+
         # FIX: send_global_state broadcast queue.
         # Раньше sync_users рассылался в цикле СИНХРОННО из tcp_handler-потока.
         # Если у одного клиента заполнен TCP send-буфер, sendall блокируется и
@@ -246,6 +261,173 @@ class SFUServer:
                             pass
                 except Exception:
                     pass
+
+    # ------------------------------------------------------------------
+    # Банлист — persistent storage (JSON)
+    # ------------------------------------------------------------------
+    # Составной ключ (ip, nick) нужен потому что несколько участников могут
+    # сидеть с одного IP: Radmin VPN обычно даёт всем разные IP, но бывает
+    # два клиента на одном ПК (тест/второй аккаунт за одним NAT) — в этом
+    # случае голый IP-бан вырубал бы всех сразу.
+    #
+    # Ник сравниваем case-insensitive (nick_lower), а на самом клиенте ник
+    # ограничен 16 символами (см. CMD_LOGIN msg.get('nick')[:16]). Смена ника
+    # == уход из-под бана — это намеренный компромисс: у нас приложение без
+    # регистрации, единственный стабильный идентификатор — именно ник+IP.
+
+    # Защищённые от бана адреса: сам владелец сервера + loopback.
+    # В _owner_ip сохраняется VPN/LAN IP хоста; 127.0.0.1 блокируется
+    # отдельно на случай если хост вдруг подключится через loopback (тест,
+    # второй клиент на той же машине и т.п.) — сам себя забанить нельзя.
+    _BAN_LOOPBACK_IPS = frozenset({'127.0.0.1', '::1', 'localhost'})
+
+    @staticmethod
+    def _ban_key(ip: str, nick: str) -> str:
+        """Составной ключ для dict. Ник нормализуем (lower + strip)."""
+        return f"{ip}|{(nick or '').strip().lower()}"
+
+    def _is_ban_protected(self, ip: str) -> bool:
+        """True если этот IP нельзя заносить в бан (сам хост/loopback)."""
+        if not ip:
+            return True
+        if ip in self._BAN_LOOPBACK_IPS:
+            return True
+        if self._owner_ip and ip == self._owner_ip:
+            return True
+        return False
+
+    def _load_bans(self) -> None:
+        """
+        Читает bans.json при старте. Поддерживает два формата:
+          • новый: ключ "ip|nick_lower", value {ip, nick, banned_at, reason}
+          • старый (v1): ключ "ip", value {nick, banned_at, reason}
+        Старые записи мигрируются в новый формат в памяти и будут
+        перезаписаны при следующем _save_bans().
+        """
+        try:
+            if not os.path.exists(BAN_LIST_PATH):
+                return
+            with open(BAN_LIST_PATH, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return
+
+            clean: dict = {}
+            migrated = 0
+            for key, info in data.items():
+                if not isinstance(info, dict):
+                    continue
+                # Определяем формат по наличию '|' в ключе и поля 'ip' в value
+                if '|' in key and 'ip' in info:
+                    # Новый формат — валидируем и добавляем
+                    ip   = str(info.get('ip',   ''))[:45]
+                    nick = str(info.get('nick', ''))[:32]
+                    if not ip:
+                        continue
+                    clean[self._ban_key(ip, nick)] = {
+                        'ip':        ip,
+                        'nick':      nick,
+                        'banned_at': float(info.get('banned_at', 0.0)),
+                        'reason':    str(info.get('reason', ''))[:120],
+                    }
+                else:
+                    # Старый формат v1 — ключ это голый IP
+                    ip   = str(key)[:45]
+                    nick = str(info.get('nick', ''))[:32]
+                    if not ip:
+                        continue
+                    clean[self._ban_key(ip, nick)] = {
+                        'ip':        ip,
+                        'nick':      nick,
+                        'banned_at': float(info.get('banned_at', 0.0)),
+                        'reason':    str(info.get('reason', ''))[:120],
+                    }
+                    migrated += 1
+
+            with self._bans_lock:
+                self._bans = clean
+            if migrated:
+                print(f"[Server] Банлист: мигрировано {migrated} "
+                      f"запис(ь/и) со старого формата")
+                self._save_bans()
+            print(f"[Server] Банлист загружен: {len(clean)} запис(ь/и)")
+        except Exception as e:
+            print(f"[Server] _load_bans error: {e}")
+
+    def _save_bans(self) -> None:
+        """Атомарная запись: tmp + os.replace()."""
+        try:
+            with self._bans_lock:
+                snapshot = dict(self._bans)
+            tmp_path = BAN_LIST_PATH + '.tmp'
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(snapshot, f, ensure_ascii=False, indent=2)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    pass
+            os.replace(tmp_path, BAN_LIST_PATH)
+        except Exception as e:
+            print(f"[Server] _save_bans error: {e}")
+
+    def _is_banned(self, ip: str, nick: str) -> bool:
+        """True если пара (ip, nick_lower) в банлисте."""
+        if not ip:
+            return False
+        key = self._ban_key(ip, nick)
+        with self._bans_lock:
+            return key in self._bans
+
+    def _add_ban(self, ip: str, nick: str, reason: str = '') -> bool:
+        """
+        True если запись добавлена/обновлена.
+        False — если IP защищён (сам хост / loopback) или пусто.
+        """
+        if self._is_ban_protected(ip):
+            print(f"[Server] ⚠ Попытка забанить защищённый IP={ip!r} — отклонено")
+            return False
+        if not nick:
+            # Пустой ник всё равно может быть записан, но составной ключ
+            # тогда выродится в "ip|" — мы разрешаем это как fallback.
+            pass
+        key = self._ban_key(ip, nick)
+        with self._bans_lock:
+            self._bans[key] = {
+                'ip':        ip,
+                'nick':      (nick or '')[:32],
+                'banned_at': time.time(),
+                'reason':    (reason or '')[:120],
+            }
+        self._save_bans()
+        return True
+
+    def _remove_ban(self, ip: str, nick: str) -> bool:
+        """Разбан по точному (ip, nick)."""
+        if not ip:
+            return False
+        key = self._ban_key(ip, nick)
+        with self._bans_lock:
+            removed = self._bans.pop(key, None)
+        if removed is not None:
+            self._save_bans()
+            return True
+        return False
+
+    def _get_ban_list_snapshot(self) -> list:
+        """Снимок для отправки хосту в UI. Сортировка: сначала свежие."""
+        with self._bans_lock:
+            entries = [
+                {
+                    'ip':        info.get('ip', ''),
+                    'nick':      info.get('nick', ''),
+                    'banned_at': info.get('banned_at', 0.0),
+                    'reason':    info.get('reason', ''),
+                }
+                for info in self._bans.values()
+            ]
+        entries.sort(key=lambda e: e.get('banned_at', 0.0), reverse=True)
+        return entries
 
     # ------------------------------------------------------------------
     # Управление каналами
@@ -544,9 +726,62 @@ class SFUServer:
                         buffer   = buffer[idx:].lstrip()
                         action   = msg.get('action')
 
+                        # ── Pre-login: проверка бан-статуса ────────────────
+                        # Клиент из MultiServerScreen шлёт это сообщение до
+                        # логина чтобы узнать «забанен ли мой ник на этом
+                        # сервере?». Отвечаем и закрываем соединение —
+                        # это разовый probe, не полноценная TCP-сессия.
+                        if action == CMD_QUERY_BAN:
+                            q_nick = str(msg.get('nick', ''))[:16]
+                            q_banned = self._is_banned(client_ip, q_nick)
+                            q_reason = ''
+                            if q_banned:
+                                with self._bans_lock:
+                                    _info = self._bans.get(
+                                        self._ban_key(client_ip, q_nick), {}
+                                    )
+                                    q_reason = _info.get('reason', '')
+                            try:
+                                self._safe_send(conn, json.dumps({
+                                    'action': CMD_QUERY_BAN_RESP,
+                                    'banned': bool(q_banned),
+                                    'reason': q_reason,
+                                }).encode('utf-8'))
+                            except Exception:
+                                pass
+                            try:
+                                conn.shutdown(socket.SHUT_WR)
+                            except Exception:
+                                pass
+                            return
+
                         # ── Login ─────────────────────────────────────────────
                         if action == CMD_LOGIN:
                             client_nick   = msg.get('nick', 'User')[:16]
+                            # Проверка бана ПО (IP, nick) до регистрации в clients.
+                            # Составной ключ: у нескольких клиентов за одним IP
+                            # (тест на одной машине / общий NAT) банится только
+                            # конкретный ник.
+                            if self._is_banned(client_ip, client_nick):
+                                with self._bans_lock:
+                                    _info = self._bans.get(
+                                        self._ban_key(client_ip, client_nick), {}
+                                    )
+                                    _reason = _info.get('reason', '')
+                                print(f"[Server] ⛔ Отклонён вход забаненного "
+                                      f"{client_nick!r} IP={client_ip}")
+                                try:
+                                    self._safe_send(conn, json.dumps({
+                                        'action': CMD_BANNED,
+                                        'reason': _reason,
+                                    }).encode('utf-8'))
+                                except Exception:
+                                    pass
+                                try:
+                                    conn.shutdown(socket.SHUT_WR)
+                                except Exception:
+                                    pass
+                                return
                             client_avatar = msg.get('avatar', '1.svg')
                             _gcn = self._general_channel_name
                             with self.clients_lock:
@@ -1031,6 +1266,68 @@ class SFUServer:
                                             'action': CMD_FORCE_MUTED,
                                         }).encode('utf-8'))
 
+                        # ── Хост: KICK участника ──────────────────────────────
+                        # Права только у первого в host_order. Самого себя
+                        # кикнуть нельзя (проверка target_uid != uid).
+                        elif action == CMD_HOST_KICK:
+                            with self._host_order_lock:
+                                is_host_k = bool(
+                                    self._host_order and self._host_order[0] == uid
+                                )
+                            if is_host_k:
+                                target_uid_k = int(msg.get('target_uid', 0))
+                                if target_uid_k and target_uid_k != uid:
+                                    self._kick_by_uid(target_uid_k)
+
+                        # ── Хост: BAN участника (kick + IP в банлист) ────────
+                        elif action == CMD_HOST_BAN:
+                            with self._host_order_lock:
+                                is_host_b = bool(
+                                    self._host_order and self._host_order[0] == uid
+                                )
+                            if is_host_b:
+                                target_uid_b = int(msg.get('target_uid', 0))
+                                reason_b = str(msg.get('reason', ''))[:120]
+                                if target_uid_b and target_uid_b != uid:
+                                    self._ban_by_uid(target_uid_b, reason_b)
+                                    # После бана шлём обновлённый список хосту
+                                    self._safe_send(conn, json.dumps({
+                                        'action':  CMD_BAN_LIST,
+                                        'entries': self._get_ban_list_snapshot(),
+                                    }).encode('utf-8'))
+
+                        # ── Хост: UNBAN по (ip, nick) ─────────────────────────
+                        elif action == CMD_HOST_UNBAN:
+                            with self._host_order_lock:
+                                is_host_u = bool(
+                                    self._host_order and self._host_order[0] == uid
+                                )
+                            if is_host_u:
+                                target_ip_u = str(msg.get('ip', '')).strip()[:45]
+                                target_nk_u = str(msg.get('nick', ''))[:32]
+                                if target_ip_u:
+                                    self._remove_ban(target_ip_u, target_nk_u)
+                                    print(f"[Server] ✓ Разбанен "
+                                          f"{target_nk_u!r} IP={target_ip_u}")
+                                # Всегда возвращаем снимок (даже если пары
+                                # не было — UI синхронизирует состояние).
+                                self._safe_send(conn, json.dumps({
+                                    'action':  CMD_BAN_LIST,
+                                    'entries': self._get_ban_list_snapshot(),
+                                }).encode('utf-8'))
+
+                        # ── Хост: запрос банлиста для UI ──────────────────────
+                        elif action == CMD_BAN_LIST_REQ:
+                            with self._host_order_lock:
+                                is_host_l = bool(
+                                    self._host_order and self._host_order[0] == uid
+                                )
+                            if is_host_l:
+                                self._safe_send(conn, json.dumps({
+                                    'action':  CMD_BAN_LIST,
+                                    'entries': self._get_ban_list_snapshot(),
+                                }).encode('utf-8'))
+
                         elif action == CMD_DRAW_STROKE:
                             self._process_draw_stroke(conn, msg)
 
@@ -1084,15 +1381,38 @@ class SFUServer:
                 if room and room != self._general_channel_name:
                     self._cleanup_temp_channels(room)
 
+                # ── Определяем роль уходящего в SFU ───────────────────────
+                # watchers[u_id] существует ТОЛЬКО если u_id сам стримил.
+                # u_id может быть в watchers[s_uid] если он смотрел чей-то стрим.
+                # Это ОБЯЗАТЕЛЬНО вычислить ДО self.watchers.pop() ниже.
                 with self.watchers_lock:
+                    was_streamer = u_id in self.watchers
+                    was_viewer = any(
+                        u_id in ws for ws in self.watchers.values()
+                    )
                     for s_uid in list(self.watchers.keys()):
                         if u_id in self.watchers[s_uid]:
                             self.watchers[s_uid].pop(u_id, None)
                     self.watchers.pop(u_id, None)
 
+                # ── SFU cleanup: ТОЛЬКО если клиент реально был в SFU ─────
+                # Ранее эти два вызова выполнялись БЕЗУСЛОВНО на отключении
+                # любого клиента. Из-за этого:
+                #   1) _sfu.close_streamer(u_id) игнорирует u_id и удаляет
+                #      ЕДИНСТВЕННЫЙ стример текущего SFU — если стримил кто-то
+                #      другой (напр. сам хост стримил экран с системным звуком),
+                #      стрим уничтожался → у всех viewers пропадал SFU-звук.
+                #      "Передача сервера другу" создавала новый SFU у нового
+                #      хоста → стример переконнекчивался → звук возвращался.
+                #   2) Оба DELETE-запроса — синхронные HTTP к локальному Go SFU
+                #      с таймаутом 10с каждый. При отключении клиента поток
+                #      tcp_handler блокировался на до 20с впустую.
+                #
+                # Теперь вызовы защищены флагами was_streamer/was_viewer.
                 _sfu = self.sfu
-                if _sfu:
+                if _sfu and was_streamer:
                     _sfu.close_streamer(u_id)
+                if _sfu and was_viewer:
                     _sfu.close_viewer(u_id)
 
                 print(
@@ -1474,6 +1794,87 @@ class SFUServer:
         # SENIOR FIX: _safe_send
         for tc in target_conns_dr:
             self._safe_send(tc, relay_dr)
+
+    # ------------------------------------------------------------------
+    # Kick / Ban: закрыть соединение участника, по необходимости занести в бан
+    # ------------------------------------------------------------------
+    def _kick_by_uid(self, target_uid: int, notify_action: str = CMD_KICKED,
+                      reason: str = '') -> None:
+        """
+        Отправляет цели notify_action, shutdown(SHUT_WR), удаляет из clients.
+        Клиент уведомит UI и не попытается reconnect (см. core._is_kicked).
+        Остальное (host_order, udp_map, channel_auth, watchers, cleanup temp-
+        каналов) отработает штатный finally в tcp_handler после выхода по
+        recv() = b''.
+        """
+        target_conn = None
+        target_nick = ''
+        with self.clients_lock:
+            for c_conn, c_data in self.clients.items():
+                if c_data.get('uid') == target_uid:
+                    target_conn = c_conn
+                    target_nick = c_data.get('nick', '')
+                    break
+        if target_conn is None:
+            return
+
+        # Шлём уведомление, клиент успеет его прочитать до закрытия
+        try:
+            self._safe_send(target_conn, json.dumps({
+                'action': notify_action,
+                'reason': reason,
+            }).encode('utf-8'))
+        except Exception:
+            pass
+
+        # Мгновенно исключаем из broadcast-цепочек — дальнейшие sync_users
+        # и чат не должны уходить на эту conn. Физически socket закроет
+        # tcp_handler в finally после того как recv() вернёт b''.
+        with self.clients_lock:
+            self.clients.pop(target_conn, None)
+
+        try:
+            target_conn.shutdown(socket.SHUT_WR)
+        except Exception:
+            pass
+
+        print(f"[Server] 👢 {target_nick} (uid={target_uid}) "
+              f"отключён ({notify_action})")
+
+        self._mark_dirty()
+        self.send_global_state()
+
+    def _ban_by_uid(self, target_uid: int, reason: str = '') -> bool:
+        """
+        Заносит (IP, nick) в банлист, затем кикает соединение через CMD_BANNED.
+
+        Возвращает True если бан реально применён. Если IP защищён
+        (сам владелец сервера или loopback) — не баним и не кикаем,
+        возвращаем False. Хост получит обновлённый CMD_BAN_LIST как обычно
+        (там просто не будет новой записи) — это и есть UI-сигнал что
+        операция отклонена.
+        """
+        target_ip = ''
+        target_nick = ''
+        with self.clients_lock:
+            for c_data in self.clients.values():
+                if c_data.get('uid') == target_uid:
+                    target_ip   = c_data.get('ip', '')
+                    target_nick = c_data.get('nick', '')
+                    break
+        if not target_ip:
+            return False
+        if self._is_ban_protected(target_ip):
+            print(f"[Server] ⚠ Бан отклонён: {target_nick!r} IP={target_ip} "
+                  f"— защищённый адрес (сам хост / loopback)")
+            return False
+
+        added = self._add_ban(target_ip, target_nick, reason)
+        if added:
+            print(f"[Server] ⛔ БАН {target_nick!r} IP={target_ip} "
+                  f"reason={reason!r}")
+        self._kick_by_uid(target_uid, notify_action=CMD_BANNED, reason=reason)
+        return added
 
     # ------------------------------------------------------------------
     # Отправка пакета зрителям стримера (UDP)

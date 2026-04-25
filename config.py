@@ -187,6 +187,27 @@ CHAT_MEDIA_MAX_B64   = 10_000_000
 CMD_HOST_MUTE   = 'host_mute'
 CMD_FORCE_MUTED = 'force_muted'
 
+# ── Хост: кик/бан участника ──────────────────────────────────────────────────
+# Права выдаются только первому в _host_order (фактический хост встроенного
+# сервера). При передаче хостинга (CMD_SERVER_TRANSFER / migrate) банлист
+# остаётся на диске прежнего владельца — у нового хоста свой bans.json.
+CMD_HOST_KICK     = 'host_kick'       # host → server: кикнуть target_uid
+CMD_HOST_BAN      = 'host_ban'        # host → server: кикнуть + добавить IP в бан
+CMD_HOST_UNBAN    = 'host_unban'      # host → server: убрать IP из бана
+CMD_BAN_LIST_REQ  = 'ban_list_req'    # host → server: запрос снимка банлиста
+CMD_BAN_LIST      = 'ban_list'        # server → host: снимок банлиста
+CMD_KICKED        = 'kicked'          # server → клиент: тебя кикнули
+CMD_BANNED        = 'banned'          # server → клиент: тебя забанили / при login
+BAN_LIST_PATH     = os.path.join(get_appdata_dir(), "bans.json")
+
+# Pre-login запрос статуса бана. Клиент шлёт его в MultiServerScreen
+# по каждому обнаруженному серверу; сервер отвечает только для текущего
+# ника — без раскрытия всего банлиста, без утечки приватных данных.
+# Source of truth — bans.json сервера. Клиент никогда не хранит бан-статус
+# локально: это решает проблему рассинхронизации после разбана.
+CMD_QUERY_BAN      = 'query_ban'      # client → server: забанен ли мой ник?
+CMD_QUERY_BAN_RESP = 'query_ban_resp' # server → client: {banned: bool, reason}
+
 # ── Typing indicator ──────────────────────────────────────────────────────────
 CMD_TYPING         = 'typing'
 TYPING_THROTTLE_MS = 3000

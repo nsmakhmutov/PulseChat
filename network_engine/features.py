@@ -19,6 +19,9 @@ from config import (
     CMD_FILE_OFFER, CMD_FILE_OFFER_ROOM,
     CMD_QUICK_MSG, QUICK_MSG_MAX_LEN,
     CMD_HOST_MUTE, CMD_FORCE_MUTED,
+    CMD_HOST_KICK, CMD_HOST_BAN, CMD_HOST_UNBAN,
+    CMD_BAN_LIST_REQ, CMD_BAN_LIST,
+    CMD_KICKED, CMD_BANNED,
     CMD_DRAW_STROKE, DRAW_MAX_POINTS,
 )
 
@@ -350,6 +353,33 @@ class FeaturesMixin:
         self.send_json({'action': CMD_HOST_MUTE, 'target_uid': int(target_uid)})
 
     # ------------------------------------------------------------------
+    # Host Kick / Ban / Unban
+    # ------------------------------------------------------------------
+    def send_host_kick(self, target_uid: int) -> None:
+        """Хост → сервер: кикнуть участника (без записи в банлист)."""
+        self.send_json({'action': CMD_HOST_KICK, 'target_uid': int(target_uid)})
+
+    def send_host_ban(self, target_uid: int, reason: str = '') -> None:
+        """Хост → сервер: кикнуть + занести IP в банлист."""
+        self.send_json({
+            'action':     CMD_HOST_BAN,
+            'target_uid': int(target_uid),
+            'reason':     str(reason)[:120],
+        })
+
+    def send_host_unban(self, ip: str, nick: str = '') -> None:
+        """Хост → сервер: убрать (IP, nick) из банлиста. В ответ прилетит CMD_BAN_LIST."""
+        self.send_json({
+            'action': CMD_HOST_UNBAN,
+            'ip':     str(ip)[:45],
+            'nick':   str(nick)[:32],
+        })
+
+    def request_ban_list(self) -> None:
+        """Хост → сервер: запрос текущего снимка банлиста для UI."""
+        self.send_json({'action': CMD_BAN_LIST_REQ})
+
+    # ------------------------------------------------------------------
     # process_message dispatch для фич
     # ------------------------------------------------------------------
     def _process_features_message(self, msg: dict, act: str) -> bool:
@@ -382,6 +412,34 @@ class FeaturesMixin:
 
         elif act == CMD_FORCE_MUTED:
             self.force_muted.emit()
+            return True
+
+        elif act == CMD_KICKED:
+            # Сервер уведомил что нас кикнули. Останавливаем сеть СИНХРОННО
+            # прямо здесь — до того как tcp_listen увидит EOF и попытается
+            # стартовать recovery. Сигнал emit попадёт в Qt-очередь и UI
+            # обработает его позже, но к этому моменту running=False и
+            # любой reconnect-путь уже отсечён.
+            self._kicked_flag    = True
+            self.running         = False
+            self._is_connected   = False
+            self._shutdown_event.set()
+            self.kicked.emit(str(msg.get('reason', '')))
+            return True
+
+        elif act == CMD_BANNED:
+            # Аналогично CMD_KICKED — блокируем сеть синхронно, эмитим сигнал.
+            self._kicked_flag    = True
+            self.running         = False
+            self._is_connected   = False
+            self._shutdown_event.set()
+            self.banned.emit(str(msg.get('reason', '')))
+            return True
+
+        elif act == CMD_BAN_LIST:
+            entries = msg.get('entries', [])
+            if isinstance(entries, list):
+                self.ban_list_updated.emit(entries)
             return True
 
         elif act == CMD_DRAW_STROKE:

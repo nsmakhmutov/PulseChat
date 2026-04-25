@@ -66,13 +66,21 @@ class _UpdaterSignals(QObject):
     """
     PyQt6 гарантирует, что сигналы, испущенные из любого потока,
     доставляются в UI-поток через event loop — никаких мьютексов не нужно.
+
+    ВАЖНО: сигнатуры должны СОВПАДАТЬ с тем, что передаёт core/updater.py:
+      • on_update_found(version: str, download_url: str)      — 2 арг
+      • on_progress(percent: int)                              — 1 арг
+      • on_no_update(), on_done(), on_error(msg: str), on_check_error(msg: str)
+    Раньше тут были сигналы на 3 и 2 аргумента — rassинхронизация с
+    updater роняла лямбду (TypeError), поток тихо умирал, UI висел
+    на «Проверка обновлений» вечно. Приводим к совпадению.
     """
-    update_found = pyqtSignal(str, int, int)   # (new_version, n_files, total_bytes)
+    update_found = pyqtSignal(str, str)   # (new_version, download_url)
     no_update    = pyqtSignal()
-    check_error  = pyqtSignal(str)   # message
-    dl_progress  = pyqtSignal(int, str)   # (0..100, status_text)
+    check_error  = pyqtSignal(str)        # message
+    dl_progress  = pyqtSignal(int)        # (0..100)
     dl_done      = pyqtSignal()
-    dl_error     = pyqtSignal(str)   # message
+    dl_error     = pyqtSignal(str)        # message
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -298,47 +306,92 @@ class ConnectingScreen(QWidget):
 
         sigs = self._upd_sigs
         from core.updater import check_for_updates_async
+        # Сигнатуры лямбд ТОЧНО соответствуют тому что передаёт updater:
+        # on_update_found получает (version, download_url) — 2 арг.
         check_for_updates_async(
-            on_update_found=lambda v, n, b: sigs.update_found.emit(v, n, b),
+            on_update_found=lambda v, url: sigs.update_found.emit(v, url),
             on_no_update=lambda: sigs.no_update.emit(),
             on_error=lambda msg: sigs.check_error.emit(msg),
         )
 
+        # Watchdog-таймер: если UpdaterThread повис или упал с молчаливым
+        # исключением в лямбде — через 15 сек форсим fail-safe в _do_tcp_probe.
+        # Без него UI висел бы на «Проверка обновлений» вечно.
+        self._update_watchdog = QTimer(self)
+        self._update_watchdog.setSingleShot(True)
+        self._update_watchdog.timeout.connect(self._on_update_watchdog)
+        self._update_watchdog.start(15000)
+
+    def _on_update_watchdog(self):
+        """Сработал если ни update_found, ни no_update, ни check_error
+        не пришли за 15 сек. Считаем что updater не отвечает и идём дальше."""
+        if getattr(self, '_update_check_done', False):
+            return
+        print("[Updater] Watchdog: нет ответа за 15 сек, пропускаем проверку")
+        self._update_check_done = True
+        self._do_tcp_probe()
+
     def _on_no_update(self):
+        if getattr(self, '_update_check_done', False):
+            return
+        self._update_check_done = True
+        try:
+            self._update_watchdog.stop()
+        except Exception:
+            pass
         print("[Updater] Версия актуальна.")
         self._do_tcp_probe()
 
     def _on_update_check_error(self, msg: str):
         """Ошибка проверки — логируем, не блокируем (fail-safe)."""
+        if getattr(self, '_update_check_done', False):
+            return
+        self._update_check_done = True
+        try:
+            self._update_watchdog.stop()
+        except Exception:
+            pass
         print(f"[Updater] Ошибка проверки: {msg}")
         self._do_tcp_probe()
 
     # ── Шаг 2а: Найдено обновление → скачиваем ───────────────────────────────
 
-    def _on_update_found(self, new_version: str, n_files: int, total_bytes: int):
-        mb = total_bytes / (1 << 20)
-        print(f"[Updater] Найдена v{new_version}: {mb:.1f} MB")
+    def _on_update_found(self, new_version: str, download_url: str):
+        """
+        Получили (версия, URL архива). Сохраняем URL — он нужен для
+        download_and_apply. Раньше здесь обработчик ожидал (v, n, b) что
+        не совпадало с тем что шлёт updater — лямбда падала TypeError'ом.
+        """
+        if getattr(self, '_update_check_done', False):
+            return
+        self._update_check_done = True
+        try:
+            self._update_watchdog.stop()
+        except Exception:
+            pass
 
-        size_str = f"{mb:.1f} MB" if mb >= 0.1 else f"{total_bytes // 1024} KB"
-        self.lbl_status.setText(f"⬇️  Обновление v{new_version} ({size_str})")
+        print(f"[Updater] Найдена v{new_version}: {download_url}")
+        self._update_download_url = download_url
+
+        self.lbl_status.setText(f"⬇️  Обновление v{new_version}")
         self._set_status_style("#c39ef5")
         self.progress_bar.setValue(0)
         self.progress_bar.show()
 
         sigs = self._upd_sigs
         from core.updater import download_and_apply
+        # download_and_apply принимает: (download_url, on_progress, on_done, on_error).
+        # on_progress получает ОДИН int (percent) — не кортеж.
         download_and_apply(
-            on_progress=lambda pct, status: sigs.dl_progress.emit(pct, status),
+            download_url,
+            on_progress=lambda pct: sigs.dl_progress.emit(int(pct)),
             on_done=lambda: sigs.dl_done.emit(),
             on_error=lambda msg: sigs.dl_error.emit(msg),
         )
 
-    def _on_dl_progress(self, pct: int, status: str = ""):
+    def _on_dl_progress(self, pct: int):
         self.progress_bar.setValue(pct)
-        if status:
-            self.lbl_status.setText(f"⬇️  {status}")
-        else:
-            self.lbl_status.setText(f"⬇️  Обновление...  {pct}%")
+        self.lbl_status.setText(f"⬇️  Обновление...  {pct}%")
 
     def _on_dl_done(self):
         """PS1 скрипт применит обновление и перезапустит приложение."""

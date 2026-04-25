@@ -110,12 +110,86 @@ class _PingWorker(QThread):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# _BanQueryWorker — спрашивает сервер «забанен ли мой ник?»
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _BanQueryWorker(QThread):
+    """
+    Короткоживущий TCP-probe: подключается к серверу, шлёт CMD_QUERY_BAN,
+    читает CMD_QUERY_BAN_RESP, закрывает соединение.
+
+    Почему отдельный коннект (а не поле в discovery-broadcast):
+      • UDP broadcast ко всем — утечка всего банлиста всем слушателям
+        в сети. Плохо для приватности.
+      • Сервер не знает кому слать ответ (IP+ник разные у разных клиентов),
+        пришлось бы класть в broadcast весь список. Плохо для UDP-MTU
+        и плохо для приватности.
+      • TCP-probe: сервер видит именно наш IP+ник и отвечает только нам.
+        Разбан синхронизируется мгновенно — следующий probe вернёт False.
+
+    Таймауты умышленно небольшие (1.5 сек) — сервер уже найден через
+    discovery, он должен отвечать быстро. Если не отвечает — просто
+    считаем «не забанены» и не блокируем UI.
+    """
+    result = pyqtSignal(bool)   # banned?
+
+    def __init__(self, ip: str, nick: str,
+                 port: int = DEFAULT_PORT_TCP, parent=None):
+        super().__init__(parent)
+        self._ip   = ip
+        self._nick = nick
+        self._port = port
+
+    def run(self):
+        import json as _json
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1.5)
+            sock.connect((self._ip, self._port))
+            sock.sendall(_json.dumps({
+                'action': 'query_ban',
+                'nick':   self._nick[:16],
+            }).encode('utf-8'))
+            # Ответ короткий, одного recv хватит
+            data = sock.recv(512)
+            if not data:
+                self.result.emit(False)
+                return
+            msg = _json.loads(data.decode('utf-8', errors='replace'))
+            self.result.emit(bool(msg.get('banned', False)))
+        except Exception:
+            # Timeout/refused/bad JSON — считаем что не забанены (карточка
+            # будет просто обычной, пользователь попробует подключиться
+            # и сервер отдаст CMD_BANNED если что).
+            self.result.emit(False)
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # _ServerItemWidget — карточка сервера в списке
 # ══════════════════════════════════════════════════════════════════════════════
 
 class _ServerItemWidget(QFrame):
     """Карточка сервера: имя, кол-во участников, пинг, дерево ников.
     Одиночный клик = подключение.
+
+    Бан-статус:
+      • Инициализируется всегда как banned=False.
+      • Внешний код вызывает set_banned(True/False) — статус приходит
+        от самого сервера через TCP-query (_BanQueryWorker), а не
+        хранится локально. Это гарантирует мгновенную синхронизацию
+        разбана: хост убрал из bans.json → следующий query вернёт False.
+
+    Когда banned=True:
+      • Слева от имени появляется «🚫».
+      • Имя и счётчик участников приглушены.
+      • Курсор = ForbiddenCursor, клик игнорируется (clicked не эмитится).
     """
     clicked        = pyqtSignal()
     double_clicked = pyqtSignal()
@@ -124,6 +198,7 @@ class _ServerItemWidget(QFrame):
         super().__init__(parent)
         self.info      = info
         self._selected = False
+        self._banned   = False   # изменится через set_banned() после query
         self.setObjectName("serverItem")
         self._apply_style()
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -132,26 +207,42 @@ class _ServerItemWidget(QFrame):
         main_lay.setContentsMargins(12, 8, 12, 8)
         main_lay.setSpacing(4)
 
-        # ── Верхняя строка: название + кол-во + пинг ──────────────────────────
+        # ── Верхняя строка: [стоп?] + название + кол-во + пинг ───────────────
         top_row = QHBoxLayout()
         top_row.setSpacing(8)
 
-        lbl_name = QLabel(info.get('server_name', 'InPulse Server'))
-        lbl_name.setStyleSheet(
+        # «Стоп»-значок: создаём скрытым, показываем через set_banned.
+        # Так layout не прыгает при обновлении статуса — метка просто
+        # меняет visibility, ширина row остаётся стабильной.
+        self._lbl_stop = QLabel("🚫")
+        self._lbl_stop.setFixedWidth(20)
+        self._lbl_stop.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
+        self._lbl_stop.setStyleSheet(
+            "font-size: 14px; background: transparent; border: none;"
+        )
+        self._lbl_stop.setToolTip("Вы забанены на этом сервере")
+        self._lbl_stop.setVisible(False)
+        top_row.addWidget(self._lbl_stop)
+
+        name_text = info.get('server_name', 'InPulse Server')
+        self._lbl_name = QLabel(name_text)
+        self._lbl_name.setStyleSheet(
             "font-size: 14px; font-weight: bold; color: #eaeef8;"
             "background: transparent; border: none;"
         )
-        top_row.addWidget(lbl_name, stretch=1)
+        top_row.addWidget(self._lbl_name, stretch=1)
 
         cnt = info.get('user_count', 0)
-        lbl_cnt = QLabel(f"👤 {cnt}")
-        lbl_cnt.setStyleSheet(
+        self._lbl_cnt = QLabel(f"👤 {cnt}")
+        self._lbl_cnt.setStyleSheet(
             "font-size: 12px; color: #82e0aa; font-weight: bold;"
             "background: transparent; border: none;"
         )
-        lbl_cnt.setFixedWidth(50)
-        lbl_cnt.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        top_row.addWidget(lbl_cnt)
+        self._lbl_cnt.setFixedWidth(50)
+        self._lbl_cnt.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        top_row.addWidget(self._lbl_cnt)
 
         self._lbl_ping = QLabel("…")
         self._lbl_ping.setStyleSheet(
@@ -184,6 +275,39 @@ class _ServerItemWidget(QFrame):
             self._ping_worker.result.connect(self._on_ping)
             self._ping_worker.start()
 
+    def set_banned(self, banned: bool):
+        """Применяет/снимает визуальные пометки бана. Вызывается после
+        получения CMD_QUERY_BAN_RESP от сервера."""
+        if self._banned == bool(banned):
+            return
+        self._banned = bool(banned)
+        self._lbl_stop.setVisible(self._banned)
+        self.setCursor(
+            Qt.CursorShape.ForbiddenCursor if self._banned
+            else Qt.CursorShape.PointingHandCursor
+        )
+        if self._banned:
+            self._lbl_name.setStyleSheet(
+                "font-size: 14px; font-weight: bold; "
+                "color: rgba(220,120,120,0.70);"
+                "background: transparent; border: none;"
+            )
+            self._lbl_name.setToolTip("Вы забанены на этом сервере")
+            self._lbl_cnt.setStyleSheet(
+                "font-size: 12px; color: rgba(130,224,170,0.45); font-weight: bold;"
+                "background: transparent; border: none;"
+            )
+        else:
+            self._lbl_name.setStyleSheet(
+                "font-size: 14px; font-weight: bold; color: #eaeef8;"
+                "background: transparent; border: none;"
+            )
+            self._lbl_name.setToolTip("")
+            self._lbl_cnt.setStyleSheet(
+                "font-size: 12px; color: #82e0aa; font-weight: bold;"
+                "background: transparent; border: none;"
+            )
+
     def _on_ping(self, ms: int):
         if ms < 0:
             self._lbl_ping.setText("—")
@@ -209,6 +333,11 @@ class _ServerItemWidget(QFrame):
         self._apply_style()
 
     def mousePressEvent(self, e):
+        if self._banned:
+            # Забаненные сервера не подключаются. Игнорим клик, не эмитим
+            # clicked — родитель (MultiServerScreen) даже не узнает.
+            super().mousePressEvent(e)
+            return
         if e.button() == Qt.MouseButton.LeftButton:
             self.clicked.emit()
         super().mousePressEvent(e)
@@ -495,6 +624,16 @@ class MultiServerScreen(QWidget):
             except RuntimeError:
                 pass
         self._item_widgets.clear()
+        # Также останавливаем ban-query workers — если discovery повторяется,
+        # старые responses не должны прилетать в уже удалённые виджеты.
+        for worker in getattr(self, '_ban_query_workers', []):
+            try:
+                if worker.isRunning():
+                    worker.quit()
+                    worker.wait(200)
+            except RuntimeError:
+                pass
+        self._ban_query_workers = []
         self._lbl_empty.hide()
         self._img_empty.hide()
 
@@ -510,11 +649,39 @@ class MultiServerScreen(QWidget):
             "font-size: 14px; font-weight: bold; color: #82e0aa;"
             "background: transparent; border: none;"
         )
+
+        # Рендерим карточки в «обычном» виде (banned=False по умолчанию).
+        # Параллельно для каждой запускаем _BanQueryWorker → сервер сам
+        # скажет «забанен ли этот ник». Worker-ы живут столько же сколько
+        # карточки, храним их чтобы избежать преждевременной сборки GC.
+        self._ban_query_workers: list = getattr(
+            self, '_ban_query_workers', []
+        )
+
         for info in servers:
             w = _ServerItemWidget(info)
-            w.clicked.connect(lambda i=info, widget=w: self._on_item_selected(i, widget))
+            w.clicked.connect(
+                lambda i=info, widget=w: self._on_item_selected(i, widget)
+            )
             self._list_layout.addWidget(w)
             self._item_widgets.append(w)
+
+            # Live-query: работает только если ник уже известен.
+            ip = info.get('ip', '')
+            if ip and self.nick:
+                worker = _BanQueryWorker(ip, self.nick, parent=self)
+                # Связь worker → виджет через замыкание. Виджет может быть
+                # уже уничтожен к моменту ответа (пользователь обновил
+                # список) — обёртка проверит через sip-valid.
+                def _on_ban_result(is_banned: bool, _widget=w):
+                    try:
+                        _widget.set_banned(is_banned)
+                    except RuntimeError:
+                        # виджет удалён — всё норм, пропускаем
+                        pass
+                worker.result.connect(_on_ban_result)
+                worker.start()
+                self._ban_query_workers.append(worker)
 
     def _on_item_selected(self, info: dict, widget: _ServerItemWidget):
         # FIX #5: одиночный клик = выбор + немедленное подключение.

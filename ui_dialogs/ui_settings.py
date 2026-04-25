@@ -5,7 +5,8 @@ import sounddevice as sd
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QScrollArea,
                              QWidget, QLabel, QSlider, QTabWidget, QComboBox, QFrame,
                              QGroupBox, QSizePolicy, QFileDialog, QMessageBox,
-                             QLineEdit, QCheckBox, QProgressBar)
+                             QLineEdit, QCheckBox, QProgressBar, QListWidget, QListWidgetItem,
+                             QAbstractItemView)
 from PyQt6.QtCore import (Qt, QSize, QSettings, QTimer, pyqtSignal, QObject, QPoint)
 from PyQt6.QtGui import QIcon, QPainter, QColor, QPen, QStandardItem, QPolygon
 
@@ -563,33 +564,116 @@ class SettingsDialog(QDialog):
         QTimer.singleShot(0, self._fix_combo_popups)
 
     # ── Вкладка «Главное» ──────────────────────────────────────────────────────
+    # Раскладка:
+    #   Верхний блок: слева аватарка (fixed 96×96) + под ней кнопка «Изменить»;
+    #                 справа — лейбл «Никнейм» + поле ввода, выровнены по верху
+    #                 аватарки.
+    #   Разделитель.
+    #   Блок «Сервер»: лейбл + кнопка «Очистить кеш» сразу под ним.
+    #   Лейбл «Забаненные участники» (без QGroupBox-рамки) + список + кнопка.
+    #
+    # Никаких пустых addSpacing(20) — интервалы задаются через lay.setSpacing
+    # и контролируемые аддонные spacing'и, чтобы окно выглядело плотно и ровно.
     def setup_profile_tab(self):
         tab = QWidget()
         lay = QVBoxLayout(tab)
+        lay.setContentsMargins(14, 14, 14, 14)
+        lay.setSpacing(10)
+
+        # ── Верхний блок: аватарка слева + ник справа (две колонки) ───────────
+        top_row = QHBoxLayout()
+        top_row.setSpacing(14)
+        top_row.setContentsMargins(0, 0, 0, 0)
+
+        # Колонка-аватарка: preview + кнопка «Изменить» под ним
+        av_col = QVBoxLayout()
+        av_col.setSpacing(6)
+        av_col.setContentsMargins(0, 0, 0, 0)
+
         self.av_lbl = QLabel()
-        self.av_lbl.setFixedSize(100, 100)
-        self.av_lbl.setStyleSheet("border: 2px solid gray; border-radius: 10px;")
+        self.av_lbl.setFixedSize(96, 96)
+        self.av_lbl.setStyleSheet(
+            "border: 2px solid rgba(255,255,255,0.18); "
+            "border-radius: 10px; background: rgba(0,0,0,0.20);"
+        )
         self.av_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.cur_av = self.mw.avatar
         self.upd_av_preview()
+        av_col.addWidget(self.av_lbl, alignment=Qt.AlignmentFlag.AlignHCenter)
 
-        btn_ch = QPushButton("Выбрать аватарку")
+        btn_ch = QPushButton("Изменить")
+        btn_ch.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_ch.setFixedWidth(96)
+        btn_ch.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(255,255,255,0.06);
+                color: #d0d8f0;
+                border: 1px solid rgba(255,255,255,0.12);
+                border-radius: 6px;
+                padding: 5px 10px;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: rgba(91,142,245,0.18);
+                border-color: rgba(91,142,245,0.45);
+                color: #ffffff;
+            }
+        """)
         btn_ch.clicked.connect(self.open_av_sel)
-        lay.addWidget(self.av_lbl, alignment=Qt.AlignmentFlag.AlignCenter)
-        lay.addWidget(btn_ch)
-        lay.addWidget(QLabel("Никнейм:"))
-        self.ed_nick = QLineEdit(self.mw.nick)
-        lay.addWidget(self.ed_nick)
+        av_col.addWidget(btn_ch, alignment=Qt.AlignmentFlag.AlignHCenter)
+        av_col.addStretch()
 
-        # ── Очистка кеша сервера ─────────────────────────────────────────────
-        lay.addSpacing(20)
-        lay.addWidget(QLabel("Сервер:"))
-        sep_cache = QLabel("")
-        sep_cache.setStyleSheet("color: gray; font-size: 11px;")
-        lay.addWidget(sep_cache)
+        top_row.addLayout(av_col)
+
+        # Колонка-никнейм: лейбл + QLineEdit. Выравниваем верх колонки с
+        # верхом аватарки — спейсер не нужен, QVBoxLayout по умолчанию
+        # начинает сверху.
+        nick_col = QVBoxLayout()
+        nick_col.setSpacing(6)
+        nick_col.setContentsMargins(0, 2, 0, 0)
+
+        lbl_nick = QLabel("Никнейм")
+        lbl_nick.setStyleSheet("color: rgba(200,200,210,0.8); font-size: 12px;")
+        nick_col.addWidget(lbl_nick)
+
+        self.ed_nick = QLineEdit(self.mw.nick)
+        self.ed_nick.setStyleSheet("""
+            QLineEdit {
+                background-color: rgba(0,0,0,0.25);
+                color: #e8ecf5;
+                border: 1px solid rgba(255,255,255,0.12);
+                border-radius: 6px;
+                padding: 7px 10px;
+                font-size: 13px;
+                selection-background-color: rgba(91,142,245,0.45);
+            }
+            QLineEdit:focus {
+                border-color: rgba(91,142,245,0.70);
+                background-color: rgba(0,0,0,0.35);
+            }
+        """)
+        nick_col.addWidget(self.ed_nick)
+        nick_col.addStretch()
+
+        top_row.addLayout(nick_col, 1)  # растягивается по ширине
+
+        lay.addLayout(top_row)
+
+        # ── Тонкий разделитель ────────────────────────────────────────────────
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("background: rgba(255,255,255,0.08); border: none; max-height: 1px;")
+        sep.setMaximumHeight(1)
+        lay.addWidget(sep)
+
+        # ── Блок «Сервер» ─────────────────────────────────────────────────────
+        lbl_server = QLabel("Сервер")
+        lbl_server.setStyleSheet(
+            "color: rgba(200,200,210,0.8); font-size: 12px;"
+        )
+        lay.addWidget(lbl_server)
 
         from ui_dialogs.ui_dialogs import NudgeHoldButton
-
         btn_clear_cache = NudgeHoldButton("🗑  Удерживайте 3 сек — очистить кеш")
         btn_clear_cache.setToolTip("Удаляет локальную историю чата (SQLite)")
         try:
@@ -615,8 +699,161 @@ class SettingsDialog(QDialog):
         btn_clear_cache.hold_complete.connect(self._on_clear_server_cache)
         lay.addWidget(btn_clear_cache)
 
+        # ── Забаненные участники (виден только хосту, без рамки QGroupBox) ────
+        # Лейбл-заголовок в том же стиле что «Сервер», список, кнопка разбана.
+        # Держим всё как child-виджеты этого же layout — если мы не хост,
+        # просто прячем их через setVisible(False).
+        self._ban_section_widgets: list = []
+
+        self._ban_title = QLabel("Забаненные участники")
+        self._ban_title.setStyleSheet(
+            "color: rgba(200,200,210,0.8); font-size: 12px; margin-top: 4px;"
+        )
+        lay.addWidget(self._ban_title)
+        self._ban_section_widgets.append(self._ban_title)
+
+        self._ban_list_widget = QListWidget()
+        self._ban_list_widget.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        self._ban_list_widget.setStyleSheet("""
+            QListWidget {
+                background-color: rgba(0,0,0,0.25);
+                border: 1px solid rgba(255,255,255,0.10);
+                border-radius: 6px;
+                color: #d0d8f0;
+                padding: 4px;
+                outline: none;
+            }
+            QListWidget::item {
+                padding: 5px 6px;
+                border-radius: 4px;
+            }
+            QListWidget::item:selected {
+                background-color: rgba(91,142,245,0.30);
+                color: #ffffff;
+            }
+            QListWidget::item:hover {
+                background-color: rgba(255,255,255,0.05);
+            }
+        """)
+        self._ban_list_widget.setMinimumHeight(96)
+        self._ban_list_widget.setMaximumHeight(160)
+        lay.addWidget(self._ban_list_widget)
+        self._ban_section_widgets.append(self._ban_list_widget)
+
+        # Кнопка разбана — с нормальным отступом от списка (через spacing).
+        lay.addSpacing(2)
+        self._btn_unban = QPushButton("Разбанить выделенных")
+        self._btn_unban.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_unban.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(91,142,245,0.18);
+                color: #8ab4f8;
+                border: 1px solid rgba(91,142,245,0.35);
+                border-radius: 6px;
+                padding: 7px 14px;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: rgba(91,142,245,0.32);
+                border-color: rgba(91,142,245,0.70);
+                color: #ffffff;
+            }
+            QPushButton:disabled {
+                color: rgba(200,200,210,0.35);
+                background-color: rgba(255,255,255,0.04);
+                border-color: rgba(255,255,255,0.08);
+            }
+        """)
+        self._btn_unban.clicked.connect(self._on_unban_selected_clicked)
+        lay.addWidget(self._btn_unban)
+        self._ban_section_widgets.append(self._btn_unban)
+
+        # Видимость банлиста: только хост. Подписываемся на ответы сервера,
+        # при открытии — дергаем запрос, если мы хост.
+        self._refresh_ban_group_visibility()
+        try:
+            self.mw.net.ban_list_updated.connect(self._on_ban_list_updated)
+        except Exception as _e:
+            print(f"[Settings] ban_list_updated connect error: {_e}")
+
+        if self._is_local_host():
+            try:
+                self.mw.net.request_ban_list()
+            except Exception:
+                pass
+
         lay.addStretch()
         self.tabs.addTab(tab, "Главное")
+
+    # ── Банлист: видимость / запросы / обработка ответа ──────────────────────
+    def _is_local_host(self) -> bool:
+        """Локальный пользователь — владелец встроенного сервера."""
+        try:
+            my_uid = getattr(self.mw.audio, 'my_uid', 0)
+            srv_uid = getattr(self.mw.net, '_server_host_uid', 0)
+            return bool(my_uid and my_uid == srv_uid)
+        except Exception:
+            return False
+
+    def _refresh_ban_group_visibility(self) -> None:
+        """Прячем/показываем все три виджета банлиста одной пачкой."""
+        visible = self._is_local_host()
+        for w in getattr(self, '_ban_section_widgets', ()):
+            try:
+                w.setVisible(visible)
+            except Exception:
+                pass
+
+    def _on_ban_list_updated(self, entries: list) -> None:
+        """
+        Пришёл свежий снимок банлиста от сервера — перерисовываем список.
+        Каждая запись — dict {ip, nick, banned_at, reason}; пару (ip, nick)
+        храним в UserRole для последующего разбана.
+        """
+        if not hasattr(self, '_ban_list_widget'):
+            return
+        self._ban_list_widget.clear()
+        if not entries:
+            placeholder = QListWidgetItem("— нет забаненных —")
+            placeholder.setFlags(Qt.ItemFlag.NoItemFlags)  # не выделяется
+            self._ban_list_widget.addItem(placeholder)
+            self._btn_unban.setEnabled(False)
+            return
+
+        self._btn_unban.setEnabled(True)
+        for entry in entries:
+            ip   = str(entry.get('ip',   '')).strip()
+            nick = str(entry.get('nick', '')).strip()
+            if not ip:
+                continue
+            display_nick = nick or '(без ника)'
+            item = QListWidgetItem(f"{display_nick}    ·    {ip}")
+            # Для разбана нужна именно пара (ip, nick) — храним как tuple.
+            item.setData(Qt.ItemDataRole.UserRole, (ip, nick))
+            self._ban_list_widget.addItem(item)
+
+    def _on_unban_selected_clicked(self) -> None:
+        """Шлём CMD_HOST_UNBAN для каждой выделенной пары (ip, nick)."""
+        selected = self._ban_list_widget.selectedItems()
+        if not selected:
+            return
+        pairs: list = []
+        for item in selected:
+            data = item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(data, tuple) and len(data) == 2:
+                ip, nick = data
+                if isinstance(ip, str) and ip:
+                    pairs.append((ip, nick or ''))
+        if not pairs:
+            return
+        try:
+            for ip, nick in pairs:
+                self.mw.net.send_host_unban(ip, nick)
+            print(f"[Settings] Разбан: {len(pairs)} запис(ь/и)")
+        except Exception as e:
+            print(f"[Settings] Unban error: {e}")
 
     def _on_clear_server_cache(self):
         """Очищает SQLite историю чата через открытое соединение."""
