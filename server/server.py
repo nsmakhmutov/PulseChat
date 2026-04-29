@@ -94,6 +94,16 @@ class SFUServer:
         self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, UDP_RECV_BUFFER_SIZE)
         self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, UDP_SEND_BUFFER_SIZE)
+        # FIX WSAECONNRESET: на Windows при sendto() на закрытый UDP-порт клиента
+        # ОС генерирует ICMP Port Unreachable и применяет его к следующему recvfrom()
+        # как WSAECONNRESET (10054). Это убивало весь UDP-поток хоста при отключении
+        # любого клиента во время активного разговора — звук пропадал у всех.
+        # SIO_UDP_CONNRESET = False отключает это поведение на уровне сокета.
+        if hasattr(socket, 'SIO_UDP_CONNRESET'):
+            try:
+                self.udp_sock.ioctl(socket.SIO_UDP_CONNRESET, False)
+            except Exception:
+                pass  # не Windows или старый Python — обработаем в udp_handler
         self.udp_sock.bind((host, DEFAULT_PORT_UDP))
 
         # -------------------------------------------------------------------
@@ -688,7 +698,16 @@ class SFUServer:
                         except Exception:
                             pass
 
-            except OSError:
+            except OSError as e:
+                # FIX WSAECONNRESET: Windows бросает OSError(10054) когда предыдущий
+                # sendto() попал на закрытый UDP-порт (клиент отключился).
+                # Это НЕ означает что наш сокет сломан — просто ICMP-эхо от мёртвого адреса.
+                # Продолжаем работу; SIO_UDP_CONNRESET при создании сокета уже
+                # подавляет большинство таких ошибок, но оставляем страховку здесь.
+                err = getattr(e, 'winerror', None) or getattr(e, 'errno', None)
+                if err == 10054:  # WSAECONNRESET
+                    continue
+                # Реальная ошибка сокета (сокет закрыт при shutdown) — выходим.
                 break
             except Exception:
                 if not self._accepting:
