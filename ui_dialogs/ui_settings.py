@@ -1546,7 +1546,7 @@ class SettingsDialog(QDialog):
     # ── Вкладка «Версия» ──────────────────────────────────────────────────────
     def setup_version_tab(self):
         class _Bridge(QObject):
-            sig_found    = pyqtSignal(str)
+            sig_found    = pyqtSignal(str, str)   # version, download_url
             sig_no_upd   = pyqtSignal()
             sig_error    = pyqtSignal(str)
             sig_progress = pyqtSignal(int)
@@ -1646,7 +1646,8 @@ class SettingsDialog(QDialog):
 
     # ── Слоты обновления ──────────────────────────────────────────────────────
 
-    def _slot_update_found(self, version: str):
+    def _slot_update_found(self, version: str, download_url: str):
+        self._pending_download_url = download_url
         self._ver_status_lbl.setTextFormat(Qt.TextFormat.RichText)
         self._ver_status_lbl.setText(
             f"🎉 Доступна новая версия: <b>v{version}</b>"
@@ -1699,7 +1700,7 @@ class SettingsDialog(QDialog):
         self._ver_status_lbl.setText("⏳ Проверяю...")
         bridge = self._upd_bridge
         check_for_updates_async(
-            on_update_found=lambda v, n, b: bridge.sig_found.emit(v),
+            on_update_found=lambda v, url: bridge.sig_found.emit(v, url),
             on_no_update=lambda: bridge.sig_no_upd.emit(),
             on_error=lambda msg: bridge.sig_error.emit(msg),
         )
@@ -1712,8 +1713,15 @@ class SettingsDialog(QDialog):
         self._ver_progress.setValue(0)
         self._ver_status_lbl.setText("⬇ Загружаю обновление...")
         bridge = self._upd_bridge
+        download_url = getattr(self, "_pending_download_url", None)
+        if not download_url:
+            bridge.sig_error.emit("URL для скачивания не найден. Нажмите «Проверить обновления» ещё раз.")
+            self._btn_install_update.setEnabled(True)
+            self._btn_check_update.setEnabled(True)
+            return
         download_and_apply(
-            on_progress=lambda pct, status: bridge.sig_progress.emit(pct),
+            download_url,
+            on_progress=lambda pct: bridge.sig_progress.emit(pct),
             on_done=lambda: bridge.sig_done.emit(),
             on_error=lambda msg: bridge.sig_error.emit(msg),
         )
