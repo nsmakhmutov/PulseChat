@@ -1,7 +1,7 @@
 # version.py
 
 APP_NAME    = "InPulse"
-APP_VERSION = "1.0.67"
+APP_VERSION = "1.0.70"
 APP_AUTHOR  = "Impulse Company"
 APP_YEAR    = "2026"
 GITHUB_REPO = "nsmakhmutov/PulseChat"
@@ -13,7 +13,7 @@ ABOUT_TEXT = f"""\
 
 Приложение для голосового общения без централизации с поддержкой
 видео-трансляций, soundboard и шумоподавлением.
-
+    
 Автор: {APP_AUTHOR}
 Год:   {APP_YEAR}
 

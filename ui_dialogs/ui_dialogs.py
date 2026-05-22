@@ -12,93 +12,41 @@ from PyQt6.QtCore import (Qt, QSize, QPoint, QTimer, pyqtSignal, QThread, QSetti
 from PyQt6.QtGui import QIcon, QGuiApplication, QPainter, QColor, QPen, QPainterPath, QBrush
 from config import (resource_path, FILE_CHUNK_SIZE, FILE_TRANSFER_TIMEOUT)
 
+CUSTOM_SOUND_MAX_BYTES = 1 * 1024 * 1024
+CUSTOM_SOUND_SLOTS     = 6
 
-# ── Максимальный размер кастомного звука (1 MB) ──────────────────────────────
-# 7 секунд MP3 @ 128kbps ≈ 112 KB, @ 320kbps ≈ 280 KB.
-# 1 MB с большим запасом перекрывает любой типичный 7-секундный звук.
-CUSTOM_SOUND_MAX_BYTES = 1 * 1024 * 1024   # 1 MB
-CUSTOM_SOUND_SLOTS     = 6                  # количество кастомных слотов
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Вспомогательные функции для нелинейной кривой громкости пользователя
-# ──────────────────────────────────────────────────────────────────────────────
-# Почему экспонента, а не линейный множитель:
-#   Речь через Opus кодируется при очень низком уровне (~-20 дБ относительно FS).
-#   Линейный диапазон 0–2.0x (слайдер 0–200) даёт буст максимум +6 дБ — почти
-#   не слышно. Экспоненциальная кривая 10^((slider-100)/100):
-#     slider 0   →  0.01x  (-40 дБ)   — тихо
-#     slider 100 →  1.00x  (  0 дБ)   — нейтрально (дефолт, поведение НЕ меняется)
-#     slider 150 →  3.16x  (+10 дБ)   — заметный буст
-#     slider 200 → 10.00x  (+20 дБ)   — максимальный буст для тихих микрофонов
-# При слайдере 100 пользователь слышит ровно то же что раньше — совместимость.
 def _slider_to_vol(slider_int: int) -> float:
-    """Слайдер 0-200 → коэффициент громкости по кубической кривой.
 
-    0-100:  кубическая кривая (x/100)^3 → 0.0 … 1.0
-            Даёт тонкую регулировку на тихих уровнях:
-              slider=1  → 0.000001 (почти тишина)
-              slider=10 → 0.001
-              slider=30 → 0.027
-              slider=50 → 0.125
-              slider=70 → 0.343
-              slider=100 → 1.0
-
-    100-200: линейный буст 1.0 … 10.0
-    """
     if slider_int <= 0:
         return 0.0
     if slider_int <= 100:
         return (slider_int / 100.0) ** 3
-    # 100-200 → 1.0 - 10.0  (линейный буст)
     return 1.0 + (slider_int - 100) * 9.0 / 100.0
 
 
 def _vol_to_slider(vol: float) -> int:
-    """Коэффициент громкости → позиция слайдера (обратная функция)."""
     if vol <= 0.0:
         return 0
     if vol <= 1.0:
         return max(0, min(100, int((vol ** (1.0 / 3.0)) * 100)))
-    # Буст: 1.0-10.0 → 100-200
     return max(100, min(200, int((vol - 1.0) * 100.0 / 9.0 + 100)))
 
-# Громкость буста: 15x ≈ +23.5 дБ — выше потолка слайдера (10x = +20 дБ).
-# Soft-limiter в аудио-движке защищает от клиппинга.
 _BOOST_VOL = 15.0
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Кнопка с удержанием (3 секунды)
-# ══════════════════════════════════════════════════════════════════════════════
 class NudgeHoldButton(QPushButton):
-    """
-    QPushButton с механикой удержания 3 секунды.
 
-    Логика:
-      • mousePress  → запускает QTimer с шагом _TICK_MS мс.
-      • каждый тик  → _progress растёт 0 → 1, вызывает update() для перерисовки.
-      • mouseRelease / leaveEvent до завершения → сброс (_progress=0).
-      • progress == 1 → emit hold_complete, кнопка блокируется (_fired=True).
-      • Опциональный hold_sound: .wav файл играет в цикле пока кнопка зажата.
-
-    paintEvent:
-      • super().paintEvent() рисует стандартную кнопку (фон, текст, рамка).
-      • Поверх рисуем скруглённый оранжевый fill с alpha=90 (≈35%),
-        шириной progress * rect.width() — текст остаётся читаемым.
-    """
 
     hold_complete = pyqtSignal()
 
-    _HOLD_MS = 3000   # общее время удержания, мс
-    _TICK_MS = 20     # интервал таймера, мс  → 150 тиков за 3 с, ~50 FPS
+    _HOLD_MS = 3000
+    _TICK_MS = 20
 
     def __init__(self, text: str, parent=None):
         super().__init__(text, parent)
-        self._progress: float = 0.0   # 0.0–1.0
+        self._progress: float = 0.0
         self._holding:  bool  = False
-        self._fired:    bool  = False  # сработал → больше не принимаем нажатия
-        self._hold_sound_path: str | None = None  # путь к .wav для loop
+        self._fired:    bool  = False
+        self._hold_sound_path: str | None = None
 
         self._tick_timer = QTimer(self)
         self._tick_timer.setInterval(self._TICK_MS)
@@ -107,7 +55,6 @@ class NudgeHoldButton(QPushButton):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def set_hold_sound(self, path: str) -> None:
-        """Устанавливает .wav файл, который играет в цикле во время удержания."""
         import os
         resolved = os.path.normpath(os.path.abspath(path))
         if os.path.isfile(resolved):
@@ -134,13 +81,10 @@ class NudgeHoldButton(QPushButton):
         if self._hold_sound_path:
             try:
                 import winsound
-                # FIX: SND_PURGE deprecated на современных Windows и может
-                # не останавливать звук. PlaySound(None, 0) — надёжная остановка.
                 winsound.PlaySound(None, 0)
             except Exception:
                 pass
 
-    # ── Таймер ────────────────────────────────────────────────────────────────
     def _on_tick(self):
         self._progress += self._TICK_MS / self._HOLD_MS
         if self._progress >= 1.0:
@@ -154,7 +98,6 @@ class NudgeHoldButton(QPushButton):
         else:
             self.update()
 
-    # ── Мышь ──────────────────────────────────────────────────────────────────
     def mousePressEvent(self, e):
         if (e.button() == Qt.MouseButton.LeftButton
                 and self.isEnabled()
@@ -175,7 +118,6 @@ class NudgeHoldButton(QPushButton):
         super().mouseReleaseEvent(e)
 
     def leaveEvent(self, e):
-        """Отпускаем удержание, если курсор ушёл за пределы кнопки."""
         if self._holding:
             self._holding = False
             self._progress = 0.0
@@ -184,12 +126,9 @@ class NudgeHoldButton(QPushButton):
             self.update()
         super().leaveEvent(e)
 
-    # ── Отрисовка ─────────────────────────────────────────────────────────────
     def paintEvent(self, e):
-        # 1. Стандартная отрисовка кнопки (фон из stylesheet, текст, рамка)
         super().paintEvent(e)
 
-        # 2. Оранжевый fill-оверлей поверх — только во время удержания
         if self._progress <= 0.0 or self._fired:
             return
 
@@ -199,50 +138,20 @@ class NudgeHoldButton(QPushButton):
         r = self.rect()
         fill_w = int(r.width() * self._progress)
 
-        # Скруглённый клип совпадает с border-radius кнопки (7 px)
         clip = QPainterPath()
         clip.addRoundedRect(0.0, 0.0, float(r.width()), float(r.height()), 7.0, 7.0)
         p.setClipPath(clip)
 
-        # alpha растёт от 70 до 130 по ходу заливки — плавно проявляется
         alpha = int(70 + 60 * self._progress)
         p.fillRect(0, 0, fill_w, r.height(), QColor(230, 126, 34, alpha))
 
-        # Тонкая светлая граница на краю заливки — визуальный «фронт»
         pen = QPen(QColor(255, 180, 80, 160), 1.5)
         p.setPen(pen)
         p.drawLine(fill_w, 2, fill_w, r.height() - 2)
 
         p.end()
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# P2P Файловая передача — Workers (QThread)
-# ══════════════════════════════════════════════════════════════════════════════
-# Архитектура: прямое TCP соединение между клиентами.
-# Сервер используется ТОЛЬКО для передачи сигнала-предложения.
-# Все байты данных идут напрямую, GIL сервера не нагружается.
-#
-# FileSenderWorker:
-#   1. bind(0.0.0.0, 0) → получаем свободный порт от ОС
-#   2. Сигнал ready(port, token) → UI отправляет file_offer через NetworkClient
-#   3. accept() с таймаутом FILE_TRANSFER_TIMEOUT секунд
-#   4. Читаем токен (8 байт hex) от приёмника — проверяем
-#   5. Стримим файл чанками FILE_CHUNK_SIZE, сигнализируем прогресс
-#
-# FileReceiverWorker:
-#   1. connect(sender_ip, sender_port) с таймаутом
-#   2. Отправляем токен (8 байт hex)
-#   3. Читаем данные до закрытия сокета, пишем во временный файл
-#   4. rename temp → target, сигнализируем finished(save_path)
-# ══════════════════════════════════════════════════════════════════════════════
-
 def _show_float_widget(widget: QWidget, margin: int = 18) -> None:
-    """
-    Позиционирует и показывает плавающий виджет в правом нижнем углу
-    основного экрана (над панелью задач Windows).
-    Виджет должен быть уже добавлен в layout или быть top-level.
-    """
     screen = QGuiApplication.primaryScreen()
     if screen is None:
         widget.show()
@@ -256,18 +165,9 @@ def _show_float_widget(widget: QWidget, margin: int = 18) -> None:
 
 
 class FileSenderWorker(QThread):
-    """
-    Поток-отправитель файла (P2P TCP).
 
-    Сигналы:
-        ready(port, token)          — сокет слушает, можно отправлять file_offer
-        progress(sent, total)       — обновление прогресс-бара (байты)
-        finished()                  — файл передан успешно
-        error(message)              — ошибка (таймаут / отказ / ввод-вывод)
-        cancelled()                 — пользователь нажал «Отмена»
-    """
-    ready     = pyqtSignal(int, str)    # (port, token)
-    progress  = pyqtSignal(int, int)    # (bytes_sent, total_bytes)
+    ready     = pyqtSignal(int, str)
+    progress  = pyqtSignal(int, int)
     finished  = pyqtSignal()
     error     = pyqtSignal(str)
     cancelled = pyqtSignal()
@@ -278,20 +178,16 @@ class FileSenderWorker(QThread):
         self._cancel_flag = False
 
     def cancel(self):
-        """Вызывается из UI-потока для отмены передачи."""
         self._cancel_flag = True
 
     def run(self):
-        # Используем context manager — гарантированное закрытие при любом исходе
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as srv:
             try:
                 srv.bind(('0.0.0.0', 0))
                 srv.listen(1)
                 port = srv.getsockname()[1]
 
-                # Криптографически стойкий 8-символьный hex-токен.
-                # Исключает подключение посторонних клиентов из той же VPN-сети.
-                token = secrets.token_hex(4)   # 4 байта → 8 символов hex
+                token = secrets.token_hex(4)
                 self.ready.emit(port, token)
                 token_bytes = token.encode('ascii')
 
@@ -306,12 +202,10 @@ class FileSenderWorker(QThread):
                 self.error.emit(f"Ошибка создания сокета: {e}")
                 return
 
-        # Соединение принято — работаем внутри второго context manager
         with conn:
             try:
                 conn.settimeout(FILE_TRANSFER_TIMEOUT)
 
-                # Шаг 1: читаем токен от приёмника
                 raw_token = b''
                 while len(raw_token) < len(token_bytes):
                     chunk = conn.recv(len(token_bytes) - len(raw_token))
@@ -324,7 +218,6 @@ class FileSenderWorker(QThread):
                     self.error.emit("Неверный токен — подозрительное подключение")
                     return
 
-                # Шаг 2: стримим файл чанками
                 total = os.path.getsize(self._filepath)
                 sent  = 0
                 with open(self._filepath, 'rb') as f:
@@ -335,7 +228,6 @@ class FileSenderWorker(QThread):
                         chunk = f.read(FILE_CHUNK_SIZE)
                         if not chunk:
                             break
-                        # sendall гарантирует отправку всего чанка
                         conn.sendall(chunk)
                         sent += len(chunk)
                         self.progress.emit(sent, total)
@@ -354,17 +246,8 @@ class FileSenderWorker(QThread):
 
 
 class FileReceiverWorker(QThread):
-    """
-    Поток-приёмник файла (P2P TCP).
-
-    Сигналы:
-        progress(received, total)   — обновление прогресс-бара (байты)
-        finished(save_path)         — файл принят и сохранён по пути save_path
-        error(message)              — ошибка сети / диска
-        cancelled()                 — пользователь нажал «Отмена»
-    """
-    progress  = pyqtSignal(int, int)   # (bytes_received, total_bytes)
-    finished  = pyqtSignal(str)        # save_path
+    progress  = pyqtSignal(int, int)
+    finished  = pyqtSignal(str)
     error     = pyqtSignal(str)
     cancelled = pyqtSignal()
 
@@ -379,11 +262,9 @@ class FileReceiverWorker(QThread):
         self._cancel_flag = False
 
     def cancel(self):
-        """Вызывается из UI-потока для отмены приёма."""
         self._cancel_flag = True
 
     def run(self):
-        # Временный файл: записываем рядом с целевым с суффиксом .inpulse_tmp
         tmp_path = self._save_path + '.inpulse_tmp'
 
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -391,10 +272,8 @@ class FileReceiverWorker(QThread):
                 s.settimeout(FILE_TRANSFER_TIMEOUT)
                 s.connect((self._sender_ip, self._sender_port))
 
-                # Шаг 1: отправляем токен — подтверждаем личность
                 s.sendall(self._token.encode('ascii'))
 
-                # Шаг 2: читаем данные и пишем во временный файл
                 received = 0
                 with open(tmp_path, 'wb') as f:
                     while True:
@@ -407,7 +286,7 @@ class FileReceiverWorker(QThread):
                             self.error.emit("Таймаут — отправитель завис во время передачи")
                             return
                         if not chunk:
-                            break   # отправитель закрыл соединение — передача завершена
+                            break
                         f.write(chunk)
                         received += len(chunk)
                         self.progress.emit(received, self._filesize)
@@ -422,9 +301,7 @@ class FileReceiverWorker(QThread):
                 self.error.emit(f"Ошибка приёма: {e}")
                 return
 
-        # Успешно получили — атомарно переименовываем temp → target
         try:
-            # Если файл уже существует — добавляем суффикс (1), (2), ...
             final_path = self._save_path
             if os.path.exists(final_path):
                 base, ext = os.path.splitext(final_path)
@@ -437,7 +314,6 @@ class FileReceiverWorker(QThread):
         except Exception as e:
             self.error.emit(f"Ошибка сохранения файла: {e}")
         finally:
-            # Удаляем temp если что-то пошло не так
             if os.path.exists(tmp_path):
                 try:
                     os.remove(tmp_path)
@@ -446,23 +322,15 @@ class FileReceiverWorker(QThread):
 
 
 class FileTransferProgressWidget(QFrame):
-    """
-    Компактный плавающий прогресс-бар передачи файла.
-    Стиль единый с остальными overlay-виджетами приложения.
-
-    Используется и отправителем, и получателем — передаём worker_ref
-    для кнопки «Отмена».
-    """
     def __init__(self, filename: str, filesize: int,
                  is_sender: bool, parent=None):
         super().__init__(parent)
         self._is_sender  = is_sender
-        self._worker_ref = None   # устанавливается снаружи после создания
+        self._worker_ref = None
 
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
 
-        # ── Карточка ──────────────────────────────────────────────────────────
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
 
@@ -493,21 +361,18 @@ class FileTransferProgressWidget(QFrame):
         lay.setContentsMargins(14, 10, 14, 10)
         lay.setSpacing(6)
 
-        # Заголовок
         direction = "📤  Отправка" if is_sender else "📥  Получение"
         lbl_title = QLabel(f"{direction}:  {filename}")
         lbl_title.setStyleSheet("font-weight: bold; font-size: 12px;")
         lbl_title.setWordWrap(True)
         lay.addWidget(lbl_title)
 
-        # Прогресс-бар
         self._bar = QProgressBar()
         self._bar.setRange(0, 100)
         self._bar.setValue(0)
         self._bar.setFixedHeight(7)
         lay.addWidget(self._bar)
 
-        # Строка статуса + кнопка отмены
         row = QHBoxLayout()
         row.setSpacing(8)
         self._lbl_status = QLabel("Ожидание подключения…" if is_sender else "Подключение…")
@@ -533,11 +398,9 @@ class FileTransferProgressWidget(QFrame):
         self.setFixedSize(self.sizeHint())
 
     def set_worker(self, worker):
-        """Устанавливаем ссылку на worker для кнопки Отмена."""
         self._worker_ref = worker
 
     def update_progress(self, done: int, total: int):
-        """Обновляем бар и текстовый статус."""
         if total > 0:
             pct = int(done * 100 / total)
             self._bar.setValue(pct)
@@ -546,7 +409,6 @@ class FileTransferProgressWidget(QFrame):
         )
 
     def set_done(self, save_path: str = ''):
-        """Помечаем передачу как завершённую."""
         self._bar.setValue(100)
         if save_path:
             self._lbl_status.setText(f"✓  Сохранено")
@@ -563,34 +425,17 @@ class FileTransferProgressWidget(QFrame):
         if self._worker_ref is not None:
             self._worker_ref.cancel()
         self._lbl_status.setText("Отменено")
-        # Плавно скрываем через 1.5 с
         QTimer.singleShot(1500, self.hide)
 
 
 def _format_size(n: int) -> str:
-    """Форматирует количество байт в читаемую строку (KB / MB)."""
     if n < 1024:
         return f"{n} B"
     if n < 1024 * 1024:
         return f"{n / 1024:.1f} KB"
     return f"{n / (1024 * 1024):.1f} MB"
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Всплывающий оверлей управления пользователем
-# ══════════════════════════════════════════════════════════════════════════════
 class UserOverlayPanel(QFrame):
-    """
-    Выпадающий полупрозрачный оверлей прямо под ником пользователя.
-    Qt.WindowType.Popup — автоматически закрывается при клике вне панели,
-    корректно работает при двух мониторах.
-
-    Особенности дизайна:
-    • Полупрозрачный тёмный фон, скруглённые углы без артефактов
-    • Никнейм убран из шапки (уже виден в дереве)
-    • Кнопка «Шепнуть» — удерживай, чтобы говорить только этому пользователю
-    • Кнопка «Смотреть стрим» — отображается только если пользователь стримит
-    """
 
     def __init__(self, nick: str, current_vol: float, uid: int, audio_handler, global_pos,
                  parent=None, is_streaming: bool = False, on_watch_stream=None,
@@ -611,14 +456,11 @@ class UserOverlayPanel(QFrame):
         self._on_host_kick = on_host_kick
         self._on_host_ban  = on_host_ban
 
-        # ── Прозрачность окна + рисуем фон сами в paintEvent ─────────────────
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setObjectName("userOverlay")
 
-        # Внешний padding — чтобы тень/скругление не обрезалось
         self.setContentsMargins(0, 0, 0, 0)
 
-        # ── Внутренний контейнер с фоном ─────────────────────────────────────
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
@@ -660,7 +502,6 @@ class UserOverlayPanel(QFrame):
         card_lay.setContentsMargins(14, 10, 14, 12)
         card_lay.setSpacing(7)
 
-        # ── Громкость ─────────────────────────────────────────────────────────
         lbl_vol_title = QLabel("🔊  Громкость")
         lbl_vol_title.setStyleSheet("font-size: 11px; color: rgba(200,200,210,0.7); background:transparent; border:none;")
         card_lay.addWidget(lbl_vol_title)
@@ -670,7 +511,6 @@ class UserOverlayPanel(QFrame):
         self.sl_vol = QSlider(Qt.Orientation.Horizontal)
         self.sl_vol.setRange(0, 200)
         self.sl_vol.setValue(_vol_to_slider(current_vol))
-        # Хороший шаг: стрелки ±5%, клик по треку ±25%
         self.sl_vol.setSingleStep(5)
         self.sl_vol.setPageStep(25)
         self.lbl_vol = QLabel(f"{self.sl_vol.value()}%")
@@ -681,7 +521,6 @@ class UserOverlayPanel(QFrame):
         vol_row.addWidget(self.lbl_vol)
         card_lay.addLayout(vol_row)
 
-        # ── Загружаем состояние буста (персистентное между сессиями) ─────────
         _s_boost = QSettings("MyVoiceChat", "GlobalSettings")
         self._is_boosted: bool = _s_boost.value(f"vol_boost_{uid}", "false") == "true"
         if self._is_boosted:
@@ -691,14 +530,12 @@ class UserOverlayPanel(QFrame):
             self.sl_vol.setEnabled(False)
             self.lbl_vol.setText("⚡")
 
-        # ── Разделитель ───────────────────────────────────────────────────────
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
         sep.setStyleSheet("background: rgba(255,255,255,0.08); border: none; max-height: 1px;")
         sep.setMaximumHeight(1)
         card_lay.addWidget(sep)
 
-        # ── Кнопка: заглушить ─────────────────────────────────────────────────
         is_m = audio_handler.remote_users[uid].is_locally_muted \
                if uid in audio_handler.remote_users else False
         self.btn_mute = self._make_btn(
@@ -708,7 +545,6 @@ class UserOverlayPanel(QFrame):
         self.btn_mute.clicked.connect(self._on_toggle_mute)
         card_lay.addWidget(self.btn_mute)
 
-        # ── Кнопка: шёпот (удерживать) ───────────────────────────────────────
         self.btn_whisper = self._make_btn("🤫  Шепнуть  (удерживай)", checkable=False)
         self.btn_whisper.setStyleSheet(self.btn_whisper.styleSheet() + """
             QPushButton { border-color: rgba(130,100,220,0.5); color: #c8b0ff; }
@@ -718,21 +554,10 @@ class UserOverlayPanel(QFrame):
                 color: #ffffff;
             }
         """)
-        # press/release — не click, иначе сработает только при отпускании
         self.btn_whisper.pressed.connect(self._on_whisper_press)
         self.btn_whisper.released.connect(self._on_whisper_release)
         card_lay.addWidget(self.btn_whisper)
 
-        # ── Чекбокс: анонимность шёпота ──────────────────────────────────────
-        # Состояние сохраняется per-target в QSettings: при следующем открытии
-        # панели для этого же собеседника чекбокс восстанавливается.
-        # При отмеченной галочке:
-        #   • sender ставит FLAG_WHISPER|FLAG_ANONYMOUS в пакете;
-        #   • сервер перезаписывает sender_uid в UDP-заголовке на ANONYMOUS_UID
-        #     перед ретрансляцией → получатель физически не видит, кто шептал;
-        #   • в UI/оверлее у получателя показывается «Аноним» вместо ника.
-        # Хост встроенного сервера по-прежнему знает реального отправителя —
-        # это архитектурное ограничение client-server модели.
         _s_anon = QSettings("MyVoiceChat", "GlobalSettings")
         self._anon_key = f"whisper_anonymous_{uid}"
         self.chk_anonymous = QCheckBox("👤  Анонимно (получатель не увидит ник)")
@@ -766,7 +591,6 @@ class UserOverlayPanel(QFrame):
         self.chk_anonymous.toggled.connect(self._on_anonymous_toggled)
         card_lay.addWidget(self.chk_anonymous)
 
-        # ── Кнопка: смотреть стрим (только если пользователь стримит) ────────
         if is_streaming and on_watch_stream is not None:
             sep2 = QFrame()
             sep2.setFrameShape(QFrame.Shape.HLine)
@@ -789,9 +613,6 @@ class UserOverlayPanel(QFrame):
             self.btn_watch.clicked.connect(self._on_watch_clicked)
             card_lay.addWidget(self.btn_watch)
 
-        # ── Подсказка под кнопкой шёпота ─────────────────────────────────────
-        # Всегда занимает место в layout (нет Layout Shift при появлении).
-        # Видимость управляется только цветом текста: прозрачный ↔ фиолетовый.
         self._lbl_whisper_hint = QLabel("Остальные тебя не слышат пока держишь")
         self._lbl_whisper_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._lbl_whisper_hint.setWordWrap(False)
@@ -806,7 +627,6 @@ class UserOverlayPanel(QFrame):
         self._lbl_whisper_hint.setStyleSheet(self._lbl_whisper_hint_idle_style)
         card_lay.addWidget(self._lbl_whisper_hint)
 
-        # ── Кнопка: Буст звука ────────────────────────────────────────────────
         sep_b = QFrame()
         sep_b.setFrameShape(QFrame.Shape.HLine)
         sep_b.setStyleSheet(
@@ -830,9 +650,6 @@ class UserOverlayPanel(QFrame):
         self.btn_boost.clicked.connect(self._on_toggle_boost)
         card_lay.addWidget(self.btn_boost)
 
-        # ── Кнопка: Пнуть (Nudge) — удержание 3 секунды ─────────────────────
-        # NudgeHoldButton: заполняется оранжевым за 3 с, только тогда отправляет.
-        # Защита от случайного нажатия — нельзя задеть мимоходом.
         if net is not None:
             sep_n = QFrame()
             sep_n.setFrameShape(QFrame.Shape.HLine)
@@ -864,7 +681,6 @@ class UserOverlayPanel(QFrame):
                 }
             """)
 
-            # Проверяем кулдаун из QSettings — показываем «через Xм» если ещё активен
             import time as _nudge_time
             _s = QSettings("MyVoiceChat", "GlobalSettings")
             _last = float(_s.value(f"nudge_ts_{uid}", 0))
@@ -877,7 +693,6 @@ class UserOverlayPanel(QFrame):
             self.btn_nudge.hold_complete.connect(self._on_nudge_clicked)
             card_lay.addWidget(self.btn_nudge)
 
-            # Подсказка под кнопкой — занимает место всегда, видна только при удержании
             self._lbl_nudge_hint = QLabel("Держи, чтобы отправить голос «Пнуть»")
             self._lbl_nudge_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self._lbl_nudge_hint.setWordWrap(False)
@@ -892,11 +707,8 @@ class UserOverlayPanel(QFrame):
             self._lbl_nudge_hint.setStyleSheet(self._lbl_nudge_hint_idle_style)
             card_lay.addWidget(self._lbl_nudge_hint)
 
-            # Показываем / скрываем hint через сигналы таймера кнопки
             self.btn_nudge._tick_timer.timeout.connect(self._on_nudge_tick_hint)
 
-        # ── Кнопка: Передать файл ─────────────────────────────────────────────
-        # Доступна только если net задан (есть активное соединение)
         if net is not None:
             sep_f = QFrame()
             sep_f.setFrameShape(QFrame.Shape.HLine)
@@ -921,8 +733,6 @@ class UserOverlayPanel(QFrame):
             self.btn_file.clicked.connect(self._on_send_file_clicked)
             card_lay.addWidget(self.btn_file)
 
-        # ── Кнопка: Передать сервер (только если on_transfer_server задан) ────
-        # Видна исключительно хосту встроенного сервера в его контекстном меню.
         if self._on_transfer_server is not None:
             sep_ts = QFrame()
             sep_ts.setFrameShape(QFrame.Shape.HLine)
@@ -948,9 +758,6 @@ class UserOverlayPanel(QFrame):
             self.btn_transfer_server.clicked.connect(self._on_transfer_server_clicked)
             card_lay.addWidget(self.btn_transfer_server)
 
-        # ── Кнопка: Выключить микрофон (только хост) ─────────────────────────
-        # Только mic off — уши не трогаются.
-        # Участник может включить mic обратно сам в любой момент.
         if self._on_host_mute is not None:
             sep_hm = QFrame()
             sep_hm.setFrameShape(QFrame.Shape.HLine)
@@ -975,8 +782,6 @@ class UserOverlayPanel(QFrame):
             self.btn_host_mute.clicked.connect(self._on_host_mute_clicked)
             card_lay.addWidget(self.btn_host_mute)
 
-        # ── Кнопка: Кикнуть (только хост) ─────────────────────────────────────
-        # Кик разрывает соединение, но пользователь может снова подключиться.
         if self._on_host_kick is not None:
             sep_hk = QFrame()
             sep_hk.setFrameShape(QFrame.Shape.HLine)
@@ -1001,9 +806,6 @@ class UserOverlayPanel(QFrame):
             self.btn_host_kick.clicked.connect(self._on_host_kick_clicked)
             card_lay.addWidget(self.btn_host_kick)
 
-        # ── Кнопка: Забанить (только хост) ────────────────────────────────────
-        # Бан = кик + запись IP в bans.json. Снять можно через
-        # «Главное → Сервер → Забаненные участники».
         if self._on_host_ban is not None:
             sep_hb = QFrame()
             sep_hb.setFrameShape(QFrame.Shape.HLine)
@@ -1028,12 +830,9 @@ class UserOverlayPanel(QFrame):
             self.btn_host_ban.clicked.connect(self._on_host_ban_clicked)
             card_lay.addWidget(self.btn_host_ban)
 
-        # Это гарантирует, что место под hint уже учтено и панель
-        # не будет прыгать при появлении текста.
         self.adjustSize()
         self.setFixedSize(self.sizeHint())
 
-        # ── Позиционирование прямо под элементом дерева ───────────────────────
         screen = QGuiApplication.screenAt(global_pos)
         if screen is None:
             screen = QGuiApplication.primaryScreen()
@@ -1051,8 +850,6 @@ class UserOverlayPanel(QFrame):
         y = max(avail.top() + 4, y)
 
         self.move(x, y)
-
-    # ── Фабрика кнопок ────────────────────────────────────────────────────────
 
     def _make_btn(self, text: str, checkable=False, checked=False) -> QPushButton:
         btn = QPushButton(text)
@@ -1081,17 +878,11 @@ class UserOverlayPanel(QFrame):
         """)
         return btn
 
-    # ── Слоты ─────────────────────────────────────────────────────────────────
-
     def _on_vol_changed(self, v: int):
-        # При v=0 показываем "Mute" вместо "0%" — понятнее пользователю
         if v == 0:
             self.lbl_vol.setText("🔇")
         else:
             self.lbl_vol.setText(f"{v}%")
-        # Экспоненциальная кривая: slider 100 = 1.0x (нейтрально),
-        # slider 200 = 10.0x (+20 дБ) — позволяет поднять тихие микрофоны.
-        # slider 0 → 0.0 (полная тишина, _slider_to_vol гарантирует это).
         self.audio.set_user_volume(self.uid, _slider_to_vol(v))
 
     def _on_toggle_mute(self):
@@ -1099,18 +890,6 @@ class UserOverlayPanel(QFrame):
         self.btn_mute.setText("🔊  Разглушить" if state else "🔇  Заглушить")
 
     def _on_toggle_boost(self, checked: bool):
-        """
-        Активирует / деактивирует буст громкости пользователя (15x ≈ +23.5 дБ).
-
-        ВКЛ: сохраняем текущий слайдер в QSettings (vol_pre_boost_{uid}),
-             ставим флаг vol_boost_{uid}="true", применяем _BOOST_VOL (15x).
-             Слайдер блокируется — случайное движение не сбросит буст.
-        ВЫКЛ: восстанавливаем сохранённый слайдер, снимаем флаги,
-              разблокируем слайдер, применяем восстановленную громкость.
-
-        Громкость сохраняется через audio.set_user_volume() в vol_ip_{ip} —
-        совместимость с register_ip_mapping() при переподключении.
-        """
         _s = QSettings("MyVoiceChat", "GlobalSettings")
         self._is_boosted = checked
         if checked:
@@ -1134,20 +913,15 @@ class UserOverlayPanel(QFrame):
             self.audio.set_user_volume(self.uid, _slider_to_vol(pre_slider))
 
     def _on_whisper_press(self):
-        """Начинаем шёпот при нажатии."""
         if not self._whisper_active:
             self._whisper_active = True
-            # Читаем состояние чекбокса в момент нажатия — если пользователь
-            # передумал и снял галочку после открытия панели, это сработает.
             anon = (self.chk_anonymous.isChecked()
                     if hasattr(self, 'chk_anonymous') else False)
             self.audio.start_whisper(self.uid, anonymous=anon)
             self.btn_whisper.setText("🤫  Шепчу анонимно..." if anon else "🤫  Шепчу...")
-            # Показываем подсказку только цветом — размер панели не меняется
             self._lbl_whisper_hint.setStyleSheet(self._lbl_whisper_hint_active_style)
 
     def _on_whisper_release(self):
-        """Останавливаем шёпот при отпускании."""
         if self._whisper_active:
             self._whisper_active = False
             self.audio.stop_whisper()
@@ -1155,21 +929,12 @@ class UserOverlayPanel(QFrame):
             self._lbl_whisper_hint.setStyleSheet(self._lbl_whisper_hint_idle_style)
 
     def _on_anonymous_toggled(self, checked: bool):
-        """
-        Сохраняем состояние чекбокса "Анонимно" в QSettings персонально для
-        этого собеседника (ключ whisper_anonymous_{uid}). Настройка пережидёт
-        перезапуск приложения — удобно для постоянных собеседников.
-        """
         try:
             QSettings("MyVoiceChat", "GlobalSettings").setValue(
                 self._anon_key, "true" if checked else "false"
             )
         except Exception:
             pass
-        # Если пользователь переключил галочку ВО ВРЕМЯ активного шёпота —
-        # применяем новый режим «на лету» без отпускания кнопки. Для этого
-        # синхронизируем флаг в audio_engine напрямую: текущая PTT-сессия
-        # продолжится, но следующие пакеты уже пойдут с/без FLAG_ANONYMOUS.
         if self._whisper_active:
             try:
                 self.audio._whisper_anonymous = bool(checked)
@@ -1180,22 +945,15 @@ class UserOverlayPanel(QFrame):
                 pass
 
     def _on_watch_clicked(self):
-        """Открываем окно стрима и закрываем оверлей."""
         self.close()
         if self._on_watch_stream is not None:
             self._on_watch_stream()
 
     def _on_nudge_tick_hint(self):
-        """
-        Вызывается каждые 20 мс пока кнопка удерживается.
-        Показывает подсказку при старте удержания (первый тик),
-        скрывает при сбросе (holding=False).
-        """
         if not hasattr(self, '_lbl_nudge_hint'):
             return
         if self.btn_nudge._holding:
             self._lbl_nudge_hint.setStyleSheet(self._lbl_nudge_hint_active_style)
-            # Динамический текст с прогрессом
             pct = int(self.btn_nudge._progress * 100)
             self._lbl_nudge_hint.setText(f"Держи… {pct}%")
         else:
@@ -1203,49 +961,28 @@ class UserOverlayPanel(QFrame):
             self._lbl_nudge_hint.setText("Держи, чтобы отправить голос «Пнуть»")
 
     def _on_nudge_clicked(self):
-        """
-        Вызывается после успешного 3-секундного удержания (hold_complete).
 
-        Двойная защита от спама:
-          1. QSettings 'nudge_ts_<uid>' — кулдаун хранится между сессиями.
-          2. NudgeHoldButton._fired = True — повторный hold невозможен.
-
-        Кулдаун совпадает с серверным (NUDGE_COOLDOWN_SEC = 600 с).
-        """
         if self._net is None:
             return
         import time as _t
         _s   = QSettings("MyVoiceChat", "GlobalSettings")
         _key = f"nudge_ts_{self.uid}"
         _now = _t.time()
-        # guard: проверяем кулдаун ещё раз
         if _now - float(_s.value(_key, 0)) < 600:
             return
-        # Сохраняем оптимистично — до ответа сервера
         _s.setValue(_key, _now)
         self._net.send_nudge_vote(self.uid)
         self.btn_nudge.setEnabled(False)
         self.btn_nudge.setText("👟  Проголосовал ✓")
-        # Скрываем hint
         if hasattr(self, '_lbl_nudge_hint'):
             self._lbl_nudge_hint.setStyleSheet(self._lbl_nudge_hint_idle_style)
         print(f"[UI] Nudge vote → uid={self.uid} nick={self._nick!r}")
 
     def _on_send_file_clicked(self):
-        """
-        Пользователь нажал «📁 Передать файл».
-
-        Открываем стандартный диалог выбора файла.
-        Закрываем оверлей до старта QFileDialog — иначе popup-тип
-        перехватывает события и диалог может не отобразиться.
-        Запуск FileSenderWorker делегируется родительскому окну
-        через специальный сигнал, чтобы не тащить логику workers
-        внутрь оверлея.
-        """
         if self._net is None:
             return
 
-        self.close()    # закрываем popup ДО открытия QFileDialog
+        self.close()
 
         filepath, _ = QFileDialog.getOpenFileName(
             None,
@@ -1259,17 +996,12 @@ class UserOverlayPanel(QFrame):
         filename = os.path.basename(filepath)
         filesize = os.path.getsize(filepath)
 
-        # Создаём и запускаем worker-отправитель
         worker = FileSenderWorker(filepath)
 
-        # Создаём прогресс-виджет.
-        # Родитель None — он будет показан MainWindow отдельно.
         prog = FileTransferProgressWidget(filename, filesize, is_sender=True)
         prog.set_worker(worker)
 
         def on_ready(port: int, token: str):
-            # Сигнал из рабочего потока — нужен переход в GUI-поток
-            # используем QTimer.singleShot(0, ...) для безопасного вызова
             def _send():
                 self._net.send_file_offer(
                     self.uid, filename, filesize, port, token
@@ -1281,8 +1013,6 @@ class UserOverlayPanel(QFrame):
 
         def _on_send_done():
             prog.set_done()
-            # FIX MEM: автоматически скрываем через 3 сек — без этого виджет
-            # оставался в памяти навсегда (держит worker → его буферы файла)
             QTimer.singleShot(3000, prog.hide)
 
         def _on_send_error(msg_text):
@@ -1293,52 +1023,36 @@ class UserOverlayPanel(QFrame):
         worker.error.connect(_on_send_error)
         worker.cancelled.connect(lambda: prog.hide())
 
-        # Показываем прогресс-виджет в правом нижнем углу экрана
         _show_float_widget(prog)
         worker.start()
 
     def _on_transfer_server_clicked(self):
-        """
-        Пользователь нажал «🔀 Передать сервер».
-        Закрываем popup и вызываем callback из MainWindow
-        (он покажет QMessageBox с подтверждением).
-        """
         self.close()
         if self._on_transfer_server is not None:
             self._on_transfer_server()
 
     def _on_host_mute_clicked(self):
-        """
-        Хост нажал «🎤 Выключить микрофон».
-        Закрываем popup до callback — Popup-тип перехватывает события мыши.
-        Участник может включить mic обратно сам в любой момент.
-        """
         self.close()
         if self._on_host_mute is not None:
             self._on_host_mute()
 
     def _on_host_kick_clicked(self):
-        """Хост нажал «👢 Кикнуть». Закрываем popup и зовём callback —
-        подтверждение показывает MainWindow (ближе к корневому окну)."""
         self.close()
         if self._on_host_kick is not None:
             self._on_host_kick()
 
     def _on_host_ban_clicked(self):
-        """Хост нажал «⛔ Забанить». Аналогично — подтверждение в MainWindow."""
         self.close()
         if self._on_host_ban is not None:
             self._on_host_ban()
 
     def hideEvent(self, event):
-        """Если панель закрылась пока шептали — останавливаем шёпот."""
         if self._whisper_active:
             self._whisper_active = False
             self.audio.stop_whisper()
         super().hideEvent(event)
 
     def paintEvent(self, event):
-        """Рисуем лёгкую тень вокруг карточки."""
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         for i in range(4, 0, -1):
@@ -1353,33 +1067,21 @@ class UserOverlayPanel(QFrame):
             )
             p.drawPath(path)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Диалог выбора аватарки
-# ══════════════════════════════════════════════════════════════════════════════
 class AvatarSelector(QDialog):
-    """
-    Диалог выбора аватарки.
-    Дизайн: безрамочный, тёмное стекло, кастомный title bar (_DialogTitleBar).
-    Кнопки аватарок подсвечиваются синим при hover и зелёной рамкой при выборе.
-    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.selected_avatar = None
 
-        # ── Безрамочное окно с прозрачным фоном ──────────────────────────────
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setWindowTitle("Выбор аватара")
         self.setFixedSize(520, 430)
 
-        # ── Корневой layout (прозрачный) ──────────────────────────────────────
         root_lay = QVBoxLayout(self)
         root_lay.setContentsMargins(0, 0, 0, 0)
         root_lay.setSpacing(0)
 
-        # ── Карточка: тёмный полупрозрачный фон со скруглёнными углами ────────
         self._card = QFrame(self)
         self._card.setObjectName("avatarCard")
         self._card.setStyleSheet("""
@@ -1419,7 +1121,6 @@ class AvatarSelector(QDialog):
         card_lay.setContentsMargins(0, 0, 0, 0)
         card_lay.setSpacing(0)
 
-        # ── Кастомный title bar ───────────────────────────────────────────────
         self._title_bar = _DialogTitleBar(self, "🖼  Выбор аватара")
         card_lay.addWidget(self._title_bar)
 
@@ -1429,7 +1130,6 @@ class AvatarSelector(QDialog):
         _sep.setStyleSheet("background: rgba(255,255,255,0.08); border: none;")
         card_lay.addWidget(_sep)
 
-        # ── Контент ───────────────────────────────────────────────────────────
         content_w = QWidget()
         content_w.setStyleSheet("background: transparent;")
         content_lay = QVBoxLayout(content_w)
@@ -1441,7 +1141,6 @@ class AvatarSelector(QDialog):
         hint.setStyleSheet("font-size: 12px; color: rgba(200,208,224,0.55);")
         content_lay.addWidget(hint)
 
-        # ── Скролл-зона с сеткой аватарок ─────────────────────────────────────
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -1485,7 +1184,6 @@ class AvatarSelector(QDialog):
         scroll.setWidget(container)
         content_lay.addWidget(scroll, stretch=1)
 
-        # ── Кнопка «Отмена» ────────────────────────────────────────────────────
         sep2 = QFrame()
         sep2.setFrameShape(QFrame.Shape.HLine)
         sep2.setStyleSheet("background: rgba(255,255,255,0.08); border: none; max-height: 1px;")
@@ -1517,10 +1215,6 @@ class AvatarSelector(QDialog):
         self.selected_avatar = filename
         self.accept()
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Панель громкости (оставляем для совместимости, но в UI используем Overlay)
-# ──────────────────────────────────────────────────────────────────────────────
 class VolumePanel(QDialog):
     def __init__(self, nick, current_vol, uid, audio_handler, parent=None):
         super().__init__(parent)
@@ -1547,21 +1241,7 @@ class VolumePanel(QDialog):
         s = self.audio.toggle_user_mute(self.uid)
         self.btn_mute.setText("Разглушить" if s else "Заглушить")
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Системный оверлей шёпота — поверх всех окон Windows
-# ──────────────────────────────────────────────────────────────────────────────
 class WhisperSystemOverlay(QWidget):
-    """
-    Полупрозрачный оверлей в правом верхнем углу экрана.
-    Появляется поверх любых окон (игры, браузер, IDE) когда тебе шепчут.
-
-    Флаги окна:
-      WindowStaysOnTopHint  — поверх всего
-      FramelessWindowHint   — без заголовка/рамки
-      Tool                  — не мигает в панели задач, не крадёт Alt+Tab
-    WA_ShowWithoutActivating — не уводит фокус из игры при появлении.
-    """
 
     def __init__(self):
         super().__init__(
@@ -1572,22 +1252,18 @@ class WhisperSystemOverlay(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        # Высота фиксирована; ширина выставляется динамически в _reposition()
         self.setFixedHeight(46)
 
-        # ── Содержимое ────────────────────────────────────────────────────────
         layout = QHBoxLayout(self)
         layout.setContentsMargins(18, 0, 18, 0)
         layout.setSpacing(12)
 
-        # Иконка whispers.ico вместо эмодзи
         self._icon_lbl = QLabel()
         self._icon_lbl.setFixedSize(26, 26)
         icon_path = resource_path("assets/icon/whispers.ico")
         if os.path.exists(icon_path):
             self._icon_lbl.setPixmap(QIcon(icon_path).pixmap(26, 26))
         else:
-            # Резерв: рендерим текстовый символ если .ico не найден
             self._icon_lbl.setText("🤫")
             self._icon_lbl.setStyleSheet(
                 "font-size: 20px; background: transparent; border: none;"
@@ -1595,18 +1271,14 @@ class WhisperSystemOverlay(QWidget):
         self._icon_lbl.setStyleSheet("background: transparent; border: none;")
         layout.addWidget(self._icon_lbl)
 
-        # Одна строка: "Тебе шепчет  NickName"
         self._text_lbl = QLabel("Тебе шепчет  ...")
         self._text_lbl.setStyleSheet(
             "color: #ecf0f1; font-size: 13px; font-weight: bold; "
             "background: transparent; border: none; letter-spacing: 0.3px;"
         )
         layout.addWidget(self._text_lbl, stretch=1)
-        # Анимация намеренно убрана: оверлей горит ровно, без мигания,
-        # пока идут пакеты шёпота, и гасится сразу по их окончании.
 
     def _reposition(self):
-        """Растягиваем на всю ширину экрана, прибиваем к верхнему краю."""
         try:
             from PyQt6.QtWidgets import QApplication
             screen = QApplication.primaryScreen()
@@ -1618,24 +1290,19 @@ class WhisperSystemOverlay(QWidget):
             pass
 
     def show_for(self, nick: str):
-        """Показать оверлей с именем шептуна."""
         self._text_lbl.setText(f"Тебе шепчет  {nick}")
         self._reposition()
         self.show()
 
     def hide_overlay(self):
-        """Скрыть оверлей."""
         self.hide()
 
     def paintEvent(self, event):
-        """Полноширинная полупрозрачная плашка — рисуем вручную (WA_TranslucentBackground)."""
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        # Тёмно-синий glassmorphism фон
         p.setBrush(QBrush(QColor(8, 10, 24, 235)))
         p.setPen(Qt.PenStyle.NoPen)
         p.drawRect(self.rect())
-        # Градиентная акцентная линия снизу (синий → фиолетовый)
         from PyQt6.QtGui import QLinearGradient
         grad = QLinearGradient(0, 0, self.width(), 0)
         grad.setColorAt(0.0, QColor(91, 142, 245, 200))
@@ -1645,16 +1312,7 @@ class WhisperSystemOverlay(QWidget):
         p.drawRect(0, self.height() - 2, self.width(), 2)
         p.end()
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Кастомный title bar для безрамочных диалогов
-# ──────────────────────────────────────────────────────────────────────────────
 class _DialogTitleBar(QWidget):
-    """
-    Компактный кастомный title bar для безрамочных QDialog.
-    Поддерживает: перетаскивание, сворачивание (опционально), закрытие.
-    Дизайн в едином стиле со SoundboardPanel и UserOverlayPanel.
-    """
 
     def __init__(self, parent_dialog, title: str = "", show_minimize: bool = False):
         super().__init__(parent_dialog)
@@ -1739,29 +1397,10 @@ class _DialogTitleBar(QWidget):
         self._drag_pos = None
         super().mouseReleaseEvent(e)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Оверлей выбора собственного статуса
-# ══════════════════════════════════════════════════════════════════════════════
 class SelfStatusOverlayPanel(QFrame):
-    """
-    Всплывающий полупрозрачный оверлей выбора собственного статуса.
-    Открывается правым кликом по своему никнейму в дереве.
 
-    Дизайн повторяет UserOverlayPanel: тёмный полупрозрачный card,
-    скруглённые углы, Qt.Popup (автозакрытие при клике вне).
-
-    Содержимое:
-    • Сетка иконок статусов (5 колонок, авто-сканирование assets/status/)
-    • Поле описания (макс. 20 символов) + счётчик
-    • Кнопки «Убрать статус» и «Применить»
-
-    on_save(icon: str, text: str) — вызывается при нажатии «Применить»
-    или «Убрать статус» (с пустыми строками).
-    """
-
-    _COLS   = 5    # иконок в строке
-    _BTN_SZ = 44   # px — размер кнопки иконки
+    _COLS   = 5
+    _BTN_SZ = 44
 
     def __init__(self, current_icon: str, current_text: str,
                  global_pos, on_save, parent=None):
@@ -1776,12 +1415,10 @@ class SelfStatusOverlayPanel(QFrame):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setObjectName("selfStatusOverlay")
 
-        # ── Внешний layout (отступы = «воздух» под тень) ─────────────────────
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
 
-        # ── Card ──────────────────────────────────────────────────────────────
         self._card = QFrame(self)
         self._card.setObjectName("statusCard")
         self._card.setStyleSheet("""
@@ -1803,7 +1440,6 @@ class SelfStatusOverlayPanel(QFrame):
         card_lay.setContentsMargins(14, 12, 14, 14)
         card_lay.setSpacing(8)
 
-        # ── Заголовок ─────────────────────────────────────────────────────────
         title = QLabel("✨  Мой статус")
         title.setStyleSheet(
             "font-size: 13px; font-weight: bold; color: #e0e0ec; "
@@ -1811,7 +1447,6 @@ class SelfStatusOverlayPanel(QFrame):
         )
         card_lay.addWidget(title)
 
-        # ── Тонкий разделитель ─────────────────────────────────────────────────
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
         sep.setStyleSheet(
@@ -1820,7 +1455,6 @@ class SelfStatusOverlayPanel(QFrame):
         sep.setMaximumHeight(1)
         card_lay.addWidget(sep)
 
-        # ── Скролл-зона с иконками ─────────────────────────────────────────────
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -1850,7 +1484,6 @@ class SelfStatusOverlayPanel(QFrame):
         scroll.setWidget(icons_w)
         card_lay.addWidget(scroll)
 
-        # ── Описание ───────────────────────────────────────────────────────────
         lbl_desc = QLabel("Описание (необязательно):")
         lbl_desc.setStyleSheet(
             "font-size: 11px; color: rgba(200,200,210,0.70); "
@@ -1887,7 +1520,6 @@ class SelfStatusOverlayPanel(QFrame):
         self._text_edit.textChanged.connect(self._on_text_changed)
         card_lay.addWidget(self._char_counter)
 
-        # ── Кнопки ────────────────────────────────────────────────────────────
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
 
@@ -1933,7 +1565,6 @@ class SelfStatusOverlayPanel(QFrame):
         btn_row.addWidget(btn_ok)
         card_lay.addLayout(btn_row)
 
-        # ── Подгон размера и позиционирование ────────────────────────────────
         self.adjustSize()
         self.setFixedWidth(max(self.sizeHint().width(), 280))
 
@@ -1952,10 +1583,7 @@ class SelfStatusOverlayPanel(QFrame):
         y = max(avail.top()  + 4, y)
         self.move(x, y)
 
-    # ── Внутренние методы ─────────────────────────────────────────────────────
-
     def _load_icons(self, selected: str):
-        """Сканирует assets/status/ и заполняет сетку кнопками-иконками."""
         status_dir = resource_path("assets/status")
         svgs = []
         if os.path.isdir(status_dir):
@@ -2064,38 +1692,13 @@ class SelfStatusOverlayPanel(QFrame):
             self._on_save(icon, text)
         self.close()
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# StatusDialog — диалог выбора пользовательского статуса
-# ══════════════════════════════════════════════════════════════════════════════
 class StatusDialog(QDialog):
-    """
-    Диалог выбора «статуса дела» пользователя.
 
-    Структура:
-      ┌──────────────────────────────────────────┐
-      │  Выбери статус                           │
-      │  ┌───┐ ┌───┐ ┌───┐ ┌───┐ ┌───┐          │
-      │  │SVG│ │SVG│ │SVG│ │SVG│ │SVG│  ...     │
-      │  └───┘ └───┘ └───┘ └───┘ └───┘          │
-      │  Описание (необязательно):               │
-      │  [ Ушёл пить чай__________________ ]    │
-      │                          0 / 30         │
-      │  [ ✕ Убрать статус ] [Отмена] [Применить]│
-      └──────────────────────────────────────────┘
-
-    Иконки: assets/status/*.svg  (авто-сканирование).
-    Выбранная иконка подсвечивается зелёной рамкой.
-    «Убрать статус» → возвращает ('', '').
-    Tooltip каждой иконки = имя файла без расширения.
-    """
-
-    _COLS   = 5    # иконок в строке
-    _BTN_SZ = 48   # размер кнопки (px)
+    _COLS   = 5
+    _BTN_SZ = 48
 
     def __init__(self, current_icon: str = "", current_text: str = "", parent=None):
         super().__init__(parent)
-        # ── Безрамочный стеклянный дизайн ────────────────────────────────────
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setWindowTitle("Мой статус")
@@ -2155,7 +1758,6 @@ class StatusDialog(QDialog):
         card_lay.setContentsMargins(0, 0, 0, 0)
         card_lay.setSpacing(0)
 
-        # Title bar
         self._title_bar = _DialogTitleBar(self, "😊  Мой статус")
         card_lay.addWidget(self._title_bar)
         _sep0 = QFrame()
@@ -2164,7 +1766,6 @@ class StatusDialog(QDialog):
         _sep0.setStyleSheet("background: rgba(255,255,255,0.08); border: none;")
         card_lay.addWidget(_sep0)
 
-        # Контент
         content_w = QWidget()
         content_w.setStyleSheet("background: transparent;")
         root = QVBoxLayout(content_w)
@@ -2172,12 +1773,10 @@ class StatusDialog(QDialog):
         root.setSpacing(10)
         card_lay.addWidget(content_w)
 
-        # ── Заголовок ──────────────────────────────────────────────────────────
         title_lbl = QLabel("Выбери статус")
         title_lbl.setStyleSheet("font-weight: bold; font-size: 14px; color: #cdd6f4; background:transparent;")
         root.addWidget(title_lbl)
 
-        # ── Скролл-зона с иконками ─────────────────────────────────────────────
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -2207,12 +1806,10 @@ class StatusDialog(QDialog):
         self._text_edit.textChanged.connect(self._on_text_changed)
         root.addWidget(self._char_counter)
 
-        # ── Разделитель ────────────────────────────────────────────────────────
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
         root.addWidget(sep)
 
-        # ── Кнопки ─────────────────────────────────────────────────────────────
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
 
@@ -2272,10 +1869,7 @@ class StatusDialog(QDialog):
         btn_row.addWidget(btn_ok)
         root.addLayout(btn_row)
 
-    # ── Внутренние методы ─────────────────────────────────────────────────────
-
     def _load_icons(self, selected: str):
-        """Сканирует assets/status/ и заполняет сетку кнопками-иконками."""
         status_dir = resource_path("assets/status")
         svgs = []
         if os.path.isdir(status_dir):
@@ -2333,7 +1927,6 @@ class StatusDialog(QDialog):
         )
 
     def _on_clear(self):
-        """Сбросить статус и сразу закрыть диалог с пустым результатом."""
         self._selected_icon = ""
         for btn in self._icon_buttons.values():
             try:
@@ -2345,5 +1938,4 @@ class StatusDialog(QDialog):
         self.accept()
 
     def get_result(self) -> tuple:
-        """Возвращает (icon_filename, status_text) после exec()."""
         return self._selected_icon, self._text_edit.text().strip()

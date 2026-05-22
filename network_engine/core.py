@@ -1,21 +1,3 @@
-# network_engine/core.py — NetworkClient: основной сетевой клиент InPulse
-#
-# ── Исправления v2 ─────────────────────────────────────────────────────────
-#
-#   FIX #47 (КРИТИЧНО): send_json thread-safe. Ранее sendall() вызывался
-#     из 6+ потоков одновременно — JSON-сообщения могли перемешаться в TCP
-#     stream (TCP сохраняет последовательность байтов, но не атомарность
-#     нескольких sendall). Теперь все TCP-отправки сериализованы через
-#     _tcp_send_lock.
-#
-#   FIX #48 (ВАЖНО): ping_loop/udp_keepalive_loop просыпаются на событие
-#     остановки вместо time.sleep(). Раньше при stop() потоки спали до 3с
-#     и вызывали sendto() на уже закрытый сокет → OSError: WinError 10038.
-#
-#   FIX #49 (ВАЖНО): UTF-8 incremental decoder в tcp_listen. Аналогично
-#     server.py, строковое raw_data через errors='ignore' теряло частичные
-#     байты кириллицы/эмоджи на границе chunk.
-
 import codecs
 import json
 import platform
@@ -51,12 +33,10 @@ from .features import FeaturesMixin
 MAX_SILENT_RECONNECT_ATTEMPTS = 2
 RECONNECT_DELAY               = 1.0
 
-# ── Фазы recovery ────────────────────────────────────────────────────────────
 _PHASE_IDLE       = 'idle'
 _PHASE_MIGRATING  = 'migrating'
 _PHASE_RECOVERING = 'recovering'
 
-# Точность таймера Windows
 if platform.system() == "Windows":
     try:
         winmm = ctypes.WinDLL('winmm')
@@ -64,14 +44,10 @@ if platform.system() == "Windows":
     except Exception:
         pass
 
-
-# FIX #49: размер TCP-буфера клиента. Меньше, чем у сервера, потому что
-# клиент получает в основном sync_users (небольшие) и chat_history.
 _TCP_BUFFER_MAX = 32 * 1024 * 1024
 
 
 class NetworkClient(WebRTCMixin, ChatMixin, FeaturesMixin, QObject):
-    # ── Сигналы ───────────────────────────────────────────────────────────
     connected           = pyqtSignal(dict)
     global_state_update = pyqtSignal(dict)
     error_occurred      = pyqtSignal(str)
@@ -106,14 +82,16 @@ class NetworkClient(WebRTCMixin, ChatMixin, FeaturesMixin, QObject):
 
     force_muted = pyqtSignal()
 
-    # ── Хост: кик / бан / обновление банлиста ─────────────────────────
-    # kicked/banned — сервер выгнал этого клиента. Строка — reason (UI).
-    # ban_list_updated — снимок банлиста для хоста (UI во вкладке «Главное»).
     kicked            = pyqtSignal(str)
     banned            = pyqtSignal(str)
     ban_list_updated  = pyqtSignal(list)
 
     draw_stroke_received = pyqtSignal(int, str, str, list, int)
+
+    remote_control_requested = pyqtSignal(int, str)   # (viewer_uid, viewer_nick)
+    remote_control_response  = pyqtSignal(bool, str)   # (granted, reason)
+    remote_control_event     = pyqtSignal(dict)
+    remote_control_stopped   = pyqtSignal()
 
     typing_received = pyqtSignal(int, str)
 
@@ -121,60 +99,32 @@ class NetworkClient(WebRTCMixin, ChatMixin, FeaturesMixin, QObject):
         super().__init__()
         self.audio  = audio
         self.video  = None
-
         self.server_addr  = None
         self.running      = False
         self.current_ping = 0
         self.packets_sent      = 0
         self.packets_received  = 0
-
         self._ip     = None
         self._nick   = None
         self._avatar = None
-
         self._is_connected       = False
         self._reconnecting       = False
         self._reconnect_attempts = 0
-
-        # Флаг «нас кикнули/забанили сервером» — блокирует авто-reconnect.
-        # Устанавливается в features._process_features_message при CMD_KICKED
-        # или CMD_BANNED. Проверяется в reconnect-логике.
         self._kicked_flag: bool = False
-
-        # FIX #47: сериализация TCP-отправок между потоками.
-        # Вызывающие send_json потоки: UI (главный), ping_loop, chat mixin,
-        # webrtc mixin (answer/ice callbacks), features mixin (nudge/file_offer),
-        # audio thread (update_status), recovery-потоки.
-        # Без лока один sendall мог попасть в середину байтов другого.
         self._tcp_send_lock: threading.Lock = threading.Lock()
-
-        # FIX #48: единое событие остановки для ping_loop / udp_keepalive_loop.
-        # Вместо time.sleep(3) используем .wait(3) → при stop() потоки
-        # просыпаются мгновенно и не пытаются sendto на закрытый сокет.
         self._shutdown_event: threading.Event = threading.Event()
-
         self._sb_playing = threading.Event()
-
         self._chat_history: list[dict] = []
-
-        # ── Встроенный сервер: миграция ─────────────────────────
         self._host_order:       list[int]      = []
         self._server_host_uid:  int            = 0
         self._host_order_ips:   dict[int, str] = {}
-
-        # ── Recovery state machine ─────────────────────────────
         self._recovery_state:     str              = _PHASE_IDLE
         self._recovery_lock:      threading.Lock   = threading.Lock()
         self._recovery_event:     threading.Event  = threading.Event()
         self._recovery_target_ip: str              = ''
-
         self._init_webrtc_attrs()
-
         self._init_sockets()
 
-    # ------------------------------------------------------------------
-    # Backward-compat
-    # ------------------------------------------------------------------
     @property
     def _migration_pending(self) -> bool:
         return self._recovery_state == _PHASE_MIGRATING
@@ -187,9 +137,6 @@ class NetworkClient(WebRTCMixin, ChatMixin, FeaturesMixin, QObject):
                     self._recovery_state     = _PHASE_IDLE
                     self._recovery_target_ip = ''
 
-    # ------------------------------------------------------------------
-    # Сокеты
-    # ------------------------------------------------------------------
     def _init_sockets(self):
         for attr in ('tcp_sock', 'udp_sock'):
             old = getattr(self, attr, None)
@@ -207,19 +154,14 @@ class NetworkClient(WebRTCMixin, ChatMixin, FeaturesMixin, QObject):
         except Exception as e:
             print(f"[Net] Socket init error: {e}")
 
-    # ------------------------------------------------------------------
-    # Подключение
-    # ------------------------------------------------------------------
     def connect_to_server(self, ip, nick, avatar):
         self._ip     = ip
         self._nick   = nick
         self._avatar = avatar
         self._reconnect_attempts = 0
         self._reconnecting       = False
-        # Свежий коннект — снимаем флаг кика (пользователь явно идёт на
-        # новый сервер либо повторно на тот же — решение за UI).
         self._kicked_flag        = False
-        self._shutdown_event.clear()  # FIX #48: сбрасываем событие при старте
+        self._shutdown_event.clear()
         threading.Thread(target=self._connect_initial, daemon=True).start()
 
     def _connect_initial(self):
@@ -269,14 +211,7 @@ class NetworkClient(WebRTCMixin, ChatMixin, FeaturesMixin, QObject):
 
         print("[Net] Connected to server")
 
-    # ------------------------------------------------------------------
-    # Recovery
-    # ------------------------------------------------------------------
     def _start_recovery(self, phase: str, target_ip: str = '') -> bool:
-        # Если нас кикнули/забанили — блокируем ЛЮБОЙ recovery на корню.
-        # Проверка стоит здесь (а не только в _on_connection_lost) потому что
-        # trigger_migration / fast_switch_to зовут _start_recovery напрямую,
-        # минуя _on_connection_lost.
         if self._kicked_flag:
             print(f"[Recovery] skip {phase}: _kicked_flag активен")
             return False
@@ -289,7 +224,6 @@ class NetworkClient(WebRTCMixin, ChatMixin, FeaturesMixin, QObject):
             self._recovery_event.clear()
             self.running       = False
             self._is_connected = False
-            # Сигнализируем ping/keepalive потокам о необходимости остановиться
             self._shutdown_event.set()
 
         threading.Thread(
@@ -308,8 +242,6 @@ class NetworkClient(WebRTCMixin, ChatMixin, FeaturesMixin, QObject):
         self._recovery_event.set()
 
     def _on_connection_lost(self) -> None:
-        # Если нас кикнули/забанили — никаких reconnect-попыток.
-        # UI получит сигнал kicked/banned и покажет экран выбора сервера.
         if self._kicked_flag:
             print("[Net] connection lost после kick/ban — reconnect заблокирован")
             return
@@ -526,10 +458,6 @@ class NetworkClient(WebRTCMixin, ChatMixin, FeaturesMixin, QObject):
         if ip:
             print(f"[Recovery] услышали анонс {ip} — пробуем подключиться вместо "
                   f"become_host")
-            # SENIOR FIX: раньше было безусловное return False, даже если
-            # _attempt_full_connect упал. Теперь: возвращаем False ТОЛЬКО
-            # если подключение к анонсированному хосту реально удалось.
-            # Иначе продолжаем по ветке "pos>0 listen" или "pos==0 become_host".
             if self._attempt_full_connect(ip):
                 return False
             print(f"[Recovery] connect к анонсированному {ip} упал — "
@@ -537,16 +465,10 @@ class NetworkClient(WebRTCMixin, ChatMixin, FeaturesMixin, QObject):
 
         if my_pos == 0:
             return True
-
-        # FIX: раньше было time.sleep(1.0) + _listen_for_announce(timeout=1.5).
-        # sleep(1.0) блокировал _recovery_loop без пользы — за это время мы
-        # всё равно не слушали анонсы. Объединяем в один listen(2.5):
-        # если за 2.5 сек никто не объявился — сдаёмся.
         stop_evt2 = threading.Event()
         ip2 = self._listen_for_announce(timeout=2.5, stop_evt=stop_evt2,
                                         exclude_ip=self._ip)
         if ip2:
-            # SENIOR FIX: аналогично — return False только если connect успешен.
             if self._attempt_full_connect(ip2):
                 return False
             print(f"[Recovery] connect к {ip2} упал — сдаёмся (pos>0)")
@@ -596,14 +518,10 @@ class NetworkClient(WebRTCMixin, ChatMixin, FeaturesMixin, QObject):
         finally:
             self._finish_recovery()
 
-    # ------------------------------------------------------------------
-    # Остановка
-    # ------------------------------------------------------------------
     def stop(self) -> None:
         print("[Net] stop(): завершаем сетевые потоки...")
         self.running = False
         self._is_connected = False
-        # FIX #48: будим все потоки ожидающие на event.wait()
         self._shutdown_event.set()
 
         self._stop_webrtc()
@@ -647,9 +565,6 @@ class NetworkClient(WebRTCMixin, ChatMixin, FeaturesMixin, QObject):
             self.server_migrating.emit(new_host_ip)
             self.trigger_migration(new_host_ip)
 
-    # ------------------------------------------------------------------
-    # UDP
-    # ------------------------------------------------------------------
     def udp_receive_loop(self):
         while self.running:
             try:
@@ -709,10 +624,6 @@ class NetworkClient(WebRTCMixin, ChatMixin, FeaturesMixin, QObject):
                 continue
 
     def udp_keepalive_loop(self):
-        """
-        FIX #48: используем _shutdown_event.wait() вместо time.sleep(1).
-        При stop() поток проснётся мгновенно и не пошлёт на закрытый сокет.
-        """
         while self.running and not self._shutdown_event.is_set():
             if self.audio.my_uid != 0:
                 flags = (1 if self.audio.is_muted else 0) | (2 if self.audio.is_deafened else 0)
@@ -728,14 +639,10 @@ class NetworkClient(WebRTCMixin, ChatMixin, FeaturesMixin, QObject):
                     print(f"[Net] Keepalive error: {e}")
                 except Exception as e:
                     print(f"[Net] Keepalive error: {e}")
-            # FIX #48: wait(1) вместо sleep(1)
             if self._shutdown_event.wait(1):
                 break
 
     def ping_loop(self):
-        """
-        FIX #48: wait() вместо sleep() для быстрого выхода при stop().
-        """
         while self.running and not self._shutdown_event.is_set():
             if self.audio.my_uid != 0:
                 try:
@@ -757,20 +664,10 @@ class NetworkClient(WebRTCMixin, ChatMixin, FeaturesMixin, QObject):
                         self.send_json({'action': 'report_ping', 'ping_ms': self.current_ping})
                     except Exception:
                         pass
-            # FIX #48: wait(3) вместо sleep(3)
             if self._shutdown_event.wait(3):
                 break
 
-    # ------------------------------------------------------------------
-    # TCP
-    # ------------------------------------------------------------------
     def tcp_listen(self):
-        """
-        FIX #49: UTF-8 incremental decoder обрабатывает multi-byte
-        последовательности, разрезанные между recv(). Раньше `decode(errors='ignore')`
-        съедал начальные байты кириллицы/эмоджи если они попадали на границу
-        chunk, что приводило к JSONDecodeError на следующей итерации.
-        """
         raw_data = ""
         _decoder = json.JSONDecoder()
         utf8_decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
@@ -780,8 +677,6 @@ class NetworkClient(WebRTCMixin, ChatMixin, FeaturesMixin, QObject):
                 chunk_bytes = self.tcp_sock.recv(4096)
                 if not chunk_bytes:
                     break
-                # FIX #49: incremental decode — сохраняет незавершённые
-                # последовательности между вызовами decode().
                 raw_data += utf8_decoder.decode(chunk_bytes, final=False)
                 if len(raw_data) > _TCP_BUFFER_MAX:
                     print(f"[Net] WARN: raw_data overflow ({len(raw_data)} bytes) — clearing")
@@ -888,26 +783,7 @@ class NetworkClient(WebRTCMixin, ChatMixin, FeaturesMixin, QObject):
         elif self._process_features_message(msg, act):
             pass
 
-    # ------------------------------------------------------------------
-    # Утилиты
-    # ------------------------------------------------------------------
     def send_json(self, data):
-        """
-        FIX #47 (КРИТИЧНО): thread-safe отправка JSON.
-
-        Вызывается из множества потоков: UI (главный), ping_loop,
-        chat/webrtc/features mixins, audio, recovery. Без _tcp_send_lock
-        две конкурентные send_json могут перемешать байты в TCP stream:
-        sendall() гарантирует что все байты уйдут, но НЕ гарантирует
-        атомарность относительно другого sendall() из другого потока.
-
-        Результат такого мерж: сервер получает `{"action":"pi{"action":"cha...`
-        → JSONDecodeError → tcp_handler уходит в except → клиент получает
-        отключение.
-
-        Лок короткий (только на время sendall), блокирующие потоки ждут
-        <1ms на нормальном TCP-пути.
-        """
         try:
             payload = json.dumps(data).encode('utf-8')
         except Exception as e:

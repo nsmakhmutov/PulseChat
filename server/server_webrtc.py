@@ -1,35 +1,10 @@
-"""
-server_webrtc.py — Pion SFU Proxy v3
-
-Заменяет WebRTCSFU (aiortc на сервере) на тонкий HTTP-прокси к Go Pion SFU.
-
-─── FIX: remote streamer viewer connect ───────────────────────────────────────
-  Старый trigger_viewer_connect() проверял self._sfu.is_running() для ВСЕХ
-  стримеров — включая удалённых. Новый код: локальный SFU нужен ТОЛЬКО
-  когда стример на той же машине. Для удалённых:
-    - Триггер отправляем сразу, локальный SFU не нужен.
-    - Offer зрителя пойдёт напрямую к remote SFU (26.x.x.x:7788).
-
-─── FIX thread-safe _send ─────────────────────────────────────────────────
-  _send() вызывается из нескольких потоков (trigger_viewer_connect и
-  handle_viewer_offer могут выполняться параллельно, так как серверный
-  tcp_handler создаёт отдельный поток на каждого клиента). Без лока
-  sendall() для одного и того же conn мог перемешаться с sendall()
-  из другого потока → битый JSON у клиента.
-
-  Используем _per_conn_locks: dict[conn, Lock] — лок на сокет.
-  После закрытия клиента очистка в close_viewer.
-"""
-
 import json
 import threading
 from typing import Optional
 
 from config import CMD_WEBRTC_OFFER, CMD_WEBRTC_ANSWER, SFU_PORT
 
-
 def _strip_mdns_candidates(sdp: str) -> str:
-    """Убирает mDNS *.local кандидаты из SDP answer (aiortc не резолвит)."""
     sep = "\r\n" if "\r\n" in sdp else "\n"
     lines = sdp.split(sep)
     filtered = [
@@ -46,15 +21,11 @@ def _strip_mdns_candidates(sdp: str) -> str:
 def _is_local_ip(ip: str) -> bool:
     return ip in ('127.0.0.1', '::1', '', 'localhost')
 
-
-# Global table of per-connection send locks.
-# Используется вместо атрибута на сокете (сокет — C-объект).
 _conn_send_locks: "dict[int, threading.Lock]" = {}
 _conn_send_locks_guard = threading.Lock()
 
 
 def _get_conn_lock(conn) -> threading.Lock:
-    """Возвращает лок для данного conn. Ленивое создание."""
     key = id(conn)
     with _conn_send_locks_guard:
         lk = _conn_send_locks.get(key)
@@ -65,14 +36,12 @@ def _get_conn_lock(conn) -> threading.Lock:
 
 
 def _drop_conn_lock(conn) -> None:
-    """Удаляет лок после закрытия conn (избегаем утечки памяти)."""
     key = id(conn)
     with _conn_send_locks_guard:
         _conn_send_locks.pop(key, None)
 
 
 class PionSfuProxy:
-    """Тонкий прокси к Go Pion SFU (sidecar.exe)."""
 
     def __init__(self, sfu_bridge=None):
         self._sfu = sfu_bridge
@@ -83,15 +52,12 @@ class PionSfuProxy:
 
     @staticmethod
     def _send(conn, msg: dict) -> None:
-        """Thread-safe отправка JSON клиенту."""
         try:
             payload = json.dumps(msg).encode('utf-8')
         except Exception as e:
             print(f"[SFU-Proxy] _send encode: {e}")
             return
 
-        # Берём лок на конкретный conn — сериализует только отправки
-        # на этот сокет, не блокируя остальные.
         lock = _get_conn_lock(conn)
         with lock:
             try:
@@ -101,8 +67,6 @@ class PionSfuProxy:
 
     def call_async(self, coro_or_whatever):
         pass
-
-    # ── Viewer connect ────────────────────────────────────────────────────────
 
     def trigger_viewer_connect(
         self,
@@ -216,10 +180,7 @@ class PionSfuProxy:
         })
         print(f"[SFU-Proxy] viewer={viewer_uid}: ✅ answer отправлен")
 
-    # ── Viewer disconnect ─────────────────────────────────────────────────────
-
     def close_viewer(self, viewer_uid: int) -> None:
-        """DELETE /viewer/{viewer_uid} в Pion SFU."""
         with self._lock:
             streamer_ip = self._viewer_streamer_ip.pop(viewer_uid, '127.0.0.1')
             old_conn = self._viewer_conns.pop(viewer_uid, None)
@@ -238,47 +199,13 @@ class PionSfuProxy:
         for uid in uids:
             self.close_viewer(uid)
 
-    # ── Streamer disconnect ───────────────────────────────────────────────────
-
     def close_streamer(self, streamer_uid: int) -> None:
-        """
-        ВАЖНО: этот метод НЕ должен вызывать delete_streamer() на локальном SFU.
-
-        Исторический баг: раньше вызов шёл по любому disconnect клиента в
-        tcp_handler finally. Внутри было безусловное:
-            self._sfu.delete_streamer()
-            self.close_all_viewers()
-        Игнорировался сам параметр streamer_uid — удалялся ЕДИНСТВЕННЫЙ
-        стример локального SFU независимо от того, чей uid отключился.
-        В сценарии «хост стримит экран + ещё один клиент уходит» это
-        убивало стрим хоста → у всех пропадал звук/видео до передачи
-        сервера другому (тогда новый SFU запускался с нуля и стрим
-        переконнекчивался).
-
-        Почему метод теперь ничего не делает:
-        • Если стример — удалённый клиент: его Go-SFU крутится на его
-          машине, мы не можем им управлять отсюда. Viewer-PC'и умрут
-          сами по ICE timeout + клиенты получат is_streaming=false в
-          следующем sync_users и почистят свои view-PC'и.
-        • Если стример — сам хост: его стоп идёт через
-          network_engine/webrtc.stop_streaming_webrtc() которая сама
-          делает delete_streamer() на своём же SFU. Этот путь работает
-          правильно и в этом методе дублировать его не нужно.
-
-        Метод оставлен с сигнатурой чтобы не ломать вызовы из
-        server.py (CMD_STREAM_STOP и finally).
-        """
-        # Ничего не делаем. См. docstring.
         pass
-
-    # ── Status ────────────────────────────────────────────────────────────────
 
     def status(self) -> dict:
         if self._sfu is not None and self._sfu.is_running():
             return self._sfu.status()
         return {"streamer": "none", "viewers": 0}
-
-    # ── Shutdown ──────────────────────────────────────────────────────────────
 
     def shutdown(self) -> None:
         self.close_all_viewers()

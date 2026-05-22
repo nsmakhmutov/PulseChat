@@ -2,8 +2,6 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
                              QWidget, QLabel, QLineEdit, QCheckBox)
 from PyQt6.QtCore import Qt
 
-
-# ── Общий stylesheet для диалогов каналов ────────────────────────────────────
 _DIALOG_CHANNEL_SS = """
     QWidget#dlgCard {
         background-color: rgba(22, 24, 35, 252);
@@ -30,7 +28,6 @@ _DIALOG_CHANNEL_SS = """
 
 
 class _CreateChannelDialog(QDialog):
-    """Диалог создания временного канала (хост → ПКМ по дереву)."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -134,7 +131,6 @@ class _CreateChannelDialog(QDialog):
 
 
 class _ChannelPasswordDialog(QDialog):
-    """Запрашивает пароль для входа в защищённый канал."""
 
     def __init__(self, channel_name: str, parent=None):
         super().__init__(parent)

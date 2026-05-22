@@ -1,5 +1,3 @@
-# network_engine/chat.py — Чат, Quick Messages, Chat Media, Chat History
-
 import time
 
 from config import (
@@ -12,18 +10,9 @@ from config import (
 
 
 class ChatMixin:
-    """Методы чата: сообщения, медиа, история."""
-
-    # ------------------------------------------------------------------
-    # Отправка
-    # ------------------------------------------------------------------
-    # ------------------------------------------------------------------
-    # Typing indicator
-    # ------------------------------------------------------------------
     _last_typing_ts: float = 0.0
 
     def send_typing(self) -> None:
-        """Отправить typing indicator (throttled, не чаще TYPING_THROTTLE_MS)."""
         import time
         now = time.time()
         if now - self._last_typing_ts < TYPING_THROTTLE_MS / 1000.0:
@@ -56,12 +45,7 @@ class ChatMixin:
             'file_data_b64': file_data_b64,
         })
 
-    # ------------------------------------------------------------------
-    # process_message dispatch для чата
-    # ------------------------------------------------------------------
     def _process_chat_message(self, msg: dict, act: str) -> bool:
-        """Обрабатывает сообщения чата. Возвращает True если обработано."""
-
         if act == CMD_QUICK_MSG:
             sender_uid  = int(msg.get('uid', 0))
             from_nick   = str(msg.get('from_nick', '?'))

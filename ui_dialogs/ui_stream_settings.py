@@ -5,10 +5,6 @@ from PyQt6.QtGui import QGuiApplication
 
 from .ui_dialogs import _DialogTitleBar
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Диалог настроек трансляции
-# ──────────────────────────────────────────────────────────────────────────────
 class StreamSettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -88,7 +84,6 @@ class StreamSettingsDialog(QDialog):
         layout.setSpacing(8)
         card_lay.addWidget(content_w)
 
-        # ── Монитор ───────────────────────────────────────────────────────────
         layout.addWidget(QLabel("Выберите монитор:"))
         self.monitor_combo = QComboBox()
 
@@ -110,13 +105,9 @@ class StreamSettingsDialog(QDialog):
 
         layout.addWidget(self.monitor_combo)
 
-        # ── Разрешение ────────────────────────────────────────────────────────
         layout.addWidget(QLabel("Разрешение:"))
         self.res_combo = QComboBox()
 
-        # Три фиксированных пресета — нативное разрешение убрано:
-        # оно создаёт избыточную нагрузку на RadminVPN и не даёт
-        # осмысленного прироста качества при сетевой демонстрации.
         self._fixed_res_options: dict[str, tuple[int, int]] = {
             "720p  (HD)   — 4,5 Mbps":  (1280, 720),
             "480p  (SD)   — 2 Mbps":  ( 854, 480),
@@ -126,18 +117,15 @@ class StreamSettingsDialog(QDialog):
         for text, res in self._fixed_res_options.items():
             self.res_combo.addItem(text, res)
 
-        # По умолчанию 480p
         self.res_combo.setCurrentIndex(1)
         layout.addWidget(self.res_combo)
 
-        # ── FPS ───────────────────────────────────────────────────────────────
         layout.addWidget(QLabel("Частота кадров (FPS):"))
         self.fps_combo = QComboBox()
         self.fps_combo.addItems(["15", "30"])
         self.fps_combo.setCurrentText("30")
         layout.addWidget(self.fps_combo)
 
-        # ── Фикс прозрачного popup ────────────────────────────────────────────
         def _fix_stream_combo(combo):
             try:
                 v = combo.view()
@@ -163,14 +151,12 @@ class StreamSettingsDialog(QDialog):
 
         layout.addSpacing(10)
 
-        # ── Аудио ─────────────────────────────────────────────────────────────
         self.cb_stream_audio = QCheckBox("🔊 Транслировать звук")
         self.cb_stream_audio.setChecked(True)
         layout.addWidget(self.cb_stream_audio)
 
         layout.addSpacing(8)
 
-        # ── Кнопки ────────────────────────────────────────────────────────────
         btn_start = QPushButton("▶  Запустить трансляцию")
         btn_start.setStyleSheet("""
             QPushButton {
@@ -209,25 +195,14 @@ class StreamSettingsDialog(QDialog):
 
         self.adjustSize()
 
-
-    # ------------------------------------------------------------------
-    # Получение настроек
-    # ------------------------------------------------------------------
-
     def get_settings(self) -> dict:
-        """
-        Возвращает dict настроек для VideoEngine.start_streaming() и
-        network_engine.start_streaming_webrtc().
 
-        quality='hq' зритель выбирает сам при stream_watch_start.
-        Здесь возвращаем только параметры стримера.
-        """
         monitor_idx  = self.monitor_combo.currentData()
         fps          = int(self.fps_combo.currentText())
         audio_on     = self.cb_stream_audio.isChecked()
 
         res_data = self.res_combo.currentData()
-        width, height = res_data  # всегда tuple (w, h)
+        width, height = res_data
 
         return {
             "monitor_idx":         monitor_idx,

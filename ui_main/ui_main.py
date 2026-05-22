@@ -7,6 +7,28 @@ import soundfile as sf
 import winsound
 import keyboard
 import time
+
+try:
+    import pyautogui
+    pyautogui.FAILSAFE = False
+    _PYAUTOGUI_AVAILABLE = True
+    try:
+        print(f"[RC-INIT] pyautogui OK, version={getattr(pyautogui,'__version__','?')}")
+    except Exception:
+        pass
+except ImportError as _e:
+    _PYAUTOGUI_AVAILABLE = False
+    print(f"[RC-INIT] pyautogui ImportError: {_e!r}")
+
+# WinAPI SendInput-бэкенд для надёжной инъекции (Unicode-текст, модификаторы).
+try:
+    from core import win_input as _win_input
+    _WIN_INPUT_AVAILABLE = _win_input.WIN_INPUT_AVAILABLE
+    print(f"[RC-INIT] win_input available={_WIN_INPUT_AVAILABLE}")
+except Exception as _e:
+    _win_input = None
+    _WIN_INPUT_AVAILABLE = False
+    print(f"[RC-INIT] win_input import failed: {_e!r}")
 from .video_engine import VideoEngine
 from .ui_video import VideoWindow, StreamerAnnotationOverlay
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -27,6 +49,7 @@ from config import (
     CMD_FORCE_MUTED,
     CHAT_MSG_MAX_LEN,
     CMD_DRAW_STROKE,
+    RC_ESC_STOP_COUNT, RC_ESC_WINDOW_SEC,
     is_anonymous_uid,
 )
 from audio_engine import AudioHandler
@@ -40,25 +63,10 @@ from .ui_widgets import QuickMsgBubble, CustomTitleBar, ChatPanel
 from .ui_channel import _CreateChannelDialog, _ChannelPasswordDialog
 from version import APP_VERSION, APP_NAME, GITHUB_REPO
 
-
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# QuickMsgBubble — стеклянный пузырь быстрого сообщения
-# ──────────────────────────────────────────────────────────────────────────────
-
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# HoldToDisconnectButton — кнопка «Отключиться» с удержанием 1 сек
-# ──────────────────────────────────────────────────────────────────────────────
-
 class HoldToDisconnectButton(QPushButton):
-    """При удержании 1 секунду заливка заполняется слева направо,
-    после чего вызывается callback отключения."""
 
-    HOLD_MS = 1000          # длительность удержания
-    TICK_MS = 16            # ~60 fps
+    HOLD_MS = 1000
+    TICK_MS = 16
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -78,7 +86,6 @@ class HoldToDisconnectButton(QPushButton):
         self._callback = callback
 
     def set_hold_sound(self, path: str) -> None:
-        """Устанавливает .wav файл, который играет в цикле во время удержания."""
         import os
         resolved = os.path.normpath(os.path.abspath(path))
         if os.path.isfile(resolved):
@@ -105,12 +112,9 @@ class HoldToDisconnectButton(QPushButton):
             return
         try:
             import winsound
-            # FIX: SND_PURGE deprecated — используем PlaySound(None, 0)
             winsound.PlaySound(None, 0)
         except Exception:
             pass
-
-    # ── events ────────────────────────────────────────────────────────────────
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -127,11 +131,8 @@ class HoldToDisconnectButton(QPushButton):
         super().mouseReleaseEvent(event)
 
     def leaveEvent(self, event):
-        """Отмена, если курсор ушёл с кнопки во время удержания."""
         self._cancel()
         super().leaveEvent(event)
-
-    # ── internals ─────────────────────────────────────────────────────────────
 
     def _tick(self):
         self._progress = min(self._progress + self.TICK_MS / self.HOLD_MS, 1.0)
@@ -151,7 +152,7 @@ class HoldToDisconnectButton(QPushButton):
         self._progress = 1.0
         self._apply_style()
         if self._callback:
-            QTimer.singleShot(80, self._callback)   # мини-пауза — видна полная заливка
+            QTimer.singleShot(80, self._callback)
         QTimer.singleShot(120, lambda: self.setStyleSheet(""))
 
     def _apply_style(self):
@@ -186,6 +187,10 @@ class HoldToDisconnectButton(QPushButton):
 
 
 class MainWindow(QMainWindow):
+    # Эмитится из потока библиотеки keyboard, когда стример нажал ESC нужное
+    # число раз. Доставляется в Qt-поток через очередь сигналов.
+    _rc_esc_triggered = pyqtSignal()
+
     def __init__(self, ip, nick, avatar):
         super().__init__()
         font_path = resource_path("assets/font/MyFont.ttf")
@@ -195,14 +200,13 @@ class MainWindow(QMainWindow):
         self.ip, self.nick, self.avatar = ip, nick, avatar
         self.app_settings = QSettings("MyVoiceChat", "GlobalSettings")
         self.known_uids = {}
-        self._icon_size = 24  # Мы уже выяснили, что она нужна
-        self._my_status_icon = None  # Для фикса ошибки в on_connected
+        self._icon_size = 24
+        self._my_status_icon = None
         from PyQt6.QtGui import QFont
-        self._font_room = QFont()  # Базовый шрифт для комнат
+        self._font_room = QFont()
         self._font_user = QFont()
         self.current_room = "General"
         self.default_rooms = ["General"]
-        # Актуальный список каналов (обновляется из sync_users → channel_list)
         self._channel_list: list = [
             {'name': 'General', 'has_password': False, 'permanent': True}
         ]
@@ -216,48 +220,29 @@ class MainWindow(QMainWindow):
             "stream_on":      resource_path("assets/music/stream_on.wav"),
             "stream_off":     resource_path("assets/music/stream_off.wav"),
             "quick_msg":      resource_path("assets/music/message.wav"),
-            # ── Новые звуки ───────────────────────────────────────────────────
-            # friend_connect.wav — воспроизводится когда ЛЮБОЙ пользователь
-            # появляется на сервере (подключается впервые в текущей сессии).
-            # file_received.wav  — воспроизводится при входящем предложении файла.
             "friend_connect": resource_path("assets/music/friend_connect.wav"),
             "file_received":  resource_path("assets/music/file.wav"),
-            # Чат: входящее сообщение / исходящее
             "chat_msg_in":    resource_path("assets/music/message.wav"),
             "chat_msg_out":   resource_path("assets/music/message_send.wav"),
         }
         self.prev_room_uids: set = set()
         self.prev_streaming_uids: set = set()
-        # ── Состояние для звука подключения друга ─────────────────────────────
-        # prev_all_uids — UIDs всех пользователей на сервере (без себя) с прошлого
-        # обновления. Используется в update_user_tree() для детектирования новых
-        # подключений к серверу (не только к текущей комнате).
-        #
-        # _server_users_initialized — False сразу после (пере)подключения.
-        # При первом sync_users просто засеваем prev_all_uids без звука,
-        # чтобы не воспроизводить friend_connect для ВСЕХ уже подключённых
-        # пользователей в момент входа в сервер.
+
         self.prev_all_uids: set = set()
         self._server_users_initialized: bool = False
 
         self.audio = AudioHandler()
         self.net = NetworkClient(self.audio)
 
-        # ── Состояние для ресайза безрамочного окна ──────────────────────────
-        self._resize_margin = 6          # px — зона у края для начала ресайза
+        self._resize_margin = 6
         self._resize_direction: str | None = None
         self._resize_start_pos: QPoint | None = None
         self._resize_start_geom: QRect | None = None
         self.setMouseTracking(True)
 
-        # Приложение-уровневый фильтр для корректного сброса курсора ресайза
-        # когда мышь уходит с края рамки на дочерние виджеты (tree, кнопки и т.п.)
         from PyQt6.QtWidgets import QApplication
         QApplication.instance().installEventFilter(self)
 
-        # Предзагрузка звуков уведомлений: каждый звук загружается ОДИН РАЗ.
-        # Хранится как (data, sr) кортеж — sounddevice воспроизводит напрямую без
-        # повторного чтения с диска при каждом событии.
         self._loaded_sounds: dict = {}
         for key, path in self.sound_files.items():
             if os.path.exists(path):
@@ -274,7 +259,6 @@ class MainWindow(QMainWindow):
         self.setup_ui()
         self.apply_theme(self.app_settings.value("theme", "Темная"))
 
-        # ── System Tray Icon ─────────────────────────────────────────────────
         self._tray_icon = QSystemTrayIcon(
             QIcon(resource_path("assets/icon/logo.ico")), self
         )
@@ -288,103 +272,59 @@ class MainWindow(QMainWindow):
         self._tray_icon.activated.connect(self._on_tray_activated)
         self._tray_icon.setToolTip(f"{APP_NAME} — {self.nick}")
         self._tray_icon.show()
-        self._force_quit = False   # True = полный выход из трея
-        self._returning_to_lobby = False  # True = отключение → возврат в лобби
-
-        # ── ChatPanel: встроена в _main_row (окно расширяется при открытии) ───
-        # ChatPanel добавлена в QHBoxLayout рядом с main_page в setup_ui().
-        # При открытии: setVisible(True) + resize(w + PANEL_WIDTH, h).
-        # При закрытии: setVisible(False) + resize(w - PANEL_WIDTH, h).
-        self._chat_panel.set_my_uid(0)     # обновится в on_connected
+        self._force_quit = False
+        self._returning_to_lobby = False
+        self._chat_panel.set_my_uid(0)
         self._chat_panel.message_sent.connect(self._on_chat_panel_send)
         self._chat_panel.media_send_requested.connect(self._on_chat_media_requested)
-        # Chat button moved from title bar to full-width button above bottom_bar
-
         self.net.connected.connect(self.on_connected)
         self.net.global_state_update.connect(self.update_user_tree)
         self.net.error_occurred.connect(self.on_connection_error)
         self.net.connection_lost.connect(self.on_connection_lost)
         self.net.connection_restored.connect(self.on_connection_restored)
         self.net.reconnect_failed.connect(self.on_reconnect_failed)
-
         self.audio.status_changed.connect(self.on_audio_status_changed)
         self.audio.status_changed.connect(self.net.send_status_update)
         self.audio.whisper_received.connect(self._on_whisper_received)
-        # Сигнал из audio_engine: ползунок громкости пользователя достиг/покинул 0.
-        # Обновляем ban-иконку немедленно, не дожидаясь следующего refresh_ui() (100 мс).
         self.audio.user_volume_zero.connect(self._on_user_volume_zero)
         self.video.frame_received.connect(self.on_video_frame)
-        # Статистика качества (FPS + Loss%) → обновляет HUD VideoWindow каждые 2 сек.
         self.video.stream_stats_updated.connect(self.on_stream_stats_updated)
-
-        # Тост «кто включил soundboard» — желтый лейбл поверх окна
         self.net.soundboard_played.connect(self._on_soundboard_played)
-
-        # Сигналы фичи «Пнуть»
         self.net.nudge_received.connect(self._on_nudge_received)
         self.net.nudge_triggered.connect(self._on_nudge_triggered)
-
-        # Хост выключил наш микрофон
         self.net.force_muted.connect(self._on_force_muted)
-
-        # Нас кикнули/забанили сервером — вернуться на экран выбора сервера
         self.net.kicked.connect(self._on_kicked_by_host)
         self.net.banned.connect(self._on_banned_by_host)
-
-        # ABR-сигнал (bitrate_adjusted) удалён: WebRTC управляет битрейтом через TWCC.
-        # _stream_conn_lbl оставлен в UI — будет подключён к WebRTC getStats() позже.
-
-        # Входящий запрос файловой передачи от другого пользователя
+        self.net.remote_control_requested.connect(self._on_rc_request_global)
+        self.net.remote_control_event.connect(self._on_rc_event_received)
+        # 3×ESC у стримера → остановка управления (сигнал из keyboard-потока)
+        self._rc_esc_triggered.connect(self._on_rc_esc_stop)
+        self._rc_esc_times: list = []     # ts последних нажатий ESC
+        self._rc_esc_hook = None          # хендл keyboard-хука (None = не активен)
         self.net.file_offer_received.connect(self._on_file_offer_received)
-
-        # Быстрый чат: всплывающий пузырь у ника отправителя
         self.net.quick_msg_received.connect(self._on_quick_msg_received)
-        # Словарь активных пузырей: uid → (QLabel, QTimer)
-        # Хранение предотвращает создание нескольких пузырей для одного юзера.
         self._quick_bubbles: dict[int, tuple] = {}
-
-        # Постоянный чат
         self.net.chat_msg_received.connect(self._on_chat_msg_received)
         self.net.chat_history_received.connect(self._on_chat_history_received)
         self.net.chat_media_received.connect(self._on_chat_media_received)
         self.net.typing_received.connect(self._on_typing_received)
         self._chat_panel.typing_started.connect(self.net.send_typing)
-
-        # ── Встроенный сервер: миграция хоста ────────────────────────────────
-        # become_host      — нам нужно стать новым хостом сервера.
-        # server_migrating — сервер переезжает к другому хосту.
         self.net.become_host.connect(self._on_become_host)
         self.net.server_migrating.connect(self._on_server_migrating)
-
-        # ── Каналы и мульти-серверная панель ─────────────────────────────────
         self.net.channel_created.connect(self._on_channel_created)
         self.net.channel_deleted.connect(self._on_channel_deleted)
         self.net.join_room_denied.connect(self._on_join_room_denied)
         self.net.channel_auth_ok.connect(self._on_channel_auth_ok)
         self.net.channel_list_updated.connect(self._on_channel_list_updated)
-
         self.ui_timer = QTimer()
         self.ui_timer.timeout.connect(self.refresh_ui)
         self.ui_timer.start(100)
-
         self.setup_hotkeys()
         self.net.connect_to_server(self.ip, self.nick, self.avatar)
         self.is_streaming = False
-        self._sb_panel = None   # ссылка на SoundboardPanel (для toggle и lifecycle)
-
-        # ── Оверлей аннотаций на экране стримера ────────────────────────────
-        # Создаётся при старте стрима, уничтожается при остановке.
-        # Показывает мазки зрителей поверх захватываемого контента.
+        self._sb_panel = None
         self._streamer_draw_overlay: StreamerAnnotationOverlay | None = None
-
-        # Входящие мазки (от сервера) → распределяем по назначению:
-        #   — если мы стример → _streamer_draw_overlay.add_stroke()
-        #   — если мы зритель → соответствующий VideoWindow.add_remote_stroke()
         self.net.draw_stroke_received.connect(self._on_draw_stroke_received)
-
-        # ── Тост soundboard ─────────────────────────────────────────────────────
-        # QLabel поверх главного окна с абсолютным позиционированием.
-        # Показывается на 3.5 с когда кто-то нажимает кнопку в soundboard-панели.
         self._sb_toast = QLabel(self)
         self._sb_toast.setStyleSheet("""
             QLabel {
@@ -399,71 +339,36 @@ class MainWindow(QMainWindow):
         """)
         self._sb_toast.setVisible(False)
         self._sb_toast.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-
         self._sb_toast_timer = QTimer(self)
         self._sb_toast_timer.setSingleShot(True)
         self._sb_toast_timer.setInterval(3500)
         self._sb_toast_timer.timeout.connect(lambda: self._sb_toast.setVisible(False))
-
-        # Таймер завершения шёпота: если >1.5 с не было пакетов — скрываем баннер/оверлей
         self._whisper_end_timer = QTimer()
         self._whisper_end_timer.setSingleShot(True)
         self._whisper_end_timer.setInterval(1500)
         self._whisper_end_timer.timeout.connect(self._on_whisper_ended)
-
-        # Системный оверлей шёпота — поверх всех окон Windows
-        # Создаём один раз, показываем/скрываем при событиях шёпота.
         self._whisper_overlay = WhisperSystemOverlay()
-
-        # Тихая проверка обновлений в фоне (без всплывающих окон)
         self._start_silent_update_check()
-
-        # ── Кэш объектов для refresh_ui() ──────────────────────────────────────
-        # refresh_ui() вызывается каждые 100 мс. Создание QColor/QSize/QSettings
-        # внутри метода = 10 аллокаций/сек × N_users без необходимости.
-        # Кэшируем один раз здесь, обновляем только при смене темы.
-        # FIX #7: только тёмная тема — _cache_theme всегда "Темная".
         self._cache_theme = "Темная"
-        self._theme_dirty = False  # ВАЖН-6: флаг вместо QSettings.value() каждые 100 мс
+        self._theme_dirty = False
         self._c_talk   = QColor("#2ecc71")
         self._c_mute   = QColor("#e74c3c")
         self._c_stream = QColor("#3498db")
         self._c_def    = QColor("#ecf0f1")
         self._icon_size = QSize(26, 26)
-
-        # ── Кэш QBrush для refresh_ui() ────────────────────────────────────────
-        # QBrush(QColor) создавался на КАЖДЫЙ вызов refresh_ui() (10 раз/сек)
-        # для КАЖДОГО пользователя → постоянное давление на GC.
-        # Кэшируем один раз, пересоздаём только при смене темы.
         self._br_talk   = QBrush(self._c_talk)
         self._br_mute   = QBrush(self._c_mute)
         self._br_stream = QBrush(self._c_stream)
         self._br_def    = QBrush(self._c_def)
         self._br_gray   = QBrush(QColor("#888888"))   # для заголовков комнат и watchers
         self._br_gold   = QBrush(QColor("#f5c518"))   # золотой — для ника хоста
-
-        # ── Кэш иконок для refresh_ui() ────────────────────────────────────────
-        # refresh_ui() вызывается каждые 100 мс и раньше создавал QIcon().pixmap()
-        # внутри цикла → 4 иконки × N пользователей × 10 вызовов/сек = лишние
-        # аллокации и давление на GC. Создаём pixmap один раз здесь.
         self._px_live      = QIcon(resource_path("assets/icon/live.svg")).pixmap(25, 25)
         self._px_vol_off   = QIcon(resource_path("assets/icon/volume_off.svg")).pixmap(self._icon_size)
         self._px_mic_off   = QIcon(resource_path("assets/icon/mic_off.svg")).pixmap(self._icon_size)
         self._px_ban       = QIcon(resource_path("assets/icon/ban.svg")).pixmap(self._icon_size)
-
-        # Кэш пиксмапов иконок статусов пользователей (assets/status/*.svg).
-        # Ключ: имя файла (например 'afk.svg'). Значение: QPixmap 20×20.
-        # Заполняется лениво в update_user_tree() при первом появлении иконки.
-        # Пересоздавать при смене темы не нужно — SVG не зависят от темы.
         self._status_px_cache: dict = {}
-
-        # Текущий статус пользователя. Загружается из QSettings при старте,
-        # отправляется на сервер при каждом (пере)подключении.
-        # Изменяется через SettingsDialog → вкладка «О себе».
         self._my_status_icon: str = self.app_settings.value("my_status_icon", "")
         self._my_status_text: str = self.app_settings.value("my_status_text", "")
-        # Создание QFont внутри метода = лишние аллокации при каждом обновлении.
-        # Шрифты зависят от custom_font_family, который не меняется в runtime.
         self._font_room    = QFont(self.custom_font_family, 12)
         self._font_room.setBold(True)
         self._font_user    = QFont(self.custom_font_family, 14)
@@ -471,33 +376,21 @@ class MainWindow(QMainWindow):
 
     def setup_ui(self):
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — {self.nick}")
-        # Минимальная ширина рассчитана по содержимому bottom_bar:
-        # margin(12) + mute(46)+sp(8) + deafen(46)+sp(8) + disconnect(46)+sp(8)
-        # + sb(46)+sp(8) + stream(46)+sp(8) + stretch(0)
-        # + latency(64)+sp(8) + settings(46) + margin(12) = 412 px
-        # + stream_conn_lbl(22)+sp(8) когда видим = 442 px → округляем до 450.
         self.setMinimumSize(440, 500)
         self.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
-        # Прозрачность по краям окна — углы и 4px внешний отступ становятся
-        # полностью прозрачными, создавая эффект «парящего» окна без жёстких
-        # прямоугольных краёв. Требует border-radius в #windowRoot stylesheet.
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
 
-        # ── Корневой контейнер окна ──────────────────────────────────────────
         _root = QWidget()
         _root.setObjectName("windowRoot")
         _root_layout = QVBoxLayout(_root)
-        # 4px внешний отступ: прозрачная «аура» вокруг окна,
-        # в которой видна тень и скруглённые углы (см. border-radius в apply_theme).
+
         _root_layout.setContentsMargins(0, 0, 0, 0)
         _root_layout.setSpacing(0)
 
-        # Кастомный заголовок
         self._title_bar = CustomTitleBar(self, f"{APP_NAME} v{APP_VERSION} — {self.nick}")
         _root_layout.addWidget(self._title_bar)
 
-        # Разделитель под заголовком
         _sep = QFrame()
         _sep.setFrameShape(QFrame.Shape.HLine)
         _sep.setObjectName("titleSeparator")
@@ -522,11 +415,6 @@ class MainWindow(QMainWindow):
         self.tree.setIconSize(QSize(32, 32))
         self.tree.setSelectionMode(QTreeWidget.SelectionMode.NoSelection)
         self.tree.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        # Убирает пустое место слева от названий комнат (# GENERAL).
-        # Qt по умолчанию резервирует колонку branch (20 px) под стрелку
-        # раскрытия корневых элементов — даже если стрелка не рисуется.
-        # setRootIsDecorated(False) отключает эту колонку для элементов
-        # верхнего уровня; дочерние элементы (пользователи) сохраняют отступ.
         self.tree.setRootIsDecorated(False)
 
         header = self.tree.header()
@@ -548,14 +436,12 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(self.tree, stretch=1)
 
-        # ── Баннер автообновления (скрыт до обнаружения новой версии) ─────────
         self._update_banner = QPushButton()
         self._update_banner.setObjectName("updateBanner")
         self._update_banner.setVisible(False)
         self._update_banner.clicked.connect(self.open_settings)  # откроет вкладку Версия
         layout.addWidget(self._update_banner)
 
-        # ── Баннер входящего шёпота (скрыт, показывается при получении шёпота) ─
         self._whisper_banner = QLabel()
         self._whisper_banner.setVisible(False)
         self._whisper_banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -567,7 +453,45 @@ class MainWindow(QMainWindow):
         self._whisper_banner.setFixedHeight(40)
         layout.addWidget(self._whisper_banner)
 
-        # ── Кнопка чата: полноширинная стеклянная кнопка ─────────────────────
+        # Баннер «Управление активно» — встроен в дерево над кнопкой Чат
+        self._rc_access_banner = QFrame()
+        self._rc_access_banner.setObjectName("rcAccessBanner")
+        self._rc_access_banner.setVisible(False)
+        self._rc_access_banner.setFixedHeight(40)
+        self._rc_access_banner.setStyleSheet("""
+            QFrame#rcAccessBanner {
+                background-color: rgba(231, 76, 60, 200);
+                border-radius: 8px;
+                border: 1px solid rgba(255,255,255,60);
+            }
+        """)
+        _rc_banner_lay = QHBoxLayout(self._rc_access_banner)
+        _rc_banner_lay.setContentsMargins(10, 4, 10, 4)
+        _rc_banner_lay.setSpacing(8)
+        _rc_ico = QLabel("🖱️")
+        _rc_ico.setStyleSheet("background:transparent; border:none; font-size:14px;")
+        _rc_lbl = QLabel("Управление активно")
+        _rc_lbl.setStyleSheet(
+            "background:transparent; border:none; color:#fff; font-size:12px; font-weight:600;"
+        )
+        _rc_stop_btn = QPushButton("Отменить")
+        _rc_stop_btn.setStyleSheet("""
+            QPushButton {
+                background: rgba(255,255,255,35);
+                border: 1px solid rgba(255,255,255,70);
+                border-radius: 6px;
+                color: #fff;
+                font-size: 11px;
+                padding: 3px 8px;
+            }
+            QPushButton:hover { background: rgba(255,255,255,65); }
+        """)
+        _rc_stop_btn.clicked.connect(self._hide_rc_streamer_banner)
+        _rc_banner_lay.addWidget(_rc_ico)
+        _rc_banner_lay.addWidget(_rc_lbl, stretch=1)
+        _rc_banner_lay.addWidget(_rc_stop_btn)
+        layout.addWidget(self._rc_access_banner)
+
         self._btn_chat_main = QPushButton("💬  Чат")
         self._btn_chat_main.setCheckable(True)
         self._btn_chat_main.setFixedHeight(36)
@@ -599,8 +523,6 @@ class MainWindow(QMainWindow):
         )
         self._chat_has_unread = False
 
-        # ── Бейдж «новое сообщение» — дочерний QLabel поверх кнопки ─────────
-        # Текст кнопки «💬  Чат» НИКОГДА не меняется — бейдж отдельный виджет.
         self._chat_badge = QLabel("● новое", self._btn_chat_main)
         self._chat_badge.setStyleSheet("""
             QLabel {
@@ -615,7 +537,6 @@ class MainWindow(QMainWindow):
         self._chat_badge.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self._chat_badge.setVisible(False)
 
-        # Таймер мигания: 900 мс — чередует setVisible(True/False)
         self._chat_blink_timer = QTimer(self)
         self._chat_blink_timer.setInterval(900)
         self._chat_blink_timer.timeout.connect(self._on_chat_badge_blink)
@@ -623,9 +544,6 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(self._btn_chat_main)
 
-        # ── Нижняя панель кнопок управления ─────────────────────────────────
-        # Отдельный QFrame с собственным фоном — визуальная иерархия:
-        # область чата (дерево) vs панель управления (кнопки), как в Discord.
         self._bottom_bar = QFrame()
         self._bottom_bar.setObjectName("bottomBar")
         self._bottom_bar.setFixedHeight(72)
@@ -665,9 +583,6 @@ class MainWindow(QMainWindow):
         self.btn_stream.setCheckable(True)
         self.btn_stream.clicked.connect(self.toggle_stream)
 
-        # ── Кнопка отключения: отключиться от сервера → показать лобби ──────────
-        # При клике: обрываем соединение (если хост — миграция как при резком
-        # отключении), закрываем главное окно, показываем экран выбора серверов.
         self.btn_lobby = HoldToDisconnectButton()
         self.btn_lobby.setFixedSize(46, 46)
         self.btn_lobby.setObjectName("barBtnDisconnect")
@@ -676,14 +591,6 @@ class MainWindow(QMainWindow):
         self.btn_lobby.set_hold_callback(self._disconnect_and_show_lobby)
         self.btn_lobby.set_hold_sound(resource_path("assets/music/call_down_progress.wav"))
 
-        # --- Индикатор качества соединения стримера ---
-        # Маленький QLabel с иконкой connection_bad.svg, появляется рядом
-        # с кнопкой трансляции когда сервер понизил битрейт из-за плохого
-        # upload-канала. Аналог индикатора «слабое соединение» в Discord.
-        # Состояния:
-        #   скрыт           — нет трансляции или битрейт ≥ 4 Mbps (норма)
-        #   🟡 tooltip      — битрейт 1.5–4 Mbps (умеренная деградация)
-        #   🔴 tooltip      — битрейт < 1.5 Mbps (сильная деградация)
         self._stream_conn_lbl = QLabel()
         self._stream_conn_lbl.setFixedSize(22, 22)
         self._stream_conn_lbl.setScaledContents(True)
@@ -692,7 +599,6 @@ class MainWindow(QMainWindow):
             QIcon(resource_path("assets/icon/connection_bad.svg")).pixmap(QSize(22, 22))
         )
 
-        # ── Пинг (текст с цифрами, не иконка) ──────────────────────────────────
         self._latency_btn = QPushButton("-- мс")
         self._latency_btn.setFixedSize(64, 46)
         self._latency_btn.setObjectName("barBtn")
@@ -720,10 +626,6 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(self._bottom_bar)
 
-        # ── ChatPanel + горизонтальный контейнер (Discord-стиль) ─────────────
-        # ChatPanel скрыта по умолчанию — при hidden QHBoxLayout не выделяет
-        # ей место, окно остаётся компактным.
-        # При toggle: setVisible(True/False) + window resize(+/- PANEL_WIDTH).
         self._chat_panel = ChatPanel(
             my_uid=0,
             current_room_fn=lambda: self.current_room,
@@ -806,25 +708,9 @@ class MainWindow(QMainWindow):
         self._btn_reconnect.setEnabled(False)
         self.net.manual_reconnect()
 
-    # ── Встроенный сервер: стать хостом ──────────────────────────────────────
 
     def _on_become_host(self):
-        """
-        Нам нужно стать новым хостом.
-        Путь сюда:
-          • CMD_SERVER_MIGRATE с new_host_uid==my_uid (обрыв + мы pos=0, или
-            старый хост передал нам через _broadcast_server_migrate)
-          • CMD_MIGRATE_PREPARE (ручная передача, новая 2-шаговая схема)
 
-        Порядок:
-          1. UI: переключаем экран на "Переключение хоста".
-          2. Запускаем EmbeddedServerManager.start() — поднимает TCP/UDP/SFU/
-             ServerAnnouncer. После этого наш сервер уже принимает подключения.
-          3. ДО смены своего подключения: send_migrate_ready() — сообщаем
-             старому серверу что мы готовы. Он сделает broadcast MIGRATE.
-          4. Через короткую паузу: fast_switch_to(host_ip) — подключаемся к себе.
-             recovery-цикл сам переживёт если порт ещё занят (retry 10с).
-        """
         print("[UI] _on_become_host: запускаем встроенный сервер")
 
         self._lost_title_lbl.setText("Переключение хоста")
@@ -847,7 +733,6 @@ class MainWindow(QMainWindow):
                 f"Ошибка запуска сервера:\n{e}\n\nПопробуйте перезапустить."
             )
             self._btn_reconnect.setEnabled(True)
-            # Сбрасываем recovery state чтобы будущие reconnect не заблокировались
             try:
                 from network_engine.core import _PHASE_IDLE
                 with self.net._recovery_lock:
@@ -856,38 +741,21 @@ class MainWindow(QMainWindow):
                 pass
             return
 
-        # 2-шаговая передача: сообщаем старому серверу что мы готовы.
-        # Старый сервер после получения migrate_ready сделает broadcast
-        # всем клиентам → они пойдут к нам. Если путь к нам был через
-        # classic CMD_SERVER_MIGRATE (не prepare), это будет no-op —
-        # сервер уже мёртв или проигнорирует сообщение.
         try:
             self.net.send_migrate_ready()
         except Exception as e:
             print(f"[UI] send_migrate_ready error (ok): {e}")
 
         def _reconnect_to_self():
-            # fast_switch_to в новой версии форсированно сбрасывает _recovery_state
-            # и стартует новый recovery phase=migrating с retry до 10 секунд.
-            # Никаких ручных сбросов _migration_pending/_reconnecting не нужно.
+
             self.net.fast_switch_to(host_ip)
 
-        # 200мс: accept() loop стартует мгновенно. recovery-цикл сам
-        # ретраит если порт ещё занят.
         QTimer.singleShot(200, _reconnect_to_self)
 
     def _on_server_migrating(self, new_host_ip: str):
-        """
-        Вызывается когда сервер переезжает к другому хосту (мы — не новый хост).
-        Сетевой movок сам переподключится через _recovery_loop (запущен из
-        process_message → trigger_migration). Здесь только UI + остановка
-        нашего embedded сервера (если мы были старым хостом).
-        """
+
         print(f"[UI] _on_server_migrating: новый хост {new_host_ip}")
 
-        # Если мы были старым хостом — останавливаемся тихо. Без этого
-        # наш ServerAnnouncer продолжал рассылать broadcast → в лобби
-        # висел "призрак" старого сервера.
         try:
             from server import EmbeddedServerManager
             mgr = EmbeddedServerManager.get()
@@ -906,12 +774,10 @@ class MainWindow(QMainWindow):
         self._stack.setCurrentIndex(1)
 
     def setWindowTitle(self, title: str):
-        """Переопределяем — синхронно обновляем кастомный title bar."""
         super().setWindowTitle(title)
         if hasattr(self, '_title_bar'):
             self._title_bar.set_title(title)
 
-    # ── Edge-resize для безрамочного окна ────────────────────────────────────
     _EDGE_CURSORS = {
         "right":        Qt.CursorShape.SizeHorCursor,
         "bottom":       Qt.CursorShape.SizeVerCursor,
@@ -954,12 +820,9 @@ class MainWindow(QMainWindow):
             min_h = self.minimumHeight()
             d     = self._resize_direction
 
-            # Нижняя граница
             if d in ("bottom", "bottom-left", "bottom-right"):
                 new_bottom = orig.bottom() + delta.y()
                 g.setBottom(max(new_bottom, orig.top() + min_h))
-
-            # Правая граница
             if d in ("right", "bottom-right"):
                 new_right = orig.right() + delta.x()
                 g.setRight(max(new_right, orig.left() + min_w))
@@ -974,52 +837,39 @@ class MainWindow(QMainWindow):
         super().mouseMoveEvent(e)
 
     def eventFilter(self, obj, event):
-        """
-        Приложение-уровневый фильтр: перехватывает MouseMove у ЛЮБОГО дочернего
-        виджета и пересчитывает курсор относительно границ главного окна.
-        """
+
         if (event.type() == QEvent.Type.MouseMove
                 and not self._resize_direction
                 and not self.isMaximized()):
-            # Глобальные координаты → локальные координаты MainWindow
             pos = self.mapFromGlobal(QCursor.pos())
             edge = self._edge_at(pos)
             if edge:
                 self.setCursor(self._EDGE_CURSORS[edge])
             else:
                 self.unsetCursor()
-        return False   # никогда не поглощаем событие
+        return False
 
     def mouseReleaseEvent(self, e):
         self._resize_direction = None
         self._resize_start_pos = None
         self._resize_start_geom = None
-        # Сбрасываем курсор ресайза обратно в стандартный.
-        # Без этого курсор «застревал» в форме SizeXxx после отпускания кнопки мыши,
-        # потому что mouseMoveEvent с зажатой кнопкой обновлял курсор только во время
-        # перетаскивания, а setCursor() остаётся в силе пока явно не вызван unsetCursor().
+
         self.unsetCursor()
         super().mouseReleaseEvent(e)
 
     def moveEvent(self, e):
-        """При перемещении окна синхронно двигаем все активные пузыри чата."""
         super().moveEvent(e)
         if hasattr(self, '_quick_bubbles') and self._quick_bubbles:
             self._reposition_quick_bubbles()
 
     def resizeEvent(self, e):
-        """При изменении размера окна пересчитываем позиции пузырей."""
         super().resizeEvent(e)
         if hasattr(self, '_quick_bubbles') and self._quick_bubbles:
             self._reposition_quick_bubbles()
 
     def apply_theme(self, theme_name):
         font_f = self.custom_font_family
-        # FIX #7: светлая тема удалена — единственная тема «Темная» (glassmorphism dark).
-        # Параметр theme_name сохранён для обратной совместимости вызовов,
-        # но значение игнорируется — используется всегда тёмная палитра.
 
-        # ── Glassmorphism dark palette ────────────────────────────────────────
         win_bg       = "rgba(22, 25, 40, 255)"
         surface      = "rgba(255,255,255,0.07)"
         surface_solid= "#1e2240"
@@ -1461,10 +1311,8 @@ class MainWindow(QMainWindow):
             }}
         """)
 
-        # ── Кэш цветов для refresh_ui: пересоздаём при смене темы ────────────
-        # FIX #7: только тёмная палитра — is_dark всегда True.
         self._cache_theme = "Темная"
-        self._theme_dirty = True   # сигнал refresh_ui: обновить _c_def / _br_def
+        self._theme_dirty = True
         self._c_talk   = QColor("#2ecc71")
         self._c_mute   = QColor("#e74c3c")
         self._c_stream = QColor("#3498db")
@@ -1476,30 +1324,10 @@ class MainWindow(QMainWindow):
         self._br_gray   = QBrush(QColor("#6e7a96"))
 
     def setup_hotkeys(self):
-        """
-        Регистрирует все глобальные горячие клавиши:
-          — mute/deafen (toggle)
-          — PTT-шёпот для каждого из 5 слотов (press → start, release → stop)
 
-        Почему НЕ используем trigger_on_release=True:
-          keyboard.add_hotkey(hk, cb, trigger_on_release=True) — это НЕ "при отпускании клавиши".
-          Это "повторить срабатывание хоткея когда комбо отпущено как единица".
-          На практике: либо не срабатывает вовсе, либо срабатывает непредсказуемо.
-          В итоге whisper_target_uid остаётся != 0 → голос навсегда застрял в шёпоте.
-
-        Правильный PTT:
-          1. keyboard.add_hotkey(hk, _press) — срабатывает при физическом нажатии комбо.
-          2. keyboard.hook(_raw_key_up)      — глобальный перехват всех key-up событий.
-             Как только физически отпущена триггер-клавиша (последняя в комбо) —
-             сразу вызываем stop_whisper(). Это работает мгновенно и надёжно.
-
-        keyboard.unhook_all() в начале снимает оба типа хуков (add_hotkey + hook).
-        suppress=False — клавиши проходят в игру/браузер без блокировки.
-        """
         try:
             keyboard.unhook_all()
 
-            # ── Базовые хоткеи ────────────────────────────────────────────────
             m = self.app_settings.value("hk_mute",   "alt+[")
             d = self.app_settings.value("hk_deafen", "alt+]")
             if m:
@@ -1513,20 +1341,16 @@ class MainWindow(QMainWindow):
                 except Exception as e:
                     print(f"[HK] deafen hotkey error: {e}")
 
-            # Ctrl+T — открыть/закрыть чат
             try:
                 keyboard.add_hotkey("ctrl+t", lambda: self._toggle_chat_panel())
             except Exception as e:
                 print(f"[HK] chat hotkey error: {e}")
 
-            # ── PTT-хоткеи шёпота (слоты 0–4) ────────────────────────────────
             for i in range(5):
                 ip   = self.app_settings.value(f"whisper_slot_{i}_ip",   "")
                 nick = self.app_settings.value(f"whisper_slot_{i}_nick", "")
                 hk   = self.app_settings.value(f"whisper_slot_{i}_hk",   "")
-                # Флаг анонимного шёпота для данного PTT-слота.
-                # Сохраняется в настройках слота (см. ui_settings.py) —
-                # чекбокс "Анонимно" рядом с назначением хоткея.
+
                 anon = self.app_settings.value(f"whisper_slot_{i}_anon", "false") == "true"
                 if (not ip and not nick) or not hk:
                     continue
@@ -1535,22 +1359,18 @@ class MainWindow(QMainWindow):
                               anonymous: bool = False):
                     active = [False]
 
-                    # Триггер-клавиша = последняя в комбо: "alt+1" → "1", "f8" → "f8"
-                    # Именно её key-up означает "пользователь отпустил PTT".
                     trigger_key = hotkey_str.replace(" ", "").split("+")[-1].lower()
 
                     def _press():
                         if active[0]:
-                            return  # автоповтор ОС — игнорируем
+                            return
                         uid = None
-                        # ── Приоритет 1: поиск по IP (работает при любом нике) ──
                         if target_ip:
                             with self.audio.users_lock:
                                 for u_uid, u_ip in self.audio.uid_to_ip.items():
                                     if u_ip == target_ip:
                                         uid = u_uid
                                         break
-                        # ── Приоритет 2: фолбэк по нику (для старых сохранений) ─
                         if uid is None and target_nick:
                             for u_uid, data in self.known_uids.items():
                                 try:
@@ -1570,13 +1390,7 @@ class MainWindow(QMainWindow):
                             print(f"[HK] Whisper PTT: '{display}' не найден онлайн")
 
                     def _raw_key_up(e):
-                        """
-                        Глобальный перехват key-up.
-                        Срабатывает при отпускании ЛЮБОЙ клавиши — но мы проверяем
-                        только нашу триггер-клавишу и только если PTT активен.
-                        Это гарантирует что stop_whisper() всегда вызовется,
-                        даже если система не доставила "hotkey release" событие.
-                        """
+
                         if (active[0]
                                 and e.event_type == 'up'
                                 and e.name
@@ -1590,18 +1404,13 @@ class MainWindow(QMainWindow):
 
                 _press, _raw_key_up = _make_ptt(ip, nick, hk, anonymous=anon)
                 try:
-                    # Только press через add_hotkey (обрабатывает модификаторы корректно)
                     keyboard.add_hotkey(hk, _press, trigger_on_release=False, suppress=False)
-                    # Release через raw hook — надёжный физический key-up
                     keyboard.hook(_raw_key_up, suppress=False)
                     print(f"[HK] Whisper slot {i}: ip='{ip}' nick='{nick}' anon={anon} "
                           f"→ '{hk}' (trigger_key='{hk.replace(' ','').split('+')[-1].lower()}')")
                 except Exception as e:
                     print(f"[HK] Whisper slot {i} error ({hk!r}): {e}")
 
-            # ── Хоткеи кастомных звуков soundboard ───────────────────────────
-            # Читаем hk_table_* и для каждой записи с ftype=="sound" регистрируем
-            # hotkey, который ищет путь к файлу по имени и отправляет его через сеть.
             hk_count = int(self.app_settings.value("hk_table_count", 0))
             for i in range(hk_count):
                 ftype = self.app_settings.value(f"hk_table_{i}_type", "none")
@@ -1612,9 +1421,8 @@ class MainWindow(QMainWindow):
                 if not fdata or not hk:
                     continue
 
-                # Ищем путь к файлу по имени среди сохранённых кастомных слотов
                 sound_path = ""
-                for j in range(10):  # >= CUSTOM_SOUND_SLOTS, с запасом
+                for j in range(10):
                     n = self.app_settings.value(f"custom_sound_{j}_name", "")
                     p = self.app_settings.value(f"custom_sound_{j}_path", "")
                     if n == fdata and p:
@@ -1654,20 +1462,21 @@ class MainWindow(QMainWindow):
         except Exception as e:
             print(f"[HK] setup_hotkeys error: {e}")
 
+        # setup_hotkeys() начинается с keyboard.unhook_all() — это сносит и наш
+        # ESC-хук. Если управление сейчас активно, вешаем его заново.
+        if self._rc_viewer_uid_get() is not None:
+            self._rc_esc_hook = None      # старый хендл уже невалиден
+            self._rc_start_esc_watch()
+
     def play_notification(self, stype="self_move"):
-        # Квадратичная кривая: vol_linear = (slider/100)^2
-        # При slider=30 (default) → 0.09x  (≈ −21 dB, ненавязчиво)
-        # При slider=70           → 0.49x  (вдвое тише прежних 0.70)
-        # При slider=100          → 1.00x  (максимум)
+
         raw = int(self.app_settings.value("system_sound_volume", 30)) / 100.0
-        vol = raw ** 2  # перцептивно равномерная шкала вместо линейной
+        vol = raw ** 2
         entry = self._loaded_sounds.get(stype)
         if entry is not None:
             try:
                 data, sr = entry
-                # FIX: sd.play() открывает новый PortAudio-поток → WASAPI
-                # перебалансирует буферы → основной callback теряет CPU →
-                # треск/провал у всех слушателей. Используем внутренний микшер.
+
                 if hasattr(self.audio, 'play_internal_sound') and self.audio.stream:
                     self.audio.play_internal_sound(data, sr, vol)
                 else:
@@ -1679,37 +1488,18 @@ class MainWindow(QMainWindow):
                 winsound.Beep(600 if stype == "self_move" else 400, 150)
 
     def _on_whisper_received(self, sender_uid: int):
-        """
-        Вызывается на КАЖДЫЙ входящий пакет шёпота (audio_engine эмитит
-        whisper_received на каждый пакет, ~50/сек).
-
-        Логика разделена на два уровня:
-          1. ВСЕГДА: перезапускаем _whisper_end_timer (1500 мс).
-             Пока идут пакеты — таймер никогда не истечёт → оверлей горит всегда.
-          2. ТОЛЬКО ПРИ СМЕНЕ ОТПРАВИТЕЛЯ или когда оверлей ещё не показан:
-             обновляем ник и вызываем show_for(). Это исключает 50 вызовов
-             show()/setText() в секунду, которые вызывали бы мерцание анимации.
-        """
-        # ── 1. Всегда: сбрасываем таймер завершения ──────────────────────────
         self._whisper_end_timer.stop()
         self._whisper_end_timer.start()
 
-        # ── 2. При смене отправителя или первом появлении: обновляем UI ──────
         if sender_uid == getattr(self, '_current_whisper_uid', None) \
                 and self._whisper_banner.isVisible():
-            # Тот же шептун, оверлей уже виден — только таймер сброшен, больше ничего.
             return
 
         self._current_whisper_uid = sender_uid
 
-        # ── Анонимный шёпот ──────────────────────────────────────────────────
-        # Сервер переписал sender_uid в UDP-заголовке на ANONYMOUS_UID перед
-        # ретрансляцией. В known_uids такого uid не существует — поэтому резолв
-        # по дереву ников не нужен (и даже вреден, т.к. покажет "Кто-то").
         if is_anonymous_uid(sender_uid):
             nick = "Аноним"
         else:
-            # Ищем ник шептуна среди активных пользователей
             nick = "Кто-то"
             for uid, data in self.known_uids.items():
                 if uid == sender_uid:
@@ -1721,31 +1511,20 @@ class MainWindow(QMainWindow):
                         pass
                     break
 
-        # ── Баннер в главном окне ─────────────────────────────────────────────
         self._whisper_banner.setText(f"🤫  {nick} шепчет вам...")
         self._whisper_banner.setVisible(True)
 
-        # ── Системный оверлей поверх всех окон ───────────────────────────────
         self._whisper_overlay.show_for(nick)
 
     def _on_whisper_ended(self):
-        """Шёпот завершился (1500 мс без пакетов) — скрываем баннер и системный оверлей."""
         self._current_whisper_uid = None
         self._whisper_banner.setVisible(False)
         self._whisper_overlay.hide_overlay()
 
-    # ── Быстрый чат ────────────────────────────────────────────────────────────
-
     def _send_quick_msg(self):
-        """Быстрый чат отключён — строка ввода убрана. Метод-заглушка."""
         pass
 
-    # ── Постоянный чат (ChatPanel) ─────────────────────────────────────────────
-
-    # ── Бейдж «новое сообщение» ───────────────────────────────────────────────
-
     def _position_chat_badge(self) -> None:
-        """Позиционирует бейдж у правого края кнопки (вертикально по центру)."""
         btn = self._btn_chat_main
         badge = self._chat_badge
         badge.adjustSize()
@@ -1755,7 +1534,6 @@ class MainWindow(QMainWindow):
         badge.move(x, y)
 
     def _show_chat_badge(self) -> None:
-        """Показывает мигающий бейдж и меняет рамку кнопки на красную."""
         if self._chat_has_unread:
             return  # уже показан
         self._chat_has_unread = True
@@ -1763,7 +1541,6 @@ class MainWindow(QMainWindow):
         self._chat_badge.setVisible(True)
         self._chat_blink_state = True
         self._chat_blink_timer.start()
-        # Красная рамка кнопки (только border — текст «Чат» не трогаем)
         self._btn_chat_main.setStyleSheet("""
             QPushButton#btnChatMain {
                 background-color: rgba(255, 255, 255, 0.04);
@@ -1788,7 +1565,6 @@ class MainWindow(QMainWindow):
         """)
 
     def _hide_chat_badge(self) -> None:
-        """Скрывает бейдж, останавливает мигание, сбрасывает стиль кнопки."""
         self._chat_has_unread = False
         self._chat_blink_timer.stop()
         self._chat_badge.setVisible(False)
@@ -1816,28 +1592,23 @@ class MainWindow(QMainWindow):
         """)
 
     def _on_chat_badge_blink(self) -> None:
-        """Слот таймера мигания — чередует видимость бейджа."""
         self._chat_blink_state = not self._chat_blink_state
         self._chat_badge.setVisible(self._chat_blink_state)
 
-    def resizeEvent(self, event) -> None:  # noqa: N802
-        """Перепозиционируем бейдж при изменении размера окна."""
+    def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         if hasattr(self, '_chat_badge') and self._chat_has_unread:
             self._position_chat_badge()
 
     def _toggle_chat_panel(self, checked: bool = None) -> None:
-        """
-        Открыть/закрыть ChatPanel. Окно расширяется/сжимается на PANEL_WIDTH.
-        checked: True = открыть, False = закрыть, None = переключить.
-        """
+
         if checked is None:
             checked = not self._chat_panel.isVisible()
 
         panel_w = ChatPanel.PANEL_WIDTH
         if checked:
             if self._chat_panel.isVisible():
-                return  # уже открыт
+                return
             self._chat_panel.update_room_label(self.current_room)
             self._chat_panel.setVisible(True)
             if not self.isMaximized():
@@ -1845,7 +1616,7 @@ class MainWindow(QMainWindow):
             self._chat_panel.focus_input()
         else:
             if not self._chat_panel.isVisible():
-                return  # уже закрыт
+                return
             self._chat_panel.setVisible(False)
             if not self.isMaximized():
                 self.resize(max(400, self.width() - panel_w), self.height())
@@ -1854,39 +1625,32 @@ class MainWindow(QMainWindow):
         self._btn_chat_main.setChecked(checked)
         self._btn_chat_main.blockSignals(False)
 
-        # Сбрасываем индикатор "новое сообщение" при открытии
         if checked and self._chat_has_unread:
             self._hide_chat_badge()
 
     def _on_typing_received(self, uid: int, nick: str) -> None:
-        """Typing indicator: другой пользователь печатает в чате."""
         if uid != self.audio.my_uid:
             self._chat_panel.show_typing(uid, nick)
 
     def _on_chat_panel_send(self, text: str) -> None:
-        """Пользователь отправил сообщение из ChatPanel."""
         self.net.send_chat_msg(text)
         self.play_notification("chat_msg_out")
 
     def _on_chat_msg_received(self, entry: dict) -> None:
-        """Входящее сообщение чата — добавляем в панель."""
         self._chat_panel.add_message(entry)
         is_own = (entry.get('uid', 0) == self.audio.my_uid)
         if is_own:
             self.play_notification("chat_msg_out")
         else:
             self.play_notification("chat_msg_in")
-            # Показываем бейдж если чат закрыт
             if not self._chat_panel.isVisible():
                 self._show_chat_badge()
 
     def _on_chat_history_received(self, messages: list) -> None:
-        """История чата получена (при подключении) — загружаем в панель."""
         if messages:
             self._chat_panel.load_history(messages)
 
     def _on_chat_media_requested(self) -> None:
-        """ChatPanel выбрала файл — берём данные и отправляем через network."""
         media = self._chat_panel.take_pending_media()
         if not media:
             return
@@ -1899,7 +1663,6 @@ class MainWindow(QMainWindow):
         self.play_notification("chat_msg_out")
 
     def _on_chat_media_received(self, entry: dict) -> None:
-        """Входящее медиа-вложение — добавляем в ChatPanel."""
         self._chat_panel.add_message(entry)
         if entry.get('uid', 0) != self.audio.my_uid:
             self.play_notification("chat_msg_in")
@@ -1907,22 +1670,11 @@ class MainWindow(QMainWindow):
                 self._show_chat_badge()
 
     def _on_quick_msg_received(self, sender_uid: int, from_nick: str, text: str):
-        """
-        Входящее быстрое сообщение.
 
-        Создаёт (или обновляет) QuickMsgBubble — frameless tool-окно поверх
-        всего приложения. Пузырь позиционируется слева от аватарки отправителя
-        по глобальным координатам экрана.
-
-        Повторное сообщение от того же uid обновляет текст без пересоздания.
-        Автоскрытие — 5 секунд.
-        """
-        # ── Звук уведомления ─────────────────────────────────────────────────
         self.play_notification("quick_msg")
 
-        # ── Глобальные координаты строки пользователя в дереве ───────────────
         global_tl = None
-        item_h    = 44   # высота строки по умолчанию
+        item_h    = 44
         data = self.known_uids.get(sender_uid)
         if data:
             try:
@@ -1932,7 +1684,6 @@ class MainWindow(QMainWindow):
             except RuntimeError:
                 pass
 
-        # ── Переиспользуем существующий пузырь ───────────────────────────────
         existing = self._quick_bubbles.get(sender_uid)
         if existing:
             bubble, timer = existing
@@ -1948,14 +1699,12 @@ class MainWindow(QMainWindow):
             except RuntimeError:
                 self._quick_bubbles.pop(sender_uid, None)
 
-        # ── Создаём новый пузырь ──────────────────────────────────────────────
-        bubble = QuickMsgBubble()   # top-level frameless tool window
+        bubble = QuickMsgBubble()
         bubble.update(text)
 
         if global_tl:
             bubble.place_left_of(global_tl, item_h)
         else:
-            # Отправитель не виден в дереве — по центру над нижней панелью
             gp = self.mapToGlobal(
                 QPoint(
                     self.width() // 2 - bubble.width() // 2,
@@ -1975,7 +1724,6 @@ class MainWindow(QMainWindow):
         self._quick_bubbles[sender_uid] = (bubble, timer)
 
     def _hide_quick_bubble(self, uid: int):
-        """Скрыть и удалить пузырь быстрого сообщения для данного uid."""
         entry = self._quick_bubbles.pop(uid, None)
         if entry:
             bubble, timer = entry
@@ -1987,12 +1735,7 @@ class MainWindow(QMainWindow):
                 pass
 
     def _reposition_quick_bubbles(self):
-        """
-        Репозиционировать все активные пузыри после пересборки дерева.
-        Вызывается из update_user_tree() после expandAll().
-        Использует глобальные экранные координаты — работает корректно
-        даже если пузырь выходит за границы главного окна.
-        """
+
         for uid, (bubble, _timer) in list(self._quick_bubbles.items()):
             d = self.known_uids.get(uid)
             if not d:
@@ -2006,23 +1749,7 @@ class MainWindow(QMainWindow):
                 pass
 
     def _on_user_volume_zero(self, uid: int, is_zero: bool):
-        """
-        Вызывается немедленно когда ползунок громкости пользователя
-        выставляется в 0 или уходит от 0.
 
-        Логика иконки:
-          is_zero=True  → ban-иконка (тот же визуал что и у кнопки «Заглушить»)
-          is_zero=False → убираем ban-иконку, НО только если кнопка «Заглушить»
-                          тоже не нажата — чтобы не конфликтовать с ней.
-
-        Цвет ника:
-          is_zero=True  → красный (_br_mute), как у заглушённых.
-          is_zero=False → стандартный (_br_def), если нет других причин краснеть.
-
-        Важно: refresh_ui() тоже проверяет volume_zero каждые 100 мс.
-        Этот слот нужен для мгновенного отклика (без задержки 0..100 мс),
-        который пользователь заметит при быстром движении ползунком.
-        """
         data = self.known_uids.get(uid)
         if data is None:
             return
@@ -2035,24 +1762,19 @@ class MainWindow(QMainWindow):
                 is_muted_btn = u_audio.is_locally_muted if u_audio else False
                 is_m_remote  = data.get('is_m', False)
 
-            # ── Иконка (колонка 4) ──────────────────────────────────────────────
             if is_zero or is_muted_btn:
-                # Выставлен в 0 ИЛИ нажата кнопка «Заглушить» → ban
                 item.setData(4, Qt.ItemDataRole.DecorationRole, self._px_ban)
             elif is_m_remote:
-                # Сам заглушил себя на сервере → mic_off
                 item.setData(4, Qt.ItemDataRole.DecorationRole, self._px_mic_off)
             else:
                 item.setData(4, Qt.ItemDataRole.DecorationRole, None)
 
-            # ── Цвет ника (колонка 0) ───────────────────────────────────────────
             if is_zero or is_muted_btn:
                 item.setForeground(0, self._br_mute)
             else:
                 item.setForeground(0, self._br_def)
 
         except RuntimeError:
-            # item уже удалён Qt (дерево пересоздалось) — просто игнорируем
             pass
 
     def toggle_mute(self):
@@ -2075,25 +1797,7 @@ class MainWindow(QMainWindow):
 
     def _on_draw_stroke_received(self, sender_uid: int, nick: str,
                                   color: str, points: list, width: int):
-        """
-        Центральный диспетчер входящих мазков (CMD_DRAW_STROKE от сервера).
 
-        Сервер ретранслирует мазок:
-          — всем зрителям стрима  (включая рисовавшего — для эха)
-          — стримеру              (он видит у себя на экране)
-
-        Здесь мы определяем кому адресован мазок и направляем его:
-          • Мы зритель и у нас открыт VideoWindow → add_remote_stroke()
-          • Мы стример и overlay создан → add_stroke()
-
-        streamer_uid в пакете не передаётся напрямую сюда (его фильтрует сервер
-        и шлёт нам только то что относится к нашему стриму/просмотру),
-        но для определения нужного VideoWindow мы ищем по UID стримера
-        (который является ключом stream_windows).
-        """
-        # ── Случай 1: мы зритель — ищем VideoWindow по streamer uid ─────────
-        # stream_windows: {streamer_uid: VideoWindow}
-        # Мазок может прийти пока нет открытых окон (race при закрытии) — guard.
         for streamer_uid, win in list(self.stream_windows.items()):
             try:
                 if win is not None and not win._closing:
@@ -2101,8 +1805,6 @@ class MainWindow(QMainWindow):
             except (RuntimeError, AttributeError):
                 pass
 
-        # ── Случай 2: мы стример — показываем на прозрачном оверлее ─────────
-        # _streamer_draw_overlay существует только пока is_streaming=True.
         if self._streamer_draw_overlay is not None:
             try:
                 self._streamer_draw_overlay.add_stroke(nick, color, points, width)
@@ -2110,16 +1812,10 @@ class MainWindow(QMainWindow):
                 pass
 
     def _on_force_muted(self):
-        """
-        Хост выключил наш микрофон (CMD_FORCE_MUTED от сервера).
-        Только mic off — уши не трогаем, динамики остаются включены.
-        Кнопки НЕ блокируются — участник может нажать mic и включить
-        микрофон обратно в любой момент.
-        """
+
         if not self.audio.is_muted:
             self.btn_mute.setChecked(True)
             self.toggle_mute()
-        # Тост над нижней панелью
         self._sb_toast.setText("🎤  Хост выключил ваш микрофон")
         self._sb_toast.adjustSize()
         _main_w = self.width()
@@ -2134,17 +1830,8 @@ class MainWindow(QMainWindow):
         self._sb_toast_timer.start()
 
     def _on_kicked_by_host(self, reason: str):
-        """
-        Сервер нас кикнул (CMD_KICKED). Reconnect заблокирован в features.py
-        сразу при получении команды (running=False + shutdown_event.set).
-
-        При кике — просто уходим в лобби с коротким тостом. Не показываем
-        modal-диалог: он перехватывает фокус и блокирует возврат, а
-        _disconnect_and_show_lobby сам делает полный teardown.
-        """
         reason_txt = (reason or '').strip()
         print(f"[UI] kicked by host. reason={reason_txt!r}")
-        # Короткий тост — пользователь увидит его на фоне нового экрана лобби
         try:
             self._sb_toast.setText(
                 f"👢  Хост отключил вас от сервера"
@@ -2159,22 +1846,7 @@ class MainWindow(QMainWindow):
         self._disconnect_and_show_lobby()
 
     def _on_banned_by_host(self, reason: str):
-        """
-        Сервер нас забанил (CMD_BANNED): либо по команде хоста в сессии,
-        либо на логине если наш IP+ник уже в bans.json сервера.
 
-        Отличается от _on_kicked тем что:
-          • Показываем BannedScreen вместо MultiServerScreen (картинка
-            banned.png + причина + кнопка «Назад»).
-          • Клик «Назад» на BannedScreen открывает MultiServerScreen,
-            который делает live-query бан-статуса к каждому серверу
-            (see _ServerItemWidget). То есть если хост уже успел нас
-            разбанить — 🚫 не появится.
-
-        НЕ пишем локальный маркер бана на клиенте: source of truth
-        только серверный bans.json, иначе разбан хоста не синхронизируется
-        к клиенту и 🚫 висит вечно (см. инцидент v3→v4).
-        """
         reason_txt = (reason or '').strip()
         banned_ip = getattr(self, 'ip', '') or ''
         print(f"[UI] banned by host. ip={banned_ip!r} reason={reason_txt!r}")
@@ -2182,10 +1854,6 @@ class MainWindow(QMainWindow):
 
     def on_connected(self, msg):
         try:
-            # FIX: сбрасываем recovery state при успешном подключении.
-            # _finish_recovery() в core.py тоже это делает, но здесь — страховка
-            # на случай если recovery-поток упал до _finish_recovery (audio.start
-            # бросил исключение, и т.п.). Без этого будущие reconnect заблокированы.
             try:
                 with self.net._recovery_lock:
                     self.net._recovery_state = 'idle'
@@ -2198,15 +1866,11 @@ class MainWindow(QMainWindow):
                 self.app_settings.value("device_out_name")
             )
 
-            # Обновляем UID в ChatPanel (был 0 до первого подключения)
             self._chat_panel.set_my_uid(self.audio.my_uid)
             self._chat_panel.update_room_label(self.current_room)
 
             self.play_notification("self_move")
 
-            # Сброс состояния «подключение друга» при каждом (пере)подключении.
-            # При первом sync_users после входа просто засеваем prev_all_uids —
-            # без звука, чтобы не «приветствовать» уже находящихся на сервере.
             self.prev_all_uids = set()
             self._server_users_initialized = False
 
@@ -2214,9 +1878,6 @@ class MainWindow(QMainWindow):
 
             self._btn_reconnect.setEnabled(True)
 
-            # Восстанавливаем сохранённый статус после переподключения.
-            # Сервер не хранит статусы постоянно — только в рамках сессии,
-            # поэтому при каждом (пере)подключении отправляем сохранённый статус.
             if self._my_status_icon:
                 self.net.send_presence_update(self._my_status_icon, self._my_status_text)
 
@@ -2229,16 +1890,13 @@ class MainWindow(QMainWindow):
             self.stream_windows[uid].update_frame(q_image)
 
     def on_stream_stats_updated(self, uid: int, fps: int, loss_pct: int):
-        """
-        Принимает статистику качества потока от VideoEngine (каждые 2 сек).
-        Пробрасывает в соответствующий VideoWindow для обновления HUD.
-        """
+
         if uid in self.stream_windows and self.stream_windows[uid].isVisible():
             self.stream_windows[uid].update_stream_stats(fps, loss_pct)
 
     def update_user_tree(self, users_map):
         user_rooms: dict = {}
-        all_active_uids = set() # Исправление 2.1: собираем всех активных пользователей
+        all_active_uids = set()
 
         for r, u_list in users_map.items():
             for u in u_list:
@@ -2259,7 +1917,7 @@ class MainWindow(QMainWindow):
         }
         current_streaming_uids = {
             u['uid']
-            for u in users_map.get(self.current_room, [])  # ИСПРАВЛЕНИЕ: только текущий канал
+            for u in users_map.get(self.current_room, [])
             if u.get('is_streaming', False)
         }
 
@@ -2277,14 +1935,12 @@ class MainWindow(QMainWindow):
                     if uid in self.stream_windows:
                         self._on_stream_window_closed(uid)
 
-        # ИСПРАВЛЕНИЕ 2.1: Очищаем движки от мусора и отключившихся
         self.audio.cleanup_users(all_active_uids)
         self.video.cleanup_users(all_active_uids)
 
         self.prev_room_uids = current_room_uids
         self.prev_streaming_uids = current_streaming_uids
 
-        # ── Звук подключения друга к серверу ──────────────────────────────────
         all_server_uids = all_active_uids - {self.audio.my_uid}
         if not self._server_users_initialized:
             self.prev_all_uids = all_server_uids
@@ -2295,37 +1951,20 @@ class MainWindow(QMainWindow):
                 self.play_notification("friend_connect")
             self.prev_all_uids = all_server_uids
 
-        # FIX #18: пропускаем полную перестройку дерева если состав и
-        # размещение пользователей не изменились.
-        # Раньше tree.clear() + полный rebuild выполнялись при КАЖДОМ sync_users
-        # (update_status → отправляется ~1 раз/сек с каждого клиента при неизменном
-        # mute/deaf). При 20 юзерах = до 20 full rebuild/сек на UI-потоке.
-        # Сигнатура: tuple отсортированных (room, uid, nick, mute, deaf, is_streaming,
-        # avatar, status_icon, status_text) + СПИСОК КАНАЛОВ.
-        #
-        # FIX CHANNELS: default_rooms включён в подпись.
-        # Проблема: при создании/удалении пустого временного канала users_map
-        # не меняется (в канале нет пользователей) → подпись была идентична →
-        # ранний return → дерево не перерисовывалось → канал не появлялся/исчезал
-        # пока не происходило любое другое событие (mute, подключение юзера и т.п.).
-        # Решение: добавляем tuple(self.default_rooms) в подпись — как только
-        # _on_channel_list_updated или _on_channel_created/deleted изменят список
-        # каналов, следующий вызов refresh_ui немедленно перестроит дерево.
         _new_sig = (
             tuple(self.default_rooms),   # ← изменение списка каналов = rebuild
             tuple(
                 (r, u['uid'], u['nick'], u.get('mute'), u.get('deaf'),
                  u.get('is_streaming'), u.get('avatar'), u.get('status_icon'),
                  u.get('status_text'),
-                 # FIX #3: watchers в подписи → дерево перерисовывается когда
-                 # зритель подключается/отключается от стрима налету.
+
                  tuple(w.get('nick', '') for w in u.get('watchers', [])))
                 for r, u_list in sorted(users_map.items())
                 for u in sorted(u_list, key=lambda x: x['uid'])
             ),
         )
         if hasattr(self, '_users_map_sig') and self._users_map_sig == _new_sig:
-            return  # ничего не изменилось — не трогаем дерево
+            return
         self._users_map_sig = _new_sig
 
         self.tree.clear()
@@ -2368,17 +2007,11 @@ class MainWindow(QMainWindow):
                     item_u.setFont(0, font_u)
                 item_u.setData(0, Qt.ItemDataRole.UserRole, uid)
 
-                # ── Колонка 1: статус дела (иконка SVG из assets/status/) ──────
-                # Показывается только если пользователь выставил статус.
-                # Tooltip показывает text-подпись при наведении мыши.
                 status_icon = u.get('status_icon', '')
                 status_text = u.get('status_text', '')
                 if status_icon:
-                    # Ленивое создание пиксмапа с кэшированием
                     if status_icon not in self._status_px_cache:
-                        # FIX MEM: ограничиваем кэш — 200 иконок достаточно для
-                        # любого реального набора статусов. Сброс при переполнении
-                        # прост и надёжен (статусы — маленький набор SVG-файлов).
+
                         if len(self._status_px_cache) >= 200:
                             self._status_px_cache.clear()
                         icon_path = resource_path(f"assets/status/{status_icon}")
@@ -2416,7 +2049,6 @@ class MainWindow(QMainWindow):
         self.tree.expandAll()
         self._update_known_users_registry(users_map)
 
-        # Репозиционируем активные пузыри быстрого чата
         self._reposition_quick_bubbles()
 
     def refresh_ui(self):
@@ -2430,10 +2062,6 @@ class MainWindow(QMainWindow):
         try:
             ping = self.net.current_ping
 
-            # FIX #16: кэшируем «зону» пинга и пересоздаём stylesheet только при
-            # переходе между зонами (зелёная < 60 < жёлтая < 150 < красная).
-            # setStyleSheet() и setToolTip() с f-строками каждые 100 мс — лишняя
-            # работа Qt-стека (CSS парсинг + repaint) даже когда ничего не изменилось.
             ping_tier = 0 if ping < 60 else (1 if ping < 150 else 2)
             if not hasattr(self, '_ping_tier_cache'):
                 self._ping_tier_cache = -1   # форсируем первый рендер
@@ -2453,18 +2081,10 @@ class MainWindow(QMainWindow):
                     f"  color: {col}; padding: 4px;"
                     f"}}"
                 )
-            # Обновляем текст при каждом вызове (пинг меняется чаще чем зона)
             self._latency_btn.setText(f"{ping} мс")
 
-            # FIX: perf_counter() — синхронизируем с last_packet_time и last_voice_time
-            # в audio_engine (тоже переведены на perf_counter). time.time() и
-            # perf_counter() — разные часы, их нельзя вычитать друг из друга.
-            # Без этой правки (now - last_packet_time) давало ~50_000_000 сек → никогда < 0.3.
             now = time.perf_counter()
 
-            # ВАЖН-6: тема меняется только через apply_theme() → флаг _theme_dirty.
-            # Избегаем QSettings.value() (обращение к реестру) 10 раз/сек.
-            # FIX #7: только тёмная тема — цвета фиксированные.
             if self._theme_dirty:
                 self._theme_dirty = False
                 self._c_def  = QColor("#ecf0f1")
@@ -2476,9 +2096,6 @@ class MainWindow(QMainWindow):
             c_def    = self._c_def
             icon_size = self._icon_size
 
-            # ВАЖН-5: Быстрый снимок под локом — только примитивы, без Qt-вызовов.
-            # users_lock не удерживается во время setData/setForeground: Qt может
-            # вызвать перерисовку внутри этих методов и заблокировать _packet_processor_loop.
             with self.audio.users_lock:
                 me_talk = (now - self.audio.last_voice_time < 0.3) and not self.audio.is_muted
                 remote_snapshot = {
@@ -2493,11 +2110,8 @@ class MainWindow(QMainWindow):
                 is_muted     = self.audio.is_muted
                 is_deafened  = self.audio.is_deafened
 
-            # Снимок host_uid вне лока — getattr безопасен без блокировки.
-            # Кэшируем здесь раз на итерацию (не вызываем getattr N раз в цикле).
             host_uid = getattr(self.net, '_server_host_uid', 0)
 
-            # Обновляем Qt-дерево БЕЗ лока
             for uid, data in self.known_uids.items():
                 item = data['item']
                 is_m = data['is_m']
@@ -2543,8 +2157,6 @@ class MainWindow(QMainWindow):
                 elif curr_d or is_m or (uid != my_uid and u_vals and (is_locally_muted or is_vol_zero)):
                     item.setForeground(0, self._br_mute)
                 else:
-                    # Хост выделяется золотым даже в «дефолтном» состоянии.
-                    # Проверка выполняется O(1) — host_uid снят до цикла.
                     if host_uid and uid == host_uid:
                         item.setForeground(0, self._br_gold)
                     else:
@@ -2556,7 +2168,6 @@ class MainWindow(QMainWindow):
     def on_tree_double_click(self, item, col):
         if item.data(0, Qt.ItemDataRole.UserRole) == "ROOM_HEADER":
             room_name = item.data(1, Qt.ItemDataRole.UserRole)
-            # Проверяем: защищён ли канал паролем?
             ch_info = next(
                 (ch for ch in self._channel_list if ch['name'] == room_name),
                 None
@@ -2569,7 +2180,6 @@ class MainWindow(QMainWindow):
     def show_context_menu(self, pos):
         item = self.tree.itemAt(pos)
 
-        # ── ПКМ по пустому месту или заголовку канала — создать/переименовать ─
         if not item or item.data(0, Qt.ItemDataRole.UserRole) == "ROOM_HEADER":
             if self._is_server_host():
                 menu = QMenu(self)
@@ -2581,13 +2191,10 @@ class MainWindow(QMainWindow):
                 )
                 act_create = menu.addAction("🔊  Создать временный канал")
 
-                # FIX #4: если клик по конкретному заголовку постоянного канала
-                # — показываем пункт переименования
                 act_rename = None
                 clicked_room = None
                 if item and item.data(0, Qt.ItemDataRole.UserRole) == "ROOM_HEADER":
                     clicked_room = item.data(1, Qt.ItemDataRole.UserRole)
-                    # Проверяем, является ли канал постоянным
                     for ch in self._channel_list:
                         if ch['name'] == clicked_room and ch.get('permanent', False):
                             menu.addSeparator()
@@ -2605,7 +2212,6 @@ class MainWindow(QMainWindow):
         if not uid:
             return
 
-        # ── Правый клик по СЕБЕ → оверлей выбора статуса ─────────────────────
         if uid == self.audio.my_uid:
             item_rect = self.tree.visualItemRect(item)
             global_pos = self.tree.viewport().mapToGlobal(item_rect.bottomLeft())
@@ -2628,7 +2234,6 @@ class MainWindow(QMainWindow):
 
         nick = item.text(0).strip()
 
-        # Получаем текущую громкость пользователя
         current_vol = 1.0
         with self.audio.users_lock:
             u = self.audio.remote_users.get(uid)
@@ -2639,17 +2244,14 @@ class MainWindow(QMainWindow):
                 if ip:
                     current_vol = float(self.audio.settings.value(f"vol_ip_{ip}", 1.0))
 
-        # Позиция оверлея: прямо под ником в дереве
         item_rect = self.tree.visualItemRect(item)
         global_pos = self.tree.viewport().mapToGlobal(item_rect.bottomLeft())
 
-        # Флаг стрима + колбэк «смотреть» — передаём в панель
         user_data = self.known_uids.get(uid)
         is_streaming = user_data.get('is_s', False) if user_data else False
 
         watch_cb = None
         if is_streaming:
-            # Захватываем uid/item в замыкание без ref на loop-переменные
             _uid = uid
             _nick_txt = item.text(0)
             watch_cb = lambda: self.open_video_window(_uid, _nick_txt)
@@ -2660,25 +2262,21 @@ class MainWindow(QMainWindow):
             is_streaming=is_streaming,
             on_watch_stream=watch_cb,
             net=self.net,
-            # Передача сервера: callback виден только хосту (первый в host_order)
             on_transfer_server=(
                 (lambda _uid=uid: self._on_request_server_transfer(_uid))
                 if self._is_server_host() and uid != self.audio.my_uid
                 else None
             ),
-            # Выключить микрофон: только хост, участник может включить сам
             on_host_mute=(
                 (lambda _uid=uid: self.net.send_host_mute(_uid))
                 if self._is_server_host() and uid != self.audio.my_uid
                 else None
             ),
-            # Кикнуть: только хост. Подтверждение показывает MainWindow.
             on_host_kick=(
                 (lambda _uid=uid, _nk=nick: self._on_request_host_kick(_uid, _nk))
                 if self._is_server_host() and uid != self.audio.my_uid
                 else None
             ),
-            # Забанить (кик + IP в банлист): только хост.
             on_host_ban=(
                 (lambda _uid=uid, _nk=nick: self._on_request_host_ban(_uid, _nk))
                 if self._is_server_host() and uid != self.audio.my_uid
@@ -2687,19 +2285,13 @@ class MainWindow(QMainWindow):
         ).show()
 
     def _is_server_host(self) -> bool:
-        """
-        Возвращает True если текущий пользователь является хозяином сервера.
-        Используется для отображения кнопки «Передать сервер» в контекстном меню.
-        """
+
         my_uid = getattr(self.audio, 'my_uid', 0)
         server_uid = getattr(self.net, '_server_host_uid', 0)
         return bool(my_uid and my_uid == server_uid)
 
     def _on_request_server_transfer(self, target_uid: int):
-        """
-        Запрашивает подтверждение и отправляет CMD_SERVER_TRANSFER на сервер.
-        Вызывается из UserOverlayPanel при клике «Передать сервер».
-        """
+
         target_info = self.known_uids.get(target_uid, {})
         target_nick = target_info.get('nick', f'uid={target_uid}')
 
@@ -2715,13 +2307,8 @@ class MainWindow(QMainWindow):
             self.net.send_server_transfer(target_uid)
             print(f"[UI] Запрошена передача сервера → {target_nick} (uid={target_uid})")
 
-    # ── Хост: kick / ban с подтверждением ────────────────────────────────────
     def _on_request_host_kick(self, target_uid: int, target_nick: str):
-        """
-        Подтверждение и отправка CMD_HOST_KICK. Права проверяет сервер
-        (только первый в _host_order). Если UI-проверка устарела (например,
-        хост сменился прямо перед кликом) — сервер просто молча проигнорирует.
-        """
+
         nick = (target_nick or '').strip() or f'uid={target_uid}'
         reply = QMessageBox.question(
             self,
@@ -2736,12 +2323,7 @@ class MainWindow(QMainWindow):
             print(f"[UI] Kick → {nick} (uid={target_uid})")
 
     def _on_request_host_ban(self, target_uid: int, target_nick: str):
-        """
-        Подтверждение и отправка CMD_HOST_BAN. Бан остаётся до ручного
-        разбана через «Главное → Сервер → Забаненные участники» и живёт
-        в bans.json текущего владельца сервера. После передачи сервера
-        другому — новый хост использует свой файл.
-        """
+
         nick = (target_nick or '').strip() or f'uid={target_uid}'
         reply = QMessageBox.question(
             self,
@@ -2760,42 +2342,39 @@ class MainWindow(QMainWindow):
         if uid not in self.stream_windows or not self.stream_windows[uid].isVisible():
             w = VideoWindow(nick)
             w.uid = uid
-            # Передаём NetworkClient для SoundboardPanel в оверлее стрима
             w.set_net(self.net)
             w.window_closed.connect(self._on_stream_window_closed)
 
-            # --- Оверлей: подключаем кнопки управления ---
-            # Микрофон и динамики переключают состояние аудио-движка
             w.overlay_mute_toggled.connect(lambda: self.btn_mute.click())
             w.overlay_deafen_toggled.connect(lambda: self.btn_deafen.click())
-            # «Прекратить просмотр» — окно само закрывается, нам остаётся отправить stop
             w.overlay_stop_watch.connect(lambda _uid=uid: self._on_stream_window_closed(_uid))
 
-            # Синхронизировать иконки оверлея при каждом изменении статуса аудио.
-            # ВАЖНО: используем прямое подключение (не lambda), чтобы можно было
-            # вызвать disconnect() по имени метода при закрытии окна.
-            # Lambda-соединения накапливались в audio.status_changed и никогда
-            # не отключались → каждое открытие окна оставляло мёртвую лямбду
-            # с живой ссылкой на VideoWindow в памяти.
             self.audio.status_changed.connect(w.sync_audio_state)
-            # Установить актуальное состояние прямо сейчас
             w.sync_audio_state(self.audio.is_muted, self.audio.is_deafened)
 
-            # Громкость стрима: подключаем к AudioHandler.set_stream_volume().
-            # AudioHandler._stream_vol управляет усилением в audio_callback (0.0–2.0).
-            # При deafen auto-ducking (0.4×) применяется поверх этого коэффициента.
             w.overlay_stream_volume_changed.connect(self.audio.set_stream_volume)
-            # Синхронизируем ползунок попапа с текущим значением движка,
-            # чтобы при повторном открытии окна ползунок не сбрасывался в 1.0.
+
             w.overlay.set_stream_volume_value(self.audio._stream_vol)
 
-            # ── Рисование: зритель закончил мазок → отправляем серверу ─────
-            # draw_stroke_ready(color, norm_points, width) испускается DrawCanvas
-            # при отпускании кнопки мыши. nick берём из self.nick (локальный).
-            # Сервер ретранслирует мазок всем зрителям + стримеру.
             w.draw_stroke_ready.connect(
                 lambda color, pts, width, _uid=uid:
                     self.net.send_draw_stroke(_uid, self.nick, color, pts, width)
+            )
+
+            w.control_requested.connect(
+                lambda _uid=uid, _w=w: self._on_viewer_rc_requested(_uid, _w)
+            )
+            w.control_released.connect(
+                lambda _uid=uid, _w=w: self._on_viewer_rc_released(_uid, _w)
+            )
+            w.remote_control_event_ready.connect(
+                lambda ev, _uid=uid: self.net.send_remote_control_event(_uid, ev)
+            )
+            self.net.remote_control_response.connect(
+                lambda granted, reason, _w=w: self._on_rc_response(_w, granted, reason)
+            )
+            self.net.remote_control_stopped.connect(
+                lambda _w=w: self._on_rc_stopped(_w)
             )
 
             w.show()
@@ -2812,6 +2391,25 @@ class MainWindow(QMainWindow):
                 self.audio.status_changed.disconnect(w.sync_audio_state)
             except (RuntimeError, TypeError):
                 pass
+            # RC-сигналы — глобальные (self.net.*), не умирают с окном.
+            # Без disconnect лямбда с захваченным _w=w дёргается после
+            # deleteLater() → RuntimeError "wrapped C++ object has been deleted".
+            for _sig in (
+                self.net.remote_control_requested,
+                self.net.remote_control_response,
+                self.net.remote_control_event,
+                self.net.remote_control_stopped,
+            ):
+                try:
+                    _sig.disconnect()
+                except (RuntimeError, TypeError):
+                    pass
+            # Сброс RC-состояния при закрытии окна
+            if self._rc_streamer_uid_get() == uid:
+                self._rc_streamer_uid = None
+            if self._rc_viewer_uid_get() is not None:
+                self._rc_viewer_uid = None
+                self._rc_stop_esc_watch()
         self.stream_windows.pop(uid, None)
 
         # stop_watching() закрывает _viewer_pc (WebRTC) в asyncio-потоке,
@@ -2847,6 +2445,640 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         QTimer.singleShot(2500, _deferred_cleanup)
+
+    # ==================================================================
+    # Remote Control — методы MainWindow
+    # ==================================================================
+
+    # ------------------------------------------------------------------
+    # Состояние (хранится в MainWindow, не в VideoWindow)
+    # ------------------------------------------------------------------
+    # _rc_viewer_uid  — uid зрителя, которому стример выдал управление (сторона стримера)
+    # _rc_streamer_uid — uid стримера, у которого этот клиент берёт управление (сторона зрителя)
+    # Инициализируются лениво при первом использовании.
+
+    def _rc_viewer_uid_get(self):
+        return getattr(self, '_rc_viewer_uid', None)
+
+    def _rc_streamer_uid_get(self):
+        return getattr(self, '_rc_streamer_uid', None)
+
+    # ------------------------------------------------------------------
+    # Сторона ЗРИТЕЛЯ
+    # ------------------------------------------------------------------
+    def _on_viewer_rc_requested(self, streamer_uid: int, window):
+        """Зритель нажал кнопку Control → отправить запрос стримеру."""
+        self._rc_streamer_uid = streamer_uid
+        self.net.send_remote_control_request(streamer_uid, self.nick)
+
+        # Если ответа нет N секунд (cooldown → сервер молча дропнул запрос,
+        # либо стример игнорирует диалог) — отжимаем кнопку обратно.
+        self._rc_pending_window = window
+        if getattr(self, '_rc_pending_timer', None) is None:
+            self._rc_pending_timer = QTimer(self)
+            self._rc_pending_timer.setSingleShot(True)
+            self._rc_pending_timer.timeout.connect(self._on_rc_request_timeout)
+        self._rc_pending_timer.start(12000)
+
+    def _on_rc_request_timeout(self):
+        """Ответа на запрос управления не было — сбрасываем кнопку."""
+        w = getattr(self, '_rc_pending_window', None)
+        self._rc_pending_window = None
+        # Управление так и не активировалось → отжать кнопку
+        if w is not None and not (
+            getattr(w, '_control_mode', False)
+        ):
+            try:
+                w.on_control_denied()
+            except RuntimeError:
+                pass
+        self._rc_streamer_uid = None
+
+    def _rc_cancel_pending_timer(self):
+        t = getattr(self, '_rc_pending_timer', None)
+        if t is not None:
+            t.stop()
+        self._rc_pending_window = None
+
+    def _on_viewer_rc_released(self, streamer_uid: int, window):
+        """
+        Зритель отжал кнопку Control / нажал кнопку отмены в баннере стримера.
+        Отправляем stop, сбрасываем состояние.
+        """
+        self._rc_cancel_pending_timer()
+        uid = streamer_uid or self._rc_streamer_uid_get()
+        if uid:
+            self.net.send_remote_control_stop(uid)
+        self._rc_streamer_uid = None
+        window.on_control_stopped()
+
+    def _on_rc_response(self, window, granted: bool, reason: str = ''):
+        """Сервер relay-нул ответ стримера на запрос управления."""
+        # При нескольких открытых окнах сигнал прилетает во все лямбды.
+        # Реагирует только то окно, что реально ждёт ответа или уже управляет.
+        pending = getattr(self, '_rc_pending_window', None)
+        if window is not pending and not getattr(window, '_control_mode', False):
+            return
+
+        self._rc_cancel_pending_timer()
+        if granted:
+            window.on_control_granted()
+            return
+
+        # Отказ. Сбрасываем состояние — кнопка отжимается, можно запросить снова.
+        window.on_control_denied()
+        self._rc_streamer_uid = None
+
+        if reason == 'cooldown':
+            # 3 отказа подряд → cooldown. Зрителю показываем мягкое уведомление
+            # один раз; дальнейшие нажатия кнопки сервер молча игнорирует.
+            self._show_rc_cooldown_dialog(window)
+        elif reason == 'busy':
+            # Управление уже у кого-то — тихо, без диалога.
+            pass
+        else:
+            self._show_rc_denied_dialog(window)
+
+    def _on_rc_stopped(self, window):
+        """
+        Сервер сообщил об остановке управления.
+        Может прийти как стримеру (зритель нажал «Отменить управление»),
+        так и зрителю (стример нажал «Отменить» / 3×ESC).
+        Здесь НЕ шлём stop обратно — иначе будет эхо.
+        """
+        # Сторона зрителя: управление у нас отобрали
+        self._rc_streamer_uid = None
+        if window is not None:
+            try:
+                window.on_control_stopped()
+            except RuntimeError:
+                pass
+        # Сторона стримера: гасим ESC-вотч и баннер без повторного send_stop
+        if self._rc_viewer_uid_get() is not None:
+            self._rc_viewer_uid = None
+            self._rc_stop_esc_watch()
+            if hasattr(self, '_rc_access_banner'):
+                self._rc_access_banner.setVisible(False)
+
+    # ------------------------------------------------------------------
+    # Сторона СТРИМЕРА
+    # ------------------------------------------------------------------
+    def _on_rc_request_global(self, viewer_uid: int, viewer_nick: str):
+        """
+        Глобальный обработчик запроса управления (подключён в __init__).
+        Когда мы сами стримим — VideoWindow нашего стрима не существует,
+        поэтому показываем диалог поверх главного окна (self).
+        """
+        # window=None → _on_rc_request_received покажет диалог поверх MainWindow
+        self._on_rc_request_received(None, viewer_uid, viewer_nick)
+
+    def _on_rc_request_received(self, window, viewer_uid: int, viewer_nick: str):
+        """
+        Сервер relay-нул запрос зрителя.
+        window — VideoWindow если мы смотрим чужой стрим, None если мы сами стримим.
+        Показываем диалог поверх window или поверх MainWindow (self).
+        """
+        # Защита от "wrapped C++ object has been deleted"
+        if window is not None:
+            try:
+                is_visible = window.isVisible()
+            except RuntimeError:
+                self.net.send_remote_control_response(viewer_uid, False)
+                return
+            if not is_visible:
+                self.net.send_remote_control_response(viewer_uid, False)
+                return
+
+        # Если уже есть активный контролёр — отклоняем без диалога
+        if self._rc_viewer_uid_get() is not None:
+            self.net.send_remote_control_response(viewer_uid, False)
+            return
+
+        # Показываем диалог: поверх VideoWindow (если есть) или поверх MainWindow
+        parent_widget = window if window is not None else self
+        granted = self._show_rc_dialog(parent_widget, viewer_nick)
+        self.net.send_remote_control_response(viewer_uid, granted)
+
+        if granted:
+            self._rc_viewer_uid = viewer_uid
+            self._rc_start_esc_watch()
+            if window is not None:
+                window.show_control_active_banner()
+            else:
+                self._show_rc_streamer_banner()
+
+    def _show_rc_dialog(self, parent, viewer_nick: str) -> bool:
+        """
+        Диалог запроса управления в стиле приложения (поверх всех окон).
+        Возвращает True если стример нажал «Да».
+        """
+        from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
+                                     QLabel, QPushButton)
+        from PyQt6.QtCore import Qt
+
+        dlg = QDialog(parent)
+        dlg.setWindowTitle("Запрос управления")
+        dlg.setWindowFlags(
+            Qt.WindowType.Dialog
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
+        dlg.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        dlg.setModal(True)
+
+        outer = QFrame(dlg)
+        outer.setObjectName("rcReqFrame")
+        outer.setStyleSheet("""
+            QFrame#rcReqFrame {
+                background-color: #1a1c2c;
+                border-radius: 12px;
+                border: 1px solid rgba(255,255,255,0.10);
+            }
+        """)
+
+        v = QVBoxLayout(outer)
+        v.setContentsMargins(24, 22, 24, 20)
+        v.setSpacing(14)
+
+        ico_lbl = QLabel("🖱️")
+        ico_lbl.setStyleSheet("background:transparent; border:none; font-size:30px;")
+        ico_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(ico_lbl)
+
+        title = QLabel("Запрос управления")
+        title.setStyleSheet(
+            "background:transparent; border:none; color:#cdd6f4;"
+            "font-size:15px; font-weight:700;"
+        )
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(title)
+
+        # Имя экранируем, чтобы ник не сломал разметку
+        safe_nick = (
+            str(viewer_nick).replace('&', '&amp;')
+                            .replace('<', '&lt;')
+                            .replace('>', '&gt;')
+        )
+        msg = QLabel(
+            f'Пользователь <b style="color:#cdd6f4;">{safe_nick}</b> хочет взять '
+            f'управление вашей мышью и клавиатурой.'
+        )
+        msg.setStyleSheet(
+            "background:transparent; border:none; color:#8890a0; font-size:12px;"
+        )
+        msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        msg.setWordWrap(True)
+        v.addWidget(msg)
+
+        hint = QLabel("Остановить можно тройным нажатием ESC.")
+        hint.setStyleSheet(
+            "background:transparent; border:none; color:#5b6172; font-size:11px;"
+        )
+        hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        hint.setWordWrap(True)
+        v.addWidget(hint)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+
+        btn_no = QPushButton("Отклонить")
+        btn_no.setFixedHeight(36)
+        btn_no.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_no.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(255,255,255,18);
+                border: 1px solid rgba(255,255,255,40);
+                border-radius: 8px;
+                color: #cdd6f4;
+                font-size: 13px;
+                font-weight: 600;
+            }
+            QPushButton:hover { background-color: rgba(255,255,255,35); }
+        """)
+
+        btn_yes = QPushButton("Разрешить")
+        btn_yes.setFixedHeight(36)
+        btn_yes.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_yes.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(88, 101, 242, 220);
+                border: 1px solid rgba(88, 101, 242, 255);
+                border-radius: 8px;
+                color: #fff;
+                font-size: 13px;
+                font-weight: 700;
+            }
+            QPushButton:hover { background-color: rgba(108, 121, 255, 240); }
+        """)
+
+        btn_no.clicked.connect(dlg.reject)
+        btn_yes.clicked.connect(dlg.accept)
+        btn_row.addWidget(btn_no, 1)
+        btn_row.addWidget(btn_yes, 1)
+        v.addLayout(btn_row)
+
+        outer.adjustSize()
+
+        root_lay = QVBoxLayout(dlg)
+        root_lay.setContentsMargins(0, 0, 0, 0)
+        root_lay.addWidget(outer)
+        dlg.setMinimumWidth(340)
+        dlg.adjustSize()
+
+        # По центру родителя/экрана и поверх всех окон
+        try:
+            dlg.raise_()
+            dlg.activateWindow()
+        except Exception:
+            pass
+
+        return dlg.exec() == QDialog.DialogCode.Accepted
+
+    def _show_rc_denied_dialog(self, parent):
+        """Кастомный диалог «управление отклонено» в стиле приложения."""
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
+        from PyQt6.QtCore import Qt
+
+        dlg = QDialog(parent)
+        dlg.setWindowTitle("Управление")
+        dlg.setWindowFlags(
+            Qt.WindowType.Dialog
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
+        dlg.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        dlg.setModal(True)
+
+        outer = QFrame(dlg)
+        outer.setObjectName("rcDeniedFrame")
+        outer.setStyleSheet("""
+            QFrame#rcDeniedFrame {
+                background-color: #1a1c2c;
+                border-radius: 12px;
+                border: 1px solid rgba(255,255,255,0.10);
+            }
+        """)
+
+        v = QVBoxLayout(outer)
+        v.setContentsMargins(24, 20, 24, 20)
+        v.setSpacing(14)
+
+        ico_lbl = QLabel("🚫")
+        ico_lbl.setStyleSheet("background:transparent; border:none; font-size:28px;")
+        ico_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(ico_lbl)
+
+        title = QLabel("Управление отклонено")
+        title.setStyleSheet(
+            "background:transparent; border:none; color:#cdd6f4;"
+            "font-size:14px; font-weight:700;"
+        )
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(title)
+
+        msg = QLabel("Стример отклонил ваш запрос.<br>Вы можете попробовать снова.")
+        msg.setStyleSheet(
+            "background:transparent; border:none; color:#8890a0; font-size:12px;"
+        )
+        msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        msg.setWordWrap(True)
+        v.addWidget(msg)
+
+        btn_ok = QPushButton("Понятно")
+        btn_ok.setFixedHeight(34)
+        btn_ok.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(88, 101, 242, 200);
+                border: 1px solid rgba(88, 101, 242, 255);
+                border-radius: 8px;
+                color: #fff;
+                font-size: 13px;
+                font-weight: 600;
+            }
+            QPushButton:hover { background-color: rgba(108, 121, 255, 230); }
+        """)
+        btn_ok.clicked.connect(dlg.accept)
+        v.addWidget(btn_ok)
+
+        outer.adjustSize()
+
+        root_lay = QVBoxLayout(dlg)
+        root_lay.setContentsMargins(0, 0, 0, 0)
+        root_lay.addWidget(outer)
+        dlg.adjustSize()
+        dlg.exec()
+
+    def _show_rc_cooldown_dialog(self, parent):
+        """Диалог «запросы временно заблокированы» (cooldown после 3 отказов)."""
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton
+        from PyQt6.QtCore import Qt
+
+        dlg = QDialog(parent)
+        dlg.setWindowTitle("Управление")
+        dlg.setWindowFlags(
+            Qt.WindowType.Dialog
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
+        dlg.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        dlg.setModal(True)
+
+        outer = QFrame(dlg)
+        outer.setObjectName("rcCooldownFrame")
+        outer.setStyleSheet("""
+            QFrame#rcCooldownFrame {
+                background-color: #1a1c2c;
+                border-radius: 12px;
+                border: 1px solid rgba(255,255,255,0.10);
+            }
+        """)
+
+        v = QVBoxLayout(outer)
+        v.setContentsMargins(24, 20, 24, 20)
+        v.setSpacing(14)
+
+        ico_lbl = QLabel("⏳")
+        ico_lbl.setStyleSheet("background:transparent; border:none; font-size:28px;")
+        ico_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(ico_lbl)
+
+        title = QLabel("Запросы заблокированы")
+        title.setStyleSheet(
+            "background:transparent; border:none; color:#cdd6f4;"
+            "font-size:14px; font-weight:700;"
+        )
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(title)
+
+        msg = QLabel(
+            "Стример отклонил запрос несколько раз.<br>"
+            "Повторная попытка будет доступна через 10 минут."
+        )
+        msg.setStyleSheet(
+            "background:transparent; border:none; color:#8890a0; font-size:12px;"
+        )
+        msg.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        msg.setWordWrap(True)
+        v.addWidget(msg)
+
+        btn_ok = QPushButton("Понятно")
+        btn_ok.setFixedHeight(34)
+        btn_ok.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(88, 101, 242, 200);
+                border: 1px solid rgba(88, 101, 242, 255);
+                border-radius: 8px;
+                color: #fff;
+                font-size: 13px;
+                font-weight: 600;
+            }
+            QPushButton:hover { background-color: rgba(108, 121, 255, 230); }
+        """)
+        btn_ok.clicked.connect(dlg.accept)
+        v.addWidget(btn_ok)
+
+        outer.adjustSize()
+
+        root_lay = QVBoxLayout(dlg)
+        root_lay.setContentsMargins(0, 0, 0, 0)
+        root_lay.addWidget(outer)
+        dlg.adjustSize()
+        dlg.exec()
+
+    def _show_rc_streamer_banner(self):
+        """Показывает встроенный баннер управления над кнопкой «Чат»."""
+        if hasattr(self, '_rc_access_banner'):
+            self._rc_access_banner.setVisible(True)
+
+    def _hide_rc_streamer_banner(self):
+        """Стример нажал «Отменить» в баннере — скрываем, останавливаем управление."""
+        if hasattr(self, '_rc_access_banner'):
+            self._rc_access_banner.setVisible(False)
+        self._rc_viewer_uid = None
+        self._rc_stop_esc_watch()
+        self.net.send_remote_control_stop(getattr(self.audio, 'my_uid', 0))
+
+    def _on_rc_event_received(self, ev: dict):
+        """
+        Стример получил событие мыши/клавиатуры от зрителя.
+        Применяем через WinAPI SendInput (надёжно, Unicode), fallback — pyautogui.
+        Координаты нормализованы (0.0–1.0).
+        """
+        ev_type = ev.get('type', '')
+        if ev_type != 'mouse_move':
+            print(f"[RC-INJECT] got {ev_type} ev={ev} "
+                  f"win={_WIN_INPUT_AVAILABLE} pyautogui={_PYAUTOGUI_AVAILABLE} "
+                  f"viewer={self._rc_viewer_uid_get()}")
+
+        if self._rc_viewer_uid_get() is None:
+            return  # управление не активно
+
+        try:
+            nx = float(ev.get('x', 0))
+            ny = float(ev.get('y', 0))
+
+            if ev_type == 'mouse_move':
+                if _WIN_INPUT_AVAILABLE:
+                    _win_input.move_to(nx, ny)
+                elif _PYAUTOGUI_AVAILABLE:
+                    sw, sh = pyautogui.size()
+                    pyautogui.moveTo(int(nx*sw), int(ny*sh), duration=0, _pause=False)
+
+            elif ev_type in ('mouse_press', 'mouse_release'):
+                down = (ev_type == 'mouse_press')
+                btn = int(ev.get('button', 1))
+                if _WIN_INPUT_AVAILABLE:
+                    _win_input.mouse_button(btn, down, nx, ny)
+                elif _PYAUTOGUI_AVAILABLE:
+                    sw, sh = pyautogui.size()
+                    pyautogui.moveTo(int(nx*sw), int(ny*sh), duration=0, _pause=False)
+                    pa_btn = _qt_button_to_pyautogui(btn)
+                    (pyautogui.mouseDown if down else pyautogui.mouseUp)(button=pa_btn, _pause=False)
+                print(f"[RC-INJECT] mouse {'down' if down else 'up'} btn={btn}")
+
+            elif ev_type == 'mouse_scroll':
+                delta = int(ev.get('delta', 0))
+                if _WIN_INPUT_AVAILABLE:
+                    if delta:
+                        _win_input.mouse_scroll(delta)
+                elif _PYAUTOGUI_AVAILABLE:
+                    clicks = delta // 120
+                    if clicks:
+                        pyautogui.scroll(clicks, _pause=False)
+
+            elif ev_type == 'key_press':
+                if int(ev.get('key', 0)) == _RC_QT_KEY_ESCAPE:
+                    return
+                self._rc_inject_key(ev, down=True)
+
+            elif ev_type == 'key_release':
+                if int(ev.get('key', 0)) == _RC_QT_KEY_ESCAPE:
+                    return
+                self._rc_inject_key(ev, down=False)
+
+        except Exception as e:
+            import traceback
+            print(f"[RC-INJECT] EXCEPTION on {ev_type}: {e!r}")
+            traceback.print_exc()
+
+    def _rc_inject_key(self, ev: dict, down: bool):
+        """
+        Инъекция одной клавиши на стороне стримера.
+
+        Приоритет — WinAPI SendInput:
+          • спец-клавиши и модификаторы → по виртуальному коду (нужно для
+            удержания и комбинаций Ctrl+C, Alt+Tab, Win и т.д.);
+          • если зажат Ctrl/Alt/Win (комбинация) → шлём латинский аналог
+            клавиши по VK (комбо срабатывает независимо от раскладки);
+          • обычный ввод символа → Unicode (печатает кириллицу/латиницу/!@#
+            на нажатии; релиз игнорируем, т.к. type_unicode делает down+up).
+        fallback — pyautogui (как раньше).
+        """
+        qt_key = int(ev.get('key', 0))
+        text   = ev.get('text', '') or ''
+        mods   = int(ev.get('modifiers', 0))
+
+        special  = _qt_key_to_special(qt_key)          # 'ctrl','enter','f5'...
+        combo    = bool(mods & (_RC_MOD_CTRL | _RC_MOD_ALT | _RC_MOD_META))
+        key_name = _qt_key_to_basic(qt_key, text)       # 'a'..'z','0'..'9'
+
+        # ── Путь WinAPI ──────────────────────────────────────────────────────
+        if _WIN_INPUT_AVAILABLE:
+            if special:
+                print(f"[RC-INJECT] win special='{special}' down={down}")
+                _win_input.key_named(special, down)
+                return
+            if combo:
+                # Комбинация: шлём базовую клавишу по VK (для a-z/0-9), модификатор
+                # уже зажат отдельным special-событием.
+                vk = _basic_to_vk(key_name)
+                print(f"[RC-INJECT] win combo name='{key_name}' vk={vk} down={down}")
+                if vk:
+                    _win_input.key_vk(vk, down)
+                return
+            # Обычный символ: печатаем Unicode на нажатии, релиз игнорим.
+            if down and text and text.isprintable():
+                print(f"[RC-INJECT] win unicode text={text!r}")
+                _win_input.type_unicode(text)
+            elif down and key_name:
+                vk = _basic_to_vk(key_name)
+                if vk:
+                    print(f"[RC-INJECT] win vk fallback name='{key_name}' vk={vk}")
+                    _win_input.key_vk(vk, True)
+                    _win_input.key_vk(vk, False)
+            return
+
+        # ── Fallback: pyautogui ──────────────────────────────────────────────
+        if not _PYAUTOGUI_AVAILABLE:
+            return
+        if special:
+            (pyautogui.keyDown if down else pyautogui.keyUp)(special, _pause=False)
+            return
+        if combo:
+            if key_name:
+                (pyautogui.keyDown if down else pyautogui.keyUp)(key_name, _pause=False)
+            return
+        if down and text and text.isprintable():
+            pyautogui.write(text, _pause=False)
+        elif key_name and down:
+            pyautogui.press(key_name, _pause=False)
+
+    # ------------------------------------------------------------------
+    # 3×ESC — экстренная остановка управления (сторона стримера)
+    # ------------------------------------------------------------------
+    def _rc_start_esc_watch(self):
+        """
+        Вешает глобальный keyboard-хук на ESC. Колбэк выполняется в потоке
+        библиотеки keyboard, поэтому реальную остановку диспатчим в Qt-поток
+        через сигнал _rc_esc_triggered.
+        """
+        if self._rc_esc_hook is not None:
+            return
+        self._rc_esc_times = []
+        try:
+            self._rc_esc_hook = keyboard.on_press_key(
+                'esc', self._rc_on_esc_press, suppress=False
+            )
+        except Exception as e:
+            print(f"[RemoteControl] не удалось повесить ESC-хук: {e}")
+            self._rc_esc_hook = None
+
+    def _rc_stop_esc_watch(self):
+        """Снимает ESC-хук (управление завершено)."""
+        hook = self._rc_esc_hook
+        self._rc_esc_hook = None
+        self._rc_esc_times = []
+        if hook is not None:
+            try:
+                keyboard.unhook(hook)
+            except Exception:
+                pass
+
+    def _rc_on_esc_press(self, event):
+        """
+        Колбэк keyboard (НЕ Qt-поток!). Считаем нажатия ESC в окне времени.
+        Достигли RC_ESC_STOP_COUNT → эмитим сигнал в Qt-поток.
+        """
+        # управление уже не активно — игнор
+        if self._rc_viewer_uid_get() is None:
+            return
+        now = time.monotonic()
+        # отбрасываем устаревшие отметки за пределами окна
+        self._rc_esc_times = [
+            t for t in self._rc_esc_times if now - t <= RC_ESC_WINDOW_SEC
+        ]
+        self._rc_esc_times.append(now)
+        if len(self._rc_esc_times) >= RC_ESC_STOP_COUNT:
+            self._rc_esc_times = []
+            # маршалим в Qt-поток
+            self._rc_esc_triggered.emit()
+
+    def _on_rc_esc_stop(self):
+        """Qt-поток: стример трижды нажал ESC → останавливаем управление."""
+        if self._rc_viewer_uid_get() is None:
+            return
+        # Скрываем баннер, снимаем хук и шлём stop зрителю.
+        self._hide_rc_streamer_banner()
 
     def open_settings(self):
         # Запоминаем текущие устройства ДО открытия диалога.
@@ -4059,6 +4291,11 @@ class MainWindow(QMainWindow):
             self.is_streaming = False
             self.net.send_json({"action": CMD_STREAM_STOP})
 
+            # Если в момент остановки трансляции кто-то нами управлял —
+            # снимаем управление, гасим баннер и ESC-хук.
+            if self._rc_viewer_uid_get() is not None:
+                self._hide_rc_streamer_banner()
+
             # FIX LEAK #1: stop_streaming_webrtc() закрывает RTCPeerConnection
             # стримера и SystemAudioTrack. Без этого вызова _streamer_pc оставался
             # открытым после каждого стрима → H264 encoder + DTLS/SRTP буферы
@@ -4082,3 +4319,120 @@ class MainWindow(QMainWindow):
 
         self.update_stream_button_icon()
         self.refresh_ui()
+
+# ===========================================================================
+# Remote Control — вспомогательные функции конвертации Qt → pyautogui
+# ===========================================================================
+
+# Qt.Key.Key_Escape == 0x01000000. Держим как модульную константу, чтобы не
+# импортировать Qt внутри горячего цикла инъекции событий.
+_RC_QT_KEY_ESCAPE = 0x01000000
+
+# Qt.KeyboardModifier значения (битовая маска). Держим как константы, чтобы
+# не импортировать Qt в горячем пути инъекции.
+_RC_MOD_SHIFT = 0x02000000
+_RC_MOD_CTRL  = 0x04000000
+_RC_MOD_ALT   = 0x08000000
+_RC_MOD_META  = 0x10000000
+
+
+def _qt_button_to_pyautogui(qt_button: int) -> str:
+    """
+    Конвертирует Qt.MouseButton int в строку pyautogui.
+    Значения Qt.MouseButton стабильны: Left=1, Right=2, Middle=4.
+    Используем числовые литералы, т.к. int(Qt.MouseButton.X) в PyQt6
+    бросает TypeError.
+    """
+    mapping = {1: 'left', 2: 'right', 4: 'middle'}
+    return mapping.get(int(qt_button), 'left')
+
+
+def _basic_to_vk(name: str) -> int:
+    """
+    VK-код для базовой клавиши 'a'..'z' / '0'..'9' (для комбинаций через WinAPI).
+    VK букв == ASCII заглавной (A=0x41), VK цифр == ASCII ('0'=0x30).
+    """
+    if not name or len(name) != 1:
+        return 0
+    c = name.lower()
+    if 'a' <= c <= 'z':
+        return ord(c.upper())
+    if '0' <= c <= '9':
+        return ord(c)
+    return 0
+
+
+def _build_special_key_map() -> dict:
+    """
+    Карта Qt.Key → имя клавиши pyautogui для НЕпечатных/спец-клавиш.
+    Значения Qt.Key стабильны между версиями; задаём их числовыми литералами,
+    т.к. int(Qt.Key.X) в PyQt6 бросает TypeError.
+    """
+    return {
+        0x01000004: 'enter',       # Key_Return
+        0x01000005: 'enter',       # Key_Enter
+        0x01000003: 'backspace',   # Key_Backspace
+        0x01000007: 'delete',      # Key_Delete
+        0x01000001: 'tab',         # Key_Tab
+        0x01000000: 'esc',         # Key_Escape
+        0x00000020: 'space',       # Key_Space
+        0x01000012: 'left',        # Key_Left
+        0x01000014: 'right',       # Key_Right
+        0x01000013: 'up',          # Key_Up
+        0x01000015: 'down',        # Key_Down
+        0x01000010: 'home',        # Key_Home
+        0x01000011: 'end',         # Key_End
+        0x01000016: 'pageup',      # Key_PageUp
+        0x01000017: 'pagedown',    # Key_PageDown
+        0x01000006: 'insert',      # Key_Insert
+        0x01000009: 'printscreen', # Key_Print
+        0x01000024: 'capslock',    # Key_CapsLock
+        0x01000025: 'numlock',     # Key_NumLock
+        0x01000026: 'scrolllock',  # Key_ScrollLock
+        0x01000021: 'ctrl',        # Key_Control
+        0x01000020: 'shift',       # Key_Shift
+        0x01000023: 'alt',         # Key_Alt
+        0x01000022: 'win',         # Key_Meta
+        0x01000030: 'f1',  0x01000031: 'f2',
+        0x01000032: 'f3',  0x01000033: 'f4',
+        0x01000034: 'f5',  0x01000035: 'f6',
+        0x01000036: 'f7',  0x01000037: 'f8',
+        0x01000038: 'f9',  0x01000039: 'f10',
+        0x0100003a: 'f11', 0x0100003b: 'f12',
+    }
+
+
+# Кэш карты спец-клавиш (строится один раз при первом обращении).
+_RC_SPECIAL_KEY_MAP: dict | None = None
+
+
+def _qt_key_to_special(qt_key: int) -> str:
+    """Возвращает имя спец-клавиши pyautogui или '' если это печатный символ."""
+    global _RC_SPECIAL_KEY_MAP
+    if _RC_SPECIAL_KEY_MAP is None:
+        _RC_SPECIAL_KEY_MAP = _build_special_key_map()
+    return _RC_SPECIAL_KEY_MAP.get(qt_key, '')
+
+
+def _qt_key_to_basic(qt_key: int, text: str = '') -> str:
+    """
+    Имя «обычной» клавиши для keyDown/keyUp (нужно для комбинаций Ctrl+X
+    и для случаев, когда text пустой).
+    Qt.Key_A..Key_Z == 0x41..0x5A, Qt.Key_0..Key_9 == 0x30..0x39 — совпадают
+    с ASCII, поэтому маппим напрямую.
+    """
+    if 0x41 <= qt_key <= 0x5A:            # A-Z
+        return chr(qt_key).lower()
+    if 0x30 <= qt_key <= 0x39:            # 0-9
+        return chr(qt_key)
+    if text and len(text) == 1 and text.isprintable():
+        return text.lower()
+    return ''
+
+
+# Совместимость со старым именем (на случай внешних вызовов).
+def _qt_key_to_pyautogui(qt_key: int, text: str = '') -> str:
+    special = _qt_key_to_special(qt_key)
+    if special:
+        return special
+    return _qt_key_to_basic(qt_key, text)

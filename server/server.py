@@ -1,32 +1,3 @@
-# server.py — SFUServer + EmbeddedServerManager
-#
-# ── Полный список исправлений v2 ────────────────────────────────────────────
-#
-#   FIX #1 (КРИТИЧНО): stream_watch_start — UnboundLocalError при гонке
-#     "клиент отключился во время обработки". w_uid/watcher_nick/watcher_avatar
-#     защищены проверкой conn in clients.
-#
-#   FIX #2 (ВАЖНО): stats атомарность — отдельный stats_lock вместо ложной
-#     надежды на GIL. `dict[key] += n` НЕ атомарно в CPython (три байткода).
-#
-#   FIX #3 (ВАЖНО): аннотация _media_cache исправлена на 5-элементный тупл.
-#
-#   FIX #4 (ВАЖНО): UTF-8 incremental decoder для TCP stream. Раньше
-#     errors='ignore' обрезал байты эмоджи/кириллицы на границе chunk.
-#
-#   FIX #5 (ВАЖНО): _state_dirty под локом (clients_lock). Раньше два потока
-#     могли потерять dirty-флаг.
-#
-#   FIX #6 (ВАЖНО): _channel_auth очищается при rename_channel.
-#
-#   FIX #7 (ВАЖНО): сравнение с _general_channel_name вместо хардкод 'General'.
-#
-#   FIX #8 (СТИЛЬ): `except Exception` вместо `except (ValueError, Exception)`.
-#
-#   FIX #9 (СТИЛЬ): math.isfinite() для ping_ms (защита от nan/inf).
-#
-#   FIX #10 (СТИЛЬ): структурированный except в start_embedded SFU-бриджа.
-
 import asyncio
 import codecs
 import hashlib
@@ -66,52 +37,35 @@ from config import (
     CMD_CHAT_MSG, CMD_CHAT_HISTORY, CMD_CHAT_HISTORY_REQ, CHAT_MSG_MAX_LEN,
     CMD_CHAT_MEDIA, CHAT_MEDIA_MAX_B64,
     CMD_DRAW_STROKE, DRAW_MAX_POINTS,
+    CMD_REMOTE_CONTROL_REQUEST, CMD_REMOTE_CONTROL_RESPONSE,
+    CMD_REMOTE_CONTROL_EVENT, CMD_REMOTE_CONTROL_STOP,
+    RC_DENY_LIMIT, RC_COOLDOWN_SEC,
     CMD_TYPING, CHAT_DB_PATH, CHAT_HISTORY_MAX,
 )
 from .chat_db import ChatDB
 from .server_webrtc import PionSfuProxy
 
-
-# FIX #4: максимальный размер входного буфера на одного клиента.
-# При CHAT_MEDIA до 10 MB в base64 + overhead JSON, 16 MB — безопасный потолок.
-# Если буфер растёт сверх этого — клиент либо атакует, либо что-то сломано.
 _TCP_BUFFER_MAX = 16 * 1024 * 1024
-
-
-# =============================================================================
-# SFUServer — основной сервер
-# =============================================================================
 
 class SFUServer:
     def __init__(self, host='0.0.0.0', server_name=''):
-        # --- TCP ---
+
         self.tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.tcp_sock.bind((host, DEFAULT_PORT_TCP))
         self.tcp_sock.listen()
 
-        # --- UDP ---
         self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, UDP_RECV_BUFFER_SIZE)
         self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, UDP_SEND_BUFFER_SIZE)
-        # FIX WSAECONNRESET: на Windows при sendto() на закрытый UDP-порт клиента
-        # ОС генерирует ICMP Port Unreachable и применяет его к следующему recvfrom()
-        # как WSAECONNRESET (10054). Это убивало весь UDP-поток хоста при отключении
-        # любого клиента во время активного разговора — звук пропадал у всех.
-        # SIO_UDP_CONNRESET = False отключает это поведение на уровне сокета.
+
         if hasattr(socket, 'SIO_UDP_CONNRESET'):
             try:
                 self.udp_sock.ioctl(socket.SIO_UDP_CONNRESET, False)
             except Exception:
-                pass  # не Windows или старый Python — обработаем в udp_handler
+                pass
         self.udp_sock.bind((host, DEFAULT_PORT_UDP))
 
-        # -------------------------------------------------------------------
-        # Разделение локов:
-        #   clients_lock  — self.clients (TCP-потоки)
-        #   udp_lock      — self.udp_map (UDP-поток)
-        #   watchers_lock — self.watchers (stream-события)
-        # -------------------------------------------------------------------
         self.clients_lock  = threading.Lock()
         self.udp_lock      = threading.Lock()
         self.watchers_lock = threading.Lock()
@@ -121,47 +75,45 @@ class SFUServer:
         self.uid_to_room = {}
         self.watchers = {}
 
-        # FIX #2: stats не атомарны через GIL, нужен отдельный лок.
-        # `self.stats["packets"] += 1` = LOAD + ADD + STORE — три байткода.
-        # Между ними GIL может переключиться → потери счётчика.
+        self.remote_controllers: dict = {}
+        self.remote_controllers_lock  = threading.Lock()
+
+        # Антиспам запросов управления.
+        #   _rc_deny_counts:    {(streamer_uid, viewer_uid): int}  — отказы подряд
+        #   _rc_cooldown_until: {(streamer_uid, viewer_uid): float} — ts окончания cooldown
+        self._rc_deny_counts:    dict = {}
+        self._rc_cooldown_until: dict = {}
+        self._rc_antispam_lock        = threading.Lock()
+
         self.stats      = {"packets": 0, "bytes": 0}
         self.stats_lock = threading.Lock()
         self.start_time = time.time()
 
-        # --- Голосование «Пнуть» (Nudge) ---
         self.nudge_votes = {}
         self.nudge_lock  = threading.Lock()
 
-        # --- WebRTC SFU ---
         self.sfu: PionSfuProxy | None = None
 
-        # ── Кэш payload send_global_state ───────────────────────────────────
         self._cached_payload: bytes | None = None
         self._state_dirty: bool = True
 
-        # ── Встроенный сервер: host_order ────────────────────────────────────
         self._host_order:      list[int] = []
         self._host_order_lock            = threading.Lock()
 
-        # ── Встроенный сервер: управление ────────────────────────────────────
         self._is_embedded: bool = False
         self._accepting:   bool = True
         self._announcer         = None
         self._owner_ip:    str  = ''
 
-        # ── Имя сервера ──────────────────────────────────────────────────────
         self._server_name = server_name or SERVER_NAME_DEFAULT
 
-        # ── Пинги клиентов ────────────────────────────────────────────────────
         self._client_pings: dict[int, int] = {}
         self._client_pings_lock = threading.Lock()
 
-        # ── 2-шаговая ручная передача сервера ──
         self._pending_migrate_target: int | None             = None
         self._pending_migrate_ready:  threading.Event | None = None
         self._pending_migrate_lock:   threading.Lock         = threading.Lock()
 
-        # ── Временные каналы ─────────────────────────────────────────────────
         _general_name = 'General'
         try:
             import json as _json_cfg
@@ -177,21 +129,13 @@ class SFUServer:
         }
         self._channels_lock = threading.Lock()
 
-        # Кэш авторизованных клиентов
         self._channel_auth: dict = {}
         self._channel_auth_lock = threading.Lock()
 
-        # ── Кэш медиа-пейлоадов ──────────────────────────────────────────────
-        # SENIOR FIX: раньше хранили prefix/suffix разрезанный по байтам ts,
-        # что было хрупко (зависело от float-repr). Теперь prefix — полный JSON
-        # без закрывающей '}', suffix всегда пустой (legacy slot — чтобы
-        # не менять 5-tuple схему). При отправке дописываем ',"ts":<ts>}'.
         self._media_cache: dict[str, tuple[float, bytes, bytes, int, str]] = {}
         self._media_cache_lock = threading.Lock()
         self._media_cache_max  = 30
         self._media_cache_ttl  = 300.0
-
-        # ── SQLite чат ────────────────────────────────────────────────────────
         self._chat_db: ChatDB | None = None
         try:
             self._chat_db = ChatDB()
@@ -200,46 +144,19 @@ class SFUServer:
             print(f"[Server] ChatDB init error: {e}")
             self._chat_db = None
 
-        # ── Банлист (per-host JSON) ──────────────────────────────────────────
-        # Формат: { "<ip>": {"nick": str, "banned_at": float, "reason": str} }
-        # Ключ — IP, потому что это единственное что сервер видит при
-        # CMD_LOGIN и может использовать для блокировки. Ник — только для UI.
-        # Файл живёт у текущего владельца сервера. После передачи хостинга
-        # новый хост поднимает СВОЙ SFUServer с СВОИМ bans.json — права
-        # автоматически обнуляются для предыдущего владельца.
         self._bans: dict = {}
         self._bans_lock = threading.Lock()
         self._load_bans()
 
-        # FIX: send_global_state broadcast queue.
-        # Раньше sync_users рассылался в цикле СИНХРОННО из tcp_handler-потока.
-        # Если у одного клиента заполнен TCP send-буфер, sendall блокируется и
-        # задерживает рассылку всем остальным (и сам tcp_handler тоже встаёт).
-        # Решение: выделенный поток-broadcaster с очередью.
-        # tcp_handler только кладёт (payload, conns) в очередь и немедленно
-        # возвращается — медленный клиент изолирован в broadcaster-потоке.
         self._bcast_queue: _queue.Queue = _queue.Queue(maxsize=64)
         self._bcast_thread = threading.Thread(
             target=self._bcast_loop, daemon=True, name="srv-bcast"
         )
         self._bcast_thread.start()
 
-    # ------------------------------------------------------------------
-    # Broadcaster loop
-    # ------------------------------------------------------------------
+
     def _bcast_loop(self) -> None:
-        """
-        Выделенный поток рассылки sync_users.
 
-        Берёт (payload, conns) из очереди и отправляет каждому клиенту.
-        Медленный клиент замедляет только свою отправку; остальные не ждут.
-
-        SO_SNDTIMEO = 500 мс: если TCP send-буфер клиента не освобождается
-        за 500 мс — sendall завершается с ошибкой (не с зависанием).
-        Следующий вызов send_global_state обновит состояние повторно.
-        Только для sendall-вызовов из broadcaster — recv в tcp_handler
-        использует отдельный таймаут и не затронут.
-        """
         from .server_webrtc import _get_conn_lock
         while self._accepting:
             try:
@@ -251,8 +168,7 @@ class SFUServer:
                 try:
                     lock = _get_conn_lock(conn)
                     with lock:
-                        # SO_SNDTIMEO: на Windows принимает int (миллисекунды).
-                        # На других ОС — struct timeval, но приложение Windows-only.
+
                         try:
                             conn.setsockopt(
                                 socket.SOL_SOCKET, socket.SO_SNDTIMEO, 500
@@ -272,32 +188,13 @@ class SFUServer:
                 except Exception:
                     pass
 
-    # ------------------------------------------------------------------
-    # Банлист — persistent storage (JSON)
-    # ------------------------------------------------------------------
-    # Составной ключ (ip, nick) нужен потому что несколько участников могут
-    # сидеть с одного IP: Radmin VPN обычно даёт всем разные IP, но бывает
-    # два клиента на одном ПК (тест/второй аккаунт за одним NAT) — в этом
-    # случае голый IP-бан вырубал бы всех сразу.
-    #
-    # Ник сравниваем case-insensitive (nick_lower), а на самом клиенте ник
-    # ограничен 16 символами (см. CMD_LOGIN msg.get('nick')[:16]). Смена ника
-    # == уход из-под бана — это намеренный компромисс: у нас приложение без
-    # регистрации, единственный стабильный идентификатор — именно ник+IP.
-
-    # Защищённые от бана адреса: сам владелец сервера + loopback.
-    # В _owner_ip сохраняется VPN/LAN IP хоста; 127.0.0.1 блокируется
-    # отдельно на случай если хост вдруг подключится через loopback (тест,
-    # второй клиент на той же машине и т.п.) — сам себя забанить нельзя.
     _BAN_LOOPBACK_IPS = frozenset({'127.0.0.1', '::1', 'localhost'})
 
     @staticmethod
     def _ban_key(ip: str, nick: str) -> str:
-        """Составной ключ для dict. Ник нормализуем (lower + strip)."""
         return f"{ip}|{(nick or '').strip().lower()}"
 
     def _is_ban_protected(self, ip: str) -> bool:
-        """True если этот IP нельзя заносить в бан (сам хост/loopback)."""
         if not ip:
             return True
         if ip in self._BAN_LOOPBACK_IPS:
@@ -307,13 +204,6 @@ class SFUServer:
         return False
 
     def _load_bans(self) -> None:
-        """
-        Читает bans.json при старте. Поддерживает два формата:
-          • новый: ключ "ip|nick_lower", value {ip, nick, banned_at, reason}
-          • старый (v1): ключ "ip", value {nick, banned_at, reason}
-        Старые записи мигрируются в новый формат в памяти и будут
-        перезаписаны при следующем _save_bans().
-        """
         try:
             if not os.path.exists(BAN_LIST_PATH):
                 return
@@ -327,9 +217,7 @@ class SFUServer:
             for key, info in data.items():
                 if not isinstance(info, dict):
                     continue
-                # Определяем формат по наличию '|' в ключе и поля 'ip' в value
                 if '|' in key and 'ip' in info:
-                    # Новый формат — валидируем и добавляем
                     ip   = str(info.get('ip',   ''))[:45]
                     nick = str(info.get('nick', ''))[:32]
                     if not ip:
@@ -341,7 +229,6 @@ class SFUServer:
                         'reason':    str(info.get('reason', ''))[:120],
                     }
                 else:
-                    # Старый формат v1 — ключ это голый IP
                     ip   = str(key)[:45]
                     nick = str(info.get('nick', ''))[:32]
                     if not ip:
@@ -365,7 +252,6 @@ class SFUServer:
             print(f"[Server] _load_bans error: {e}")
 
     def _save_bans(self) -> None:
-        """Атомарная запись: tmp + os.replace()."""
         try:
             with self._bans_lock:
                 snapshot = dict(self._bans)
@@ -382,7 +268,6 @@ class SFUServer:
             print(f"[Server] _save_bans error: {e}")
 
     def _is_banned(self, ip: str, nick: str) -> bool:
-        """True если пара (ip, nick_lower) в банлисте."""
         if not ip:
             return False
         key = self._ban_key(ip, nick)
@@ -390,16 +275,12 @@ class SFUServer:
             return key in self._bans
 
     def _add_ban(self, ip: str, nick: str, reason: str = '') -> bool:
-        """
-        True если запись добавлена/обновлена.
-        False — если IP защищён (сам хост / loopback) или пусто.
-        """
+
         if self._is_ban_protected(ip):
             print(f"[Server] ⚠ Попытка забанить защищённый IP={ip!r} — отклонено")
             return False
         if not nick:
-            # Пустой ник всё равно может быть записан, но составной ключ
-            # тогда выродится в "ip|" — мы разрешаем это как fallback.
+
             pass
         key = self._ban_key(ip, nick)
         with self._bans_lock:
@@ -413,7 +294,6 @@ class SFUServer:
         return True
 
     def _remove_ban(self, ip: str, nick: str) -> bool:
-        """Разбан по точному (ip, nick)."""
         if not ip:
             return False
         key = self._ban_key(ip, nick)
@@ -425,7 +305,6 @@ class SFUServer:
         return False
 
     def _get_ban_list_snapshot(self) -> list:
-        """Снимок для отправки хосту в UI. Сортировка: сначала свежие."""
         with self._bans_lock:
             entries = [
                 {
@@ -439,9 +318,6 @@ class SFUServer:
         entries.sort(key=lambda e: e.get('banned_at', 0.0), reverse=True)
         return entries
 
-    # ------------------------------------------------------------------
-    # Управление каналами
-    # ------------------------------------------------------------------
     def get_client_count(self) -> int:
         with self.clients_lock:
             return len(self.clients)
@@ -451,7 +327,6 @@ class SFUServer:
             return [c.get('nick', '') for c in self.clients.values() if c.get('nick')]
 
     def _pick_best_host(self, exclude_uid: int = 0) -> tuple[int, str]:
-        """Выбирает лучшего кандидата в новые хосты по минимальному RTT."""
         with self.clients_lock:
             candidates = [
                 (c['uid'], c.get('ip', ''))
@@ -505,17 +380,6 @@ class SFUServer:
         return True
 
     def _cleanup_temp_channels(self, leaving_room: str):
-        """Удаляет пустой временный канал и рассылает CMD_CHANNEL_DELETED.
-
-        SENIOR FIX: TOCTOU-гонка. Раньше occupants-проверка и pop() были
-        в разных lock-секциях: между ними новый клиент мог войти в канал,
-        попадая в "фантомный" канал (удалённый, но кто-то внутри).
-
-        Решение: финальная проверка occupants под ОБОИМИ локами одновременно
-        перед pop(). Порядок локов: channels_lock → clients_lock (согласован
-        с другими местами в коде).
-        """
-        # Быстрый exit: канал постоянный или не существует
         with self._channels_lock:
             ch = self._channels.get(leaving_room)
             if not ch or ch['permanent']:
@@ -529,12 +393,10 @@ class SFUServer:
         if occupants > 0:
             return
 
-        # SENIOR FIX: атомарная финальная проверка + pop под channels_lock+clients_lock
         with self._channels_lock:
             ch = self._channels.get(leaving_room)
             if not ch or ch['permanent']:
                 return
-            # Перепроверяем occupants — если кто-то вошёл между двумя проверками
             with self.clients_lock:
                 occupants_final = sum(
                     1 for c in self.clients.values()
@@ -544,7 +406,6 @@ class SFUServer:
                     return
                 self._channels.pop(leaving_room, None)
 
-        # FIX #6: чистим _channel_auth для удалённого канала у всех клиентов.
         with self._channel_auth_lock:
             for auth_set in self._channel_auth.values():
                 auth_set.discard(leaving_room)
@@ -556,8 +417,6 @@ class SFUServer:
         }).encode('utf-8')
         with self.clients_lock:
             conns = list(self.clients.keys())
-        # SENIOR FIX: _safe_send вместо прямого sendall — защита от гонки
-        # с broadcaster-потоком (_bcast_loop шлёт sync_users параллельно).
         for c in conns:
             self._safe_send(c, payload)
 
@@ -572,17 +431,9 @@ class SFUServer:
             return channel_name in self._channel_auth.get(conn, set())
 
     def send_to_conn(self, conn, msg: dict) -> None:
-        """Синхронная отправка JSON клиенту."""
         self._safe_send(conn, json.dumps(msg).encode('utf-8'))
 
     def _safe_send(self, conn, payload: bytes) -> None:
-        """
-        Потокобезопасная отправка байтов клиенту.
-
-        FIX #47 (серверная сторона): sendall() на один socket из разных потоков
-        (например, broadcast из tcp_handler и ответ на команду из другого) мог
-        перемешать байты JSON. Используем per-conn lock из server_webrtc.
-        """
         from .server_webrtc import _get_conn_lock
         lock = _get_conn_lock(conn)
         with lock:
@@ -591,9 +442,6 @@ class SFUServer:
             except Exception:
                 pass
 
-    # ------------------------------------------------------------------
-    # Мониторинг
-    # ------------------------------------------------------------------
     def stats_monitor(self):
         last_bytes = 0
         while self._accepting:
@@ -602,18 +450,13 @@ class SFUServer:
                 break
             with self.clients_lock:
                 active = len(self.clients)
-            # FIX #2: читаем под локом для консистентности.
             with self.stats_lock:
                 curr_bytes = self.stats["bytes"]
             diff = (curr_bytes - last_bytes) / 1024 / 5
             print(f"[Stats] Active: {active} | Traffic: {diff:.1f} KB/s")
             last_bytes = curr_bytes
 
-    # ------------------------------------------------------------------
-    # UDP-маршрутизация
-    # ------------------------------------------------------------------
     def udp_handler(self):
-        """UDP-поток держит лок только на минимальное время."""
         while self._accepting:
             try:
                 data, addr = self.udp_sock.recvfrom(BUFFER_SIZE)
@@ -624,7 +467,6 @@ class SFUServer:
                     data[:UDP_HEADER_SIZE]
                 )
 
-                # Ping: отвечаем немедленно
                 if flags == 254:
                     self.udp_sock.sendto(data, addr)
                     continue
@@ -632,7 +474,6 @@ class SFUServer:
                 with self.udp_lock:
                     self.udp_map[sender_uid] = addr
                     sender_room = self.uid_to_room.get(sender_uid)
-                # FIX #2: stats_lock защищает от race
                 with self.stats_lock:
                     self.stats["packets"] += 1
                     self.stats["bytes"]   += len(data)
@@ -652,14 +493,7 @@ class SFUServer:
                     with self.udp_lock:
                         target_addr = self.udp_map.get(target_uid)
                     if target_addr:
-                        # ── Анонимный шёпот ──────────────────────────────────
-                        # Клиент-отправитель не может сам подменить sender_uid
-                        # в header (иначе сервер не найдёт sender_room и дропнет
-                        # пакет). Поэтому подмену делает сервер: сохраняем
-                        # keepalive по реальному sender_uid, но на wire к
-                        # получателю отправляем пакет с ANONYMOUS_UID в header.
-                        # Реальный uid отправителя остаётся известен ТОЛЬКО
-                        # серверу — получатель физически его не видит.
+
                         if flags & FLAG_ANONYMOUS:
                             new_header = UDP_HEADER_STRUCT.pack(
                                 ANONYMOUS_UID, msg_ts, seq, flags
@@ -676,7 +510,6 @@ class SFUServer:
                     self._send_to_watchers(sender_uid, data)
 
                 else:
-                    # АУДИО КОМНАТЫ
                     with self.clients_lock:
                         target_uids = [
                             c_data['uid']
@@ -699,31 +532,20 @@ class SFUServer:
                             pass
 
             except OSError as e:
-                # FIX WSAECONNRESET: Windows бросает OSError(10054) когда предыдущий
-                # sendto() попал на закрытый UDP-порт (клиент отключился).
-                # Это НЕ означает что наш сокет сломан — просто ICMP-эхо от мёртвого адреса.
-                # Продолжаем работу; SIO_UDP_CONNRESET при создании сокета уже
-                # подавляет большинство таких ошибок, но оставляем страховку здесь.
+
                 err = getattr(e, 'winerror', None) or getattr(e, 'errno', None)
-                if err == 10054:  # WSAECONNRESET
+                if err == 10054:
                     continue
-                # Реальная ошибка сокета (сокет закрыт при shutdown) — выходим.
                 break
             except Exception:
                 if not self._accepting:
                     break
 
-    # ------------------------------------------------------------------
-    # TCP-обработчик одного клиента
-    # ------------------------------------------------------------------
     def tcp_handler(self, conn, addr):
         uid       = secrets.randbelow(10**9) + 1
         client_ip = addr[0]
         _decoder  = json.JSONDecoder()
 
-        # FIX #4: инкрементальный UTF-8 декодер корректно обрабатывает байты
-        # на границах chunk. Раньше `bytes.decode(errors='ignore')` съедал
-        # частичные последовательности эмоджи/кириллицы на границе recv(4096).
         utf8_decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
         buffer = ""
 
@@ -734,7 +556,6 @@ class SFUServer:
                     break
                 buffer += utf8_decoder.decode(chunk_bytes, final=False)
 
-                # FIX #4: защита от переполнения буфера (медленный клиент / атака)
                 if len(buffer) > _TCP_BUFFER_MAX:
                     print(f"[Server] Клиент uid={uid}: буфер превысил {_TCP_BUFFER_MAX}, отключаем")
                     break
@@ -745,11 +566,6 @@ class SFUServer:
                         buffer   = buffer[idx:].lstrip()
                         action   = msg.get('action')
 
-                        # ── Pre-login: проверка бан-статуса ────────────────
-                        # Клиент из MultiServerScreen шлёт это сообщение до
-                        # логина чтобы узнать «забанен ли мой ник на этом
-                        # сервере?». Отвечаем и закрываем соединение —
-                        # это разовый probe, не полноценная TCP-сессия.
                         if action == CMD_QUERY_BAN:
                             q_nick = str(msg.get('nick', ''))[:16]
                             q_banned = self._is_banned(client_ip, q_nick)
@@ -774,13 +590,8 @@ class SFUServer:
                                 pass
                             return
 
-                        # ── Login ─────────────────────────────────────────────
                         if action == CMD_LOGIN:
                             client_nick   = msg.get('nick', 'User')[:16]
-                            # Проверка бана ПО (IP, nick) до регистрации в clients.
-                            # Составной ключ: у нескольких клиентов за одним IP
-                            # (тест на одной машине / общий NAT) банится только
-                            # конкретный ник.
                             if self._is_banned(client_ip, client_nick):
                                 with self._bans_lock:
                                     _info = self._bans.get(
@@ -869,7 +680,6 @@ class SFUServer:
                                 self._mark_dirty()
                                 self.send_global_state()
 
-                        # ── Аутентификация для защищённого канала ─────────────
                         elif action == CMD_JOIN_CHANNEL_AUTH:
                             ch_name = msg.get('channel_name', '')[:CHANNEL_NAME_MAX_LEN]
                             ch_pass = msg.get('password', '')[:CHANNEL_PASS_MAX_LEN]
@@ -898,7 +708,6 @@ class SFUServer:
                                     'channel_name': ch_name,
                                 }).encode('utf-8'))
 
-                        # ── Создание временного канала ──────────
                         elif action == CMD_CREATE_CHANNEL:
                             with self._host_order_lock:
                                 is_host = bool(self._host_order and self._host_order[0] == uid)
@@ -928,7 +737,6 @@ class SFUServer:
                                         'ok': False, 'reason': 'already_exists',
                                     }).encode('utf-8'))
 
-                        # ── Переименование постоянного канала ──
                         elif action == 'rename_channel':
                             with self._host_order_lock:
                                 is_host = bool(self._host_order and self._host_order[0] == uid)
@@ -949,7 +757,6 @@ class SFUServer:
                                                     if v == old_nm:
                                                         self.uid_to_room[k] = new_nm
                                             self._general_channel_name = new_nm
-                                            # FIX #6: переносим записи в _channel_auth
                                             with self._channel_auth_lock:
                                                 for auth_set in self._channel_auth.values():
                                                     if old_nm in auth_set:
@@ -959,7 +766,6 @@ class SFUServer:
                                     self._mark_dirty()
                                     self.send_global_state()
 
-                        # ── Update User ───────────────────────────────────────
                         elif action == 'update_user':
                             with self.clients_lock:
                                 if conn in self.clients:
@@ -985,10 +791,8 @@ class SFUServer:
                                 self._mark_dirty()
                                 self.send_global_state()
 
-                        # ── Ping Report ────────
                         elif action == 'report_ping':
                             ping_ms = msg.get('ping_ms', 0)
-                            # FIX #9: защита от nan/inf (int(nan) → ValueError)
                             if (isinstance(ping_ms, (int, float))
                                     and math.isfinite(ping_ms)
                                     and ping_ms >= 0 and ping_ms < 60000):
@@ -1006,7 +810,6 @@ class SFUServer:
                             self._mark_dirty()
                             self.send_global_state()
 
-                        # ── Stream Start ──────────────────────────────────────
                         elif action == CMD_STREAM_START:
                             started_uid = None
                             with self.clients_lock:
@@ -1031,8 +834,6 @@ class SFUServer:
                                             c for c, info in self.clients.items()
                                             if info.get('uid') in existing_watchers
                                         ]
-                                    # SENIOR FIX: вышли из-под clients_lock перед I/O
-                                    # (sendall может блокироваться на медленном клиенте)
                                     for c in _watchers_to_notify:
                                         self._safe_send(c, notify)
                                         notified += 1
@@ -1041,7 +842,6 @@ class SFUServer:
                             self._mark_dirty()
                             self.send_global_state()
 
-                        # ── Stream Stop ───────────────────────────────────────
                         elif action == CMD_STREAM_STOP:
                             stopped_uid = None
                             with self.clients_lock:
@@ -1058,12 +858,9 @@ class SFUServer:
                             self._mark_dirty()
                             self.send_global_state()
 
-                        # ── Stream Watch Start ────────────────────────────────
                         elif action == 'stream_watch_start':
                             streamer_uid = msg.get('streamer_uid')
                             if streamer_uid is not None:
-                                # FIX #1: все w_uid/watcher_nick/watcher_avatar
-                                # защищены проверкой conn in clients.
                                 w_uid = watcher_nick = watcher_avatar = None
                                 with self.clients_lock:
                                     if conn in self.clients:
@@ -1108,7 +905,6 @@ class SFUServer:
                             self._mark_dirty()
                             self.send_global_state()
 
-                        # ── Stream Watch Stop ─────────────────────────────────
                         elif action == 'stream_watch_stop':
                             streamer_uid = msg.get('streamer_uid')
                             if streamer_uid is not None:
@@ -1127,7 +923,6 @@ class SFUServer:
                             self._mark_dirty()
                             self.send_global_state()
 
-                        # ── WebRTC Offer ──────────────────────────────────────
                         elif action == CMD_WEBRTC_OFFER:
                             sdp      = msg.get('sdp')
                             sdp_type = msg.get('type', 'offer')
@@ -1150,12 +945,11 @@ class SFUServer:
                                 print(f"[Server] CMD_WEBRTC_OFFER неизвестный role={role!r} uid={uid}")
 
                         elif action == CMD_WEBRTC_ANSWER:
-                            pass  # v3: answer идёт server→viewer
+                            pass
 
                         elif action == CMD_WEBRTC_ICE:
-                            pass  # v3: gather-complete ICE
+                            pass
 
-                        # ── Передача сервера (2-шаговая) ────
                         elif action == CMD_SERVER_TRANSFER:
                             target_uid_st = msg.get('target_uid')
                             if not isinstance(target_uid_st, int):
@@ -1166,26 +960,21 @@ class SFUServer:
                                 uid, target_uid_st, snap, conn
                             )
 
-                        # ── Целевой клиент подтверждает готовность ─────────────
                         elif action == CMD_MIGRATE_READY:
                             self._handle_migrate_ready(uid)
 
-                        # ── Soundboard ────────────────────────────────────────
                         elif action == CMD_SOUNDBOARD:
                             with self.clients_lock:
                                 sender_nick = self.clients[conn]['nick'] if conn in self.clients else '?'
                                 conns = list(self.clients.keys())
                             msg['from_nick'] = sender_nick
                             payload = json.dumps(msg).encode('utf-8')
-                            # SENIOR FIX: _safe_send вместо прямого sendall
                             for c in conns:
                                 self._safe_send(c, payload)
 
-                        # ── Nudge Vote ────────────────────────────────────────
                         elif action == CMD_NUDGE_VOTE:
                             self._process_nudge_vote(conn, uid, msg)
 
-                        # ── Файловая передача P2P ─────────────────────────────
                         elif action == CMD_FILE_OFFER:
                             target_uid_fo = msg.get('target_uid')
                             if isinstance(target_uid_fo, int):
@@ -1198,7 +987,6 @@ class SFUServer:
                                             target_conn_fo = c_conn
                                             break
                                 if target_conn_fo:
-                                    # SENIOR FIX: _safe_send — гонка с broadcaster-потоком
                                     self._safe_send(target_conn_fo, payload_fo)
                                     print(f"[Server] 📁 file_offer: uid={uid} → uid={target_uid_fo}")
 
@@ -1217,19 +1005,16 @@ class SFUServer:
                                         if c_data['room'] == sender_room_fo
                                         and c_data['uid'] != uid
                                     ]
-                            # SENIOR FIX: _safe_send вместо прямого sendall
                             for rc in room_conns:
                                 self._safe_send(rc, payload_for)
                             if room_conns:
                                 print(f"[Server] 📁 file_offer_room: uid={uid} → {len(room_conns)} получателей")
 
-                        # ── Быстрый чат ───────────────────────────────────────
                         elif action == CMD_QUICK_MSG:
                             text = str(msg.get('text', '')).strip()[:QUICK_MSG_MAX_LEN]
                             if text:
                                 self._process_quick_msg(conn, uid, text)
 
-                        # ── Постоянный чат: новое сообщение ───────────────────
                         elif action == CMD_CHAT_MSG:
                             text_cm = str(msg.get('text', '')).strip()[:CHAT_MSG_MAX_LEN]
                             if text_cm:
@@ -1249,7 +1034,6 @@ class SFUServer:
                                         None
                                     )
                                 if target_conn_ch:
-                                    # SENIOR FIX: _safe_send вместо прямого sendall
                                     self._safe_send(target_conn_ch, json.dumps({
                                         'action':   CMD_CHAT_HISTORY,
                                         'messages': messages_ch,
@@ -1264,7 +1048,6 @@ class SFUServer:
                                     and len(file_data_b64) <= CHAT_MEDIA_MAX_B64):
                                 self._process_chat_media(conn, msg, file_data_b64)
 
-                        # ── Хост выключает микрофон участника ─────────────────
                         elif action == CMD_HOST_MUTE:
                             with self._host_order_lock:
                                 is_host = bool(
@@ -1280,14 +1063,10 @@ class SFUServer:
                                             None
                                         )
                                     if target_conn_hm:
-                                        # SENIOR FIX: _safe_send
                                         self._safe_send(target_conn_hm, json.dumps({
                                             'action': CMD_FORCE_MUTED,
                                         }).encode('utf-8'))
 
-                        # ── Хост: KICK участника ──────────────────────────────
-                        # Права только у первого в host_order. Самого себя
-                        # кикнуть нельзя (проверка target_uid != uid).
                         elif action == CMD_HOST_KICK:
                             with self._host_order_lock:
                                 is_host_k = bool(
@@ -1298,7 +1077,6 @@ class SFUServer:
                                 if target_uid_k and target_uid_k != uid:
                                     self._kick_by_uid(target_uid_k)
 
-                        # ── Хост: BAN участника (kick + IP в банлист) ────────
                         elif action == CMD_HOST_BAN:
                             with self._host_order_lock:
                                 is_host_b = bool(
@@ -1309,13 +1087,11 @@ class SFUServer:
                                 reason_b = str(msg.get('reason', ''))[:120]
                                 if target_uid_b and target_uid_b != uid:
                                     self._ban_by_uid(target_uid_b, reason_b)
-                                    # После бана шлём обновлённый список хосту
                                     self._safe_send(conn, json.dumps({
                                         'action':  CMD_BAN_LIST,
                                         'entries': self._get_ban_list_snapshot(),
                                     }).encode('utf-8'))
 
-                        # ── Хост: UNBAN по (ip, nick) ─────────────────────────
                         elif action == CMD_HOST_UNBAN:
                             with self._host_order_lock:
                                 is_host_u = bool(
@@ -1328,14 +1104,11 @@ class SFUServer:
                                     self._remove_ban(target_ip_u, target_nk_u)
                                     print(f"[Server] ✓ Разбанен "
                                           f"{target_nk_u!r} IP={target_ip_u}")
-                                # Всегда возвращаем снимок (даже если пары
-                                # не было — UI синхронизирует состояние).
                                 self._safe_send(conn, json.dumps({
                                     'action':  CMD_BAN_LIST,
                                     'entries': self._get_ban_list_snapshot(),
                                 }).encode('utf-8'))
 
-                        # ── Хост: запрос банлиста для UI ──────────────────────
                         elif action == CMD_BAN_LIST_REQ:
                             with self._host_order_lock:
                                 is_host_l = bool(
@@ -1350,6 +1123,15 @@ class SFUServer:
                         elif action == CMD_DRAW_STROKE:
                             self._process_draw_stroke(conn, msg)
 
+                        elif action == CMD_REMOTE_CONTROL_REQUEST:
+                            self._process_rc_request(conn, msg)
+                        elif action == CMD_REMOTE_CONTROL_RESPONSE:
+                            self._process_rc_response(conn, msg)
+                        elif action == CMD_REMOTE_CONTROL_EVENT:
+                            self._process_rc_event(conn, msg)
+                        elif action == CMD_REMOTE_CONTROL_STOP:
+                            self._process_rc_stop(conn, msg)
+
                     except json.JSONDecodeError:
                         break
 
@@ -1360,7 +1142,6 @@ class SFUServer:
                 print(f"[Server] TCP ошибка: {e}")
 
         finally:
-            # Очистка при отключении
             u_id = None
             nick = 'Unknown'
             room = '?'
@@ -1396,14 +1177,9 @@ class SFUServer:
                         for target_votes in r_votes.values():
                             target_votes.pop(u_id, None)
 
-                # FIX #7: сравнение с _general_channel_name вместо хардкод 'General'
                 if room and room != self._general_channel_name:
                     self._cleanup_temp_channels(room)
 
-                # ── Определяем роль уходящего в SFU ───────────────────────
-                # watchers[u_id] существует ТОЛЬКО если u_id сам стримил.
-                # u_id может быть в watchers[s_uid] если он смотрел чей-то стрим.
-                # Это ОБЯЗАТЕЛЬНО вычислить ДО self.watchers.pop() ниже.
                 with self.watchers_lock:
                     was_streamer = u_id in self.watchers
                     was_viewer = any(
@@ -1414,20 +1190,25 @@ class SFUServer:
                             self.watchers[s_uid].pop(u_id, None)
                     self.watchers.pop(u_id, None)
 
-                # ── SFU cleanup: ТОЛЬКО если клиент реально был в SFU ─────
-                # Ранее эти два вызова выполнялись БЕЗУСЛОВНО на отключении
-                # любого клиента. Из-за этого:
-                #   1) _sfu.close_streamer(u_id) игнорирует u_id и удаляет
-                #      ЕДИНСТВЕННЫЙ стример текущего SFU — если стримил кто-то
-                #      другой (напр. сам хост стримил экран с системным звуком),
-                #      стрим уничтожался → у всех viewers пропадал SFU-звук.
-                #      "Передача сервера другу" создавала новый SFU у нового
-                #      хоста → стример переконнекчивался → звук возвращался.
-                #   2) Оба DELETE-запроса — синхронные HTTP к локальному Go SFU
-                #      с таймаутом 10с каждый. При отключении клиента поток
-                #      tcp_handler блокировался на до 20с впустую.
-                #
-                # Теперь вызовы защищены флагами was_streamer/was_viewer.
+                # Remote Control: снимаем активное управление, где участвует uid
+                with self.remote_controllers_lock:
+                    # клиент был стримером
+                    self.remote_controllers.pop(u_id, None)
+                    # клиент был контролёром у кого-то — убираем эти пары
+                    for s_uid in [
+                        s for s, v in self.remote_controllers.items()
+                        if v == u_id
+                    ]:
+                        self.remote_controllers.pop(s_uid, None)
+
+                # Remote Control: чистим антиспам-записи, где участвует uid
+                with self._rc_antispam_lock:
+                    for d in (self._rc_deny_counts, self._rc_cooldown_until):
+                        for key in [
+                            k for k in d if u_id in k
+                        ]:
+                            d.pop(key, None)
+
                 _sfu = self.sfu
                 if _sfu and was_streamer:
                     _sfu.close_streamer(u_id)
@@ -1445,7 +1226,6 @@ class SFUServer:
                 conn.close()
             except Exception:
                 pass
-            # FIX #47: очищаем per-conn lock чтобы не накапливались dict ключей
             try:
                 from .server_webrtc import _drop_conn_lock
                 _drop_conn_lock(conn)
@@ -1454,12 +1234,7 @@ class SFUServer:
             self._mark_dirty()
             self.send_global_state()
 
-    # ------------------------------------------------------------------
-    # Вспомогательные методы — вынесены из tcp_handler для читаемости
-    # ------------------------------------------------------------------
-
     def _process_nudge_vote(self, conn, uid: int, msg: dict) -> None:
-        """Обработка голосования «Пнуть»."""
         target_uid = msg.get('target_uid')
         if not isinstance(target_uid, int):
             return
@@ -1532,7 +1307,6 @@ class SFUServer:
                 fire = True
 
         if fire:
-            # SENIOR FIX: _safe_send вместо прямого sendall
             self._safe_send(
                 t_conn,
                 json.dumps({'action': CMD_PLAY_NUDGE}).encode('utf-8')
@@ -1575,7 +1349,6 @@ class SFUServer:
                 'from_nick':  sender_nick,
                 'text':       text,
             }).encode('utf-8')
-            # SENIOR FIX: _safe_send
             for bc in room_conns_qm:
                 self._safe_send(bc, broadcast_qm)
 
@@ -1613,7 +1386,6 @@ class SFUServer:
                     'avatar': sender_avatar_cm, 'text': text_cm,
                     'room': sender_room_cm or '', 'ts': ts_cm,
                 })
-            # SENIOR FIX: _safe_send
             for bc in room_conns_cm:
                 self._safe_send(bc, broadcast_cm)
 
@@ -1628,7 +1400,6 @@ class SFUServer:
                 if self._chat_db else []
             )
             if messages_db:
-                # SENIOR FIX: _safe_send
                 self._safe_send(conn, json.dumps({
                     'action':   CMD_CHAT_HISTORY,
                     'messages': messages_db,
@@ -1654,12 +1425,10 @@ class SFUServer:
                         if cd.get('room') == t_room and cc is not conn
                     ]
         if t_payload is not None:
-            # SENIOR FIX: _safe_send
             for tc in t_conns:
                 self._safe_send(tc, t_payload)
 
     def _process_chat_media(self, conn, msg: dict, file_data_b64: str) -> None:
-        """Медиа-вложение в постоянный чат. Использует MD5-кэш для сериализации."""
         s_nick_md = s_uid_md = s_room_md = None
         s_avatar_md = ''
         room_conns_md: list = []
@@ -1688,23 +1457,11 @@ class SFUServer:
 
         with self._media_cache_lock:
             cached = self._media_cache.get(md5_key)
-            # FIX #3: тупл 5-элементный (ts, prefix, suffix, uid, nick)
             hit = (cached is not None
                    and cached[0] > now_ts
                    and cached[3] == s_uid_md
                    and cached[4] == s_nick_md)
 
-        # SENIOR FIX: раньше кэш пытался разрезать готовый JSON по байтам
-        # "ts": <number>, что зависело от того, что Python `f"{float}"`
-        # и `json.dumps(float)` дадут одинаковую репрезентацию. Для
-        # большинства float это правда, но для пограничных значений
-        # (NaN, субнормальные, миллисекундные тики с точным float64-repr)
-        # порядок записи float мог расходиться → cache miss после первого
-        # удачного кэширования или KeyError на index().
-        #
-        # Новый подход: кэшируем JSON-объект БЕЗ поля 'ts' (всегда новое),
-        # храним как bytes без закрывающей '}'. При отправке добавляем
-        # ',"ts":<now_ts>}' — это всегда валидный JSON.
         if hit:
             cached_prefix: bytes = cached[1]  # JSON без '}' и без ts
             broadcast_md = cached_prefix + f',"ts":{now_ts}}}'.encode('ascii')
@@ -1719,15 +1476,12 @@ class SFUServer:
                 'file_type':     msg.get('file_type', ''),
                 'file_data_b64': file_data_b64,
             }
-            # Кэшируем JSON без '}' в конце — потом дописываем ",ts":... и "}"
             prefix_bytes = json.dumps(full_dict, ensure_ascii=False).encode('utf-8')
             assert prefix_bytes.endswith(b'}'), "json.dumps должен заканчиваться на }"
-            cached_prefix = prefix_bytes[:-1]  # без закрывающей скобки
+            cached_prefix = prefix_bytes[:-1]
 
-            # Итоговый broadcast — сразу с ts
             broadcast_md = cached_prefix + f',"ts":{now_ts}}}'.encode('ascii')
 
-            # Сохраняем в кэш (с эвикшеном по TTL/size)
             try:
                 with self._media_cache_lock:
                     if len(self._media_cache) >= self._media_cache_max:
@@ -1739,17 +1493,15 @@ class SFUServer:
                             oldest = min(self._media_cache,
                                          key=lambda k: self._media_cache[k][0])
                             del self._media_cache[oldest]
-                    # 5-tuple совместимый с существующей аннотацией:
-                    # (expire_ts, prefix_bytes, empty_suffix, uid, nick)
+
                     self._media_cache[md5_key] = (
                         now_ts + self._media_cache_ttl,
-                        cached_prefix, b'',  # suffix пустой — legacy slot
+                        cached_prefix, b'',
                         s_uid_md, s_nick_md,
                     )
             except Exception:
-                pass  # кэш не удался — broadcast_md уже готов
+                pass
 
-        # SENIOR FIX: _safe_send
         for bc in room_conns_md:
             self._safe_send(bc, broadcast_md)
 
@@ -1810,22 +1562,193 @@ class SFUServer:
             if streamer_conn_dr:
                 target_conns_dr.append(streamer_conn_dr)
 
-        # SENIOR FIX: _safe_send
         for tc in target_conns_dr:
             self._safe_send(tc, relay_dr)
 
     # ------------------------------------------------------------------
-    # Kick / Ban: закрыть соединение участника, по необходимости занести в бан
+    # Remote Control: relay запросов управления мышью/клавиатурой
     # ------------------------------------------------------------------
+    def _uid_to_conn(self, uid: int):
+        """Вернуть socket клиента по UID или None."""
+        with self.clients_lock:
+            return next(
+                (c for c, d in self.clients.items() if d.get('uid') == uid),
+                None,
+            )
+
+    def _rc_send(self, conn, payload: dict) -> None:
+        """Сериализовать dict и отправить через _safe_send."""
+        self._safe_send(conn, (json.dumps(payload) + '\n').encode('utf-8'))
+
+    def _rc_cooldown_remaining(self, streamer_uid: int, viewer_uid: int) -> int:
+        """Сколько секунд осталось до конца cooldown пары (0 если cooldown нет)."""
+        key = (streamer_uid, viewer_uid)
+        with self._rc_antispam_lock:
+            until = self._rc_cooldown_until.get(key, 0.0)
+            remaining = until - time.time()
+            if remaining <= 0:
+                # cooldown истёк — чистим, чтобы словарь не рос
+                self._rc_cooldown_until.pop(key, None)
+                return 0
+            return int(remaining) + 1
+
+    def _rc_register_deny(self, streamer_uid: int, viewer_uid: int) -> int:
+        """
+        Зафиксировать отказ. Возвращает остаток cooldown в секундах,
+        если после этого отказа лимит исчерпан (иначе 0).
+        """
+        key = (streamer_uid, viewer_uid)
+        with self._rc_antispam_lock:
+            cnt = self._rc_deny_counts.get(key, 0) + 1
+            if cnt >= RC_DENY_LIMIT:
+                self._rc_deny_counts.pop(key, None)
+                self._rc_cooldown_until[key] = time.time() + RC_COOLDOWN_SEC
+                return RC_COOLDOWN_SEC
+            self._rc_deny_counts[key] = cnt
+            return 0
+
+    def _rc_reset_antispam(self, streamer_uid: int, viewer_uid: int) -> None:
+        """Сбросить счётчик отказов и cooldown пары (при выдаче управления)."""
+        key = (streamer_uid, viewer_uid)
+        with self._rc_antispam_lock:
+            self._rc_deny_counts.pop(key, None)
+            self._rc_cooldown_until.pop(key, None)
+
+    def _process_rc_request(self, conn, msg: dict) -> None:
+        """
+        Зритель запрашивает управление → relay стримеру с sender_uid.
+        - Если у стримера уже есть активный контролёр — автоотказ зрителю.
+        - Если пара (стример, зритель) в cooldown — запрос молча отбрасывается
+          (стример не видит диалог, зритель не получает ответа).
+        """
+        streamer_uid = msg.get('streamer_uid')
+        nick         = str(msg.get('nick', '?'))[:32]
+        if not streamer_uid:
+            return
+
+        with self.clients_lock:
+            viewer_uid = self.clients.get(conn, {}).get('uid', 0)
+
+        # Cooldown активен — тихо игнорируем (никакого диалога у стримера)
+        if self._rc_cooldown_remaining(streamer_uid, viewer_uid) > 0:
+            return
+
+        # Уже кто-то управляет — отказываем сразу
+        with self.remote_controllers_lock:
+            if streamer_uid in self.remote_controllers:
+                self._rc_send(conn, {
+                    'action':  CMD_REMOTE_CONTROL_RESPONSE,
+                    'granted': False,
+                    'reason':  'busy',
+                })
+                return
+
+        streamer_conn = self._uid_to_conn(streamer_uid)
+        if not streamer_conn:
+            return
+
+        self._rc_send(streamer_conn, {
+            'action':     CMD_REMOTE_CONTROL_REQUEST,
+            'viewer_uid': viewer_uid,
+            'nick':       nick,
+        })
+
+    def _process_rc_response(self, conn, msg: dict) -> None:
+        """
+        Стример отвечает: relay ответа зрителю.
+        - granted=True  → записываем пару streamer→viewer, сбрасываем антиспам.
+        - granted=False → +1 к счётчику отказов; на RC_DENY_LIMIT-м отказе
+                          пара уходит в cooldown (зрителю шлём reason='cooldown').
+        """
+        granted    = bool(msg.get('granted', False))
+        viewer_uid = msg.get('viewer_uid')
+        if not viewer_uid:
+            return
+
+        with self.clients_lock:
+            streamer_uid = self.clients.get(conn, {}).get('uid', 0)
+
+        if not streamer_uid:
+            return
+
+        reason = 'denied'
+        if granted:
+            self._rc_reset_antispam(streamer_uid, viewer_uid)
+            with self.remote_controllers_lock:
+                self.remote_controllers[streamer_uid] = viewer_uid
+        else:
+            cooldown = self._rc_register_deny(streamer_uid, viewer_uid)
+            if cooldown > 0:
+                reason = 'cooldown'
+
+        viewer_conn = self._uid_to_conn(viewer_uid)
+        if not viewer_conn:
+            return
+
+        self._rc_send(viewer_conn, {
+            'action':  CMD_REMOTE_CONTROL_RESPONSE,
+            'granted': granted,
+            'reason':  reason,
+        })
+
+    def _process_rc_event(self, conn, msg: dict) -> None:
+        """
+        Зритель шлёт событие мыши/клавиш → relay стримеру.
+        Только авторизованный контролёр может отправлять события.
+        """
+        streamer_uid = msg.get('streamer_uid')
+        if not streamer_uid:
+            return
+
+        with self.clients_lock:
+            viewer_uid = self.clients.get(conn, {}).get('uid', 0)
+
+        with self.remote_controllers_lock:
+            if self.remote_controllers.get(streamer_uid) != viewer_uid:
+                return  # не авторизован — игнорируем
+
+        streamer_conn = self._uid_to_conn(streamer_uid)
+        if not streamer_conn:
+            return
+
+        self._rc_send(streamer_conn, {
+            'action': CMD_REMOTE_CONTROL_EVENT,
+            'event':  msg.get('event', {}),
+        })
+
+    def _process_rc_stop(self, conn, msg: dict) -> None:
+        """
+        Остановка управления от любой стороны.
+        Удаляем запись из таблицы, уведомляем обе стороны.
+        """
+        streamer_uid = msg.get('streamer_uid')
+        if not streamer_uid:
+            return
+
+        with self.clients_lock:
+            sender_uid = self.clients.get(conn, {}).get('uid', 0)
+
+        with self.remote_controllers_lock:
+            viewer_uid = self.remote_controllers.pop(streamer_uid, None)
+
+        stop_payload = {
+            'action':       CMD_REMOTE_CONTROL_STOP,
+            'streamer_uid': streamer_uid,
+        }
+
+        # Уведомить стримера
+        streamer_conn = self._uid_to_conn(streamer_uid)
+        if streamer_conn:
+            self._rc_send(streamer_conn, stop_payload)
+
+        # Уведомить зрителя (если он не сам инициировал stop)
+        if viewer_uid and viewer_uid != sender_uid:
+            viewer_conn = self._uid_to_conn(viewer_uid)
+            if viewer_conn:
+                self._rc_send(viewer_conn, stop_payload)
+
     def _kick_by_uid(self, target_uid: int, notify_action: str = CMD_KICKED,
                       reason: str = '') -> None:
-        """
-        Отправляет цели notify_action, shutdown(SHUT_WR), удаляет из clients.
-        Клиент уведомит UI и не попытается reconnect (см. core._is_kicked).
-        Остальное (host_order, udp_map, channel_auth, watchers, cleanup temp-
-        каналов) отработает штатный finally в tcp_handler после выхода по
-        recv() = b''.
-        """
         target_conn = None
         target_nick = ''
         with self.clients_lock:
@@ -1837,7 +1760,6 @@ class SFUServer:
         if target_conn is None:
             return
 
-        # Шлём уведомление, клиент успеет его прочитать до закрытия
         try:
             self._safe_send(target_conn, json.dumps({
                 'action': notify_action,
@@ -1846,9 +1768,6 @@ class SFUServer:
         except Exception:
             pass
 
-        # Мгновенно исключаем из broadcast-цепочек — дальнейшие sync_users
-        # и чат не должны уходить на эту conn. Физически socket закроет
-        # tcp_handler в finally после того как recv() вернёт b''.
         with self.clients_lock:
             self.clients.pop(target_conn, None)
 
@@ -1864,15 +1783,6 @@ class SFUServer:
         self.send_global_state()
 
     def _ban_by_uid(self, target_uid: int, reason: str = '') -> bool:
-        """
-        Заносит (IP, nick) в банлист, затем кикает соединение через CMD_BANNED.
-
-        Возвращает True если бан реально применён. Если IP защищён
-        (сам владелец сервера или loopback) — не баним и не кикаем,
-        возвращаем False. Хост получит обновлённый CMD_BAN_LIST как обычно
-        (там просто не будет новой записи) — это и есть UI-сигнал что
-        операция отклонена.
-        """
         target_ip = ''
         target_nick = ''
         with self.clients_lock:
@@ -1895,9 +1805,6 @@ class SFUServer:
         self._kick_by_uid(target_uid, notify_action=CMD_BANNED, reason=reason)
         return added
 
-    # ------------------------------------------------------------------
-    # Отправка пакета зрителям стримера (UDP)
-    # ------------------------------------------------------------------
     def _send_to_watchers(self, sender_uid: int, data: bytes):
         with self.watchers_lock:
             watcher_uids = list(self.watchers.get(sender_uid, {}).keys())
@@ -1915,38 +1822,16 @@ class SFUServer:
             except Exception:
                 pass
 
-    # ------------------------------------------------------------------
-    # Рассылка глобального состояния (FIX #5)
-    # ------------------------------------------------------------------
     def _mark_dirty(self) -> None:
-        """Помечает кэш payload как устаревший."""
-        # FIX #5: эта операция простая bool-запись, атомарна через GIL.
-        # Проблема была в том, что ОЧИСТКА флага после сборки payload
-        # не была атомарной относительно mark_dirty. Теперь сборка + сброс
-        # защищены clients_lock (см. send_global_state).
         self._state_dirty = True
 
     def send_global_state(self):
-        """
-        Кэшированная версия — payload пересобирается только при изменениях.
-
-        FIX #5: check-and-clear защищён clients_lock. Раньше было race:
-        1. send_global_state прочитал dirty=True
-        2. начал сборку
-        3. ДРУГОЙ поток изменил state + вызвал _mark_dirty() (dirty=True)
-        4. send_global_state закончил сборку и поставил dirty=False
-        → изменение из шага 3 потеряно, новый payload содержит старое состояние.
-
-        Решение: захват dirty и очистка выполняются под clients_lock
-        одновременно со сбором snapshot'а clients.
-        """
         payload = None
 
         with self.clients_lock:
             dirty_now = self._state_dirty
             if dirty_now:
-                self._state_dirty = False  # сбрасываем ПЕРЕД сборкой
-                # Собираем snapshot всего нужного под одним локом
+                self._state_dirty = False
                 clients_snap = {
                     c_conn: dict(c_data)
                     for c_conn, c_data in self.clients.items()
@@ -1993,17 +1878,11 @@ class SFUServer:
         if payload is None:
             return
 
-        # FIX: кладём в broadcaster-очередь вместо синхронного sendall.
-        # Если очередь переполнена (64 слота) — drop: клиенты обновятся
-        # при следующем изменении состояния.
         try:
             self._bcast_queue.put_nowait((payload, conns_snapshot))
         except _queue.Full:
             pass
 
-    # ------------------------------------------------------------------
-    # Встроенный сервер: запуск
-    # ------------------------------------------------------------------
     def start_embedded(self, host_ip: str, host_nick: str) -> None:
         """Запускает сервер в фоновых потоках."""
         self._is_embedded = True
@@ -2017,7 +1896,6 @@ class SFUServer:
                 print(f"[Server] ChatDB init error: {e}")
         self._owner_ip = host_ip
 
-        # FIX #10: более точная обработка ошибок SFU-инициализации.
         try:
             from network_engine.sfu_bridge import get_shared as _get_sfu
         except ImportError:
@@ -2082,7 +1960,6 @@ class SFUServer:
                 break
 
     def stop_gracefully(self) -> None:
-        """Корректная остановка с передачей хостинга."""
         if not self._is_embedded:
             return
 
@@ -2141,7 +2018,6 @@ class SFUServer:
         print("[Server] Встроенный сервер остановлен")
 
     def stop_silent(self) -> None:
-        """Немедленная тихая остановка без broadcast."""
         if not self._is_embedded:
             return
         print("[Server] stop_silent: освобождаем сокеты")
@@ -2181,9 +2057,6 @@ class SFUServer:
 
         print("[Server] stop_silent: готово")
 
-    # ------------------------------------------------------------------
-    # 2-шаговая ручная передача
-    # ------------------------------------------------------------------
     def _handle_server_transfer_v2(self, uid: int, target_uid: int,
                                     clients_snapshot: dict,
                                     initiator_conn) -> None:
@@ -2237,7 +2110,6 @@ class SFUServer:
         try:
             with self._host_order_lock:
                 order_snap = list(self._host_order)
-            # SENIOR FIX: _safe_send — per-conn lock защищает от гонки с broadcaster
             self._safe_send(target_conn, json.dumps({
                 'action':     CMD_MIGRATE_PREPARE,
                 'host_order': order_snap,
@@ -2332,14 +2204,9 @@ class SFUServer:
         with self.clients_lock:
             conns = list(self.clients.keys())
 
-        # SENIOR FIX: _safe_send — при миграции broadcaster ещё активен,
-        # иначе байты CMD_SERVER_MIGRATE могут перемешаться с sync_users.
         for c in conns:
             self._safe_send(c, payload)
 
-    # ------------------------------------------------------------------
-    # Запуск сервера (standalone режим)
-    # ------------------------------------------------------------------
     def start(self):
         if self.sfu is None:
             try:
@@ -2368,10 +2235,6 @@ class SFUServer:
                 daemon=True,
             ).start()
 
-
-# =============================================================================
-# EmbeddedServerManager — менеджер встроенного сервера
-# =============================================================================
 class EmbeddedServerManager:
     """Singleton-менеджер встроенного SFUServer."""
     _instance: 'EmbeddedServerManager | None' = None

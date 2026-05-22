@@ -1,16 +1,3 @@
-r"""
-media_engine_bridge.py — Python-мост к Rust Media Engine v3 (sidecar-процесс)
-
-─── FIX: авто-рестарт SFU при WEBRTC_OFFER ─────────────────────────────────
-  Старый код: если SFU не запущен при WEBRTC_OFFER — молча дропал offer.
-  Новый код:  пробует перезапустить SFU (до 2 попыток), затем форвардит offer.
-
-  Причина: SFU мог упасть из-за занятого порта (зомби предыдущей сессии).
-  После первого запуска sfu_bridge.py убивает зомби (fix там), но при старте
-  embedded-сервера SFU и media-engine стартуют почти одновременно —
-  race condition. Авто-рестарт здесь закрывает это окно.
-"""
-
 import json
 import logging
 import os
@@ -30,12 +17,6 @@ except ImportError:
 
 
 class MediaEngineBridge:
-    """
-    Управляет Rust Media Engine (media-engine.exe) как дочерним процессом.
-    JSON-команды/события — stdin/stdout.
-    WebRTC сигнализация — через SfuBridge (Go Pion SFU).
-    """
-
     def __init__(
         self,
         exe_path: str = None,
@@ -62,8 +43,6 @@ class MediaEngineBridge:
         self._running = False
         self._ready   = threading.Event()
         self._version: Optional[str] = None
-
-    # ── Жизненный цикл ───────────────────────────────────────────────────────
 
     def start(self, timeout: float = 5.0) -> bool:
         if self._process is not None:
@@ -120,13 +99,6 @@ class MediaEngineBridge:
             return False
 
     def stop(self) -> None:
-        """Останавливает media-engine.exe. Убивает процесс независимо от _running.
-
-        FIX: старый код начинался с `if not self._running: return`.
-        После EOF stdout (Rust закрывает stdout после READY) _running=False →
-        stop() немедленно возвращал, оставляя процесс живым.
-        Аналогичный баг был исправлен в SfuBridge.stop() — теперь исправлен и здесь.
-        """
         self._running = False
 
         if self._process is None:
@@ -139,7 +111,6 @@ class MediaEngineBridge:
             self._on_exit(code if code is not None else -1)
             return
 
-        # Процесс жив — шлём SHUTDOWN, потом terminate/kill
         try:
             self.send_command({"cmd": "SHUTDOWN"})
         except Exception:
@@ -172,8 +143,6 @@ class MediaEngineBridge:
             and self._process is not None
             and self._process.poll() is None
         )
-
-    # ── IPC ──────────────────────────────────────────────────────────────────
 
     def send_command(self, cmd: dict) -> None:
         if self._process is None or self._process.stdin is None:
@@ -221,34 +190,16 @@ class MediaEngineBridge:
         })
 
     def restart_capture(self) -> None:
-        """
-        Шлёт RESTART_CAPTURE команду в Rust media-engine.
-        Используется audio_capture.py watchdog'ом при обнаружении зависшего
-        DLL Capture (RMS=0 timeout). Rust перезапускает ТОЛЬКО захват экрана,
-        WebRTC-соединение и энкодер остаются живыми — зритель не увидит
-        разрыва, только кратковременный стоп видео.
-        """
         try:
             self.send_command({"cmd": "RESTART_CAPTURE"})
         except Exception as e:
             logger.warning("[Bridge] RESTART_CAPTURE error: %s", e)
 
-    # ── WebRTC сигнализация (внутреннее) ─────────────────────────────────────
-
     def _handle_webrtc_offer(self, sdp: str) -> None:
-        """
-        Rust прислал WEBRTC_OFFER (gather-complete SDP).
-        1. POST sdp → Pion SFU /streamer/offer → answer SDP
-        2. WEBRTC_ANSWER → Rust stdin
-
-        FIX: если SFU не запущен (упал из-за zombie порта при старте),
-        пробуем перезапустить до 2 раз перед тем как роняем offer.
-        """
         if self._sfu_bridge is None:
             logger.error("[Bridge] WEBRTC_OFFER: sfu_bridge не задан")
             return
 
-        # FIX: авто-рестарт SFU если он упал
         if not self._sfu_bridge.is_running():
             logger.warning("[Bridge] WEBRTC_OFFER: SFU не запущен, пробуем перезапустить...")
             restarted = False
@@ -276,8 +227,6 @@ class MediaEngineBridge:
             self.send_command({"cmd": "WEBRTC_ANSWER", "sdp": answer})
         except Exception as e:
             logger.error("[Bridge] send WEBRTC_ANSWER: %s", e)
-
-    # ── Чтение stdout ────────────────────────────────────────────────────────
 
     def _read_stdout(self) -> None:
         try:
@@ -310,7 +259,6 @@ class MediaEngineBridge:
                         ).start()
 
                 else:
-                    # STREAM_STARTED, STREAM_STOPPED, STATS, ERROR
                     try:
                         self._on_event(event)
                     except Exception as e:
@@ -326,21 +274,6 @@ class MediaEngineBridge:
                 self._on_exit(code or 0)
 
     def _read_stderr(self) -> None:
-        """
-        Читает логи Rust media-engine из stderr.
-
-        FIX #42: УДАЛЁН мёртвый watchdog на [DLL-DIAG] regex.
-        Причина: строки [DLL-DIAG] пишутся в Python audio_capture.py (другой
-        процесс!), а не в Rust media-engine. Regex в этом обработчике stderr
-        никогда не срабатывал → RESTART_CAPTURE никогда не вызывался.
-
-        Правильный watchdog живёт в audio_capture.py (Python) где действительно
-        доступны RMS/peak реальных аудио-данных. Если он решит, что DLL Capture
-        завис, он сам вызовет self._restart_dll_capture() — внутрипроцессный
-        вызов, без межпроцессного regex-парсинга.
-
-        Здесь остаётся только форвард лог-строк в _on_log callback.
-        """
         try:
             for raw in iter(self._process.stderr.readline, b""):
                 if not self._running:

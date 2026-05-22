@@ -1,13 +1,3 @@
-# app_config.py — Единый конфиг InPulse
-#
-# Все настройки в одном JSON: %APPDATA%/InPulse/inpulse_config.json
-# При первом запуске — создаётся с дефолтами.
-# При обновлении — новые ключи мерджатся, старые сохраняются.
-#
-# Использование:
-#   from app_config import cfg
-#   cfg.get("ui.theme", "Темная")
-#   cfg.set("ui.theme", "Светлая"); cfg.save()
 
 import json, os, threading
 from config import APP_CONFIG_PATH

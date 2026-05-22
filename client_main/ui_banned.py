@@ -1,18 +1,3 @@
-# client_main/ui_banned.py
-# ──────────────────────────────────────────────────────────────────────────────
-# Экран «Вы забанены на сервере».
-#
-# Показывается вместо ConnectingScreen или MainWindow в двух случаях:
-#   1. Нас кикнули с пометкой «бан» посреди сессии (CMD_BANNED из net).
-#      → MainWindow делает teardown и открывает этот экран.
-#   2. Мы попытались зайти на сервер, который нас уже забанил (CMD_BANNED
-#      на этапе login). → ConnectingScreen перехватывает ответ login и
-#      показывает нас.
-#
-# Кнопка «Назад» → MultiServerScreen, где забаненный сервер помечен
-# значком «стоп» (bans-статус приходит от сервера через CMD_QUERY_BAN,
-# хранится только в памяти UI, никакого локального persistent-списка).
-# ──────────────────────────────────────────────────────────────────────────────
 
 import os
 
@@ -29,17 +14,10 @@ from .ui_titlebar import AppTitleBar
 
 
 def _make_banned_pixmap(size: int = 128) -> QPixmap:
-    """
-    Fallback-иконка если assets/icon/banned.png не найден.
-    Рисуем красный круг с диагональной чертой — стандартный 🚫.
-    Нужно чтобы приложение не падало даже без файла ресурсов.
-    """
     pm = QPixmap(size, size)
     pm.fill(Qt.GlobalColor.transparent)
     p = QPainter(pm)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-    # Красный круг с толстым контуром
     pen = QPen(QColor(231, 76, 60))
     pen.setWidth(max(6, size // 12))
     p.setPen(pen)
@@ -47,7 +25,6 @@ def _make_banned_pixmap(size: int = 128) -> QPixmap:
     margin = max(4, size // 16)
     p.drawEllipse(margin, margin, size - 2 * margin, size - 2 * margin)
 
-    # Диагональная черта сверху-слева → вниз-вправо (классический no-entry)
     import math
     cx, cy = size / 2, size / 2
     r = (size - 2 * margin) / 2
@@ -61,13 +38,7 @@ def _make_banned_pixmap(size: int = 128) -> QPixmap:
 
 
 class BannedScreen(QWidget):
-    """
-    Модальный full-screen замена: показывает причину бана + кнопку «Назад».
-    По клику «Назад» открывает MultiServerScreen и сам себя hide'ит.
-    """
 
-    # Эмитится при клике «Назад». Аргумент — IP забаненного сервера
-    # (чтобы следующий экран знал какой отметить «стопом»).
     back_clicked = pyqtSignal(str)
 
     def __init__(
@@ -82,8 +53,6 @@ class BannedScreen(QWidget):
         self._server_name = (server_name or '').strip() or self._server_ip
 
         self._build_ui()
-
-    # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
         from version import APP_NAME, APP_VERSION
@@ -121,7 +90,6 @@ class BannedScreen(QWidget):
         root.setContentsMargins(36, 24, 36, 24)
         card_lay.addLayout(root)
 
-        # ── Иконка бана: пробуем assets/icon/banned.png, иначе fallback ───
         self.lbl_img = QLabel()
         self.lbl_img.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_img.setFixedHeight(140)
@@ -131,10 +99,8 @@ class BannedScreen(QWidget):
         if os.path.exists(banned_path):
             pm.load(banned_path)
         if pm.isNull():
-            # Fallback — рисуем сами
             pm = _make_banned_pixmap(128)
         else:
-            # Масштабируем под 128px максимум, сохраняя пропорции
             pm = pm.scaled(
                 128, 128,
                 Qt.AspectRatioMode.KeepAspectRatio,
@@ -153,7 +119,6 @@ class BannedScreen(QWidget):
         )
         root.addWidget(lbl_title)
 
-        # ── Имя / IP сервера ─────────────────────────────────────────────────
         lbl_srv = QLabel(self._server_name)
         lbl_srv.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl_srv.setStyleSheet(
@@ -162,7 +127,6 @@ class BannedScreen(QWidget):
         )
         root.addWidget(lbl_srv)
 
-        # ── Причина (если была) ───────────────────────────────────────────────
         if self._reason:
             frm_reason = QFrame()
             frm_reason.setStyleSheet(
@@ -184,12 +148,9 @@ class BannedScreen(QWidget):
 
         root.addStretch()
 
-        # ── Кнопка «Назад» ────────────────────────────────────────────────────
         self.btn_back = QPushButton("← Назад")
         self.btn_back.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_back.setFixedHeight(38)
-        # Используем тот же secondary-стиль что и в LoginWindow для
-        # визуальной согласованности между экранами лобби.
         self.btn_back.setStyleSheet(BTN_SECONDARY_SS)
         self.btn_back.clicked.connect(self._on_back)
         root.addWidget(self.btn_back)

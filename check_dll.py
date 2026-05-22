@@ -1,4 +1,3 @@
-# Запусти отдельно: python -c "..."
 import ctypes, os, time
 
 dll = ctypes.CDLL(r"E:\Mychat\VoiceChat\dlls\InPulseAudioExclusion.dll")

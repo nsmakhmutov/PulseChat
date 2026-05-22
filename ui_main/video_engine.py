@@ -1,47 +1,3 @@
-# video_engine.py — WebRTC видеодвижок (aiortc)
-#
-# ── Изменения v5 ────────────────────────────────────────────────────────────
-#
-#   FIX 6 (СРЕДНИЙ): NVENC параметры для screen content.
-#     preset p4 → p5: чуть медленнее кодирование, заметно лучше качество
-#       для UI/текста с большими статичными зонами.
-#     cq=20 → cq=18: более низкий CQ = выше качество (диапазон 0-51).
-#       Для мелкого шрифта разница отчётлива.
-#     temporal-aq удалён: оптимизирует для движущегося видео, не для экрана.
-#     spatial-aq остался: помогает тонким деталям интерфейса.
-#     aq-strength 8 → 10: чуть сильнее → чёткость текстовых элементов.
-#
-#   FIX 7 (СРЕДНИЙ): Keyframe interval G=60 → G=30 (1 секунда @ 30fps).
-#     При потере пакетов на RadminVPN зритель ждал до 2 сек до следующего
-#     I-frame. При screen sharing IDR-кадр на статичных зонах весит мало,
-#     поэтому уменьшение интервала не даёт значительного прироста битрейта.
-#     Применено ко всем кодекам: NVENC, AMF, h264_mf, libx264.
-#
-#   FIX 8 (СРЕДНИЙ): x264 preset slow → medium.
-#     slow — слишком медленный для realtime при 30fps на скромном CPU.
-#     При 1080p и 30fps slow занимал >33ms на кадр → дропы.
-#     medium = хороший баланс quality/speed для realtime screen capture.
-#     crf=18 сохранён — он даёт качество, preset только скорость поиска.
-#
-#   FIX 9 (СРЕДНИЙ): patch_aiortc_nvenc() — явное предупреждение в v3.
-#     В v3 стримером является Rust Media Engine (media-engine.exe).
-#     aiortc в Python используется ТОЛЬКО у зрителя для ДЕКОДИРОВАНИЯ.
-#     Патч H264Encoder для зрителя бессмысленен — декодер не кодирует.
-#     Функция сохранена для обратной совместимости, но теперь возвращает
-#     False и логирует WARNING если вызвана без явного флага force=True.
-#     Убери вызов patch_aiortc_nvenc() из точки старта приложения.
-#
-#   FIX 10 (НИЗКИЙ): VideoReceiver — RTP PTS-based jitter buffer.
-#     Было: синхронизация по wall-clock (time.monotonic() arrival time).
-#     Это не настоящий jitter buffer — кадры планировались по времени
-#     прихода, а не по временным меткам энкодера. При сетевых флуктуациях
-#     несколько кадров могли прийти в burst → отображались почти одновременно.
-#     Стало: используем frame.pts (RTP timestamp, clock 90000 Hz для H.264).
-#     Первый кадр устанавливает PTS-якорь и wall-clock якорь.
-#     Каждый следующий кадр планируется через pts_delta / 90000 секунд
-#     от якоря + VIEWER_JITTER_BUFFER_MS задержка.
-#     Результат: плавное воспроизведение независимо от сетевого jitter.
-
 import asyncio
 import collections
 import gc
@@ -58,8 +14,6 @@ from config import (
     get_lq_resolution, get_bitrate_for_resolution,
     VIEWER_JITTER_BUFFER_MS,
 )
-
-# ─── Опциональные зависимости ─────────────────────────────────────────────────
 
 try:
     import av
@@ -83,18 +37,12 @@ except ImportError:
     _AiortcVideoStreamTrack = object
     print("[Video] ОШИБКА: aiortc не установлен!")
 
-# cv2.INTER_AREA — лучший алгоритм downscale для UI/текста
 try:
     import cv2 as _cv2
     _CV2_AVAILABLE = True
 except ImportError:
     _CV2_AVAILABLE = False
     print("[Video] INFO: OpenCV не найден — fallback на PyAV bilinear (качество хуже).")
-
-
-# =============================================================================
-# Динамический битрейт энкодера
-# =============================================================================
 
 _encoder_state = {'bitrate': VIDEO_BITRATE, 'lq_bitrate': 1_000_000}
 
@@ -107,25 +55,8 @@ def set_encoder_bitrate(bitrate: int, lq_bitrate: int = 0) -> None:
         f"LQ={_encoder_state['lq_bitrate']//1000} kbps"
     )
 
-
-# =============================================================================
-# patch_aiortc_nvenc — DEPRECATED в v3 (только для обратной совместимости)
-# =============================================================================
-
 def patch_aiortc_nvenc(force: bool = False) -> bool:
-    """
-    DEPRECATED в v3: стримером является Rust Media Engine, не aiortc.
-    aiortc в Python используется ТОЛЬКО у зрителя для декодирования.
-    Патч H264Encoder для зрителя не нужен — там нет кодирования.
 
-    FIX 9: функция теперь возвращает False и логирует WARNING по умолчанию.
-    Установи force=True только если ты ТОЧНО знаешь что aiortc используется
-    для кодирования (например, при откате с v3 на v2 архитектуру).
-
-    Параметры:
-      force: True → принудительно применить патч несмотря на предупреждение.
-             False (default) → вернуть False с WARNING (рекомендуется).
-    """
     if not force:
         print(
             "[Video] WARNING: patch_aiortc_nvenc() вызвана в v3, где Rust делает "
@@ -142,25 +73,16 @@ def patch_aiortc_nvenc(force: bool = False) -> bool:
             'codec': 'h264_nvenc',
             'name':  'NVIDIA NVENC',
             'options': {
-                # FIX 6: preset p4 → p5 для screen content (UI/текст).
-                # p5 = лучше quality/speed баланс при статичных зонах.
-                # Для движущегося видео p4 быстрее, для экрана разница <2ms/frame.
+
                 'preset':      'p5',
                 'tune':        'hq',
                 'rc':          'vbr',
-                # FIX 6: cq=20 → cq=18. Ниже = лучше качество (диапазон 0-51).
-                # Критично для мелкого текста и тонких UI-элементов.
+
                 'cq':          '18',
                 'bf':          '2',
                 'profile':     'high',
                 'spatial-aq':  '1',
-                # FIX 6: temporal-aq УДАЛЁН. Оптимизирует движущееся видео,
-                # для статичного экрана только тратит время энкодера.
-                # FIX 6: aq-strength 8 → 10. Чуть сильнее → чётче детали UI.
                 'aq-strength': '10',
-                # FIX 7: g=60 → g=30. IDR каждые 1 сек вместо 2.
-                # При потере пакетов зритель восстанавливается в 2× быстрее.
-                # Screen content = много статики → IDR маленький по размеру.
                 'g':           '30',
                 'forced-idr':  '1',
             },
@@ -174,7 +96,6 @@ def patch_aiortc_nvenc(force: bool = False) -> bool:
                 'profile': 'high',
                 'bf':      '2',
                 'rc':      'vbr_peak',
-                # FIX 7: добавлен g=30 для AMF
                 'g':       '30',
             },
         },
@@ -184,7 +105,6 @@ def patch_aiortc_nvenc(force: bool = False) -> bool:
             'options': {
                 'scenario':         'livestreaming',
                 'quality_vs_speed': '100',
-                # FIX 7: добавлен g=30 для MF
                 'g':                '30',
             },
         },
@@ -208,19 +128,14 @@ def patch_aiortc_nvenc(force: bool = False) -> bool:
         'codec': 'libx264',
         'name':  'libx264 (CPU)',
         'options': {
-            # FIX 8: preset slow → medium для realtime screen capture.
-            # slow занимает >33ms/frame при 1080p → дропы.
-            # medium = хороший баланс quality/speed при 30fps.
-            # crf=18 управляет качеством — preset влияет только на скорость.
             'preset':       'medium',
             'profile':      'high',
             'level':        '4.1',
-            # FIX 7: g=60 → g=30
             'g':            '30',
             'sc_threshold': '40',
             'crf':          '18',
             'x264-params': (
-                'rc-lookahead=30:'        # было 40; снижено под medium preset
+                'rc-lookahead=30:'      
                 'bframes=3:'
                 'b-adapt=2:'
                 'no-fast-pskip=1:'
@@ -324,16 +239,7 @@ def patch_aiortc_nvenc(force: bool = False) -> bool:
         print(f"[Video] patch_aiortc_nvenc: ошибка патча — {e}")
         return False
 
-
-# =============================================================================
-# DXCamTrack — захват экрана как aiortc VideoStreamTrack (HQ)
-# =============================================================================
-
 class DXCamTrack(_AiortcVideoStreamTrack):
-    """
-    aiortc VideoStreamTrack: захват рабочего стола через dxcam (HQ-поток).
-    В v3 не используется стримером (захват в Rust). Сохранён для совместимости.
-    """
 
     kind = "video"
     _QUEUE_MAXSIZE = 4
@@ -439,7 +345,6 @@ class DXCamTrack(_AiortcVideoStreamTrack):
             return None
 
     def _enqueue_frame(self, av_frame: 'av.VideoFrame') -> None:
-        """Drop-oldest стратегия: новый кадр важнее старого."""
         if self._queue is None:
             return
         if self._queue.full():
@@ -541,16 +446,7 @@ class DXCamTrack(_AiortcVideoStreamTrack):
             pass
         del camera
 
-
-# =============================================================================
-# DXCamTrackLQ — LQ-трек для simulcast
-# =============================================================================
-
 class DXCamTrackLQ(_AiortcVideoStreamTrack):
-    """
-    LQ-версия видеотрека для simulcast (Discord-стиль).
-    Получает raw RGB кадры от родительского DXCamTrack через _on_raw_frame().
-    """
 
     kind = "video"
     _QUEUE_MAXSIZE = 4
@@ -584,7 +480,6 @@ class DXCamTrackLQ(_AiortcVideoStreamTrack):
             self._loop.call_soon_threadsafe(self._enqueue_frame, av_frame)
 
     def _convert_to_yuv_lq(self, frame_np: np.ndarray) -> 'av.VideoFrame | None':
-        """cv2.INTER_AREA downscale + BT.709 colorspace (LIMITED range)."""
         try:
             if _CV2_AVAILABLE:
                 resized = _cv2.resize(frame_np, (self._width, self._height),
@@ -651,40 +546,13 @@ class DXCamTrackLQ(_AiortcVideoStreamTrack):
         av_frame.time_base = time_base
         return av_frame
 
-
-# =============================================================================
-# VideoReceiver — WebRTC трек → QImage → frame_received сигнал
-# =============================================================================
-
-# RTP clock для H.264 видео (90000 Гц — стандарт RFC 6184)
 _H264_RTP_CLOCK = 90000
 
 
 class VideoReceiver(QObject):
-    """
-    Принимает один видеотрек от WebRTC и конвертирует кадры в QImage.
-
-    Jitter Buffer (VIEWER_JITTER_BUFFER_MS):
-      FIX 10: RTP PTS-based timing вместо wall-clock arrival time.
-
-      Было (wall-clock):
-        Кадры сортировались по времени прихода. При burst-доставке
-        (несколько кадров пришли одновременно после задержки) они
-        отображались почти мгновенно друг за другом — рывки.
-
-      Стало (RTP PTS-based):
-        Первый кадр устанавливает PTS-якорь (pts_anchor) и wall-clock якорь.
-        Каждый следующий кадр получает display_at = wall_anchor +
-        (frame.pts - pts_anchor) / RTP_CLOCK + buffer_ms/1000.
-        При burst-доставке кадры всё равно показываются с правильным
-        интервалом (33ms @ 30fps) — плавное воспроизведение.
-
-      VIEWER_JITTER_BUFFER_MS = 0   → буфер отключён (немедленный показ)
-      VIEWER_JITTER_BUFFER_MS = 700 → 700ms задержка (рекомендуется)
-    """
 
     frame_received       = pyqtSignal(int, QImage)
-    stream_stats_updated = pyqtSignal(int, int, int)   # uid, fps, loss_pct
+    stream_stats_updated = pyqtSignal(int, int, int)
 
     _STATS_INTERVAL = 2.0
 
@@ -699,27 +567,15 @@ class VideoReceiver(QObject):
         self._track   = track
         self._loop    = loop
         self._running = True
-
         self._stats_decoded   = 0
         self._stats_last_time = time.monotonic()
-
-        # ── Jitter Buffer (FIX 10: RTP PTS-based) ────────────────────────
         self._buffer_ms = VIEWER_JITTER_BUFFER_MS
-
-        # Буфер хранит (display_at: float, q_img: QImage).
-        # display_at = wall time когда кадр должен быть показан.
-        # Сортировка не нужна — RTP PTS гарантирует порядок от энкодера.
         self._jitter_buf: collections.deque = collections.deque()
-
-        # PTS-якорь: устанавливается при первом кадре
         self._pts_anchor:  int   | None = None   # RTP timestamp первого кадра
         self._wall_anchor: float | None = None   # monotonic time первого кадра
         self._pts_clock:   int          = _H264_RTP_CLOCK  # 90000 для H264
-
-        # Защита от wrap-around RTP timestamp (32-bit, переполняется ~13 часов)
         self._pts_prev: int | None = None
 
-        # Playback thread
         self._playback_thread: threading.Thread | None = None
         if self._buffer_ms > 0:
             self._playback_thread = threading.Thread(
@@ -737,39 +593,22 @@ class VideoReceiver(QObject):
 
         asyncio.run_coroutine_threadsafe(self._recv_loop(), loop)
 
-    # Instance-level flag (не class-level как было — иначе все экземпляры делят один флаг)
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
 
     _first_frame_logged: bool = False
 
-    # ------------------------------------------------------------------
-    # FIX 10: RTP PTS-based jitter buffer — push
-    # ------------------------------------------------------------------
-
     def _buf_push(self, q_img: QImage, frame_pts: int | None) -> None:
-        """
-        Добавляет кадр в jitter buffer с правильным display_at временем.
 
-        FIX 10: display_at вычисляется из RTP PTS а не wall-clock.
-        Это гарантирует равномерное воспроизведение (33ms между кадрами
-        при 30fps) независимо от сетевого jitter.
-
-        frame_pts: RTP timestamp кадра (units = RTP clock, 90000 Гц для H264).
-                   None → fallback на wall-clock (например, первый кадр без PTS).
-        """
         now = time.monotonic()
 
         if frame_pts is None or not isinstance(frame_pts, int):
-            # Fallback: PTS недоступен → используем wall-clock arrival
             display_at = now + self._buffer_ms / 1000.0
             self._jitter_buf.append((display_at, q_img))
-            # Ограничиваем размер буфера
             while len(self._jitter_buf) > 200:
                 self._jitter_buf.popleft()
             return
 
-        # Первый кадр — устанавливаем якорь
         if self._pts_anchor is None:
             self._pts_anchor  = frame_pts
             self._wall_anchor = now
@@ -778,11 +617,8 @@ class VideoReceiver(QObject):
             self._jitter_buf.append((display_at, q_img))
             return
 
-        # RTP wrap-around защита: 32-bit PTS переполняется примерно через 13 часов.
-        # Если разница с предыдущим PTS отрицательна и большая — это wrap.
         pts_diff = frame_pts - self._pts_prev
         if pts_diff < -0x3FFFFFFF:
-            # Wrap-around произошёл → сбрасываем якорь
             self._pts_anchor  = frame_pts
             self._wall_anchor = now
             self._pts_prev    = frame_pts
@@ -792,31 +628,16 @@ class VideoReceiver(QObject):
 
         self._pts_prev = frame_pts
 
-        # Вычисляем когда кадр должен быть показан
-        # pts_delta_secs = разница в секундах от первого кадра по энкодер-таймстампу
         pts_delta_secs = (frame_pts - self._pts_anchor) / self._pts_clock
         display_at = self._wall_anchor + pts_delta_secs + self._buffer_ms / 1000.0
 
         self._jitter_buf.append((display_at, q_img))
 
-        # Ограничиваем размер буфера: 200 кадров ≈ ~6.7 сек @ 30fps
         while len(self._jitter_buf) > 200:
             self._jitter_buf.popleft()
 
-    # ------------------------------------------------------------------
-    # FIX 10: RTP PTS-based jitter buffer — playback
-    # ------------------------------------------------------------------
-
     def _playback_loop(self) -> None:
-        """
-        Daemon thread: проверяет буфер с интервалом ~8ms (выше 30fps).
-        Показывает все кадры у которых display_at <= now.
 
-        FIX 10: логика основана на display_at из RTP PTS, не на arrival time.
-        При корректном RTP stream кадры выходят из буфера равномерно (33ms).
-        При burst-delivery (jitter) кадры сглаживаются автоматически.
-        """
-        # Опрашиваем в 2× быстрее чем fps чтобы не пропустить момент
         poll_interval = max(0.005, 0.5 / VIDEO_FPS)
 
         while self._running:
@@ -827,8 +648,6 @@ class VideoReceiver(QObject):
             now = time.monotonic()
             frame_to_show: QImage | None = None
 
-            # Достаём все созревшие кадры; показываем только последний
-            # (если кадры накопились, показываем актуальный, не устаревший)
             while self._jitter_buf:
                 display_at, img = self._jitter_buf[0]
                 if display_at <= now:
@@ -840,18 +659,12 @@ class VideoReceiver(QObject):
             if frame_to_show is not None:
                 self.frame_received.emit(self.uid, frame_to_show)
 
-    # ------------------------------------------------------------------
-    # Asyncio recv loop
-    # ------------------------------------------------------------------
-
     async def _recv_loop(self) -> None:
 
         _loop = asyncio.get_running_loop()
         _use_buffer = self._buffer_ms > 0
         _rtp_diag_count = 0
 
-        # FIX 10: Определяем RTP clock из первого кадра
-        # H264 всегда 90000, но Opus/другие треки могут быть другими
         _clock_detected = False
 
         try:
@@ -871,7 +684,6 @@ class VideoReceiver(QObject):
                 _rtp_diag_count += 1
 
                 try:
-                    # FIX 10: извлекаем RTP PTS из frame
                     frame_pts: int | None = None
                     try:
                         if hasattr(frame, 'pts') and frame.pts is not None:
@@ -879,12 +691,10 @@ class VideoReceiver(QObject):
                     except Exception:
                         pass
 
-                    # Детектируем RTP clock из time_base (один раз)
                     if not _clock_detected and frame_pts is not None:
                         try:
                             if hasattr(frame, 'time_base') and frame.time_base:
                                 tb = frame.time_base
-                                # time_base = 1/90000 для H264 → clock = 90000
                                 detected_clock = int(round(1.0 / float(tb)))
                                 if 8000 <= detected_clock <= 120000:
                                     self._pts_clock = detected_clock
@@ -896,14 +706,12 @@ class VideoReceiver(QObject):
                         except Exception:
                             pass
 
-                    # Colorspace hint для декодера
                     try:
                         if hasattr(frame, 'colorspace') and frame.colorspace == 0:
                             frame.colorspace = 1
                     except Exception:
                         pass
 
-                    # Декодирование в numpy в executor (не блокируем event loop)
                     img_np = await _loop.run_in_executor(
                         None,
                         lambda f=frame: f.to_ndarray(format='rgb24')
@@ -918,7 +726,6 @@ class VideoReceiver(QObject):
                     ).copy()
 
                     if _use_buffer:
-                        # FIX 10: передаём RTP PTS для точного scheduling
                         self._buf_push(q_img, frame_pts)
                     else:
                         self.frame_received.emit(self.uid, q_img)
@@ -961,25 +768,7 @@ class VideoReceiver(QObject):
         except Exception:
             pass
 
-
-# =============================================================================
-# VideoEngine — менеджер (совместимый публичный API)
-# =============================================================================
-
 class VideoEngine(QObject):
-    """
-    Менеджер WebRTC видео (v3).
-
-    Стример (v3):
-      Захват экрана — Rust WGC (media-engine.exe, ~2% CPU).
-      Кодирование   — NVENC/AMF через FFmpeg (Rust).
-      Отправка RTP  — webrtc-rs → Pion SFU (sidecar.exe).
-
-    Зритель (v3):
-      Pion SFU → aiortc PC → VideoReceiver → frame_received → VideoWindow.
-      VideoReceiver использует RTP PTS-based jitter buffer (FIX 10).
-    """
-
     frame_received       = pyqtSignal(int, QImage)
     stream_stats_updated = pyqtSignal(int, int, int)
 
@@ -998,12 +787,10 @@ class VideoEngine(QObject):
         print("[VideoEngine] WebRTC asyncio loop установлен")
 
     def start_streaming(self, settings: dict | None = None) -> bool:
-        """v3: Захват и кодирование выполняет Rust Media Engine. No-op."""
         print("[VideoEngine] start_streaming: v3 — захват в Rust, no-op")
         return True
 
     def stop_streaming(self) -> None:
-        """v3: DXCamTrack отсутствует — GC + Windows heap trim."""
         self._dxcam_track    = None
         self._dxcam_track_lq = None
 
@@ -1026,18 +813,12 @@ class VideoEngine(QObject):
             print("[VideoEngine] stop_streaming: GC выполнен")
 
     def get_dxcam_track(self):
-        """v3: всегда None — захват в Rust."""
         return None
 
     def get_lq_track(self):
-        """v3: всегда None — simulcast управляется Pion SFU."""
         return None
 
     def add_receiver(self, uid: int, track) -> VideoReceiver:
-        """
-        Создаёт VideoReceiver для входящего WebRTC трека зрителя.
-        track — aiortc MediaStreamTrack от Pion SFU (через RTCPeerConnection).
-        """
         if self._webrtc_loop is None:
             raise RuntimeError(
                 "[VideoEngine] WebRTC loop не установлен. "
@@ -1072,7 +853,6 @@ class VideoEngine(QObject):
             receiver.stop()
         print(f"[VideoEngine] stop_viewer_for_uid({uid})")
 
-    # ── Заглушки для совместимости ────────────────────────────────────────────
 
     def process_incoming_packet(self, uid, data, is_lq: bool = False) -> None:
         pass

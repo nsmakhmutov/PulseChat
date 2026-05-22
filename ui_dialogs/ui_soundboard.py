@@ -10,10 +10,7 @@ from PyQt6.QtGui import QPainter, QColor, QPainterPath
 from config import resource_path, CMD_SOUNDBOARD
 from .ui_dialogs import CUSTOM_SOUND_MAX_BYTES, CUSTOM_SOUND_SLOTS
 
-
-# ── Emoji-коллекция для подбора иконки по имени файла ────────────────────────
 _SB_EMOJI_MAP = {
-    # Keywords → emoji
     "drum": "🥁", "bass": "🎸", "guitar": "🎸", "piano": "🎹",
     "gun": "🔫", "shot": "💥", "boom": "💥", "explode": "💣",
     "yes": "✅", "no": "❌", "win": "🏆", "fail": "😬", "lose": "💀",
@@ -28,31 +25,13 @@ _SB_EMOJI_MAP = {
 }
 
 def _pick_emoji(name: str) -> str:
-    """Подбирает подходящий эмодзи для названия звука по ключевым словам."""
     lo = name.lower()
     for kw, em in _SB_EMOJI_MAP.items():
         if kw in lo:
             return em
-    return "🎵"  # дефолт
+    return "🎵"
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SoundboardPanel
-# ══════════════════════════════════════════════════════════════════════════════
 class SoundboardPanel(QWidget):
-    """
-    Discord-style прозрачная панель Soundboard.
-    Выезжает снизу вверх над кнопкой вызова с анимацией.
-    Закрывается при клике вне панели (Popup).
-
-    ИСПРАВЛЕНО:
-    - WA_DeleteOnClose УБРАН — он уничтожал C++ объект при close(), но Python-ссылка
-      _sb_panel в MainWindow оставалась живой → RuntimeError при следующем обращении.
-      Теперь close() просто скрывает виджет; MainWindow сам управляет временем жизни.
-    - _flash_timer хранится как атрибут экземпляра — больше не используем __import__
-      и не создаём новый QTimer на каждый клик.
-    - Кнопки: setFixedHeight(34) вместо setMinimumHeight(46).
-    """
 
     _PANEL_BG   = QColor(32, 34, 42, 235)
     _ACCENT     = QColor(88, 101, 242)
@@ -68,7 +47,6 @@ class SoundboardPanel(QWidget):
             Qt.WindowType.FramelessWindowHint | Qt.WindowType.Popup
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        # WA_DeleteOnClose намеренно НЕ установлен — см. docstring выше
         self.setMinimumWidth(420)
 
         self.net = net_client
@@ -77,15 +55,8 @@ class SoundboardPanel(QWidget):
 
         self._build_ui()
 
-    # ── Public: пересборка при изменении кастомных звуков ─────────────────────
-
     def rebuild(self):
-        """
-        Пересобирает UI панели при добавлении / удалении кастомных звуков.
-        Вызывается через _rebuild_sb_panel_if_open().
-        Сохраняет состояние жёлтой метки автора между пересборками.
-        """
-        # Сохраняем состояние метки автора — _build_ui создаст новые виджеты
+
         saved_text    = ""
         saved_visible = False
         saved_ms      = 0
@@ -101,7 +72,6 @@ class SoundboardPanel(QWidget):
         self._build_ui()
         self.adjustSize()
 
-        # Восстанавливаем метку если была активна
         if saved_visible and saved_text:
             try:
                 self._from_nick_lbl.setText(saved_text)
@@ -111,10 +81,7 @@ class SoundboardPanel(QWidget):
             except (RuntimeError, AttributeError):
                 pass
 
-    # ── UI ────────────────────────────────────────────────────────────────────
-
     def _build_ui(self):
-        # Если уже есть layout — очищаем его
         existing = self.layout()
         if existing is not None:
             QWidget().setLayout(existing)   # «уводим» старый layout
@@ -122,7 +89,6 @@ class SoundboardPanel(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(8, 8, 8, 8)
 
-        # ── Карточка ──────────────────────────────────────────────────────────
         self._card = QWidget(self)
         self._card.setObjectName("sbCard")
         self._card.setStyleSheet("""
@@ -136,7 +102,6 @@ class SoundboardPanel(QWidget):
         card_lay.setContentsMargins(12, 10, 12, 12)
         card_lay.setSpacing(8)
 
-        # Заголовок
         hdr = QHBoxLayout()
         hdr.setContentsMargins(0, 0, 0, 0)
 
@@ -149,14 +114,9 @@ class SoundboardPanel(QWidget):
             border: none;
         """)
 
-        # Жёлтая метка «▶ [ник]» — кто последний включил звук.
-        # Живёт в заголовке панели, но скрыта: уведомление теперь
-        # показывается тостом в MainWindow (над нижней панелью, по центру).
-        # Оставляем объект для flash_from_nick() — чтобы не ломать вызовы из MainWindow.
         self._from_nick_lbl = QLabel("")
         self._from_nick_lbl.setVisible(False)   # всегда скрыта в заголовке панели
 
-        # Таймер скрытия метки (single-shot, 4 с)
         self._from_nick_timer = QTimer(self)
         self._from_nick_timer.setSingleShot(True)
         self._from_nick_timer.timeout.connect(self._hide_from_nick_lbl)
@@ -184,21 +144,18 @@ class SoundboardPanel(QWidget):
         hdr.addWidget(btn_close)
         card_lay.addLayout(hdr)
 
-        # Разделитель
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
         sep.setStyleSheet("background: rgba(255,255,255,0.07); border: none; max-height: 1px;")
         card_lay.addWidget(sep)
 
-        # ── Собираем все звуки ────────────────────────────────────────────────
         sd_dir = resource_path("assets/panel")
         default_files = []
         if os.path.exists(sd_dir):
             default_files = sorted([f for f in os.listdir(sd_dir)
                                     if f.lower().endswith(('.wav', '.mp3', '.ogg'))])
 
-        # Кастомные звуки из QSettings
-        custom_sounds: list[tuple[str, str]] = []   # (name, path)
+        custom_sounds: list[tuple[str, str]] = []
         for i in range(CUSTOM_SOUND_SLOTS):
             path = self._settings.value(f"custom_sound_{i}_path", "")
             name = self._settings.value(f"custom_sound_{i}_name", "")
@@ -217,7 +174,6 @@ class SoundboardPanel(QWidget):
             empty_lbl.setContentsMargins(0, 10, 0, 10)
             card_lay.addWidget(empty_lbl)
         else:
-            # Общий scroll-контейнер для обоих разделов
             scroll = QScrollArea()
             scroll.setWidgetResizable(True)
             scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -241,7 +197,6 @@ class SoundboardPanel(QWidget):
             content_lay.setContentsMargins(0, 0, 0, 0)
             content_lay.setSpacing(10)
 
-            # ── Секция: Стандартные звуки ─────────────────────────────────────
             if has_default:
                 self._add_sounds_section(
                     content_lay,
@@ -251,7 +206,6 @@ class SoundboardPanel(QWidget):
                     is_custom=False
                 )
 
-            # ── Секция: Мои звуки ─────────────────────────────────────────────
             if has_custom:
                 if has_default:
                     div = QFrame()
@@ -278,14 +232,7 @@ class SoundboardPanel(QWidget):
                              buttons_data: list[tuple[str, str | None, str | None]],
                              accent_color: str,
                              is_custom: bool):
-        """
-        Добавляет секцию кнопок звуков в parent_lay.
 
-        buttons_data: list of (display_name, fname_or_None, path_or_None)
-          - fname: имя файла в assets/panel/ (стандартные звуки)
-          - path:  абсолютный путь (кастомные звуки)
-        """
-        # Подзаголовок секции
         sec_hdr = QLabel(f"  {title}")
         sec_hdr.setStyleSheet(f"""
             font-size: 11px;
@@ -347,20 +294,11 @@ class SoundboardPanel(QWidget):
         parent_lay.addWidget(grid_w)
 
     def _on_custom_sound_clicked(self, fpath: str, name: str):
-        """
-        Кастомный звук: читает файл → base64 → отправляет JSON с data_b64.
 
-        Сервер ретранслирует этот JSON всем клиентам без изменений.
-        Клиенты в play_soundboard_file() декодируют data_b64 и воспроизводят
-        из BytesIO (soundfile.read поддерживает файловоподобные объекты).
-
-        Имя файла в поле 'file' помечается префиксом '__custom__:',
-        чтобы получатель не искал этот «файл» в assets/panel/.
-        """
         try:
             fsize = os.path.getsize(fpath)
             if fsize > CUSTOM_SOUND_MAX_BYTES:
-                return  # защита (теоретически уже проверено при добавлении)
+                return
             with open(fpath, 'rb') as f:
                 raw_bytes = f.read()
             b64 = base64.b64encode(raw_bytes).decode('ascii')
@@ -373,17 +311,9 @@ class SoundboardPanel(QWidget):
             print(f"[SoundboardPanel] Custom sound error: {e}")
 
     def _on_sound_clicked(self, fname: str):
-        """Отправляет soundboard-команду серверу. Flash-эффект убран."""
         self.net.send_json({"action": CMD_SOUNDBOARD, "file": fname})
 
-    # ── Публичный API: желтая метка автора ───────────────────────────────────
-
     def flash_from_nick(self, nick: str):
-        """
-        Показывает «▶ [nick]» жёлтым в заголовке панели на 4 секунды.
-        Вызывается из MainWindow/_on_soundboard_played каждый раз при звуке.
-        Безопасен к вызову даже если панель скрыта (обновит метку к следующему открытию).
-        """
         try:
             self._from_nick_lbl.setText(f"▶  {nick}")
             self._from_nick_lbl.setVisible(True)
@@ -397,15 +327,8 @@ class SoundboardPanel(QWidget):
         except (RuntimeError, AttributeError):
             pass
 
-    # ── Анимация ──────────────────────────────────────────────────────────────
-
     def show_above(self, ref_widget: QWidget):
-        """
-        Центрирует панель горизонтально по родительскому окну.
-        Ширина = ширина окна − 32 px (16 px отступ с каждого края).
-        Панель выезжает снизу вверх над ref_widget с анимацией.
-        """
-        # Верхнеуровневое окно — по его ширине растягиваем панель
+
         top_win = ref_widget.window()
         target_w = max(self.minimumWidth(), top_win.width() - 32)
         self.setMinimumWidth(target_w)
@@ -415,11 +338,9 @@ class SoundboardPanel(QWidget):
         panel_w = self.width()
         panel_h = self.height()
 
-        # X: центр окна
         g_win = top_win.mapToGlobal(QPoint(0, 0))
         x = g_win.x() + (top_win.width() - panel_w) // 2
 
-        # Y: над кнопкой ref_widget
         g_btn = ref_widget.mapToGlobal(QPoint(0, 0))
         y_final = g_btn.y() - panel_h - 6
         y_start = y_final + 18
@@ -434,10 +355,7 @@ class SoundboardPanel(QWidget):
         self._anim.setEndValue(QRect(x, y_final, panel_w, panel_h))
         self._anim.start()
 
-    # ── Отрисовка ─────────────────────────────────────────────────────────────
-
     def paintEvent(self, event):
-        """Рисуем лёгкую тень вокруг карточки."""
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
 
@@ -453,6 +371,4 @@ class SoundboardPanel(QWidget):
             )
             p.drawPath(path)
 
-
-# Backward-compatible alias
 SoundboardDialog = SoundboardPanel

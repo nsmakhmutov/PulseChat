@@ -1,28 +1,4 @@
-"""
-job_object.py — Windows Job Object для автоматического kill дочерних процессов.
 
-При завершении Python-процесса (штатном, крэше, Task Manager kill)
-ОС автоматически убивает все процессы в Job Object.
-Это решает проблему зомби sidecar.exe / media-engine.exe раз и навсегда.
-
-Использование:
-    from core.job_object import assign_to_job
-    proc = subprocess.Popen(...)
-    assign_to_job(proc)
-
-─── FIX #51: выравнивание ctypes-структур ──────────────────────────────────
-  На Windows x64 sizeof(JOBOBJECT_BASIC_LIMIT_INFORMATION) = 72, а
-  sizeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION) = 152 — после учёта padding
-  между DWORD (4 байта) и size_t (8 байт), который ctypes автоматически
-  вставляет при дефолтном _pack_.
-
-  Python ctypes.Structure без явного _pack_ использует выравнивание
-  по размеру самого широкого поля, что совпадает с MSVC #pragma pack без
-  аргумента = natural alignment. Размеры совпадают с Windows SDK (validated).
-
-  Явно НЕ ставим _pack_ = 1 — это сломает работу на x64 (Windows
-  ожидает natural alignment, не packed layout).
-"""
 
 import sys
 import subprocess
@@ -44,8 +20,6 @@ def _init_job_object():
 
         kernel32 = ctypes.windll.kernel32
 
-        # Явно задаём типы возврата для AssignProcessToJobObject и других,
-        # иначе ctypes использует c_int (32 бита) и handle может потеряться.
         kernel32.CreateJobObjectW.restype  = wintypes.HANDLE
         kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
 
@@ -68,8 +42,6 @@ def _init_job_object():
             logger.warning("[JobObject] CreateJobObjectW failed")
             return None
 
-        # FIX #51: структуры соответствуют Windows SDK layout (natural alignment).
-        # На x64 ctypes автоматически вставляет нужное padding между DWORD и size_t.
         class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
             _fields_ = [
                 ("PerProcessUserTimeLimit", ctypes.c_int64),
@@ -130,13 +102,6 @@ def _init_job_object():
 
 
 def assign_to_job(proc: subprocess.Popen) -> bool:
-    """
-    Привязывает дочерний процесс к Job Object.
-    Вызывать сразу после subprocess.Popen().
-
-    Returns: True если успешно, False если нет (не критично —
-    процесс просто не будет автоматически убит при крэше родителя).
-    """
     global _job_handle
     if _job_handle is None:
         return False
@@ -164,6 +129,4 @@ def assign_to_job(proc: subprocess.Popen) -> bool:
         logger.warning("[JobObject] assign error PID %d: %s", proc.pid, e)
         return False
 
-
-# Инициализация при импорте
 _job_handle = _init_job_object()

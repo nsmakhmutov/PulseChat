@@ -1,13 +1,5 @@
-# network_engine/sdp_utils.py — SDP-утилиты для WebRTC сигнализации
-
-
 def normalize_sdp_ice(sdp: str) -> str:
-    """
-    Нормализует ice-ufrag/ice-pwd в SDP для совместимости с Pion SFU.
 
-    aiortc создаёт offer где каждая m-секция (video, audio) имеет
-    собственный ice-ufrag/ice-pwd. Pion ожидает BUNDLE с единым ice-ufrag.
-    """
     sep = "\r\n" if "\r\n" in sdp else "\n"
     lines = sdp.split(sep)
 
@@ -37,7 +29,6 @@ def normalize_sdp_ice(sdp: str) -> str:
 
 
 def patch_audio_bitrate(sdp: str, bitrate_kbps: int) -> str:
-    """Вставляет b=AS:<kbps> в audio m-секцию SDP для ограничения Opus битрейта."""
     sep = "\r\n" if "\r\n" in sdp else "\n"
     lines = sdp.split(sep)
     result = []
@@ -57,15 +48,10 @@ def patch_audio_bitrate(sdp: str, bitrate_kbps: int) -> str:
 
 
 def patch_opus_fec(sdp: str) -> str:
-    """
-    Убеждается что Opus в SDP имеет useinbandfec=1 и usedtx=1.
-    Добавляет параметры в fmtp строку Opus кодека.
-    """
     sep = "\r\n" if "\r\n" in sdp else "\n"
     lines = sdp.split(sep)
     opus_pt = None
 
-    # Найти payload type Opus
     for line in lines:
         if "opus/48000" in line and line.startswith("a=rtpmap:"):
             opus_pt = line.split(":")[1].split()[0]
@@ -89,7 +75,6 @@ def patch_opus_fec(sdp: str) -> str:
             result.append(line)
 
     if not fmtp_found:
-        # Вставляем fmtp после rtpmap Opus
         final = []
         for line in result:
             final.append(line)

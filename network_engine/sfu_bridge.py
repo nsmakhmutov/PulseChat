@@ -1,23 +1,3 @@
-"""
-sfu_bridge.py — Python-мост к Go Pion SFU (sidecar.exe)
-
-─── Что делает ──────────────────────────────────────────────────────────────
-  1. Запускает sidecar.exe как дочерний процесс
-  2. Читает {"event":"READY","port":7788} из stdout → HTTP API готов
-  3. Предоставляет методы для сигнализации:
-       post_streamer_offer(sdp)        → answer SDP (для Rust webrtc-rs)
-       post_viewer_offer(id, sdp)      → answer SDP (для aiortc viewer)
-       delete_streamer()               → закрыть streamer PC в SFU
-       delete_viewer(id)               → закрыть viewer PC в SFU
-       status()                        → {"streamer":"connected","viewers":N,...}
-  4. При stop() отправляет SIGTERM / terminate() и ждёт завершения
-
-─── FIX: зомби-убийца ──────────────────────────────────────────────────────
-  Старый код: проверял netstat на 127.0.0.1:{port}
-  Новый код:  проверяет 0.0.0.0:{port} И 127.0.0.1:{port}
-  Причина:    sidecar.exe слушает на 0.0.0.0, а не на 127.0.0.1.
-              Старый код никогда не находил зомби → порт занят → SFU падал.
-"""
 
 import json
 import logging
@@ -46,9 +26,6 @@ except ImportError:
 
 
 def _find_free_port(start: int = _DEFAULT_PORT, attempts: int = _PORT_RANGE) -> int:
-    """Возвращает первый свободный TCP-порт начиная с start.
-    НЕ использует SO_REUSEADDR — на Windows он разрешает bind() на занятый порт,
-    что давало ложный 'порт свободен' при живом зомби-процессе."""
     import socket as _sock
     for port in range(start, start + attempts):
         s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
@@ -67,11 +44,6 @@ READY_TIMEOUT = 8.0
 
 
 class SfuBridge:
-    """
-    Управляет Go Pion SFU как дочерним процессом.
-
-    Потокобезопасен: HTTP-методы можно вызывать из любого потока.
-    """
 
     def __init__(
         self,
@@ -109,20 +81,13 @@ class SfuBridge:
 
     @property
     def port(self) -> int:
-        """Реальный порт SFU — может отличаться от 7788 если тот был занят."""
         return self._port
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Жизненный цикл
-    # ──────────────────────────────────────────────────────────────────────────
-
     def start(self, timeout: float = READY_TIMEOUT) -> bool:
-        """Запускает sidecar.exe и ждёт HTTP-готовности."""
         if self._process is not None:
             if self.is_running():
                 logger.info("[SfuBridge] уже запущен")
                 return True
-            # Процесс умер но _process не сброшен — чистим и перезапускаем
             logger.warning("[SfuBridge] процесс умер — перезапускаем")
             self._process = None
             self._running = False
@@ -131,10 +96,6 @@ class SfuBridge:
             logger.error("[SfuBridge] %s не найден", self._exe_path)
             return False
 
-        # ── Динамический выбор порта при (пере)запуске ───────────────────────
-        # Каждый раз проверяем желаемый порт. Если занят — берём следующий
-        # свободный: не убиваем чужие процессы, просто уступаем порт.
-        # _kill_zombie — крайний fallback когда весь диапазон занят.
         try:
             free = _find_free_port(self._port)
         except RuntimeError:
@@ -147,19 +108,7 @@ class SfuBridge:
             self._port = free
             self._base_url = f"http://127.0.0.1:{self._port}"
 
-        # SENIOR FIX: _kill_zombie_on_port вызывается ТОЛЬКО если порт
-        # по-прежнему выглядит занятым после _find_free_port.
-        #
-        # Раньше было безусловно — но если free == self._port значит порт
-        # СВОБОДЕН, и мы пытались убить чужой процесс на соседнем порту
-        # (self._port уже был обновлён выше). В худшем случае убивали
-        # чужой sidecar или прошлую копию себя, на чужом порту.
-        #
-        # Теперь: если _find_free_port вернул тот же порт что и запрашивали,
-        # и выше в диапазоне портов вообще всё занято (RuntimeError) — тогда
-        # уже пробуем kill. В нормальном случае этот блок не срабатывает.
         if free == self._port:
-            # Порт свободен — зомби убивать не надо.
             pass
 
         try:
@@ -201,31 +150,19 @@ class SfuBridge:
             return False
 
     def _kill_zombie_on_port(self) -> None:
-        """
-        Убивает процесс слушающий на нашем порту перед запуском нового SFU.
 
-        FIX: проверяем ОБА адреса:
-          - 0.0.0.0:{port}   — sidecar.exe (listen all interfaces)
-          - 127.0.0.1:{port} — любой другой процесс на localhost
-
-        Старый код проверял только 127.0.0.1 и никогда не находил зомби.
-        """
         if sys.platform != "win32":
             return
 
-        # Быстрая проверка: порт свободен?
-        # FIX: НЕ ставим SO_REUSEADDR — на Windows он позволяет bind()
-        # на занятый порт → ложный "порт свободен" → зомби не убит.
         import socket as _sock
         probe = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
         try:
             probe.bind(("0.0.0.0", self._port))
             probe.close()
-            return  # Порт свободен — ничего убивать не надо
+            return
         except OSError:
             probe.close()
 
-        # Порт занят — ищем PID через netstat
         logger.warning("[SfuBridge] порт %d занят, ищем зомби...", self._port)
         pids_to_kill: set[str] = set()
 
@@ -235,7 +172,6 @@ class SfuBridge:
                 capture_output=True, text=True, timeout=5
             )
             for line in result.stdout.splitlines():
-                # FIX: проверяем 0.0.0.0:port И 127.0.0.1:port
                 addr_match = (
                     f"0.0.0.0:{self._port}" in line or
                     f"127.0.0.1:{self._port}" in line or
@@ -248,7 +184,6 @@ class SfuBridge:
         except Exception as e:
             logger.warning("[SfuBridge] netstat error: %s", e)
 
-        # Убиваем найденные PID
         for pid in pids_to_kill:
             try:
                 result = subprocess.run(
@@ -263,32 +198,18 @@ class SfuBridge:
                 logger.warning("[SfuBridge] taskkill PID=%s error: %s", pid, e)
 
         if pids_to_kill:
-            # FIX: было 0.3 с — мало на медленных машинах.
-            # После taskkill /F ОС не сразу освобождает сокет.
-            # 1.0 с гарантирует завершение TIME_WAIT.
             time.sleep(1.0)
         else:
-            # Порт занят но PID не найден — нестандартная ситуация
             logger.warning("[SfuBridge] порт %d занят, PID не найден — ждём 1 с", self._port)
             time.sleep(1.0)
 
     def stop(self) -> None:
-        """Останавливает sidecar.exe. Убивает процесс независимо от _running."""
         self._running = False
-
-        # FIX: старый код начинался с `if not self._running: return`.
-        # После EOF stdout _running = False → stop() немедленно возвращал ничего,
-        # оставляя Go-процесс живым на порту 7788.
-        # Теперь: убиваем процесс если он вообще существует и ещё жив.
         if self._process is None:
             return
-
         if self._process.poll() is not None:
-            # Уже мёртв — просто очищаем ссылку
             self._process = None
             return
-
-        # Процесс жив — даём 3 с на terminate(), потом kill()
         try:
             self._process.terminate()
         except Exception:
@@ -308,39 +229,9 @@ class SfuBridge:
         logger.info("[SfuBridge] завершён (code=%s)", code)
 
     def is_running(self) -> bool:
-        # ── FIX: корневой баг "зомби SFU + зритель не подключается" ─────────
-        #
-        # Go SFU намеренно закрывает stdout СРАЗУ после отправки READY JSON
-        # (дизайн: stdout используется только как канал инициализации).
-        # _read_stdout() видит EOF → устанавливает self._running = False.
-        #
-        # СТАРЫЙ КОД возвращал False из-за `self._running`, хотя OS-процесс
-        # продолжал работать на порту 7788. Это ломало:
-        #
-        #   1. stop_streaming_webrtc() — проверял is_running() и пропускал kill →
-        #      процесс оставался живым → следующий старт стрима получал
-        #      "bind: Only one usage of each socket address" и падал.
-        #
-        #   2. trigger_viewer_connect() — проверял is_running() и возвращал
-        #      без триггера → зритель никогда не получал CMD_WEBRTC_OFFER →
-        #      "Ожидание видео" на всё время сессии.
-        #
-        # НОВЫЙ КОД: проверяет только живой ли OS-процесс (poll() is None).
-        # _running используется только для чтения stdout (флаг "стоп потока").
         return self._process is not None and self._process.poll() is None
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # HTTP API — сигнализация
-    # ──────────────────────────────────────────────────────────────────────────
-
     def post_streamer_offer(self, sdp: str) -> str:
-        """
-        POST /streamer/offer
-        Отправляет SDP offer Rust webrtc-rs в Pion SFU.
-        Блокирует пока SFU не соберёт ICE (~50-200 мс для localhost).
-        Returns: answer SDP string
-        Raises: RuntimeError при HTTP/network ошибке.
-        """
         resp = self._post("/streamer/offer", {"sdp": sdp})
         answer = resp.get("sdp", "")
         if not answer:
@@ -349,12 +240,6 @@ class SfuBridge:
         return answer
 
     def post_viewer_offer(self, viewer_id: str, sdp: str) -> str:
-        """
-        POST /viewer/{viewer_id}/offer
-        Отправляет SDP offer aiortc viewer в Pion SFU.
-        Returns: answer SDP string
-        Raises: RuntimeError при ошибке.
-        """
         resp = self._post(f"/viewer/{viewer_id}/offer", {"sdp": sdp})
         answer = resp.get("sdp", "")
         if not answer:
@@ -365,25 +250,12 @@ class SfuBridge:
         return answer
 
     def delete_streamer(self) -> None:
-        """DELETE /streamer — закрывает streamer PC в SFU."""
         try:
             self._request("DELETE", "/streamer")
         except Exception as e:
             logger.warning("[SfuBridge] delete_streamer error: %s", e)
 
     def post_streamer_audio_offer(self, sdp: str) -> str:
-        """
-        POST /streamer/audio/offer
-        Отправляет SDP offer Python aiortc (SystemAudioTrack) в Pion SFU.
-
-        FIX: Rust media-engine не имеет доступа к InPulseAudioExclusion.dll.
-        Python захватывает системный звук через C++ DLL (WASAPI Process Loopback
-        с исключением PID InPulse) и подключает audio-only PC сюда.
-        SFU создаёт relay-трек и добавляет его ко всем зрителям.
-
-        Returns: answer SDP string
-        Raises:  RuntimeError при HTTP/network ошибке.
-        """
         resp = self._post("/streamer/audio/offer", {"sdp": sdp})
         answer = resp.get("sdp", "")
         if not answer:
@@ -392,21 +264,18 @@ class SfuBridge:
         return answer
 
     def delete_audio_streamer(self) -> None:
-        """DELETE /streamer/audio — закрывает audio streamer PC в SFU."""
         try:
             self._request("DELETE", "/streamer/audio")
         except Exception as e:
             logger.warning("[SfuBridge] delete_audio_streamer error: %s", e)
 
     def delete_viewer(self, viewer_id: str) -> None:
-        """DELETE /viewer/{viewer_id} — закрывает viewer PC в SFU."""
         try:
             self._request("DELETE", f"/viewer/{viewer_id}")
         except Exception as e:
             logger.warning("[SfuBridge] delete_viewer(%s) error: %s", viewer_id, e)
 
     def status(self) -> dict:
-        """GET /status → {"streamer":"connected|none","tracks":N,"viewers":N,...}"""
         try:
             return self._get("/status")
         except Exception as e:
@@ -414,7 +283,6 @@ class SfuBridge:
             return {"error": str(e)}
 
     def health(self) -> bool:
-        """GET /health → True если SFU отвечает."""
         try:
             resp = self._get("/health")
             return resp.get("ok", False)
@@ -422,20 +290,10 @@ class SfuBridge:
             return False
 
     def get_loss_stats(self) -> dict | None:
-        """
-        GET /stats/loss → агрегированная статистика потерь от зрителей.
-        Возвращает {'avg_loss_pct': float, 'max_loss_pct': float,
-                    'avg_jitter_ms': float, 'viewers': int} или None при ошибке.
-        Используется ABR потоком для адаптации битрейта.
-        """
         try:
             return self._get("/stats/loss")
         except Exception:
             return None
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Внутренние HTTP helpers
-    # ──────────────────────────────────────────────────────────────────────────
 
     def _post(self, path: str, body: dict) -> dict:
         data = json.dumps(body).encode("utf-8")
@@ -469,10 +327,6 @@ class SfuBridge:
         with request.urlopen(req, timeout=HTTP_TIMEOUT):
             pass
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # Чтение stdout (JSON events от Go SFU)
-    # ──────────────────────────────────────────────────────────────────────────
-
     def _read_stdout(self) -> None:
         try:
             for raw in iter(self._process.stdout.readline, b""):
@@ -504,7 +358,6 @@ class SfuBridge:
                 self._on_exit(code or 0)
 
     def _read_stderr(self) -> None:
-        """Читает логи Go SFU из stderr."""
         try:
             for raw in iter(self._process.stderr.readline, b""):
                 if not self._running:
@@ -514,13 +367,6 @@ class SfuBridge:
                     self._on_log(line)
         except Exception:
             pass
-
-
-# ── Module-level singleton ────────────────────────────────────────────────────
-# Both SFUServer (server.py) and NetworkClient (network_engine.py) call
-# SfuBridge.shared() to get the same instance.
-# Only the first caller actually spawns sidecar.exe.
-# This prevents a dual-process conflict when the user is both host and streamer.
 
 _shared_instance: "SfuBridge | None" = None
 _shared_lock = __import__('threading').Lock()
@@ -532,11 +378,7 @@ def get_shared(
     on_log=None,
     on_exit=None,
 ) -> "SfuBridge":
-    """
-    Returns the module-level singleton SfuBridge.
-    Creates it on first call with the given parameters.
-    Subsequent calls ignore exe_path/port/callbacks and return the existing instance.
-    """
+
     global _shared_instance
     if _shared_instance is None:
         with _shared_lock:
@@ -549,12 +391,9 @@ def get_shared(
                 )
     return _shared_instance
 
-
-# ── atexit: страховка от зомби при завершении Python-процесса ─────────────────
 import atexit as _atexit
 
 def _atexit_cleanup():
-    """Убивает sidecar.exe при завершении Python-процесса."""
     global _shared_instance
     if _shared_instance is not None:
         try:

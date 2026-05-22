@@ -20,23 +20,14 @@ from .ui_dialogs import (
     CUSTOM_SOUND_SLOTS,
 )
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Виджет: полоса уровня микрофона + маркер порога VAD в одной плоскости
-# ──────────────────────────────────────────────────────────────────────────────
 class MicVadWidget(QWidget):
-    """
-    Комбинированный виджет: VU-метр + встроенный порог VAD.
-    Перетаскивание мышью по полосе меняет порог.
-    Плавные цвета, без кислотного зелёного.
-    """
     threshold_changed = pyqtSignal(int)  # slider_val 1-50
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._level = 0          # 0–100
-        self._smooth_level = 0.0 # для плавной анимации
-        self._threshold_pos = 10 # 0–100
+        self._level = 0
+        self._smooth_level = 0.0
+        self._threshold_pos = 10
         self._dragging = False
         self.setMinimumHeight(32)
         self.setMaximumHeight(32)
@@ -46,7 +37,6 @@ class MicVadWidget(QWidget):
 
     def set_level(self, val: int):
         target = max(0, min(100, val))
-        # Плавная анимация: быстро вверх, медленно вниз
         if target > self._smooth_level:
             self._smooth_level = self._smooth_level * 0.3 + target * 0.7
         else:
@@ -83,27 +73,23 @@ class MicVadWidget(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
 
-        # Фон скруглённый
         p.setBrush(QColor(35, 38, 52))
         p.setPen(Qt.PenStyle.NoPen)
         p.drawRoundedRect(0, 0, w, h, 6, 6)
 
-        # Полоса уровня — мягкий градиент
         bar_w = int(self._level / 100.0 * w)
         if bar_w > 0:
             if self._level < self._threshold_pos:
-                bar_color = QColor(180, 80, 70, 180)    # приглушённый красный
+                bar_color = QColor(180, 80, 70, 180)
             else:
-                bar_color = QColor(80, 180, 120, 200)   # мягкий зелёный
+                bar_color = QColor(80, 180, 120, 200)
             p.setBrush(bar_color)
             p.drawRoundedRect(0, 0, bar_w, h, 6, 6)
 
-        # Маркер порога — треугольник сверху + вертикальная линия
         tx = int(self._threshold_pos / 100.0 * w)
         pen = QPen(QColor(255, 100, 80, 200), 2)
         p.setPen(pen)
         p.drawLine(tx, 4, tx, h - 4)
-        # Маленький треугольник-ручка сверху
         p.setBrush(QColor(255, 100, 80))
         p.setPen(Qt.PenStyle.NoPen)
         tri = [QPoint(tx - 4, 0), QPoint(tx + 4, 0), QPoint(tx, 6)]
@@ -111,23 +97,7 @@ class MicVadWidget(QWidget):
 
         p.end()
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Виджет перехвата нажатия горячих клавиш
-# ──────────────────────────────────────────────────────────────────────────────
 class HotkeyCaptureEdit(QLineEdit):
-    """
-    Поле для записи горячей клавиши кликом.
-
-    Поведение:
-      • Кликни → поле подсвечивается фиолетовым, появляется «Нажми клавишу…»
-      • Нажми любую клавишу (одиночную или с модификаторами) → записывается
-        строка вида «ctrl+shift+a», «alt+f4», «f8» и т.д.
-      • Escape во время захвата → отменяет, восстанавливает прежнее значение
-      • Повторный клик по занятому полю → очищает и снова ждёт ввода
-
-    Формат совпадает с форматом keyboard-библиотеки (строчные, '+' как разделитель).
-    """
 
     _WAIT_SS = (
         "QLineEdit {"
@@ -168,18 +138,13 @@ class HotkeyCaptureEdit(QLineEdit):
         self.setMinimumWidth(180)
         self.setFixedHeight(30)
 
-    # ── публичный API ─────────────────────────────────────────────────────────
-
     def set_hotkey(self, text: str):
-        """Программно задать значение (без перехода в режим захвата)."""
         self._prev_value = text
         self.setText(text)
         self.setStyleSheet(self._FILLED_SS if text else self._EMPTY_SS)
 
     def get_hotkey(self) -> str:
         return self.text()
-
-    # ── события ───────────────────────────────────────────────────────────────
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -201,7 +166,6 @@ class HotkeyCaptureEdit(QLineEdit):
 
         key = event.key()
 
-        # Escape — отмена
         if key == Qt.Key.Key_Escape:
             self._capturing = False
             self.setText(self._prev_value)
@@ -210,12 +174,10 @@ class HotkeyCaptureEdit(QLineEdit):
             self.clearFocus()
             return
 
-        # Игнорируем нажатие одних модификаторов — ждём основную клавишу
         if key in (Qt.Key.Key_Control, Qt.Key.Key_Shift, Qt.Key.Key_Alt,
                    Qt.Key.Key_Meta, Qt.Key.Key_AltGr):
             return
 
-        # Собираем строку модификаторов
         mods = event.modifiers()
         parts = []
         if mods & Qt.KeyboardModifier.ControlModifier:
@@ -225,7 +187,6 @@ class HotkeyCaptureEdit(QLineEdit):
         if mods & Qt.KeyboardModifier.ShiftModifier:
             parts.append("shift")
 
-        # Название основной клавиши
         key_name = self._key_to_str(key)
         if key_name:
             parts.append(key_name)
@@ -238,7 +199,6 @@ class HotkeyCaptureEdit(QLineEdit):
         self.clearFocus()
 
     def focusOutEvent(self, event):
-        """Отмена захвата при потере фокуса."""
         if self._capturing:
             self._capturing = False
             self.setText(self._prev_value)
@@ -248,18 +208,13 @@ class HotkeyCaptureEdit(QLineEdit):
 
     @staticmethod
     def _key_to_str(key: int) -> str:
-        """Qt.Key → строка совместимая с keyboard-библиотекой."""
-        # Буквы
         if Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
             return chr(key).lower()
-        # Цифры
         if Qt.Key.Key_0 <= key <= Qt.Key.Key_9:
             return chr(key)
-        # F-клавиши
         if Qt.Key.Key_F1 <= key <= Qt.Key.Key_F24:
             n = key - Qt.Key.Key_F1 + 1
             return f"f{n}"
-        # Специальные
         _MAP = {
             Qt.Key.Key_Space:       "space",
             Qt.Key.Key_Return:      "enter",
@@ -295,37 +250,25 @@ class HotkeyCaptureEdit(QLineEdit):
         }
         return _MAP.get(key, "")
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Диалог настроек
-# ──────────────────────────────────────────────────────────────────────────────
 class SettingsDialog(QDialog):
     def __init__(self, audio_engine, parent):
         super().__init__(parent)
         self.audio = audio_engine
-        self.mw = parent  # MainWindow
+        self.mw = parent
         self.app_settings = QSettings("MyVoiceChat", "GlobalSettings")
 
-        # ── Безрамочный стеклянный дизайн (единый стиль с SoundboardPanel) ──
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setWindowTitle("Настройки")
         self.resize(780, 660)
         self.setMinimumSize(480, 520)
 
-        # ── FIX MEM: удаляем C++ объект при закрытии (accept/reject/X). ─────
-        # Без WA_DeleteOnClose Qt скрывает диалог, но не уничтожает его.
-        # audio_engine держит сильную ссылку на mic_vad через сигнальный слот →
-        # весь диалог остаётся в памяти. Каждое открытие настроек добавляло
-        # ~20–30 МБ виджетов, которые никогда не освобождались.
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
 
-        # ── Корневой layout: прозрачный фон, карточка с border-radius ─────────
         root_lay = QVBoxLayout(self)
         root_lay.setContentsMargins(0, 0, 0, 0)
         root_lay.setSpacing(0)
 
-        # Карточка — полупрозрачный тёмный фон, скруглённые углы
         self._card = QFrame(self)
         self._card.setObjectName("settingsCard")
         self._card.setStyleSheet("""
@@ -495,18 +438,15 @@ class SettingsDialog(QDialog):
         card_lay.setContentsMargins(0, 0, 0, 0)
         card_lay.setSpacing(0)
 
-        # ── Кастомный title bar ───────────────────────────────────────────────
         self._title_bar = _DialogTitleBar(self, "⚙  Настройки")
         card_lay.addWidget(self._title_bar)
 
-        # Разделитель под title bar
         _sep = QFrame()
         _sep.setFrameShape(QFrame.Shape.HLine)
         _sep.setFixedHeight(1)
         _sep.setStyleSheet("background: rgba(255,255,255,0.08); border: none;")
         card_lay.addWidget(_sep)
 
-        # ── Основной контент ──────────────────────────────────────────────────
         content_w = QWidget()
         content_w.setStyleSheet("background: transparent;")
         content_lay = QVBoxLayout(content_w)
@@ -517,24 +457,18 @@ class SettingsDialog(QDialog):
         self.tabs = QTabWidget()
         self.tabs.setUsesScrollButtons(True)
 
-        # 1. Профиль
         self.setup_profile_tab()
 
-        # 2. Аудио
         self.setup_audio_tab()
 
-        # 3. Персонализация (Хоткеи + бывший Шёпот)
         self.setup_personalization_tab()
 
-        # 4. SoundBoard — кастомные звуки + громкость
         self.setup_soundboard_tab()
 
-        # 5. Версия
         self.setup_version_tab()
 
         content_lay.addWidget(self.tabs)
 
-        # Кнопка «Сохранить» внизу карточки
         btn_save = QPushButton("✔  Сохранить")
         btn_save.setStyleSheet("""
             QPushButton {
@@ -555,37 +489,18 @@ class SettingsDialog(QDialog):
         btn_save.clicked.connect(self.save_all)
         content_lay.addWidget(btn_save)
 
-        # ── Фикс прозрачности выпадающих списков на Windows ──────────────────
-        # QComboBox-popup — отдельное top-level окно. Если родитель имеет
-        # WA_TranslucentBackground, Windows-compositor рендерит popup тоже
-        # прозрачным, игнорируя background-color из CSS.
-        # Решение: явно задаём solid-stylesheet непосредственно на view-виджете
-        # каждого комбобокса и снимаем флаг TranslucentBackground с его окна.
         QTimer.singleShot(0, self._fix_combo_popups)
 
-    # ── Вкладка «Главное» ──────────────────────────────────────────────────────
-    # Раскладка:
-    #   Верхний блок: слева аватарка (fixed 96×96) + под ней кнопка «Изменить»;
-    #                 справа — лейбл «Никнейм» + поле ввода, выровнены по верху
-    #                 аватарки.
-    #   Разделитель.
-    #   Блок «Сервер»: лейбл + кнопка «Очистить кеш» сразу под ним.
-    #   Лейбл «Забаненные участники» (без QGroupBox-рамки) + список + кнопка.
-    #
-    # Никаких пустых addSpacing(20) — интервалы задаются через lay.setSpacing
-    # и контролируемые аддонные spacing'и, чтобы окно выглядело плотно и ровно.
     def setup_profile_tab(self):
         tab = QWidget()
         lay = QVBoxLayout(tab)
         lay.setContentsMargins(14, 14, 14, 14)
         lay.setSpacing(10)
 
-        # ── Верхний блок: аватарка слева + ник справа (две колонки) ───────────
         top_row = QHBoxLayout()
         top_row.setSpacing(14)
         top_row.setContentsMargins(0, 0, 0, 0)
 
-        # Колонка-аватарка: preview + кнопка «Изменить» под ним
         av_col = QVBoxLayout()
         av_col.setSpacing(6)
         av_col.setContentsMargins(0, 0, 0, 0)
@@ -625,9 +540,6 @@ class SettingsDialog(QDialog):
 
         top_row.addLayout(av_col)
 
-        # Колонка-никнейм: лейбл + QLineEdit. Выравниваем верх колонки с
-        # верхом аватарки — спейсер не нужен, QVBoxLayout по умолчанию
-        # начинает сверху.
         nick_col = QVBoxLayout()
         nick_col.setSpacing(6)
         nick_col.setContentsMargins(0, 2, 0, 0)
@@ -655,18 +567,16 @@ class SettingsDialog(QDialog):
         nick_col.addWidget(self.ed_nick)
         nick_col.addStretch()
 
-        top_row.addLayout(nick_col, 1)  # растягивается по ширине
+        top_row.addLayout(nick_col, 1)
 
         lay.addLayout(top_row)
 
-        # ── Тонкий разделитель ────────────────────────────────────────────────
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
         sep.setStyleSheet("background: rgba(255,255,255,0.08); border: none; max-height: 1px;")
         sep.setMaximumHeight(1)
         lay.addWidget(sep)
 
-        # ── Блок «Сервер» ─────────────────────────────────────────────────────
         lbl_server = QLabel("Сервер")
         lbl_server.setStyleSheet(
             "color: rgba(200,200,210,0.8); font-size: 12px;"
@@ -699,10 +609,6 @@ class SettingsDialog(QDialog):
         btn_clear_cache.hold_complete.connect(self._on_clear_server_cache)
         lay.addWidget(btn_clear_cache)
 
-        # ── Забаненные участники (виден только хосту, без рамки QGroupBox) ────
-        # Лейбл-заголовок в том же стиле что «Сервер», список, кнопка разбана.
-        # Держим всё как child-виджеты этого же layout — если мы не хост,
-        # просто прячем их через setVisible(False).
         self._ban_section_widgets: list = []
 
         self._ban_title = QLabel("Забаненные участники")
@@ -741,8 +647,6 @@ class SettingsDialog(QDialog):
         self._ban_list_widget.setMaximumHeight(160)
         lay.addWidget(self._ban_list_widget)
         self._ban_section_widgets.append(self._ban_list_widget)
-
-        # Кнопка разбана — с нормальным отступом от списка (через spacing).
         lay.addSpacing(2)
         self._btn_unban = QPushButton("Разбанить выделенных")
         self._btn_unban.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -770,8 +674,6 @@ class SettingsDialog(QDialog):
         lay.addWidget(self._btn_unban)
         self._ban_section_widgets.append(self._btn_unban)
 
-        # Видимость банлиста: только хост. Подписываемся на ответы сервера,
-        # при открытии — дергаем запрос, если мы хост.
         self._refresh_ban_group_visibility()
         try:
             self.mw.net.ban_list_updated.connect(self._on_ban_list_updated)
@@ -787,9 +689,7 @@ class SettingsDialog(QDialog):
         lay.addStretch()
         self.tabs.addTab(tab, "Главное")
 
-    # ── Банлист: видимость / запросы / обработка ответа ──────────────────────
     def _is_local_host(self) -> bool:
-        """Локальный пользователь — владелец встроенного сервера."""
         try:
             my_uid = getattr(self.mw.audio, 'my_uid', 0)
             srv_uid = getattr(self.mw.net, '_server_host_uid', 0)
@@ -798,7 +698,6 @@ class SettingsDialog(QDialog):
             return False
 
     def _refresh_ban_group_visibility(self) -> None:
-        """Прячем/показываем все три виджета банлиста одной пачкой."""
         visible = self._is_local_host()
         for w in getattr(self, '_ban_section_widgets', ()):
             try:
@@ -807,11 +706,7 @@ class SettingsDialog(QDialog):
                 pass
 
     def _on_ban_list_updated(self, entries: list) -> None:
-        """
-        Пришёл свежий снимок банлиста от сервера — перерисовываем список.
-        Каждая запись — dict {ip, nick, banned_at, reason}; пару (ip, nick)
-        храним в UserRole для последующего разбана.
-        """
+
         if not hasattr(self, '_ban_list_widget'):
             return
         self._ban_list_widget.clear()
@@ -830,12 +725,10 @@ class SettingsDialog(QDialog):
                 continue
             display_nick = nick or '(без ника)'
             item = QListWidgetItem(f"{display_nick}    ·    {ip}")
-            # Для разбана нужна именно пара (ip, nick) — храним как tuple.
             item.setData(Qt.ItemDataRole.UserRole, (ip, nick))
             self._ban_list_widget.addItem(item)
 
     def _on_unban_selected_clicked(self) -> None:
-        """Шлём CMD_HOST_UNBAN для каждой выделенной пары (ip, nick)."""
         selected = self._ban_list_widget.selectedItems()
         if not selected:
             return
@@ -856,7 +749,6 @@ class SettingsDialog(QDialog):
             print(f"[Settings] Unban error: {e}")
 
     def _on_clear_server_cache(self):
-        """Очищает SQLite историю чата через открытое соединение."""
         try:
             from server import EmbeddedServerManager
             mgr = EmbeddedServerManager.get()
@@ -875,7 +767,6 @@ class SettingsDialog(QDialog):
         except Exception as e:
             print(f"[Settings] Ошибка очистки: {e}")
 
-    # ── Вкладка «Аудио» ───────────────────────────────────────────────────────
     def setup_audio_tab(self):
         aud_tab = QWidget()
         aud_lay = QVBoxLayout(aud_tab)
@@ -884,7 +775,6 @@ class SettingsDialog(QDialog):
         self.cb_out = QComboBox()
         self.refresh_devices_list()
 
-        # ── Шумоподавление: ComboBox с тремя режимами ──────────────────────────
         nr_label = QLabel("🎛  Шумоподавление микрофона:")
         nr_label.setStyleSheet("font-weight: bold; font-size: 12px; margin-top: 6px;")
 
@@ -896,20 +786,16 @@ class SettingsDialog(QDialog):
             "DeepFilterNet — глубокая фильтрация (средняя нагрузка)"
         )
 
-        # Пункт 0: всегда доступен
         self.cb_nr.addItem("🔇  Выкл", 0)
 
-        # Пункт 1: RNNoise
         rnn_item_text = "🟢  RNNoise" if PYRNNOISE_AVAILABLE else "🔴  RNNoise (модуль не установлен)"
         self.cb_nr.addItem(rnn_item_text, 1)
         if not PYRNNOISE_AVAILABLE:
-            # Блокируем пункт через setData на роль Qt.ItemDataRole.UserRole+1
             model = self.cb_nr.model()
             item = model.item(1)
             if item:
                 item.setEnabled(False)
 
-        # Пункт 2: DeepFilterNet
         dfn_ok = getattr(self.audio, 'dfn_available', False)
         dfn_item_text = "🔵  DeepFilterNet" if dfn_ok else "🔴  DeepFilterNet (dll не найдена)"
         self.cb_nr.addItem(dfn_item_text, 2)
@@ -919,7 +805,6 @@ class SettingsDialog(QDialog):
             if item:
                 item.setEnabled(False)
 
-        # Восстанавливаем сохранённый режим
         saved_nr = getattr(self.audio, 'nr_mode', 0)
         idx = self.cb_nr.findData(saved_nr)
         if idx != -1:
@@ -953,7 +838,6 @@ class SettingsDialog(QDialog):
         aud_lay.addWidget(nr_label)
         aud_lay.addWidget(self.cb_nr)
 
-        # ── Блок: Микрофон + Порог VAD (объединённый) ────────────────────────
         aud_lay.addSpacing(10)
         mic_group = QGroupBox("🎙  Микрофон и порог активации (VAD)")
         mic_group.setStyleSheet("QGroupBox { font-weight: bold; }")
@@ -966,12 +850,10 @@ class SettingsDialog(QDialog):
         hint_lbl.setWordWrap(True)
         mic_lay.addWidget(hint_lbl)
 
-        # Комбо-виджет: полоса уровня + маркер VAD
         self.mic_vad = MicVadWidget()
         self.audio.volume_level_signal.connect(self.mic_vad.set_level)
         mic_lay.addWidget(self.mic_vad)
 
-        # Ползунок VAD встроен в MicVadWidget (перетаскивание мышью)
         vad_slider_val = int(self.app_settings.value("vad_threshold_slider", 5))
         self._current_vad_val = vad_slider_val
         self.mic_vad.set_threshold(vad_slider_val)
@@ -979,17 +861,8 @@ class SettingsDialog(QDialog):
 
         aud_lay.addWidget(mic_group)
 
-        # ── Прочие ползунки ───────────────────────────────────────────────────
         aud_lay.addSpacing(8)
 
-        # Системные звуки (уведомления):  слайдер 0-100, но применяется КВАДРАТ
-        # (slider/100)^2.  Это выравнивает перцептивную громкость:
-        #   0% →  0.00x  (тихо)
-        #  20% →  0.04x  (‑28 dB, комфортно для фоновых уведомлений)
-        #  50% →  0.25x  (‑12 dB, средне)
-        # 100% →  1.00x  (0 dB, максимум pygame)
-        # При линейной шкале default 70 → pygame vol 0.70 — слишком громко.
-        # При квадратичной default 30 → 0.09x (≈ −21 dB) — ненавязчиво.
         sys_vol = int(self.app_settings.value("system_sound_volume", 30))
         self.lbl_sys = QLabel(f"Системные звуки: {sys_vol}%")
         self.sl_sys = QSlider(Qt.Orientation.Horizontal)
@@ -1002,18 +875,8 @@ class SettingsDialog(QDialog):
         aud_lay.addStretch()
         self.tabs.addTab(aud_tab, "Аудио")
 
-    # ── Вкладка «Персонализация» (Горячие клавиши) ────────────────────────────
     def setup_personalization_tab(self):
-        """
-        Вкладка объединяет:
-        • Горячие клавиши для mute/deafen (раньше были статическими QLineEdit)
-        • PTT-шёпот по нику (раньше вкладка «Шёпот»)
-        • Горячие клавиши для звуков Soundboard
 
-        Дизайн: динамическая таблица строк.
-        Каждая строка = [Функция (ComboBox)] + [Горячая клавиша (HotkeyCaptureEdit)] + [✕]
-        По умолчанию — 1 пустая строка. Кнопка «+» добавляет ещё (макс 8).
-        """
         tab = QWidget()
         outer = QVBoxLayout(tab)
         outer.setSpacing(10)
@@ -1026,7 +889,6 @@ class SettingsDialog(QDialog):
         hk_group_lay.setContentsMargins(10, 14, 10, 10)
         outer.addWidget(hk_group, stretch=1)
 
-        # ── Заголовки колонок ─────────────────────────────────────────────────
         hdr_row = QHBoxLayout()
         hdr_row.setContentsMargins(4, 0, 36, 0)   # 36 = ширина кнопки «✕»
         hdr_row.setSpacing(8)
@@ -1038,7 +900,6 @@ class SettingsDialog(QDialog):
         hdr_row.addWidget(lbl_key,  stretch=5)
         hk_group_lay.addLayout(hdr_row)
 
-        # ── Скролл-область со строками ────────────────────────────────────────
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -1053,7 +914,6 @@ class SettingsDialog(QDialog):
         scroll.setWidget(self._hk_rows_container)
         hk_group_lay.addWidget(scroll, stretch=1)
 
-        # ── Кнопка «Добавить» — жёстко прибита к низу вкладки (вне GroupBox) ──
         self._btn_hk_add = QPushButton("＋  Добавить назначение")
         self._btn_hk_add.setStyleSheet("""
             QPushButton {
@@ -1076,35 +936,20 @@ class SettingsDialog(QDialog):
         self._btn_hk_add.clicked.connect(self._add_hk_row)
         outer.addWidget(self._btn_hk_add, alignment=Qt.AlignmentFlag.AlignLeft)
 
-        # ── Список строк (модель) ─────────────────────────────────────────────
-        # Каждый элемент: {"cb": QComboBox, "hk": HotkeyCaptureEdit, "frame": QFrame}
         self._hk_rows: list[dict] = []
 
-        # ── Загружаем сохранённые строки ──────────────────────────────────────
         self._load_hk_rows()
 
         self.tabs.addTab(tab, "Персонализация")
 
-    # ── Вспомогательные методы новой таблицы горячих клавиш ──────────────────
-
     def _build_function_options(self) -> list[tuple[str, str, str]]:
-        """
-        Возвращает список (display_text, func_type, func_data) для ComboBox.
 
-        func_type:
-          "none"      — не задано
-          "mute_mic"  — замутить микрофон
-          "deafen"    — замутить динамики
-          "whisper"   — шёпот; func_data = IP пользователя
-          "sound"     — soundboard; func_data = имя звука (строка из QSettings)
-        """
         opts: list[tuple[str, str, str]] = [
             ("— не задано —",                  "none",     ""),
             ("🎙  Замутить микрофон",           "mute_mic", ""),
             ("🔇  Замутить динамики (Deafen)",  "deafen",   ""),
         ]
 
-        # ── Пользователи из known_users.json (для шёпота) ─────────────────────
         try:
             if os.path.exists(KNOWN_USERS_PATH):
                 with open(KNOWN_USERS_PATH, "r", encoding="utf-8") as f:
@@ -1119,7 +964,6 @@ class SettingsDialog(QDialog):
         except Exception:
             pass
 
-        # ── Кастомные звуки soundboard ────────────────────────────────────────
         s = self.app_settings
         for i in range(CUSTOM_SOUND_SLOTS):
             name = s.value(f"custom_sound_{i}_name", "")
@@ -1130,13 +974,6 @@ class SettingsDialog(QDialog):
 
     def _add_hk_row(self, func_type: str = "none", func_data: str = "",
                     hotkey: str = "", anonymous: bool = False) -> None:
-        """Добавляет одну строку в таблицу горячих клавиш.
-
-        :param anonymous: применимо только для функции 'whisper' — если True,
-            при срабатывании PTT-хоткея включается анонимный режим
-            (получатель не видит имя отправителя). Игнорируется для других
-            типов функций.
-        """
         MAX_ROWS = 7
         if len(self._hk_rows) >= MAX_ROWS:
             self._btn_hk_add.setEnabled(False)
@@ -1144,7 +981,6 @@ class SettingsDialog(QDialog):
 
         opts = self._build_function_options()
 
-        # ── Фрейм строки ──────────────────────────────────────────────────────
         frame = QFrame()
         frame.setStyleSheet("""
             QFrame {
@@ -1157,13 +993,11 @@ class SettingsDialog(QDialog):
         row_lay.setContentsMargins(8, 5, 8, 5)
         row_lay.setSpacing(8)
 
-        # Колонка 1: выбор функции
         cb = QComboBox()
         cb.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         for text, ftype, fdata in opts:
             cb.addItem(text, (ftype, fdata))
 
-        # Восстанавливаем выбор
         selected_idx = 0
         for j in range(cb.count()):
             d = cb.itemData(j)
@@ -1172,7 +1006,6 @@ class SettingsDialog(QDialog):
                 break
         cb.setCurrentIndex(selected_idx)
 
-        # ── Фикс прозрачности выпадающего списка на Windows ──────────────────
         def _fix_this_cb_popup(combo=cb):
             try:
                 v = combo.view()
@@ -1193,13 +1026,9 @@ class SettingsDialog(QDialog):
                 pass
         QTimer.singleShot(0, _fix_this_cb_popup)
 
-        # Колонка 2: захват клавиши
         hk_edit = HotkeyCaptureEdit()
         hk_edit.set_hotkey(hotkey)
 
-        # Колонка 3: чекбокс «Анонимно» (виден только для функции whisper).
-        # Занимает фиксированное место в layout даже когда скрыт — чтобы
-        # столбцы не «прыгали» при смене типа функции в соседних строках.
         chk_anon = QCheckBox("👤")
         chk_anon.setChecked(bool(anonymous))
         chk_anon.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1232,20 +1061,15 @@ class SettingsDialog(QDialog):
             }
         """)
 
-        # Видимость чекбокса завязана на текущую функцию: только для whisper.
         def _sync_anon_visibility(_ignored=None, _combo=cb, _chk=chk_anon):
             data = _combo.currentData()
             is_whisper = bool(data and data[0] == "whisper")
             _chk.setVisible(is_whisper)
             if not is_whisper and _chk.isChecked():
-                # Снимаем галочку если функция больше не whisper — настройка
-                # для других функций бессмысленна, и это предотвратит утечку
-                # whisper_slot_{i}_anon=true при сохранении.
                 _chk.setChecked(False)
         _sync_anon_visibility()
         cb.currentIndexChanged.connect(_sync_anon_visibility)
 
-        # Кнопка удаления
         btn_del = QPushButton("✕")
         btn_del.setFixedSize(28, 28)
         btn_del.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1272,23 +1096,17 @@ class SettingsDialog(QDialog):
         slot = {"cb": cb, "hk": hk_edit, "anon": chk_anon, "frame": frame}
         self._hk_rows.append(slot)
 
-        # Вставляем перед последним stretch
         stretch_idx = self._hk_rows_layout.count() - 1
         self._hk_rows_layout.insertWidget(stretch_idx, frame)
 
-        # Кнопка «+» — недоступна при максимуме
         self._btn_hk_add.setEnabled(len(self._hk_rows) < MAX_ROWS)
 
-        # ── Удаление строки ───────────────────────────────────────────────────
-        # ВАЖНО: btn_del.clicked передаёт checked:bool первым аргументом.
-        # Принимаем его явно, чтобы он не попал в _slot и list.remove() не падал.
         def _remove(checked: bool = False, _slot=slot):
             if _slot not in self._hk_rows:
-                return   # защита от двойного срабатывания
+                return
             self._hk_rows.remove(_slot)
             _slot["frame"].setParent(None)
             _slot["frame"].deleteLater()
-            # Если строк не осталось — добавляем одну пустую
             if not self._hk_rows:
                 self._add_hk_row()
             self._btn_hk_add.setEnabled(len(self._hk_rows) < MAX_ROWS)
@@ -1296,11 +1114,7 @@ class SettingsDialog(QDialog):
         btn_del.clicked.connect(_remove)
 
     def _load_hk_rows(self) -> None:
-        """
-        Загружает строки горячих клавиш из QSettings.
-        Если сохранённых строк нет (первый запуск или всё удалено) —
-        добавляет одну пустую строку-шаблон.
-        """
+
         s = self.app_settings
         count = s.value("hk_table_count", None)
 
@@ -1312,34 +1126,17 @@ class SettingsDialog(QDialog):
             ftype = s.value(f"hk_table_{i}_type", "none")
             fdata = s.value(f"hk_table_{i}_data", "")
             fhk   = s.value(f"hk_table_{i}_key",  "")
-            # Флаг анонимного шёпота — бэк-совместим: для старых сохранений ключа
-            # нет → чекбокс будет снят по умолчанию.
+
             fanon = s.value(f"hk_table_{i}_anon", "false") == "true"
             self._add_hk_row(ftype, fdata, fhk, anonymous=fanon)
 
-    # ── Старая вкладка «Шёпот» — удалена (логика перенесена в Персонализацию) ─
-    # setup_whisper_tab — метод намеренно отсутствует.
-    # _clear_whisper_slots — метод намеренно отсутствует.
-
-    # ── Вкладка «SoundBoard» ──────────────────────────────────────────────────
     def setup_soundboard_tab(self):
-        """
-        Вкладка управления Soundboard:
-        - Ползунок громкости (перенесён с вкладки Аудио)
-        - 3 слота кастомных звуков: выбор файла mp3/wav с ПК (макс. 1 МБ),
-          отображение имени, кнопка удаления.
 
-        Хранение: QSettings, ключи custom_sound_{i}_path и custom_sound_{i}_name.
-        Воспроизведение: файл читается в байты → base64 → поле data_b64 в
-        JSON-пакете CMD_SOUNDBOARD. Сервер ретранслирует его без изменений.
-        Клиенты декодируют base64 и воспроизводят из памяти (BytesIO).
-        """
         tab = QWidget()
         lay = QVBoxLayout(tab)
         lay.setSpacing(14)
         lay.setContentsMargins(16, 16, 16, 16)
 
-        # ── Блок: Громкость Soundboard ────────────────────────────────────────
         vol_group = QGroupBox("🔊  Громкость Soundboard")
         vol_group.setStyleSheet("QGroupBox { font-weight: bold; }")
         vol_lay = QVBoxLayout(vol_group)
@@ -1354,7 +1151,6 @@ class SettingsDialog(QDialog):
         vol_lay.addWidget(self.sl_sb)
         lay.addWidget(vol_group)
 
-        # ── Блок: Кастомные звуки ─────────────────────────────────────────────
         cust_group = QGroupBox("🎵  Мои звуки")
         cust_group.setStyleSheet("QGroupBox { font-weight: bold; }")
         cust_lay = QVBoxLayout(cust_group)
@@ -1379,7 +1175,6 @@ class SettingsDialog(QDialog):
 
     def _add_custom_sound_row(self, parent_lay: QVBoxLayout, idx: int,
                                saved_path: str = "", saved_name: str = ""):
-        """Создаёт строку кастомного звука с кнопками Browse и Delete."""
         row_frame = QFrame()
         row_frame.setStyleSheet("""
             QFrame {
@@ -1392,7 +1187,6 @@ class SettingsDialog(QDialog):
         row_lay.setContentsMargins(10, 7, 10, 7)
         row_lay.setSpacing(8)
 
-        # Номер слота
         num_lbl = QLabel(f"#{idx + 1}")
         num_lbl.setFixedWidth(24)
         num_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1402,7 +1196,6 @@ class SettingsDialog(QDialog):
         )
         row_lay.addWidget(num_lbl)
 
-        # Имя файла (или заглушка)
         name_lbl = QLabel(saved_name if saved_name else "— не выбрано —")
         name_lbl.setStyleSheet(
             "font-size: 12px; color: #ccc; background: transparent; border: none;"
@@ -1412,7 +1205,6 @@ class SettingsDialog(QDialog):
         name_lbl.setToolTip(saved_path)
         row_lay.addWidget(name_lbl, stretch=1)
 
-        # Кнопка «Выбрать»
         btn_browse = QPushButton("📂  Выбрать")
         btn_browse.setFixedHeight(28)
         btn_browse.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1432,7 +1224,6 @@ class SettingsDialog(QDialog):
         """)
         row_lay.addWidget(btn_browse)
 
-        # Кнопка «Удалить»
         btn_del = QPushButton("✕")
         btn_del.setFixedSize(28, 28)
         btn_del.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1462,7 +1253,6 @@ class SettingsDialog(QDialog):
                 "name_lbl": name_lbl, "btn_del": btn_del}
         self._custom_sound_rows.append(slot)
 
-        # ── Слоты ──────────────────────────────────────────────────────────────
         def _on_browse(checked=False, _idx=idx, _slot=slot):
             path, _ = QFileDialog.getOpenFileName(
                 self, f"Выбрать звук для слота #{_idx + 1}",
@@ -1470,7 +1260,6 @@ class SettingsDialog(QDialog):
             )
             if not path:
                 return
-            # Проверка размера
             try:
                 fsize = os.path.getsize(path)
             except OSError:
@@ -1482,7 +1271,6 @@ class SettingsDialog(QDialog):
                     f"Выбранный файл: {fsize // 1024} КБ."
                 )
                 return
-            # Проверка длительности для WAV
             if path.lower().endswith(".wav"):
                 try:
                     with wave.open(path, 'rb') as wf:
@@ -1495,7 +1283,7 @@ class SettingsDialog(QDialog):
                         )
                         return
                 except Exception:
-                    pass  # не WAV-совместимый заголовок — пропускаем проверку
+                    pass
 
             name = os.path.splitext(os.path.basename(path))[0]
             _slot["path"] = path
@@ -1506,10 +1294,8 @@ class SettingsDialog(QDialog):
                 "font-size: 12px; color: #7ecf8e; background: transparent; border: none;"
             )
             _slot["btn_del"].setEnabled(True)
-            # Сохраняем немедленно — чтобы SoundboardPanel мог перестроиться
             self.app_settings.setValue(f"custom_sound_{_idx}_path", path)
             self.app_settings.setValue(f"custom_sound_{_idx}_name", name)
-            # Перестраиваем панель если открыта
             self._rebuild_sb_panel_if_open()
 
         def _on_delete(checked=False, _idx=idx, _slot=slot):
@@ -1531,7 +1317,6 @@ class SettingsDialog(QDialog):
         parent_lay.addWidget(row_frame)
 
     def _rebuild_sb_panel_if_open(self):
-        """Перестраивает SoundboardPanel если он сейчас открыт."""
         try:
             mw = self.mw
             if hasattr(mw, '_sb_panel') and mw._sb_panel is not None:
@@ -1543,7 +1328,6 @@ class SettingsDialog(QDialog):
         except Exception:
             pass
 
-    # ── Вкладка «Версия» ──────────────────────────────────────────────────────
     def setup_version_tab(self):
         class _Bridge(QObject):
             sig_found    = pyqtSignal(str, str)   # version, download_url
@@ -1610,15 +1394,11 @@ class SettingsDialog(QDialog):
             self._btn_check_update.setEnabled(False)
             self._ver_status_lbl.setText("⚠ GITHUB_REPO не задан в version.py")
 
-        # ── Разделитель ───────────────────────────────────────────────────────
         sep2 = QFrame()
         sep2.setFrameShape(QFrame.Shape.HLine)
         sep2.setFrameShadow(QFrame.Shadow.Sunken)
         lay.addWidget(sep2)
 
-        # ── Кнопка «Открыть папку с логами» ──────────────────────────────────
-        # Открывает %APPDATA%\InPulse\logs в проводнике Windows.
-        # Пользователи-тестировщики прикладывают логи к баг-репортам.
         btn_logs = QPushButton("📂  Открыть папку с логами")
         btn_logs.setFixedHeight(34)
         btn_logs.setToolTip("Открывает папку с файлами логов в Проводнике")
@@ -1643,8 +1423,6 @@ class SettingsDialog(QDialog):
 
         lay.addStretch()
         self.tabs.addTab(tab, "Версия")
-
-    # ── Слоты обновления ──────────────────────────────────────────────────────
 
     def _slot_update_found(self, version: str, download_url: str):
         self._pending_download_url = download_url
@@ -1673,17 +1451,14 @@ class SettingsDialog(QDialog):
         QTimer.singleShot(1500, QApplication.instance().quit)
 
     def _on_open_logs_folder(self):
-        """Открывает папку с логами в Проводнике Windows (или файловом менеджере ОС)."""
         import subprocess
         _appdata = os.environ.get('APPDATA') or os.path.expanduser('~')
         logs_dir = os.path.join(_appdata, 'InPulse', 'logs')
         os.makedirs(logs_dir, exist_ok=True)
         try:
             if os.name == 'nt':
-                # Windows: открываем проводник с фокусом на папке
                 os.startfile(logs_dir)
             else:
-                # macOS / Linux fallback
                 subprocess.Popen(['xdg-open', logs_dir])
         except Exception as e:
             from PyQt6.QtWidgets import QMessageBox
@@ -1726,8 +1501,6 @@ class SettingsDialog(QDialog):
             on_error=lambda msg: bridge.sig_error.emit(msg),
         )
 
-    # ── Вспомогательные методы профиля ───────────────────────────────────────
-
     def open_av_sel(self):
         d = AvatarSelector(self)
         if d.exec():
@@ -1742,7 +1515,6 @@ class SettingsDialog(QDialog):
         devs = sd.query_devices()
         apis = sd.query_hostapis()
 
-        # Ищем индекс WASAPI. Если его нет (что редкость) — фоллбэк на дефолт ОС.
         wasapi_idx = next((i for i, a in enumerate(apis) if 'WASAPI' in a['name']), None)
         target_api_idx = wasapi_idx if wasapi_idx is not None else sd.default.hostapi
 
@@ -1767,7 +1539,6 @@ class SettingsDialog(QDialog):
                 self.cb_out.addItem(dn)
                 u_out.add(dn)
 
-        # Если сохраненных настроек нет, выбираем дефолтные WASAPI устройства
         if not s_in and target_api_idx is not None:
             def_in_idx = apis[target_api_idx]['default_input_device']
             s_in = f"{devs[def_in_idx]['name']} ({apis[target_api_idx]['name']})"
@@ -1785,21 +1556,13 @@ class SettingsDialog(QDialog):
         self.mic_vad.set_threshold(val)
 
     def _on_nr_mode_changed(self, index: int):
-        """Вызывается при смене режима шумодава в ComboBox."""
         mode = self.cb_nr.currentData()
         if mode is None:
             return
         self.audio.set_nr_mode(mode)
 
     def _fix_combo_popups(self):
-        """
-        Устраняет прозрачность выпадающих меню QComboBox на Windows.
 
-        Причина: диалог имеет WA_TranslucentBackground, и Windows-compositor
-        рендерит popup-окно комбобокса тоже прозрачным, несмотря на CSS.
-        Решение: для каждого QComboBox явно ставим solid-stylesheet на view-виджет
-        и снимаем WA_TranslucentBackground с его top-level окна.
-        """
         from PyQt6.QtWidgets import QComboBox as _QCB
         _VIEW_SS = (
             "QAbstractItemView {"
@@ -1823,18 +1586,11 @@ class SettingsDialog(QDialog):
     def get_devices(self):
         return self.cb_in.currentText(), self.cb_out.currentText()
 
-    # ── FIX MEM: отключаем сигнал уровня микрофона перед закрытием ───────────
-    # audio_engine.volume_level_signal.connect(mic_vad.set_level) создаёт
-    # сильную ссылку: audio_engine → bound-method → mic_vad → SettingsDialog.
-    # Без disconnect диалог не освобождается из памяти даже при WA_DeleteOnClose,
-    # пока audio_engine жив (то есть всё время работы приложения).
-    # done() вызывается для accept(), reject() и кнопки закрытия окна —
-    # единственная точка выхода, которая покрывает все сценарии.
     def done(self, result: int):
         try:
             self.audio.volume_level_signal.disconnect(self.mic_vad.set_level)
         except (RuntimeError, TypeError):
-            pass  # уже отключён или C++ объект уничтожен
+            pass
         super().done(result)
 
     def save_all(self):
@@ -1845,14 +1601,12 @@ class SettingsDialog(QDialog):
         s.setValue("soundboard_volume", self.sl_sb.value())
         s.setValue("vad_threshold_slider", self._current_vad_val)
 
-        # ── Сохраняем таблицу горячих клавиш ─────────────────────────────────
         s.setValue("hk_table_count", len(self._hk_rows))
-        whisper_slot_idx = 0   # счётчик для обратносовместимых ключей шёпота
+        whisper_slot_idx = 0
 
-        # Сбрасываем прежние значения mute/deafen — перезапишем из таблицы
         s.setValue("hk_mute", "")
         s.setValue("hk_deafen", "")
-        # Сбрасываем старые whisper-слоты
+
         for i in range(8):
             s.setValue(f"whisper_slot_{i}_nick", "")
             s.setValue(f"whisper_slot_{i}_ip",   "")
@@ -1860,11 +1614,15 @@ class SettingsDialog(QDialog):
             s.setValue(f"whisper_slot_{i}_anon", "false")
 
         for i, row in enumerate(self._hk_rows):
-            data = row["cb"].currentData()   # (func_type, func_data)
-            hk   = row["hk"].get_hotkey()
-            # Флаг анонимного шёпота: читаем состояние чекбокса ряда; валиден
-            # только для whisper — для остальных функций _sync_anon_visibility
-            # гарантирует что чекбокс снят, поэтому данные не протекут.
+            data = row["cb"].currentData()
+
+            # FIX: переменная hk раньше нигде не определялась → NameError в
+            # save_all → диалог настроек не закрывался по «Сохранить».
+            try:
+                hk = row["hk"].get_hotkey()
+            except Exception:
+                hk = ""
+
             anon_checked = False
             try:
                 anon_checked = bool(row["anon"].isChecked())
@@ -1879,13 +1637,11 @@ class SettingsDialog(QDialog):
             s.setValue(f"hk_table_{i}_anon",
                        "true" if (anon_checked and ftype == "whisper") else "false")
 
-            # Обратносовместимые ключи для остального кода приложения
             if ftype == "mute_mic" and not s.value("hk_mute", ""):
                 s.setValue("hk_mute", hk)
             elif ftype == "deafen" and not s.value("hk_deafen", ""):
                 s.setValue("hk_deafen", hk)
             elif ftype == "whisper" and whisper_slot_idx < 8 and hk:
-                # Восстанавливаем nick из known_users.json по IP
                 nick = ""
                 try:
                     if os.path.exists(KNOWN_USERS_PATH):
@@ -1897,8 +1653,7 @@ class SettingsDialog(QDialog):
                 s.setValue(f"whisper_slot_{whisper_slot_idx}_ip",   fdata)
                 s.setValue(f"whisper_slot_{whisper_slot_idx}_nick", nick)
                 s.setValue(f"whisper_slot_{whisper_slot_idx}_hk",   hk)
-                # Пишем отдельный ключ whisper_slot_{idx}_anon —
-                # его читает ui_main.py при регистрации PTT-хоткеев шёпота.
+
                 s.setValue(f"whisper_slot_{whisper_slot_idx}_anon",
                            "true" if anon_checked else "false")
                 whisper_slot_idx += 1
@@ -1909,8 +1664,6 @@ class SettingsDialog(QDialog):
         if hasattr(self.mw, 'net'):
             self.mw.net.update_user_info(self.mw.nick, self.mw.avatar)
 
-        # Синхронизируем статус: QSettings обновляется через SelfStatusOverlayPanel
-        # (правый клик по нику). Читаем актуальное значение и обновляем MainWindow.
         new_icon = self.app_settings.value("my_status_icon", "")
         new_text = self.app_settings.value("my_status_text", "")
         if hasattr(self.mw, '_my_status_icon'):

@@ -1,8 +1,3 @@
-# app_init.py
-# ──────────────────────────────────────────────────────────────────────────────
-# Инициализация приложения: кодировки, логирование краша, загрузка DLL.
-# Должен быть импортирован ПЕРВЫМ в client_main.py, ДО всех остальных импортов.
-# ──────────────────────────────────────────────────────────────────────────────
 
 import os
 import sys
@@ -14,10 +9,6 @@ _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 1. UTF-8 консоль
-# ══════════════════════════════════════════════════════════════════════════════
 import io as _io
 
 for _stream_name in ('stdout', 'stderr'):
@@ -41,15 +32,6 @@ for _stream_name in ('stdout', 'stderr'):
 
 del _io, _stream_name, _stream
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 2. Crash diagnostics
-# ══════════════════════════════════════════════════════════════════════════════
-# FIX: путь к crash_native.log вынесен в %APPDATA%\InPulse\logs\.
-#   Раньше файл создавался в CWD. Если приложение запущено из защищённой
-#   папки (Program Files без прав записи) — open() падал с PermissionError
-#   на самом старте, до вывода любого сообщения пользователю.
-
 def _resolve_logs_dir() -> str:
     appdata = os.environ.get('APPDATA') or os.path.expanduser('~')
     logs_dir = os.path.join(appdata, 'InPulse', 'logs')
@@ -60,7 +42,6 @@ def _resolve_logs_dir() -> str:
         logs_dir = tempfile.gettempdir()
     return logs_dir
 
-
 _LOGS_DIR = _resolve_logs_dir()
 _crash_native_path = os.path.join(_LOGS_DIR, 'crash_native.log')
 try:
@@ -69,7 +50,6 @@ try:
 except OSError as _e:
     print(f"[DEBUG] Не удалось открыть {_crash_native_path}: {_e}", flush=True)
     faulthandler.enable()
-
 
 def _global_excepthook(exc_type, exc_value, exc_tb):
     msg = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
@@ -86,11 +66,6 @@ def _global_excepthook(exc_type, exc_value, exc_tb):
 sys.excepthook = _global_excepthook
 print(f"[DEBUG] faulthandler активирован → {_crash_native_path}", flush=True)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 3. Пути к ресурсам
-# ══════════════════════════════════════════════════════════════════════════════
-
 def resource_path(relative_path: str) -> str:
     try:
         base_path = sys._MEIPASS
@@ -98,10 +73,6 @@ def resource_path(relative_path: str) -> str:
         base_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     return os.path.join(base_path, relative_path)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 4. Загрузка DLL (opus, rnnoise, DeepFilterNet)
-# ══════════════════════════════════════════════════════════════════════════════
 if not os.environ.get("RUST_LOG"):
     os.environ["RUST_LOG"] = "error"
 
@@ -144,8 +115,6 @@ for _opus_path in _opus_candidates:
 if not _opus_loaded:
     print(f"[DLL] ВНИМАНИЕ: opus.dll не найдена в {_dlls_dir}", flush=True)
 
-# FIX: безопасная очистка namespace — удаляем только существующие переменные.
-# Раньше `del _opus_path` падал с NameError если _opus_candidates был пуст.
 for _v in ('_opus_path', '_opus_candidates', '_opus_loaded',
            '_d', '_extra_paths', '_project_dir', '_dlls_dir', '_dfn_dir',
            '_package_dir'):

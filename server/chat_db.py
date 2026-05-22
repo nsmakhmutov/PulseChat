@@ -1,9 +1,3 @@
-# server/chat_db.py — SQLite-хранилище чата для хоста сервера
-#
-# Хост хранит историю на диске. При перезапуске — история сохраняется.
-# При миграции сервера — история остаётся у старого хоста (новая сессия).
-# Клиенты получают историю через CMD_CHAT_HISTORY при подключении.
-
 import json
 import os
 import sqlite3
@@ -14,7 +8,6 @@ from config import CHAT_DB_PATH, CHAT_HISTORY_MAX
 
 
 class ChatDB:
-    """Потокобезопасный SQLite wrapper для серверного чата."""
 
     def __init__(self, db_path: str = CHAT_DB_PATH):
         self._db_path = db_path
@@ -49,7 +42,6 @@ class ChatDB:
         print(f"[ChatDB] Инициализирован: {self._db_path}")
 
     def add_message(self, entry: dict) -> None:
-        """Сохраняет сообщение (текст или медиа)."""
         with self._lock:
             self._conn.execute(
                 """INSERT INTO chat_messages
@@ -69,11 +61,9 @@ class ChatDB:
             )
             self._conn.commit()
 
-        # Trim старые сообщения
         self._trim()
 
     def get_history(self, room: str = '', limit: int = CHAT_HISTORY_MAX) -> list[dict]:
-        """Возвращает последние N сообщений для комнаты (или все если room='')."""
         with self._lock:
             if room:
                 rows = self._conn.execute(
@@ -94,12 +84,12 @@ class ChatDB:
                 ).fetchall()
 
         messages = []
-        for row in reversed(rows):  # reversed: от старых к новым
+        for row in reversed(rows):
             entry = {
                 'uid': row[0], 'nick': row[1], 'avatar': row[2],
                 'text': row[3], 'room': row[4], 'ts': row[5],
             }
-            if row[6]:  # file_name — медиа-вложение
+            if row[6]:
                 entry['file_name'] = row[6]
                 entry['file_type'] = row[7]
                 entry['file_data_b64'] = row[8]
@@ -108,7 +98,6 @@ class ChatDB:
         return messages
 
     def _trim(self) -> None:
-        """Удаляем сообщения сверх лимита."""
         with self._lock:
             self._conn.execute(
                 """DELETE FROM chat_messages
@@ -121,12 +110,10 @@ class ChatDB:
             self._conn.commit()
 
     def clear(self) -> int:
-        """Удаляет ВСЕ сообщения из БД. Возвращает число удалённых строк."""
         with self._lock:
             cur = self._conn.execute("DELETE FROM chat_messages")
             self._conn.commit()
             deleted = cur.rowcount
-            # VACUUM вне транзакции — освобождает место на диске
             try:
                 self._conn.execute("VACUUM")
             except Exception:

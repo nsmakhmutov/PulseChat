@@ -1,8 +1,6 @@
 import sys
 import os
 import struct
-
-# --- Утилиты ---
 def resource_path(relative_path):
     """Получает абсолютный путь к ресурсам, работает для dev и для PyInstaller."""
     try:
@@ -11,32 +9,31 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
-# ── Сетевые настройки ────────────────────────────────────────────────────────
+# ── Сетевые настройки
 DEFAULT_PORT_TCP = 5000
 DEFAULT_PORT_UDP = 5001
 
 BUFFER_SIZE = 65536
 
-UDP_RECV_BUFFER_SIZE = 2 * 1024 * 1024   # 2 MB
-UDP_SEND_BUFFER_SIZE = 2 * 1024 * 1024   # 2 MB
+UDP_RECV_BUFFER_SIZE = 2 * 1024 * 1024
+UDP_SEND_BUFFER_SIZE = 2 * 1024 * 1024
 
-# ── Аудио настройки (голос комнаты — без изменений) ──────────────────────────
+# ── Аудио настройки
 SAMPLE_RATE     = 48000
 CHANNELS        = 1
 FRAME_DURATION  = 20
-CHUNK_SIZE      = int(SAMPLE_RATE * (FRAME_DURATION / 1000))  # 960 сэмплов
+CHUNK_SIZE      = int(SAMPLE_RATE * (FRAME_DURATION / 1000))
 
-# ── Видео настройки (захват DXCam → WebRTC) ──────────────────────────────────
+# ── Видео настройки (захват DXCam → WebRTC)
 VIDEO_WIDTH   = 1280
 VIDEO_HEIGHT  = 720
 VIDEO_FPS     = 30
 
 # Jitter buffer для зрителя (мс).
 VIEWER_JITTER_BUFFER_MS = 700
+VIDEO_BITRATE = 4_500_000
 
-VIDEO_BITRATE = 4_500_000   # 4.5 Mbps (720p default, maxrate для CQ режима)
-
-# ── HQ битрейты по разрешению ─────────────────────────────────────────────────
+# ── HQ битрейты по разрешению
 VIDEO_BITRATES: dict = {
     (3840, 2160): 20_000_000,
     (2560, 1440): 12_000_000,
@@ -81,38 +78,26 @@ def get_bitrate_for_resolution(width: int, height: int, lq: bool = False) -> int
     return max(1_500_000, min(estimated, 20_000_000))
 
 
-# ── Opus (голос комнаты) ─────────────────────────────────────────────────────
+# ── Opus (голос комнаты)
 OPUS_APPLICATION = 2048
 DEFAULT_BITRATE        = 64000
 STREAM_AUDIO_BITRATE   = 128000
 
-# ── UDP-заголовок ─────────────────────────────────────────────────────────────
+# ── UDP-заголовок
 UDP_HEADER_STRUCT = struct.Struct("!IdIB")
 UDP_HEADER_SIZE   = UDP_HEADER_STRUCT.size
 
-# ── UDP Flags ─────────────────────────────────────────────────────────────────
-# Биты 1 (mute) и 2 (deaf) резервируются под базовое состояние участника в
-# обычных аудио-пакетах. 16/32/64/128 — режимные флаги пакета.
+# ── UDP Flags
+
 FLAG_LOOPBACK_AUDIO = 16
 FLAG_STREAM_VOICES  = 32
 FLAG_WHISPER        = 64
-# Анонимный шёпот: устанавливается отправителем совместно с FLAG_WHISPER.
-# Сервер при ретрансляции переписывает sender_uid в UDP-заголовке на
-# ANONYMOUS_UID — получатель физически не видит реальный uid отправителя.
 FLAG_ANONYMOUS      = 128
 
 STREAM_VOICE_HEADER_STRUCT = struct.Struct("!I")
 STREAM_VOICE_HEADER_SIZE   = STREAM_VOICE_HEADER_STRUCT.size
 
-# ── Anonymous whisper ─────────────────────────────────────────────────────────
-# Зарезервированный «псевдо-uid» для анонимного шёпота. Реальные uid генерируются
-# как secrets.randbelow(10**9)+1 = 1..1_000_000_000, поэтому 0xFFFFFFFE
-# (4_294_967_294) гарантированно не пересекается с ними.
-# Используется:
-#   * сервером — подставляется в UDP-заголовок вместо реального sender_uid при
-#     ретрансляции пакета с FLAG_ANONYMOUS;
-#   * получателем — маркер в UI для отображения «Аноним» вместо ника;
-#   * audio_engine — ключ отдельного RemoteUser/JitterBuffer для анонимов.
+# ── Anonymous whisper
 ANONYMOUS_UID = 0xFFFFFFFE
 
 
@@ -120,7 +105,7 @@ def is_anonymous_uid(uid: int) -> bool:
     """True если переданный uid — зарезервированный маркер анонимного шёпота."""
     return uid == ANONYMOUS_UID
 
-# ── WebRTC ───────────────────────────────────────────────────────────────────
+# ── WebRTC
 CMD_WEBRTC_OFFER  = 'webrtc_offer'
 CMD_WEBRTC_ANSWER = 'webrtc_answer'
 CMD_WEBRTC_ICE    = 'webrtc_ice'
@@ -128,12 +113,12 @@ CMD_WEBRTC_ICE    = 'webrtc_ice'
 WEBRTC_ICE_TIMEOUT  = 3.0
 WEBRTC_ICE_SERVERS: list = []
 
-# ── SFU (Go sidecar) ─────────────────────────────────────────────────────────
+# ── SFU (Go sidecar)
 SFU_PORT       = 7788
 SFU_EXE_NAME   = "sidecar.exe"
 SFU_PORT_RANGE = 20
 
-# ── TCP-команды ───────────────────────────────────────────────────────────────
+# ── TCP-команды
 CMD_LOGIN           = 'login'
 CMD_JOIN_ROOM       = 'join_room'
 CMD_CHAT_MSG        = 'chat_msg'
@@ -187,40 +172,47 @@ CHAT_MEDIA_MAX_B64   = 10_000_000
 CMD_HOST_MUTE   = 'host_mute'
 CMD_FORCE_MUTED = 'force_muted'
 
-# ── Хост: кик/бан участника ──────────────────────────────────────────────────
-# Права выдаются только первому в _host_order (фактический хост встроенного
-# сервера). При передаче хостинга (CMD_SERVER_TRANSFER / migrate) банлист
-# остаётся на диске прежнего владельца — у нового хоста свой bans.json.
-CMD_HOST_KICK     = 'host_kick'       # host → server: кикнуть target_uid
-CMD_HOST_BAN      = 'host_ban'        # host → server: кикнуть + добавить IP в бан
-CMD_HOST_UNBAN    = 'host_unban'      # host → server: убрать IP из бана
-CMD_BAN_LIST_REQ  = 'ban_list_req'    # host → server: запрос снимка банлиста
-CMD_BAN_LIST      = 'ban_list'        # server → host: снимок банлиста
-CMD_KICKED        = 'kicked'          # server → клиент: тебя кикнули
-CMD_BANNED        = 'banned'          # server → клиент: тебя забанили / при login
+# ── Хост: кик/бан участника
+CMD_HOST_KICK     = 'host_kick'
+CMD_HOST_BAN      = 'host_ban'
+CMD_HOST_UNBAN    = 'host_unban'
+CMD_BAN_LIST_REQ  = 'ban_list_req'
+CMD_BAN_LIST      = 'ban_list'
+CMD_KICKED        = 'kicked'
+CMD_BANNED        = 'banned'
 BAN_LIST_PATH     = os.path.join(get_appdata_dir(), "bans.json")
 
-# Pre-login запрос статуса бана. Клиент шлёт его в MultiServerScreen
-# по каждому обнаруженному серверу; сервер отвечает только для текущего
-# ника — без раскрытия всего банлиста, без утечки приватных данных.
-# Source of truth — bans.json сервера. Клиент никогда не хранит бан-статус
-# локально: это решает проблему рассинхронизации после разбана.
-CMD_QUERY_BAN      = 'query_ban'      # client → server: забанен ли мой ник?
-CMD_QUERY_BAN_RESP = 'query_ban_resp' # server → client: {banned: bool, reason}
+CMD_QUERY_BAN      = 'query_ban'
+CMD_QUERY_BAN_RESP = 'query_ban_resp'
 
-# ── Typing indicator ──────────────────────────────────────────────────────────
+# ── Typing indicator
 CMD_TYPING         = 'typing'
 TYPING_THROTTLE_MS = 3000
 TYPING_EXPIRE_SEC  = 5.0
 
-# ── SQLite чат (хост хранит историю на диске) ────────────────────────────────
+# ── SQLite чат (хост хранит историю на диске)
 CHAT_DB_PATH = os.path.join(get_appdata_dir(), "chat_history.db")
 
-# ── Единый конфиг приложения ─────────────────────────────────────────────────
+# ── Единый конфиг приложения
 APP_CONFIG_PATH = os.path.join(get_appdata_dir(), "inpulse_config.json")
 
-# ── Аннотации стрима ────────────────────────────────────────────────────────
+# ── Аннотации стрима
 CMD_DRAW_STROKE = 'draw_stroke'
+
+CMD_REMOTE_CONTROL_REQUEST  = 'remote_control_request'
+CMD_REMOTE_CONTROL_RESPONSE = 'remote_control_response'
+CMD_REMOTE_CONTROL_EVENT    = 'remote_control_event'
+CMD_REMOTE_CONTROL_STOP     = 'remote_control_stop'
+
+# ── Remote Control: антиспам запросов управления
+# После RC_DENY_LIMIT отказов подряд для пары (стример, зритель)
+# зритель уходит в cooldown на RC_COOLDOWN_SEC секунд: его запросы
+# молча отбрасываются сервером (стример не видит диалог).
+RC_DENY_LIMIT     = 3
+RC_COOLDOWN_SEC   = 600          # 10 минут
+# Сколько кадров ESC подряд (на стороне стримера) останавливают управление.
+RC_ESC_STOP_COUNT = 3
+RC_ESC_WINDOW_SEC = 2.0          # три ESC должны уложиться в это окно
 DRAW_MAX_POINTS = 300
 DRAW_FADE_SEC   = 5.0
 
@@ -235,15 +227,13 @@ CHANNEL_PASS_MAX_LEN  = 64
 SERVER_NAME_MAX_LEN = 40
 SERVER_NAME_DEFAULT = 'InPulse Server'
 
-# ═══════════════════════════════════════════════════════════════════════════
 # Миграция сервера — таймауты и команды
-# ═══════════════════════════════════════════════════════════════════════════
 MIGRATION_ANNOUNCE_WAIT_SEC = 4.0
 MIGRATION_TCP_TIMEOUT_SEC   = 1.0
 MIGRATION_TCP_RETRY_SEC     = 0.3
 MIGRATION_TOTAL_DEADLINE    = 10.0
 
-# ── Обрыв связи с хостом (без CMD_SERVER_MIGRATE) ────────────────────────────
+# ── Обрыв связи с хостом (без CMD_SERVER_MIGRATE)
 RECONNECT_SAME_HOST_WINDOW_SEC = 8.0
 DISCOVERY_WINDOW_SEC           = 6.0
 BECOME_HOST_POS0_DELAY_SEC     = 0.5
@@ -251,17 +241,14 @@ BECOME_HOST_POS_N_DELAY_SEC    = 1.2
 
 RECONNECT_SAME_HOST_TCP_ATTEMPTS = 20
 
-# ── Обратная совместимость со старым API ────────────────────────────────────
+# ── Обратная совместимость со старым API
 MAX_SILENT_RECONNECT_ATTEMPTS = 2
 RECONNECT_DELAY               = 1.0
 
-# ── Команды 2-шаговой ручной передачи сервера ───────────────────────────────
+# ── Команды 2-шаговой ручной передачи сервера
 CMD_MIGRATE_PREPARE        = 'migrate_prepare'
 CMD_MIGRATE_READY          = 'migrate_ready'
 MIGRATE_PREPARE_TIMEOUT_SEC = 7.0
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Диагностические флаги (FIX: раньше RMS/peak считались всегда, даже если
-# не нужны для лога. Это O(n) на каждый audio-фрейм в hot path.)
-# ══════════════════════════════════════════════════════════════════════════════
+
 AUDIO_DIAG_ENABLED = False   # True → логи [VIEWER-DIAG], [OUT-DIAG], [DLL-DIAG]

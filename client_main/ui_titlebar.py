@@ -1,10 +1,3 @@
-# ui_titlebar.py
-# ──────────────────────────────────────────────────────────────────────────────
-# Кастомный title bar для безрамочных QWidget.
-# Поддерживает перетаскивание мышью и кнопку закрытия.
-# Используется в: LoginWindow, ConnectingScreen, MultiServerScreen,
-#                 DiscoveryScreen, _CreateServerDialog
-# ──────────────────────────────────────────────────────────────────────────────
 
 from PyQt6.QtWidgets import QWidget, QHBoxLayout, QLabel, QPushButton
 from PyQt6.QtCore import Qt
@@ -50,7 +43,6 @@ class AppTitleBar(QWidget):
         lay.setContentsMargins(12, 0, 6, 0)
         lay.setSpacing(4)
 
-        # Иконка приложения
         ico = QLabel()
         ico.setFixedSize(18, 18)
         try:
@@ -60,17 +52,13 @@ class AppTitleBar(QWidget):
         ico.setStyleSheet("background:transparent; border:none;")
         lay.addWidget(ico)
 
-        # Заголовок
         self._lbl = QLabel(title)
         lay.addWidget(self._lbl, stretch=1)
 
-        # Кнопка закрытия
         btn_close = QPushButton("✕")
         btn_close.setObjectName("appBtnClose")
         btn_close.clicked.connect(parent_widget.close)
         lay.addWidget(btn_close)
-
-    # ── Перетаскивание окна ───────────────────────────────────────────────────
 
     def mousePressEvent(self, e):
         if e.button() == Qt.MouseButton.LeftButton:

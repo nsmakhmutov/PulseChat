@@ -22,14 +22,9 @@ from PyQt6.QtGui import (
 
 from config import resource_path, CHAT_MSG_MAX_LEN
 
-# ── Кэш QFontMetrics на уровне модуля ────────────────────────────────────────
-# Создаём один раз при старте модуля — не аллоцируем на каждое сообщение.
-# _fm_cache[px] → QFontMetrics для шрифта размером px пикселей.
-# Заполняется лениво при первом запросе.
 _fm_cache: dict = {}
 
 def _get_fm(px: int) -> 'QFontMetrics':
-    """Возвращает закэшированный QFontMetrics для шрифта размером px px."""
     if px not in _fm_cache:
         from PyQt6.QtWidgets import QApplication
         f = QFont(QApplication.font())
@@ -37,7 +32,6 @@ def _get_fm(px: int) -> 'QFontMetrics':
         _fm_cache[px] = QFontMetrics(f)
     return _fm_cache[px]
 
-# ── QMediaPlayer (опциональный — PyQt6.QtMultimedia) ─────────────────────────
 try:
     from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
     from PyQt6.QtMultimediaWidgets import QVideoWidget
@@ -46,24 +40,18 @@ except ImportError:
     _MEDIA_OK = False
     print("[Chat] PyQt6.QtMultimedia не найден — видео воспроизведение отключено")
 
-# ── Кэш медиафайлов: временная папка, очищается при выходе ───────────────────
 _CACHE_DIR: str = tempfile.mkdtemp(prefix="inpulse_media_")
 atexit.register(shutil.rmtree, _CACHE_DIR, True)
 
-# ── Keep-alive: предотвращает GC top-level окон (viewer/player) ───────────────
-# QWidget без родителя — GC Python может собрать его СРАЗУ после возврата
-# из статического метода. Список удерживает сильную ссылку до закрытия окна.
 _OPEN_WINDOWS: list = []
 
 def _cache_write(data: bytes, suffix: str) -> str:
-    """Записывает bytes во временный файл кэша, возвращает путь."""
     path = os.path.join(_CACHE_DIR, uuid.uuid4().hex + suffix)
     with open(path, 'wb') as f:
         f.write(data)
     return path
 
 def clear_media_cache() -> None:
-    """Удаляет все файлы кэша (вызывается при закрытии сервера)."""
     try:
         for name in os.listdir(_CACHE_DIR):
             try:
@@ -74,7 +62,6 @@ def clear_media_cache() -> None:
     except Exception:
         pass
 
-# ── GIF → MP4 конвертация ─────────────────────────────────────────────────────
 def _gif_to_mp4(gif_data: bytes) -> bytes:
     """
     Конвертирует GIF в MP4 (H.264, CRF 28, preset fast).
@@ -82,9 +69,9 @@ def _gif_to_mp4(gif_data: bytes) -> bytes:
     Требует: pip install imageio imageio-ffmpeg
     """
     try:
-        import imageio                              # type: ignore
+        import imageio
         import io
-        import numpy as np                         # type: ignore
+        import numpy as np
 
         reader  = imageio.get_reader(io.BytesIO(gif_data), format='gif')
         meta    = reader.get_meta_data()
@@ -104,7 +91,6 @@ def _gif_to_mp4(gif_data: bytes) -> bytes:
             arr = np.asarray(frame)
             if arr.ndim == 3 and arr.shape[2] == 4:
                 arr = arr[:, :, :3]
-            # H.264 требует чётных размеров
             h, w = arr.shape[:2]
             arr = arr[:(h & ~1), :(w & ~1)]
             writer.append_data(arr)
@@ -123,14 +109,13 @@ def _gif_to_mp4(gif_data: bytes) -> bytes:
 
 
 def _extract_first_frame(video_data: bytes, suffix: str = '.mp4') -> 'QPixmap | None':
-    """Извлекает первый кадр видео как QPixmap для превью."""
     try:
-        import imageio    # type: ignore
+        import imageio
         path = _cache_write(video_data, suffix)
         reader = imageio.get_reader(path)
         frame  = reader.get_data(0)
         reader.close()
-        import numpy as np  # type: ignore
+        import numpy as np
         arr = np.asarray(frame)
         if arr.ndim == 3 and arr.shape[2] == 4:
             arr = arr[:, :, :3]
@@ -143,26 +128,18 @@ def _extract_first_frame(video_data: bytes, suffix: str = '.mp4') -> 'QPixmap | 
         print(f"[Chat] extract_first_frame: {ex}")
         return None
 
-
-# ── Вспомогательная функция: SVG/base64 → круглый QPixmap ───────────────────
 def _make_round_avatar(avatar: str, size: int) -> 'QPixmap | None':
-    """
-    SVG-имя ('1.svg') из assets/avatars/ или base64 PNG → круглый QPixmap.
-    Рендерим SVG в 2× размере и масштабируем вниз — антиалиасинг как в дереве.
-    """
+
     raw_pix = None
 
-    # SVG из assets/avatars/
     if avatar and len(avatar) < 60 and '/' not in avatar and '\\' not in avatar:
         path = resource_path(f"assets/avatars/{avatar}")
         ico  = QIcon(path)
         if not ico.isNull():
-            # 2× рендер для HiDPI-качества, затем плавное уменьшение
             raw_pix = ico.pixmap(size * 2, size * 2)
             if raw_pix and not raw_pix.isNull():
                 raw_pix.setDevicePixelRatio(1.0)
 
-    # base64 PNG/JPEG
     if (raw_pix is None or raw_pix.isNull()) and avatar and len(avatar) > 60:
         try:
             raw = base64.b64decode(avatar)
@@ -177,7 +154,6 @@ def _make_round_avatar(avatar: str, size: int) -> 'QPixmap | None':
     if raw_pix is None or raw_pix.isNull():
         return None
 
-    # Масштабируем плавно до size×size
     scaled = raw_pix.scaled(
         size, size,
         Qt.AspectRatioMode.IgnoreAspectRatio,
@@ -185,7 +161,6 @@ def _make_round_avatar(avatar: str, size: int) -> 'QPixmap | None':
     )
     scaled.setDevicePixelRatio(1.0)
 
-    # Круглая маска через clip-path (без QBrush-тайлинга)
     result = QPixmap(size, size)
     result.fill(Qt.GlobalColor.transparent)
     p = QPainter(result)
@@ -198,10 +173,6 @@ def _make_round_avatar(avatar: str, size: int) -> 'QPixmap | None':
     p.end()
     return result
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# QuickMsgBubble
-# ──────────────────────────────────────────────────────────────────────────────
 class QuickMsgBubble(QWidget):
     MAX_W = 210
 
@@ -245,7 +216,7 @@ class QuickMsgBubble(QWidget):
         self._tail.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
         outer.addWidget(self._tail)
 
-    def update(self, text: str) -> None:  # type: ignore[override]
+    def update(self, text: str) -> None:
         self._text_lbl.setText(text)
         fm = QFontMetrics(self._text_lbl.font())
         text_w = fm.horizontalAdvance(text) + 8
@@ -266,12 +237,7 @@ class QuickMsgBubble(QWidget):
             y = max(sg.top() + 4, min(y, sg.bottom() - bh - 4))
         self.move(x, y)
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# CustomTitleBar
-# ──────────────────────────────────────────────────────────────────────────────
 class CustomTitleBar(QWidget):
-    """Кастомный title bar с минимизацией / максимизацией / закрытием."""
 
     def __init__(self, parent_window, title=""):
         super().__init__(parent_window)
@@ -334,23 +300,15 @@ class CustomTitleBar(QWidget):
             self._toggle_maximize()
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# ChatMessageWidget — одно сообщение (текст / картинка / видео / файл)
-# ──────────────────────────────────────────────────────────────────────────────
 class ChatMessageWidget(QWidget):
-    _AV   = 32    # совпадает с tree.setIconSize(32,32)
+    _AV   = 32
     _BMAX = 440
 
     def __init__(self, entry: dict, my_uid: int,
                  show_avatar: bool = True,
                  show_header: bool = True,
                  parent=None):
-        """
-        show_avatar — показывать ли аватарку (False для всех сообщений группы
-                      кроме последнего; вместо аватарки — пустой отступ).
-        show_header — показывать ли строку ник+время (True только для первого
-                      сообщения в группе или для одиночных сообщений).
-        """
+
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setObjectName("chatMsgWidget")
@@ -366,9 +324,6 @@ class ChatMessageWidget(QWidget):
         file_type     = entry.get('file_type', 'file')
         time_str      = QDateTime.fromSecsSinceEpoch(int(ts)).toString('HH:mm')
 
-        # ── Аватарка / пустой отступ ──────────────────────────────────────────
-        # Если аватарку не показываем — ставим прозрачный spacer той же ширины,
-        # чтобы пузырь не прыгал по горизонтали внутри группы.
         av_lbl = QLabel()
         av_lbl.setFixedSize(self._AV, self._AV)
         av_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -387,20 +342,8 @@ class ChatMessageWidget(QWidget):
                     f"font-size:10px;font-weight:bold;color:{color};"
                 )
         else:
-            # Прозрачный держатель — место аватарки остаётся, но пустое
             av_lbl.setStyleSheet("background:transparent;border:none;")
 
-        # ── Пузырь — скругление углов по позиции в группе (Telegram-стиль) ──
-        # R = 12px — полное скругление изолированных углов
-        # r =  4px — «хвост» (угол со стороны стека сообщений)
-        #
-        # Собственные сообщения (правый край = сторона стека):
-        #   single : все=12, кроме TR=4 и BR=4
-        #   first  : все=12, кроме TR=4 (начало группы — верхний правый острый)
-        #   middle : все=12, кроме TR=4 и BR=4 (оба правых — острые)
-        #   last   : все=12, кроме BR=4 (конец группы — нижний правый острый у аватарки)
-        #
-        # Чужие сообщения (левый край = сторона стека): зеркально.
         R, r = 12, 4
         if show_header and show_avatar:
             _pos = 'single'
@@ -431,7 +374,6 @@ class ChatMessageWidget(QWidget):
             _bord = "rgba(255,255,255,0.10)"
 
         bubble = QFrame()
-        # objectName сохраняем для совместимости, стиль ставим напрямую
         bubble.setObjectName("chatBubbleOwn" if is_own else "chatBubbleOther")
         bubble.setStyleSheet(
             f"QFrame#{bubble.objectName()} {{"
@@ -444,7 +386,6 @@ class ChatMessageWidget(QWidget):
         b_lay.setContentsMargins(10, 6, 10, 6)
         b_lay.setSpacing(4)
 
-        # Шапка (ник + время) — только для первого сообщения в группе
         if show_header:
             hdr   = QWidget()
             hdr.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -472,10 +413,8 @@ class ChatMessageWidget(QWidget):
                 h_lay.addStretch()
             b_lay.addWidget(hdr)
 
-        # t_lbl — инициализируем как None, чтобы проверить ниже без dir()
         t_lbl = None
 
-        # ── Контент ───────────────────────────────────────────────────────────
         if file_data_b64:
             self._add_media(b_lay, file_data_b64, file_name, file_type, is_own)
         elif text:
@@ -500,17 +439,13 @@ class ChatMessageWidget(QWidget):
                     Qt.TextInteractionFlag.LinksAccessibleByMouse)
                 t_lbl.setOpenExternalLinks(True)
 
-                # ── Link Preview Card ─────────────────────────────────
                 if has_url:
                     first_url = url_re.search(text)
                     if first_url:
                         self._preview_card = _LinkPreviewCard(first_url.group(0))
                         b_lay.addWidget(self._preview_card)
-                # ВАЖНО: не ставим qproperty-alignment в stylesheet —
-                # он перекрывает setAlignment() и текст всегда слева
                 t_lbl.setStyleSheet(
                     "font-size:13px;background:transparent;border:none;padding:0;")
-                # Выравнивание: своё — вправо, чужое — влево
                 if is_own:
                     t_lbl.setAlignment(
                         Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
@@ -518,7 +453,6 @@ class ChatMessageWidget(QWidget):
                     t_lbl.setAlignment(
                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
 
-                # ── Русское контекстное меню ───────────────────────────────────
                 _MENU_STYLE = """
                     QMenu {
                         background-color: rgba(14, 16, 28, 245);
@@ -570,13 +504,11 @@ class ChatMessageWidget(QWidget):
                 )
                 b_lay.addWidget(t_lbl)
 
-        # ── Ширина пузыря: точно по содержимому ──────────────────────────────
-        _PAD = 20 + 20   # b_lay.contentsMargins left+right
+        _PAD = 20 + 20
         if file_data_b64 or (text and self._extract_youtube_id(text)):
             bubble.setMaximumWidth(self._BMAX)
             bubble.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         elif text:
-            # Используем кэшированные метрики — не аллоцируем QFont/QLabel на каждое сообщение
             _fm13 = _get_fm(13)
             _tw   = _fm13.horizontalAdvance(text) + 8
 
@@ -595,11 +527,10 @@ class ChatMessageWidget(QWidget):
             bubble.setMaximumWidth(self._BMAX)
             bubble.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
 
-        # ── Сборка ────────────────────────────────────────────────────────────
         outer = QHBoxLayout(self)
         outer.setContentsMargins(8, 2, 8, 2)
         outer.setSpacing(8)
-        self._av_lbl = av_lbl   # сохраняем для hide_avatar()
+        self._av_lbl = av_lbl
         if is_own:
             outer.addStretch(); outer.addWidget(bubble)
             outer.addWidget(av_lbl, alignment=Qt.AlignmentFlag.AlignTop)
@@ -608,11 +539,8 @@ class ChatMessageWidget(QWidget):
             outer.addWidget(bubble); outer.addStretch()
 
     def hide_avatar(self) -> None:
-        """Скрывает аватарку — вызывается когда следующее сообщение того же автора."""
         self._av_lbl.clear()
         self._av_lbl.setStyleSheet("background:transparent;border:none;")
-
-    # ── YouTube ───────────────────────────────────────────────────────────────
 
     @staticmethod
     def _extract_youtube_id(text: str) -> 'str | None':
@@ -641,7 +569,6 @@ class ChatMessageWidget(QWidget):
         thumb_lbl.setFixedSize(320, 180)
         thumb_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         thumb_lbl.setStyleSheet("background:#111;border-radius:8px 8px 0 0;border:none;")
-        # Иконка воспроизведения поверх превью (CSS overlay не работает в Qt — нарисуем)
         play_overlay = QLabel("▶", thumb_lbl)
         play_overlay.setFixedSize(60, 60)
         play_overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -677,7 +604,6 @@ class ChatMessageWidget(QWidget):
         def _fetch():
             pix_res   = None
             title_str = "YouTube"
-            # Превью: пробуем качество от лучшего к худшему
             for q in ("maxresdefault", "hqdefault", "mqdefault", "0"):
                 try:
                     req = urllib.request.Request(
@@ -691,7 +617,6 @@ class ChatMessageWidget(QWidget):
                             320, 180,
                             Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                             Qt.TransformationMode.SmoothTransformation)
-                        # Центральная обрезка до 320×180
                         if pix.width() > 320:
                             pix = pix.copy((pix.width()-320)//2, 0, 320, pix.height())
                         if pix.height() > 180:
@@ -700,7 +625,6 @@ class ChatMessageWidget(QWidget):
                         break
                 except Exception:
                     continue
-            # Заголовок через oEmbed
             try:
                 oe = (f"https://www.youtube.com/oembed?"
                       f"url=https://youtu.be/{_vid}&format=json")
@@ -710,7 +634,6 @@ class ChatMessageWidget(QWidget):
                     title_str = _json.loads(r2.read()).get('title', 'YouTube')[:60]
             except Exception:
                 pass
-            # Обновляем UI строго через QTimer.singleShot (из главного потока)
             if pix_res is not None:
                 _px = pix_res
                 QTimer.singleShot(0, lambda: _t_lb.setPixmap(_px))
@@ -719,19 +642,16 @@ class ChatMessageWidget(QWidget):
 
         threading.Thread(target=_fetch, daemon=True).start()
 
-    # ── Медиа ─────────────────────────────────────────────────────────────────
-
     def _add_media(self, layout, file_data_b64, file_name, file_type, is_own):
-        # ── Изображение ───────────────────────────────────────────────────────
         if file_type == 'image':
             try:
                 raw      = base64.b64decode(file_data_b64)
                 img      = QImage.fromData(raw)
-                del raw   # bytes больше не нужны — QImage уже скопировал
+                del raw
                 if img.isNull():
                     raise ValueError
                 orig_pix = QPixmap.fromImage(img)
-                del img   # QPixmap скопировал данные
+                del img
                 thumb    = orig_pix
                 if thumb.width() > 320 or thumb.height() > 320:
                     thumb = orig_pix.scaled(320, 320,
@@ -739,19 +659,17 @@ class ChatMessageWidget(QWidget):
                         Qt.TransformationMode.SmoothTransformation)
                 img_lbl = QLabel()
                 img_lbl.setPixmap(thumb)
-                del thumb   # скопирован в лейбл
+                del thumb
                 img_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 img_lbl.setStyleSheet("border-radius:8px;background:transparent;border:none;")
                 img_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
-                # orig_pix держим для полноэкранного просмотра — это нормально,
-                # это единственная копия изображения в памяти
+
                 _p = orig_pix
                 img_lbl.mousePressEvent = lambda e, p=_p: (
                     self._open_image_viewer(p)
                     if e.button() == Qt.MouseButton.LeftButton else None
                 )
                 layout.addWidget(img_lbl)
-                # FIX #6: кнопка сохранения изображения
                 _d_img, _n_img = file_data_b64, file_name
                 save_btn_img = QPushButton("💾  Сохранить")
                 save_btn_img.setFixedHeight(26)
@@ -766,15 +684,13 @@ class ChatMessageWidget(QWidget):
             except Exception as ex:
                 print(f"[Chat] image: {ex}")
 
-        # ── Видео / GIF-конвертированный ──────────────────────────────────────
         if file_type in ('video', 'gif'):
             try:
                 raw  = base64.b64decode(file_data_b64)
-                # Записываем в кэш-файл ОДИН РАЗ — замыкание держит путь (строку),
-                # а не raw bytes (могут быть MB). raw освобождается сразу.
+
                 _cache_path = _cache_write(raw, '.mp4')
                 thumb_pix   = _extract_first_frame(raw, '.mp4')
-                del raw   # освобождаем байты — путь уже сохранён
+                del raw
 
                 container = QFrame()
                 container.setFixedWidth(320)
@@ -795,7 +711,7 @@ class ChatMessageWidget(QWidget):
                         Qt.AspectRatioMode.KeepAspectRatio,
                         Qt.TransformationMode.SmoothTransformation)
                     thumb_lbl.setPixmap(t)
-                    del thumb_pix   # thumbnail уже скопирован в лейбл
+                    del thumb_pix
                 else:
                     thumb_lbl.setText("🎬")
                     thumb_lbl.setStyleSheet(
@@ -820,7 +736,6 @@ class ChatMessageWidget(QWidget):
 
                 c_lay.addWidget(thumb_lbl)
 
-                # Замыкание держит только строку пути, не bytes
                 def _make_click_handler(path, n):
                     def _click(e):
                         if e.button() == Qt.MouseButton.LeftButton:
@@ -831,7 +746,6 @@ class ChatMessageWidget(QWidget):
                 thumb_lbl.mousePressEvent = _make_click_handler(_cache_path, file_name)
 
                 layout.addWidget(container)
-                # FIX #6: кнопка сохранения видео/GIF
                 _d_vid, _n_vid = file_data_b64, file_name
                 save_btn_vid = QPushButton("💾  Сохранить")
                 save_btn_vid.setFixedHeight(26)
@@ -846,7 +760,6 @@ class ChatMessageWidget(QWidget):
             except Exception as ex:
                 print(f"[Chat] video thumb: {ex}")
 
-        # ── Прочие файлы ──────────────────────────────────────────────────────
         try:
             raw_size = len(base64.b64decode(file_data_b64))
             size_str = (f"{raw_size/1_048_576:.1f} МБ" if raw_size >= 1_048_576
@@ -863,14 +776,9 @@ class ChatMessageWidget(QWidget):
         save_btn.clicked.connect(lambda: self._save_file(_d, _n))
         layout.addWidget(save_btn)
 
-    # ── Просмотр изображения ──────────────────────────────────────────────────
-
     @staticmethod
     def _open_image_viewer(pix: 'QPixmap') -> None:
-        """
-        Полноэкранный просмотр: QGraphicsView + зум колесом,
-        панорама перетаскиванием, кнопки +/−/⊡/✕, Esc.
-        """
+
         screen = QApplication.primaryScreen().availableGeometry()
 
         viewer = QWidget(
@@ -887,7 +795,6 @@ class ChatMessageWidget(QWidget):
         vlay.setContentsMargins(0, 0, 0, 0)
         vlay.setSpacing(0)
 
-        # Тулбар
         toolbar = QWidget()
         toolbar.setFixedHeight(44)
         toolbar.setStyleSheet("background:rgba(0,0,0,0.60);")
@@ -915,7 +822,6 @@ class ChatMessageWidget(QWidget):
             t_lay.addWidget(b)
         vlay.addWidget(toolbar)
 
-        # Scene + View
         scene = QGraphicsScene()
         item  = QGraphicsPixmapItem(pix)
         item.setTransformationMode(Qt.TransformationMode.SmoothTransformation)
@@ -968,7 +874,6 @@ class ChatMessageWidget(QWidget):
         btn_close.clicked.connect(viewer.close)
         viewer.keyPressEvent = lambda e: (viewer.close() if e.key() == Qt.Key.Key_Escape else None)
 
-        # Keep-alive: удерживаем ссылку пока окно открыто
         _OPEN_WINDOWS.append(viewer)
         _orig_close_ev = viewer.closeEvent if hasattr(viewer, 'closeEvent') else None
         def _on_viewer_close(ev, _w=viewer):
@@ -984,17 +889,13 @@ class ChatMessageWidget(QWidget):
 
         viewer.show()
 
-    # ── Проигрыватель видео ───────────────────────────────────────────────────
-
     @staticmethod
     def _open_video_player(video_data: bytes, file_name: str) -> None:
-        """Открывает плеер из raw bytes (legacy — для обратной совместимости)."""
         path = _cache_write(video_data, os.path.splitext(file_name)[1] or '.mp4')
         ChatMessageWidget._open_video_player_impl(path, file_name)
 
     @staticmethod
     def _open_video_player_impl(path: str, file_name: str) -> None:
-        """Общая реализация плеера — принимает готовый путь к файлу."""
         if not _MEDIA_OK:
             import subprocess
             try:
@@ -1019,7 +920,6 @@ class ChatMessageWidget(QWidget):
         vlay.setContentsMargins(0, 0, 0, 0)
         vlay.setSpacing(0)
 
-        # Тулбар
         toolbar = QWidget()
         toolbar.setFixedHeight(44)
         toolbar.setStyleSheet("background:rgba(0,0,0,0.70);")
@@ -1040,12 +940,10 @@ class ChatMessageWidget(QWidget):
         t_lay.addWidget(btn_close)
         vlay.addWidget(toolbar)
 
-        # Видеовиджет
         video_w = QVideoWidget()
         video_w.setStyleSheet("background:#000;")
         vlay.addWidget(video_w, stretch=1)
 
-        # Панель управления
         ctrl = QWidget()
         ctrl.setFixedHeight(52)
         ctrl.setStyleSheet("background:rgba(0,0,0,0.70);")
@@ -1078,7 +976,6 @@ class ChatMessageWidget(QWidget):
         c_lay.addWidget(time_lbl)
         vlay.addWidget(ctrl)
 
-        # Плеер
         player = QMediaPlayer()
         audio  = QAudioOutput()
         audio.setVolume(1.0)
@@ -1131,13 +1028,10 @@ class ChatMessageWidget(QWidget):
         win.keyPressEvent = _keypress
 
         win.show()
-        # Привязываем player и audio к win — иначе GC Python соберёт их
-        # СРАЗУ после возврата из статического метода (они локальные),
-        # и видео остановится без видимой причины.
+
         win._player = player
         win._audio  = audio
 
-        # Keep-alive: удерживаем ссылку пока окно открыто
         _OPEN_WINDOWS.append(win)
         def _on_win_close(ev, _w=win):
             try:
@@ -1148,8 +1042,6 @@ class ChatMessageWidget(QWidget):
         win.closeEvent = _on_win_close
 
         player.play()
-
-    # ── Сохранить файл ────────────────────────────────────────────────────────
 
     @staticmethod
     def _save_file(file_data_b64: str, file_name: str) -> None:
@@ -1164,14 +1056,8 @@ class ChatMessageWidget(QWidget):
                 print(f"[Chat] save: {ex}")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# ChatPanel — полноценная боковая панель (Discord-стиль)
-# ──────────────────────────────────────────────────────────────────────────────
 class _ChatInput(QLineEdit):
-    """
-    QLineEdit с перехватом Ctrl+V для изображений из буфера обмена.
-    При вставке картинки эмитирует image_pasted(QImage).
-    """
+
     image_pasted = pyqtSignal(QImage)
 
     typing_started = pyqtSignal()
@@ -1184,17 +1070,11 @@ class _ChatInput(QLineEdit):
             if not img.isNull():
                 self.image_pasted.emit(img)
                 return
-        # Любая печатная клавиша → typing indicator
         if e.text() and not e.modifiers() & Qt.KeyboardModifier.ControlModifier:
             self.typing_started.emit()
         super().keyPressEvent(e)
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Link Preview Card — показывает OG-метаданные ссылки (заголовок, описание)
-# ──────────────────────────────────────────────────────────────────────────────
 class _LinkPreviewCard(QFrame):
-    """Карточка превью ссылки (Open Graph). Загружается в фоновом потоке."""
 
     def __init__(self, url: str, parent=None):
         super().__init__(parent)
@@ -1239,7 +1119,6 @@ class _LinkPreviewCard(QFrame):
         )
         lay.addWidget(self._domain_lbl)
 
-        # Фоновая загрузка OG-метаданных
         threading.Thread(
             target=self._fetch_og, args=(url,), daemon=True
         ).start()
@@ -1253,22 +1132,17 @@ class _LinkPreviewCard(QFrame):
             return url[:40]
 
     def _fetch_og(self, url: str) -> None:
-        """Загружает страницу и парсит og:title, og:description."""
         try:
             import urllib.request
             req = urllib.request.Request(url, headers={
                 'User-Agent': 'Mozilla/5.0 (InPulse LinkPreview)',
             })
             with urllib.request.urlopen(req, timeout=5) as resp:
-                # Читаем только первые 32KB — OG-теги в <head>
                 html = resp.read(32768).decode('utf-8', errors='ignore')
 
             title = self._parse_meta(html, 'og:title') or self._parse_title(html) or url[:60]
             desc  = self._parse_meta(html, 'og:description') or ''
 
-            # FIX: Qt.Q_ARG убран в PyQt6 — используем QTimer.singleShot(0, lambda)
-            # QTimer.singleShot всегда выполняется в GUI-потоке через очередь событий,
-            # что потокобезопасно и не требует Q_ARG.
             _title_safe = title[:120]
             QTimer.singleShot(0, lambda t=_title_safe: self._title_lbl.setText(t))
             if desc:
@@ -1282,7 +1156,6 @@ class _LinkPreviewCard(QFrame):
 
     @staticmethod
     def _parse_meta(html: str, prop: str) -> str:
-        """Быстрый парсинг meta property без BeautifulSoup."""
         import re
         pat = re.compile(
             rf'<meta[^>]+property=["\']{prop}["\'"][^>]+content=["\']([^"\'>]+)',
@@ -1291,7 +1164,6 @@ class _LinkPreviewCard(QFrame):
         m = pat.search(html)
         if m:
             return m.group(1).strip()
-        # fallback: content before property
         pat2 = re.compile(
             rf'<meta[^>]+content=["\']([^"\'>]+)["\'"][^>]+property=["\']{prop}',
             re.IGNORECASE,
@@ -1307,13 +1179,9 @@ class _LinkPreviewCard(QFrame):
 
 
 class ChatPanel(QFrame):
-    """
-    При show() MainWindow вызывает resize(w + PANEL_WIDTH, h).
-    GIF конвертируется в MP4 перед отправкой.
-    """
     message_sent         = pyqtSignal(str)
     media_send_requested = pyqtSignal()
-    typing_started       = pyqtSignal()   # пользователь начал печатать
+    typing_started       = pyqtSignal()
 
     PANEL_WIDTH = 600
 
@@ -1325,7 +1193,6 @@ class ChatPanel(QFrame):
         self._current_room_fn = current_room_fn
         self._msg_widgets: dict[tuple, ChatMessageWidget] = {}
         self._pending_media   = None
-        # Состояние группировки: uid и виджет последнего добавленного сообщения
         self._last_uid: 'int | None'             = None
         self._last_widget: 'ChatMessageWidget | None' = None
 
@@ -1333,12 +1200,8 @@ class ChatPanel(QFrame):
         main_lay.setContentsMargins(0, 0, 0, 0)
         main_lay.setSpacing(0)
 
-        # Заголовок удалён намеренно:
-        # Чат закрывается ТОЛЬКО через кнопку 💬 в title bar главного окна.
-        # _room_lbl — заглушка для совместимости с update_room_label()
         self._room_lbl = QLabel()
 
-        # Список сообщений
         self._scroll = QScrollArea()
         self._scroll.setWidgetResizable(True)
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -1358,7 +1221,6 @@ class ChatPanel(QFrame):
         sep2.setFixedHeight(1)
         main_lay.addWidget(sep2)
 
-        # ── Typing indicator ──────────────────────────────────────────────
         self._typing_lbl = QLabel("")
         self._typing_lbl.setObjectName("chatTypingLbl")
         self._typing_lbl.setFixedHeight(18)
@@ -1370,14 +1232,12 @@ class ChatPanel(QFrame):
         self._typing_lbl.hide()
         main_lay.addWidget(self._typing_lbl)
 
-        # Таймер гашения typing indicator (5 сек без обновления)
         self._typing_timer = QTimer(self)
         self._typing_timer.setSingleShot(True)
         self._typing_timer.setInterval(5000)
         self._typing_timer.timeout.connect(self._hide_typing)
         self._typing_nicks: dict[int, str] = {}  # uid → nick
 
-        # Поле ввода
         input_bar = QFrame()
         input_bar.setObjectName("chatInputBar")
         input_bar.setFixedHeight(50)
@@ -1410,11 +1270,7 @@ class ChatPanel(QFrame):
         self._send_btn.clicked.connect(self._on_send)
         i_lay.addWidget(self._send_btn)
         main_lay.addWidget(input_bar)
-
-        # ── Drag & Drop файлов в чат ─────────────────────────────────────
         self.setAcceptDrops(True)
-
-        # Оверлей «Перетащите файлы сюда» — показывается при наведении файла
         self._drop_overlay = QLabel("📎  Перетащите файлы сюда", self)
         self._drop_overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._drop_overlay.setObjectName("chatDropOverlay")
@@ -1431,10 +1287,6 @@ class ChatPanel(QFrame):
         """)
         self._drop_overlay.hide()
 
-    # Максимум сообщений в панели чата.
-    # При превышении удаляем самое старое: виджет + запись из _msg_widgets.
-    # Выбрано 200 — достаточно контекста для разговора на 30 человек,
-    # при этом ОЗУ не растёт бесконечно (каждый ChatMessageWidget ~несколько KB).
     MAX_MESSAGES = 200
 
     def _trim_oldest(self) -> None:
@@ -1447,7 +1299,6 @@ class ChatPanel(QFrame):
             w = item.widget()
             if w is None:
                 continue
-            # Удаляем из dict по значению
             key_to_del = next((k for k, v in self._msg_widgets.items() if v is w), None)
             if key_to_del is not None:
                 del self._msg_widgets[key_to_del]
@@ -1459,25 +1310,8 @@ class ChatPanel(QFrame):
     def update_room_label(self, room: str) -> None:
         self._room_lbl.setText("💬  Чат")
 
-    # ── Вспомогательный метод: определяем параметры группировки ──────────────
     def _group_flags(self, entry: dict) -> 'tuple[bool, bool]':
-        """
-        Возвращает (show_avatar, show_header) для нового сообщения.
 
-        Правило Discord-стиля:
-          • Первое сообщение в группе (или после другого автора):
-              show_header=True  (показываем ник+время)
-              show_avatar=False (аватарка будет у последнего в группе)
-          • Последнее сообщение в группе — определяем ретроспективно
-            при добавлении следующего: у предыдущего скрываем аватарку.
-          • Одиночное сообщение: show_header=True, show_avatar=True.
-
-        Реализация упрощённая — двухпроходная не нужна:
-          при добавлении нового сообщения:
-            1. если тот же автор — скрыть аватарку у предыдущего
-            2. show_header = (новый автор != предыдущего)
-            3. show_avatar = True (аватарка у текущего, пока следующий не придёт)
-        """
         uid = entry.get('uid', 0)
         same_author = (uid == self._last_uid)
         show_header = not same_author
@@ -1485,7 +1319,6 @@ class ChatPanel(QFrame):
         return show_avatar, show_header
 
     def _hide_prev_avatar(self) -> None:
-        """Скрывает аватарку у предыдущего виджета (он больше не последний в группе)."""
         if self._last_widget is not None:
             try:
                 self._last_widget.hide_avatar()
@@ -1500,7 +1333,6 @@ class ChatPanel(QFrame):
         show_avatar, show_header = self._group_flags(entry)
         uid = entry.get('uid', 0)
 
-        # Предыдущий виджет того же автора больше не последний → скрываем его аватарку
         if uid == self._last_uid and self._last_widget is not None:
             self._hide_prev_avatar()
 
@@ -1513,7 +1345,6 @@ class ChatPanel(QFrame):
         self._last_uid    = uid
         self._last_widget = w
 
-        # Ограничиваем размер чата — удаляем старые сообщения
         self._trim_oldest()
 
         QTimer.singleShot(40, self._scroll_to_bottom)
@@ -1537,9 +1368,7 @@ class ChatPanel(QFrame):
             same_prev   = (uid == self._last_uid)
             same_next   = (uid == next_uid)
 
-            # Шапка только у первого в группе
             show_header = not same_prev
-            # Аватарка только у последнего в группе
             show_avatar = not same_next
 
             w = ChatMessageWidget(entry, self._my_uid,
@@ -1563,7 +1392,6 @@ class ChatPanel(QFrame):
 
     @pyqtSlot()
     def _emit_ready(self) -> None:
-        """Вызывается из фонового потока через QMetaObject.invokeMethod."""
         self.media_send_requested.emit()
 
     def _on_send(self) -> None:
@@ -1574,7 +1402,6 @@ class ChatPanel(QFrame):
         self.message_sent.emit(text)
 
     def _on_image_pasted(self, img: QImage) -> None:
-        """Скриншот из буфера обмена — конвертируем в PNG и отправляем."""
         try:
             from PyQt6.QtCore import QBuffer, QIODevice
             buf = QBuffer()
@@ -1608,14 +1435,12 @@ class ChatPanel(QFrame):
                     data = f.read()
 
                 if ext == '.gif':
-                    # GIF → MP4 в фоне
                     mp4 = _gif_to_mp4(data)
                     if mp4:
                         final_data = mp4
                         file_type  = 'video'
                         file_name  = os.path.splitext(os.path.basename(path))[0] + '.mp4'
                     else:
-                        # Fallback: отправить как image (первый кадр)
                         final_data = data
                         file_type  = 'image'
                         file_name  = os.path.basename(path)
@@ -1639,8 +1464,6 @@ class ChatPanel(QFrame):
                 )
                 print(f"[Chat] attach готово: {file_name} ({file_type}) "
                       f"{len(self._pending_media[2])} символов b64")
-                # Строго потокобезопасный вызов — QMetaObject.invokeMethod
-                # гарантирует исполнение в GUI-потоке через очередь событий Qt.
                 QMetaObject.invokeMethod(
                     self, "_emit_ready",
                     Qt.ConnectionType.QueuedConnection,
@@ -1648,16 +1471,11 @@ class ChatPanel(QFrame):
             except Exception as ex:
                 print(f"[Chat] attach: {ex}")
 
-        # GIF конвертация может занять время — делаем в фоне
         threading.Thread(target=_load_and_prepare, daemon=True).start()
 
-    # ------------------------------------------------------------------
-    # Drag & Drop
-    # ------------------------------------------------------------------
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
-            # Показываем оверлей поверх чата
             self._drop_overlay.setGeometry(
                 8, 8,
                 self.width() - 16,
@@ -1677,7 +1495,6 @@ class ChatPanel(QFrame):
         super().dragLeaveEvent(event)
 
     def dropEvent(self, event):
-        """Файлы перетащены в чат — обрабатываем первый файл."""
         self._drop_overlay.hide()
         urls = event.mimeData().urls()
         if not urls:
@@ -1689,7 +1506,6 @@ class ChatPanel(QFrame):
         self._process_dropped_file(path)
 
     def _process_dropped_file(self, path: str) -> None:
-        """Загружает файл в фоне и ставит в _pending_media (как attach)."""
         ext = os.path.splitext(path)[1].lower()
 
         def _load():
@@ -1726,11 +1542,7 @@ class ChatPanel(QFrame):
 
         threading.Thread(target=_load, daemon=True).start()
 
-    # ------------------------------------------------------------------
-    # Typing indicator
-    # ------------------------------------------------------------------
     def show_typing(self, uid: int, nick: str) -> None:
-        """Показать что пользователь печатает."""
         self._typing_nicks[uid] = nick
         self._update_typing_text()
         self._typing_timer.start()  # перезапуск таймера
@@ -1753,7 +1565,6 @@ class ChatPanel(QFrame):
         self._typing_lbl.show()
 
     def clear_typing(self, uid: int) -> None:
-        """Убрать typing для конкретного uid (после получения его сообщения)."""
         self._typing_nicks.pop(uid, None)
         self._update_typing_text()
 

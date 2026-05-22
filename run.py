@@ -212,6 +212,7 @@ LOGS_DIR: str = _setup_logging()
 # импортировать модуль при анализе, он молча выпадает из бандла без ошибки.
 # Статический import здесь = модуль всегда виден через граф зависимостей.
 import core.updater  # noqa: F401
+import core.win_input  # noqa: F401  (WinAPI-инъекция для удалённого управления)
 
 # ── Явный import — PyInstaller включает client_main.client_main в сборку ─────
 from client_main.client_main import main  # noqa: E402

@@ -1,25 +1,7 @@
-"""
-rust_video_track.py — DEPRECATED в v3
-
-В v3 Rust (webrtc-rs) отправляет RTP напрямую в Pion SFU.
-Этот файл сохранён для обратной совместимости — его классы
-не используются стримером.
-
-RustVideoTrack может понадобиться в будущем если нужно
-принимать кадры не через WebRTC (например, локальный preview),
-но в текущей архитектуре он не задействован.
-
-Архитектура v3:
-  Rust: WGC → NVENC → webrtc-rs → RTP → Pion SFU
-  Python (зритель): aiortc PC → recvonly tracks от Pion SFU
-  Python (стример): не держит видео-треки — только сигнализация
-"""
-
 import logging
 logger = logging.getLogger(__name__)
 logger.debug("rust_video_track.py loaded (deprecated in v3 — not used by streamer)")
 
-# Заглушки для импортов которые могут быть в старом коде
 try:
     from aiortc.mediastreams import VideoStreamTrack as _VST
     _base = _VST

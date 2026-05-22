@@ -1,15 +1,3 @@
-# ui_connecting.py
-# ──────────────────────────────────────────────────────────────────────────────
-# Экран подключения к серверу с обязательной проверкой обновлений.
-#
-# Поток работы:
-#   _start_probe()
-#     └─► _check_for_update_then_connect()   (всегда первым делом)
-#           ├─ on_update_found → скачиваем → PS1 перезапустит приложение
-#           ├─ on_no_update  → _do_tcp_probe()
-#           └─ on_error      → _do_tcp_probe()   (fail-safe)
-#     └─► _do_tcp_probe()                    (после проверки обновлений)
-# ──────────────────────────────────────────────────────────────────────────────
 
 import os
 import socket
@@ -25,20 +13,9 @@ from config import resource_path, DEFAULT_PORT_TCP
 from .ui_styles import GLASS_CARD_SS, GLASS_ERROR_SS, BTN_PRIMARY_SS, BTN_SECONDARY_SS
 from .ui_titlebar import AppTitleBar
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Константы
-# ══════════════════════════════════════════════════════════════════════════════
-
 PROBE_TIMEOUT_SEC = 3.0
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ConnectWorker — TCP probe в фоне
-# ══════════════════════════════════════════════════════════════════════════════
-
 class ConnectWorker(QThread):
-    """Проверяет TCP-доступность сервера. Не блокирует UI."""
     result = pyqtSignal(bool)
 
     def __init__(self, ip: str):
@@ -57,24 +34,8 @@ class ConnectWorker(QThread):
             pass
         self.result.emit(ok)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# _UpdaterSignals — мост updater-поток → Qt UI-поток
-# ══════════════════════════════════════════════════════════════════════════════
-
 class _UpdaterSignals(QObject):
-    """
-    PyQt6 гарантирует, что сигналы, испущенные из любого потока,
-    доставляются в UI-поток через event loop — никаких мьютексов не нужно.
 
-    ВАЖНО: сигнатуры должны СОВПАДАТЬ с тем, что передаёт core/updater.py:
-      • on_update_found(version: str, download_url: str)      — 2 арг
-      • on_progress(percent: int)                              — 1 арг
-      • on_no_update(), on_done(), on_error(msg: str), on_check_error(msg: str)
-    Раньше тут были сигналы на 3 и 2 аргумента — rassинхронизация с
-    updater роняла лямбду (TypeError), поток тихо умирал, UI висел
-    на «Проверка обновлений» вечно. Приводим к совпадению.
-    """
     update_found = pyqtSignal(str, str)   # (new_version, download_url)
     no_update    = pyqtSignal()
     check_error  = pyqtSignal(str)        # message
@@ -82,20 +43,7 @@ class _UpdaterSignals(QObject):
     dl_done      = pyqtSignal()
     dl_error     = pyqtSignal(str)        # message
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ConnectingScreen
-# ══════════════════════════════════════════════════════════════════════════════
-
 class ConnectingScreen(QWidget):
-    """
-    Показывается пока идёт probe к серверу.
-
-    КЛЮЧЕВЫЕ ПРАВИЛА:
-      - Никогда не вызываем close() первым — только hide().
-        Qt не считает hide() закрытием последнего окна → event loop не завершается.
-      - show_login испускается ДО hide(), чтобы новое окно появилось раньше.
-    """
     show_login = pyqtSignal(str, str, str)   # ip, nick, avatar
 
     def __init__(
@@ -112,7 +60,6 @@ class ConnectingScreen(QWidget):
         self._worker: ConnectWorker | None = None
         self._main_window = None   # держим ссылку — GC не убьёт MainWindow
 
-        # Сигналы для безопасного взаимодействия updater-потока с UI
         self._upd_sigs = _UpdaterSignals()
         self._upd_sigs.update_found.connect(self._on_update_found)
         self._upd_sigs.no_update.connect(self._on_no_update)
@@ -123,8 +70,6 @@ class ConnectingScreen(QWidget):
 
         self._build_ui()
         self._start_probe()
-
-    # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build_ui(self):
         from version import APP_NAME, APP_VERSION
@@ -162,7 +107,6 @@ class ConnectingScreen(QWidget):
         root.setContentsMargins(36, 24, 36, 24)
         card_lay.addLayout(root)
 
-        # Изображение состояния
         self.lbl_img = QLabel()
         self.lbl_img.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_img.setFixedHeight(120)
@@ -179,7 +123,6 @@ class ConnectingScreen(QWidget):
         )
         root.addWidget(self.lbl_status)
 
-        # IP (мелко)
         self.lbl_ip = QLabel(f"Адрес:  {self.ip}")
         self.lbl_ip.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_ip.setStyleSheet(
@@ -188,7 +131,6 @@ class ConnectingScreen(QWidget):
         )
         root.addWidget(self.lbl_ip)
 
-        # Прогресс-бар скачивания
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
@@ -198,7 +140,6 @@ class ConnectingScreen(QWidget):
         self.progress_bar.hide()
         root.addWidget(self.progress_bar)
 
-        # Блок ошибки
         self.frm_error = QFrame()
         self.frm_error.setStyleSheet(GLASS_ERROR_SS)
         err_lay = QVBoxLayout(self.frm_error)
@@ -214,8 +155,6 @@ class ConnectingScreen(QWidget):
         err_lay.addWidget(self.lbl_error)
         self.frm_error.hide()
         root.addWidget(self.frm_error)
-
-        # Кнопки (Повторить / Изменить IP)
         btn_row = QHBoxLayout()
         btn_row.setSpacing(10)
 
@@ -235,10 +174,7 @@ class ConnectingScreen(QWidget):
 
         self._set_image("connecting")
 
-    # ── Изображение состояния ─────────────────────────────────────────────────
-
     def _set_image(self, state: str):
-        """state = 'connecting' | 'fail'"""
         if state == "fail":
             candidates = [
                 resource_path("assets/fail_connect.svg"),
@@ -259,7 +195,6 @@ class ConnectingScreen(QWidget):
                     self.lbl_img.setStyleSheet("")
                     self.lbl_img.setText("")
                     return
-            # Файла нет — эмодзи fallback
             self.lbl_img.setPixmap(QPixmap())
             self.lbl_img.setText("❌")
             self.lbl_img.setStyleSheet("font-size: 72px;")
@@ -279,14 +214,7 @@ class ConnectingScreen(QWidget):
                 self.lbl_img.setText("🔄")
                 self.lbl_img.setStyleSheet("font-size: 72px;")
 
-    # ── Главная точка входа ───────────────────────────────────────────────────
-
     def _start_probe(self):
-        """
-        Вызывается при старте и при «Повторить».
-        Первый запуск — проверяем обновления, потом TCP probe.
-        Повторная попытка — сразу TCP probe (не раздражаем пользователя).
-        """
         self.frm_error.hide()
         self.btn_retry.hide()
         self.btn_change_ip.hide()
@@ -294,11 +222,7 @@ class ConnectingScreen(QWidget):
         self.progress_bar.setValue(0)
         self.lbl_ip.setText(f"Адрес:  {self.ip}")
         self._set_image("connecting")
-
-        # Обновление ОБЯЗАТЕЛЬНО — всегда проверяем первым делом
         self._check_for_update_then_connect()
-
-    # ── Шаг 1: Проверка обновлений ───────────────────────────────────────────
 
     def _check_for_update_then_connect(self):
         self.lbl_status.setText("Проверка обновлений...")
@@ -306,25 +230,18 @@ class ConnectingScreen(QWidget):
 
         sigs = self._upd_sigs
         from core.updater import check_for_updates_async
-        # Сигнатуры лямбд ТОЧНО соответствуют тому что передаёт updater:
-        # on_update_found получает (version, download_url) — 2 арг.
         check_for_updates_async(
             on_update_found=lambda v, url: sigs.update_found.emit(v, url),
             on_no_update=lambda: sigs.no_update.emit(),
             on_error=lambda msg: sigs.check_error.emit(msg),
         )
 
-        # Watchdog-таймер: если UpdaterThread повис или упал с молчаливым
-        # исключением в лямбде — через 15 сек форсим fail-safe в _do_tcp_probe.
-        # Без него UI висел бы на «Проверка обновлений» вечно.
         self._update_watchdog = QTimer(self)
         self._update_watchdog.setSingleShot(True)
         self._update_watchdog.timeout.connect(self._on_update_watchdog)
         self._update_watchdog.start(15000)
 
     def _on_update_watchdog(self):
-        """Сработал если ни update_found, ни no_update, ни check_error
-        не пришли за 15 сек. Считаем что updater не отвечает и идём дальше."""
         if getattr(self, '_update_check_done', False):
             return
         print("[Updater] Watchdog: нет ответа за 15 сек, пропускаем проверку")
@@ -343,7 +260,6 @@ class ConnectingScreen(QWidget):
         self._do_tcp_probe()
 
     def _on_update_check_error(self, msg: str):
-        """Ошибка проверки — логируем, не блокируем (fail-safe)."""
         if getattr(self, '_update_check_done', False):
             return
         self._update_check_done = True
@@ -354,14 +270,7 @@ class ConnectingScreen(QWidget):
         print(f"[Updater] Ошибка проверки: {msg}")
         self._do_tcp_probe()
 
-    # ── Шаг 2а: Найдено обновление → скачиваем ───────────────────────────────
-
     def _on_update_found(self, new_version: str, download_url: str):
-        """
-        Получили (версия, URL архива). Сохраняем URL — он нужен для
-        download_and_apply. Раньше здесь обработчик ожидал (v, n, b) что
-        не совпадало с тем что шлёт updater — лямбда падала TypeError'ом.
-        """
         if getattr(self, '_update_check_done', False):
             return
         self._update_check_done = True
@@ -380,8 +289,6 @@ class ConnectingScreen(QWidget):
 
         sigs = self._upd_sigs
         from core.updater import download_and_apply
-        # download_and_apply принимает: (download_url, on_progress, on_done, on_error).
-        # on_progress получает ОДИН int (percent) — не кортеж.
         download_and_apply(
             download_url,
             on_progress=lambda pct: sigs.dl_progress.emit(int(pct)),
@@ -394,7 +301,6 @@ class ConnectingScreen(QWidget):
         self.lbl_status.setText(f"⬇️  Обновление...  {pct}%")
 
     def _on_dl_done(self):
-        """PS1 скрипт применит обновление и перезапустит приложение."""
         self.progress_bar.setValue(100)
         self.lbl_status.setText("✅  Обновление установлено, перезапуск...")
         self._set_status_style("#82e0aa")
@@ -409,8 +315,6 @@ class ConnectingScreen(QWidget):
         self.lbl_error.setText(f"⚠️  {msg}")
         self.frm_error.show()
         self.btn_retry.show()
-
-    # ── Шаг 2б: TCP probe ────────────────────────────────────────────────────
 
     def _do_tcp_probe(self):
         self.lbl_status.setText("Подключение к серверу...")
@@ -448,26 +352,16 @@ class ConnectingScreen(QWidget):
             self.btn_change_ip.show()
 
     def _open_main_window(self):
-        # v3: encoder patch removed — encoding is done by Rust (media-engine.exe)
-        # (media-engine.exe). aiortc у зрителя только декодирует, патч не нужен.
-
         from ui_main.ui_main import MainWindow
         self._main_window = MainWindow(self.ip, self.nick, self.avatar)
         self._main_window.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
         self._main_window.show()
-        # ✅ hide() — Qt не считает это закрытием последнего окна
         self.hide()
 
     def _on_change_ip(self):
-        """
-        ✅ ПОРЯДОК КРИТИЧЕН:
-          1. Сначала emit — получатель откроется и станет видимым.
-          2. Потом hide() — только после появления нового окна.
-        """
+
         self.show_login.emit(self.ip, self.nick, self.avatar)
         self.hide()
-
-    # ── Вспомогательный метод ─────────────────────────────────────────────────
 
     def _set_status_style(self, color: str):
         self.lbl_status.setStyleSheet(

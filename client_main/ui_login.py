@@ -1,11 +1,3 @@
-# ui_login.py
-# ──────────────────────────────────────────────────────────────────────────────
-# Окно входа и вспомогательные функции работы с конфигом пользователя.
-#
-# Показывается:
-#   1. При первом запуске (нет user_config.json).
-#   2. Когда ConnectingScreen провалился и пользователь нажал «Изменить IP».
-# ──────────────────────────────────────────────────────────────────────────────
 
 import os
 import json
@@ -23,18 +15,8 @@ from .ui_styles import GLASS_CARD_SS, GLASS_ERROR_SS, BTN_PRIMARY_SS
 from .ui_titlebar import AppTitleBar
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# Config helpers
-# ══════════════════════════════════════════════════════════════════════════════
-
 def migrate_old_configs() -> None:
-    """
-    Единожды переносит старые JSON-файлы из корня приложения в AppData.
 
-    Миграция срабатывает только если:
-      - старый файл существует в папке запуска
-      - новый файл в AppData ещё НЕ существует (не перезаписываем!)
-    """
     import sys as _sys
     old_dir = (
         os.path.dirname(_sys.executable)
@@ -112,10 +94,6 @@ def load_server_name() -> str:
     return 'InPulse Server'
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# LoginWindow
-# ══════════════════════════════════════════════════════════════════════════════
-
 class LoginWindow(QWidget):
     """Окно первичного входа: IP, ник, аватар."""
 
@@ -131,14 +109,10 @@ class LoginWindow(QWidget):
         super().__init__()
         self.current_avatar = avatar
 
-        # ✅ Обязательная ссылка на ConnectingScreen — GC не уберёт объект
         self._connecting_screen = None
-
         self._build_ui(ip, nick)
         if error_msg:
             self._show_error(error_msg)
-
-    # ── UI ────────────────────────────────────────────────────────────────────
 
     def _build_ui(self, ip: str, nick: str):
         from version import APP_NAME, APP_VERSION
@@ -170,7 +144,6 @@ class LoginWindow(QWidget):
         sep.setStyleSheet("background: rgba(255,255,255,0.08); border: none;")
         card_lay.addWidget(sep)
 
-        # ── Кнопка «Назад» (хлебные крошки) ──────────────────────────────────
         btn_back = QPushButton("←  Назад")
         btn_back.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_back.setStyleSheet(
@@ -188,7 +161,6 @@ class LoginWindow(QWidget):
         layout.setSpacing(10)
         card_lay.addLayout(layout)
 
-        # Аватарка
         self.avatar_lbl = QLabel()
         self.avatar_lbl.setFixedSize(110, 110)
         self.avatar_lbl.setStyleSheet(
@@ -221,7 +193,6 @@ class LoginWindow(QWidget):
 
         layout.addSpacing(6)
 
-        # IP
         lbl_ip = QLabel("IP-адрес сервера")
         lbl_ip.setStyleSheet(
             "font-size: 12px; font-weight: bold; color: #8899bb; "
@@ -233,7 +204,6 @@ class LoginWindow(QWidget):
         self.ip_in.setPlaceholderText("например: 192.168.1.100")
         layout.addWidget(self.ip_in)
 
-        # Ник
         lbl_nick = QLabel("Никнейм")
         lbl_nick.setStyleSheet(
             "font-size: 12px; font-weight: bold; color: #8899bb; "
@@ -252,7 +222,6 @@ class LoginWindow(QWidget):
 
         layout.addSpacing(4)
 
-        # Блок ошибки
         self.frm_error = QFrame()
         self.frm_error.setStyleSheet(GLASS_ERROR_SS)
         err_lay = QVBoxLayout(self.frm_error)
@@ -269,7 +238,6 @@ class LoginWindow(QWidget):
         self.frm_error.hide()
         layout.addWidget(self.frm_error)
 
-        # Кнопка входа
         self.btn_go = QPushButton("Войти")
         self.btn_go.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_go.setStyleSheet(BTN_PRIMARY_SS)
@@ -277,8 +245,6 @@ class LoginWindow(QWidget):
         layout.addWidget(self.btn_go)
 
         self._refresh_avatar()
-
-    # ── Аватар ────────────────────────────────────────────────────────────────
 
     def _open_avatar_picker(self):
         from ui_dialogs import AvatarSelector
@@ -292,8 +258,6 @@ class LoginWindow(QWidget):
         px = QIcon(p).pixmap(100, 100) if os.path.exists(p) else QIcon().pixmap(0, 0)
         self.avatar_lbl.setPixmap(px)
 
-    # ── Ошибки ────────────────────────────────────────────────────────────────
-
     def _show_error(self, msg: str):
         self.lbl_error.setText(msg)
         self.frm_error.show()
@@ -303,11 +267,8 @@ class LoginWindow(QWidget):
         self.lbl_error.clear()
 
     def _on_go_back(self):
-        """Возврат на экран выбора серверов."""
         self.go_back.emit()
         self.close()
-
-    # ── Логин ─────────────────────────────────────────────────────────────────
 
     def _on_login(self):
         ip   = self.ip_in.text().strip()
@@ -322,14 +283,10 @@ class LoginWindow(QWidget):
         if self.cb_save.isChecked():
             save_config(ip, nick, self.current_avatar)
 
-        # ✅ hide() — не close(). LoginWindow живёт в памяти,
-        # вернётся если ConnectingScreen снова испустит show_login.
         self.hide()
         self._open_connecting(ip, nick, self.current_avatar)
 
     def _open_connecting(self, ip: str, nick: str, avatar: str):
-        # ✅ self._connecting_screen — не локальная переменная!
-        # Сохраняем в атрибут, иначе GC убьёт объект сразу после return.
         from .ui_connecting import ConnectingScreen
         self._connecting_screen = ConnectingScreen(ip, nick, avatar)
         self._connecting_screen.setWindowIcon(
@@ -348,5 +305,4 @@ class LoginWindow(QWidget):
             f"⚠️  Сервер недоступен: {ip}\n"
             "Проверьте адрес и нажмите «Войти»."
         )
-        # ✅ show() — окно уже живое, просто было скрыто через hide()
         self.show()

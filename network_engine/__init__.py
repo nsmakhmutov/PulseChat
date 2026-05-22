@@ -1,7 +1,3 @@
-# network_engine/__init__.py — Пакет сетевого клиента InPulse
-#
-# Совместимость: from network_engine import NetworkClient — работает как раньше.
-
 from .core import NetworkClient
 from .sfu_bridge import SfuBridge, get_shared as get_shared_sfu
 from .media_engine_bridge import MediaEngineBridge

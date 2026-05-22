@@ -1,66 +1,25 @@
-# client_main.py
-# ──────────────────────────────────────────────────────────────────────────────
-# Точка входа приложения InPulse.
-#
-# ПОРЯДОК ИМПОРТОВ КРИТИЧЕН:
-#   1. multiprocessing.freeze_support() — ДО всего, требование Windows spawn
-#   2. app_init  — UTF-8, faulthandler, DLL-загрузка
-#   3. PyQt6     — после DLL
-#   4. остальное — после PyQt6
-# ──────────────────────────────────────────────────────────────────────────────
 
-# ── 0. multiprocessing freeze_support — ПЕРВЫЙ вызов в __main__ ───────────────
-# Windows spawn-режим: подпроцессы re-импортируют main module и должны
-# завершиться до возврата из freeze_support(). Вызов в main() уже поздно.
 import multiprocessing as _mp
 import sys as _sys
 
 if __name__ == "__main__" or getattr(_sys, 'frozen', False):
     _mp.freeze_support()
-    # Если это дочерний multiprocessing-процесс — завершиться немедленно.
-    # current_process().name == 'MainProcess' только в главном.
     if _mp.current_process().name != 'MainProcess':
         _sys.exit(0)
 
 del _mp, _sys
 
-# ── 1. Инициализация (должна быть первой после freeze_support!) ───────────────
 from . import app_init
-
-# ── 2. Стандартная библиотека ─────────────────────────────────────────────────
 import sys
-
-# ── 3. Qt ─────────────────────────────────────────────────────────────────────
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtGui import QIcon, QSurfaceFormat
-
-# ── 4. Приложение ─────────────────────────────────────────────────────────────
 from config import resource_path
 from .ui_login import load_config, LoginWindow
 from .ui_server_select import MultiServerScreen
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Точка входа
-# ══════════════════════════════════════════════════════════════════════════════
-
 def main():
-    """
-    Основная функция приложения.
-
-    Вызывается из:
-      • run.py (PyInstaller exe): from client_main.client_main import main; main()
-      • dev-режим: python -m client_main.client_main → if __name__ == '__main__'
-    """
-    # ── Защита от subprocess-вызовов ffmpeg/aiortc проверкой кодеков ──────────
-    # FIX: Раньше было `if len(sys.argv) > 1: sys.exit(0)` — слишком грубо,
-    # блокировало любые CLI-флаги. Теперь проверяем только известные маркеры
-    # multiprocessing. Обычные CLI флаги (--debug, --log-level) пройдут.
     for _arg in sys.argv[1:]:
         if _arg.startswith('--multiprocessing') or _arg == '--freeze':
             sys.exit(0)
-
-    # ── Дамп аудио-устройств до создания QApplication ─────────────────────────
     try:
         import sounddevice as _sd
         print("[DEBUG] Аудио-устройства системы:", flush=True)
@@ -79,7 +38,6 @@ def main():
     except Exception as _ex:
         print(f"[DEBUG] query_devices() упал: {_ex}", flush=True)
 
-    # ── Перехват исключений в дочерних потоках ────────────────────────────────
     import logging as _logging
     import threading as _threading
     import traceback as _tb
@@ -95,16 +53,13 @@ def main():
     _threading.excepthook = _thread_excepthook
     _logging.debug("threading.excepthook установлен")
 
-    # ── QSurfaceFormat ДО создания QApplication ───────────────────────────────
     _gl_fmt = QSurfaceFormat()
     _gl_fmt.setSwapBehavior(QSurfaceFormat.SwapBehavior.DoubleBuffer)
     _gl_fmt.setSwapInterval(1)
     QSurfaceFormat.setDefaultFormat(_gl_fmt)
 
-    # ── QApplication ──────────────────────────────────────────────────────────
     app = QApplication(sys.argv)
 
-    # Держим глобальные ссылки — GC не уничтожит окна после выхода из if/else.
     _login_window:   LoginWindow        | None = None
     _connect_screen: MultiServerScreen  | None = None
 

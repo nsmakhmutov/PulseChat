@@ -1,16 +1,3 @@
-# ui_server_select.py
-# ──────────────────────────────────────────────────────────────────────────────
-# Экраны выбора сервера:
-#   MultiServerScreen  — основной экран (список всех серверов в сети)
-#   DiscoveryScreen    — старый экран (оставлен для совместимости)
-#
-# Helpers:
-#   DiscoveryWorker    — UDP поиск одного сервера (QThread)
-#   DiscoveryAllWorker — UDP поиск всех серверов (QThread)
-#   _PingWorker        — TCP-latency измерение (QThread)
-#   _ServerItemWidget  — карточка сервера в списке
-#   _CreateServerDialog— диалог ввода имени сервера
-# ──────────────────────────────────────────────────────────────────────────────
 
 import socket
 import threading
@@ -33,11 +20,6 @@ from .ui_styles import (
 from .ui_titlebar import AppTitleBar
 from .ui_login import save_server_name
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# DiscoveryWorker — UDP поиск одного сервера
-# ══════════════════════════════════════════════════════════════════════════════
-
 class DiscoveryWorker(QThread):
     """Запускает ServerDiscovery.discover() в отдельном потоке."""
     found     = pyqtSignal(dict)   # {'ip': ..., 'port': ..., 'host_nick': ...}
@@ -59,11 +41,6 @@ class DiscoveryWorker(QThread):
             print(f"[Discovery] Worker error: {e}")
             self.not_found.emit()
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# DiscoveryAllWorker — UDP поиск всех серверов
-# ══════════════════════════════════════════════════════════════════════════════
-
 class DiscoveryAllWorker(QThread):
     """Запускает ServerDiscovery.discover_all() в отдельном потоке."""
     done = pyqtSignal(list)
@@ -80,11 +57,6 @@ class DiscoveryAllWorker(QThread):
         except Exception as e:
             print(f"[DiscoveryAll] Worker error: {e}")
             self.done.emit([])
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# _PingWorker — TCP-latency в фоне
-# ══════════════════════════════════════════════════════════════════════════════
 
 class _PingWorker(QThread):
     """Измеряет RTT TCP-соединения к серверу. Не блокирует UI."""
@@ -108,29 +80,8 @@ class _PingWorker(QThread):
         except Exception:
             self.result.emit(-1)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# _BanQueryWorker — спрашивает сервер «забанен ли мой ник?»
-# ══════════════════════════════════════════════════════════════════════════════
-
 class _BanQueryWorker(QThread):
-    """
-    Короткоживущий TCP-probe: подключается к серверу, шлёт CMD_QUERY_BAN,
-    читает CMD_QUERY_BAN_RESP, закрывает соединение.
 
-    Почему отдельный коннект (а не поле в discovery-broadcast):
-      • UDP broadcast ко всем — утечка всего банлиста всем слушателям
-        в сети. Плохо для приватности.
-      • Сервер не знает кому слать ответ (IP+ник разные у разных клиентов),
-        пришлось бы класть в broadcast весь список. Плохо для UDP-MTU
-        и плохо для приватности.
-      • TCP-probe: сервер видит именно наш IP+ник и отвечает только нам.
-        Разбан синхронизируется мгновенно — следующий probe вернёт False.
-
-    Таймауты умышленно небольшие (1.5 сек) — сервер уже найден через
-    discovery, он должен отвечать быстро. Если не отвечает — просто
-    считаем «не забанены» и не блокируем UI.
-    """
     result = pyqtSignal(bool)   # banned?
 
     def __init__(self, ip: str, nick: str,
@@ -151,7 +102,6 @@ class _BanQueryWorker(QThread):
                 'action': 'query_ban',
                 'nick':   self._nick[:16],
             }).encode('utf-8'))
-            # Ответ короткий, одного recv хватит
             data = sock.recv(512)
             if not data:
                 self.result.emit(False)
@@ -159,9 +109,7 @@ class _BanQueryWorker(QThread):
             msg = _json.loads(data.decode('utf-8', errors='replace'))
             self.result.emit(bool(msg.get('banned', False)))
         except Exception:
-            # Timeout/refused/bad JSON — считаем что не забанены (карточка
-            # будет просто обычной, пользователь попробует подключиться
-            # и сервер отдаст CMD_BANNED если что).
+
             self.result.emit(False)
         finally:
             if sock is not None:
@@ -170,27 +118,7 @@ class _BanQueryWorker(QThread):
                 except Exception:
                     pass
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# _ServerItemWidget — карточка сервера в списке
-# ══════════════════════════════════════════════════════════════════════════════
-
 class _ServerItemWidget(QFrame):
-    """Карточка сервера: имя, кол-во участников, пинг, дерево ников.
-    Одиночный клик = подключение.
-
-    Бан-статус:
-      • Инициализируется всегда как banned=False.
-      • Внешний код вызывает set_banned(True/False) — статус приходит
-        от самого сервера через TCP-query (_BanQueryWorker), а не
-        хранится локально. Это гарантирует мгновенную синхронизацию
-        разбана: хост убрал из bans.json → следующий query вернёт False.
-
-    Когда banned=True:
-      • Слева от имени появляется «🚫».
-      • Имя и счётчик участников приглушены.
-      • Курсор = ForbiddenCursor, клик игнорируется (clicked не эмитится).
-    """
     clicked        = pyqtSignal()
     double_clicked = pyqtSignal()
 
@@ -198,7 +126,7 @@ class _ServerItemWidget(QFrame):
         super().__init__(parent)
         self.info      = info
         self._selected = False
-        self._banned   = False   # изменится через set_banned() после query
+        self._banned   = False
         self.setObjectName("serverItem")
         self._apply_style()
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -207,13 +135,9 @@ class _ServerItemWidget(QFrame):
         main_lay.setContentsMargins(12, 8, 12, 8)
         main_lay.setSpacing(4)
 
-        # ── Верхняя строка: [стоп?] + название + кол-во + пинг ───────────────
         top_row = QHBoxLayout()
         top_row.setSpacing(8)
 
-        # «Стоп»-значок: создаём скрытым, показываем через set_banned.
-        # Так layout не прыгает при обновлении статуса — метка просто
-        # меняет visibility, ширина row остаётся стабильной.
         self._lbl_stop = QLabel("🚫")
         self._lbl_stop.setFixedWidth(20)
         self._lbl_stop.setAlignment(
@@ -255,7 +179,6 @@ class _ServerItemWidget(QFrame):
 
         main_lay.addLayout(top_row)
 
-        # ── Список участников (дерево ников) ──────────────────────────────────
         nicks = info.get('user_nicks', [])
         if nicks:
             nicks_text = "  •  ".join(nicks[:20])
@@ -268,7 +191,6 @@ class _ServerItemWidget(QFrame):
             )
             main_lay.addWidget(lbl_nicks)
 
-        # ── Пинг ──────────────────────────────────────────────────────────────
         ip = info.get('ip', '')
         if ip:
             self._ping_worker = _PingWorker(ip)
@@ -276,8 +198,6 @@ class _ServerItemWidget(QFrame):
             self._ping_worker.start()
 
     def set_banned(self, banned: bool):
-        """Применяет/снимает визуальные пометки бана. Вызывается после
-        получения CMD_QUERY_BAN_RESP от сервера."""
         if self._banned == bool(banned):
             return
         self._banned = bool(banned)
@@ -334,18 +254,11 @@ class _ServerItemWidget(QFrame):
 
     def mousePressEvent(self, e):
         if self._banned:
-            # Забаненные сервера не подключаются. Игнорим клик, не эмитим
-            # clicked — родитель (MultiServerScreen) даже не узнает.
             super().mousePressEvent(e)
             return
         if e.button() == Qt.MouseButton.LeftButton:
             self.clicked.emit()
         super().mousePressEvent(e)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# _CreateServerDialog — диалог ввода имени сервера
-# ══════════════════════════════════════════════════════════════════════════════
 
 class _CreateServerDialog(QDialog):
     """Диалог: ввод имени сервера перед его созданием."""
@@ -421,18 +334,13 @@ class _CreateServerDialog(QDialog):
     def get_name(self) -> str:
         return self._inp.text().strip() or "InPulse Server"
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MultiServerScreen — основной стартовый экран
-# ══════════════════════════════════════════════════════════════════════════════
-
 class MultiServerScreen(QWidget):
     """
     Стартовый экран: список всех найденных серверов в сети.
     Заменяет DiscoveryScreen.
     """
     open_login = pyqtSignal(str, str, str)
-    _ready     = pyqtSignal(str)   # внутренний: ip готового сервера
+    _ready     = pyqtSignal(str)
 
     def __init__(self, nick: str, avatar: str, server_name: str = ''):
         super().__init__()
@@ -484,7 +392,6 @@ class MultiServerScreen(QWidget):
         root.setContentsMargins(20, 16, 20, 14)
         card_lay.addLayout(root)
 
-        # ── Заголовок + кнопка обновления (справа, как в браузерах) ─────────
         header_row = QHBoxLayout()
         header_row.setContentsMargins(0, 0, 0, 0)
 
@@ -512,7 +419,6 @@ class MultiServerScreen(QWidget):
 
         root.addLayout(header_row)
 
-        # Список серверов
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -544,7 +450,6 @@ class MultiServerScreen(QWidget):
         self._lbl_empty.hide()
         self._list_layout.addWidget(self._lbl_empty)
 
-        # Картинка empty.png — заполняет пустоту когда серверов нет
         self._img_empty = QLabel()
         self._img_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._img_empty.setStyleSheet("background: transparent; border: none;")
@@ -560,7 +465,6 @@ class MultiServerScreen(QWidget):
         scroll.setWidget(self._list_container)
         root.addWidget(scroll, stretch=1)
 
-        # Кнопка «Создать сервер» — полная ширина (на месте бывшей «Подключиться»)
         self.btn_create = QPushButton("➕  Создать сервер")
         self.btn_create.setStyleSheet(BTN_CREATE_SS)
         self.btn_create.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -587,7 +491,6 @@ class MultiServerScreen(QWidget):
         self.btn_manual.clicked.connect(self._on_manual_ip)
         bot_row.addWidget(self.btn_manual, stretch=1)
 
-        # Кнопка «Выйти» — полное завершение приложения (справа)
         self.btn_exit = QPushButton("✖  Выйти")
         self.btn_exit.setStyleSheet(BTN_EXIT_SS)
         self.btn_exit.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -595,8 +498,6 @@ class MultiServerScreen(QWidget):
         bot_row.addWidget(self.btn_exit, stretch=1)
 
         root.addLayout(bot_row)
-
-    # ── Discovery ─────────────────────────────────────────────────────────────
 
     def _start_discovery(self):
         self._selected_info = None
@@ -624,8 +525,6 @@ class MultiServerScreen(QWidget):
             except RuntimeError:
                 pass
         self._item_widgets.clear()
-        # Также останавливаем ban-query workers — если discovery повторяется,
-        # старые responses не должны прилетать в уже удалённые виджеты.
         for worker in getattr(self, '_ban_query_workers', []):
             try:
                 if worker.isRunning():
@@ -650,10 +549,6 @@ class MultiServerScreen(QWidget):
             "background: transparent; border: none;"
         )
 
-        # Рендерим карточки в «обычном» виде (banned=False по умолчанию).
-        # Параллельно для каждой запускаем _BanQueryWorker → сервер сам
-        # скажет «забанен ли этот ник». Worker-ы живут столько же сколько
-        # карточки, храним их чтобы избежать преждевременной сборки GC.
         self._ban_query_workers: list = getattr(
             self, '_ban_query_workers', []
         )
@@ -665,27 +560,21 @@ class MultiServerScreen(QWidget):
             )
             self._list_layout.addWidget(w)
             self._item_widgets.append(w)
-
-            # Live-query: работает только если ник уже известен.
             ip = info.get('ip', '')
             if ip and self.nick:
                 worker = _BanQueryWorker(ip, self.nick, parent=self)
-                # Связь worker → виджет через замыкание. Виджет может быть
-                # уже уничтожен к моменту ответа (пользователь обновил
-                # список) — обёртка проверит через sip-valid.
+
                 def _on_ban_result(is_banned: bool, _widget=w):
                     try:
                         _widget.set_banned(is_banned)
                     except RuntimeError:
-                        # виджет удалён — всё норм, пропускаем
                         pass
                 worker.result.connect(_on_ban_result)
                 worker.start()
                 self._ban_query_workers.append(worker)
 
     def _on_item_selected(self, info: dict, widget: _ServerItemWidget):
-        # FIX #5: одиночный клик = выбор + немедленное подключение.
-        # Кнопка «Подключиться» остаётся для доступности с клавиатуры.
+
         for w in self._item_widgets:
             try:
                 w.set_selected(False)
@@ -696,12 +585,9 @@ class MultiServerScreen(QWidget):
         except RuntimeError:
             pass
         self._selected_info = info
-        # Подключаемся сразу при клике
         ip = info.get('ip', '')
         if ip:
             self._open_connecting(ip)
-
-    # ── Действия ──────────────────────────────────────────────────────────────
 
     def _on_connect_selected(self):
         if self._selected_info:
@@ -772,8 +658,6 @@ class MultiServerScreen(QWidget):
             return
         self._connecting_in_progress = True
 
-        # v3: encoder patch removed — Rust handles encoding, aiortc is decode-only
-
         try:
             from network_engine.server_discovery import get_local_radmin_ip
             local_ip = get_local_radmin_ip()
@@ -824,7 +708,6 @@ class MultiServerScreen(QWidget):
         Вызывается по кнопке «Выйти» на экране выбора сервера.
         """
         import sys, os, signal
-        # Останавливаем встроенный сервер если запущен
         try:
             from server import EmbeddedServerManager
             mgr = EmbeddedServerManager.get()
@@ -832,29 +715,15 @@ class MultiServerScreen(QWidget):
                 mgr.stop()
         except Exception:
             pass
-        # Завершаем Qt
         from PyQt6.QtWidgets import QApplication
         QApplication.quit()
-        # Гарантированно убиваем процесс
         try:
             os.kill(os.getpid(), signal.SIGTERM)
         except Exception:
             sys.exit(0)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# DiscoveryScreen — старый экран (оставлен для совместимости)
-# ══════════════════════════════════════════════════════════════════════════════
-
 class DiscoveryScreen(QWidget):
-    """
-    Первый экран после запуска приложения (устаревший — используй MultiServerScreen).
-
-    Логика:
-      1. Поиск серверов → DiscoveryWorker (UDP, 2.5 сек).
-      2. Найден  → автоподключение через ConnectingScreen.
-      3. Не найден → «Создать сервер» или «Ввести IP вручную».
-    """
+    """Первый экран после запуска приложения"""
     open_login = pyqtSignal(str, str, str)
     _ready     = pyqtSignal(str)
 
@@ -1085,8 +954,6 @@ class DiscoveryScreen(QWidget):
         if self._connecting_in_progress:
             return
         self._connecting_in_progress = True
-
-        # v3: encoder patch removed — Rust handles encoding, aiortc is decode-only
 
         try:
             from network_engine.server_discovery import get_local_radmin_ip

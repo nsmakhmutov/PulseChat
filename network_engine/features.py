@@ -23,6 +23,8 @@ from config import (
     CMD_BAN_LIST_REQ, CMD_BAN_LIST,
     CMD_KICKED, CMD_BANNED,
     CMD_DRAW_STROKE, DRAW_MAX_POINTS,
+    CMD_REMOTE_CONTROL_REQUEST, CMD_REMOTE_CONTROL_RESPONSE,
+    CMD_REMOTE_CONTROL_EVENT, CMD_REMOTE_CONTROL_STOP,
 )
 
 
@@ -347,6 +349,53 @@ class FeaturesMixin:
         })
 
     # ------------------------------------------------------------------
+    # Remote Control
+    # ------------------------------------------------------------------
+    def send_remote_control_request(self, streamer_uid: int, nick: str) -> None:
+        """Зритель просит у стримера разрешение на управление мышью/клавиатурой."""
+        self.send_json({
+            'action':       CMD_REMOTE_CONTROL_REQUEST,
+            'streamer_uid': int(streamer_uid),
+            'nick':         str(nick)[:32],
+        })
+
+    def send_remote_control_response(self, viewer_uid: int, granted: bool) -> None:
+        """Стример отвечает зрителю: True — разрешить, False — отклонить."""
+        self.send_json({
+            'action':     CMD_REMOTE_CONTROL_RESPONSE,
+            'viewer_uid': int(viewer_uid),
+            'granted':    bool(granted),
+        })
+
+    def send_remote_control_event(self, streamer_uid: int, event: dict) -> None:
+        """
+        Зритель отправляет событие мыши/клавиатуры стримеру.
+        event = {
+          'type': 'mouse_move'|'mouse_press'|'mouse_release'|'mouse_scroll'
+                  |'key_press'|'key_release',
+          'x': float,      # 0.0–1.0 нормализованные по экрану
+          'y': float,
+          'button': int,   # Qt.MouseButton (для mouse_*)
+          'key': int,      # Qt.Key (для key_*)
+          'modifiers': int,
+          'text': str,     # символ (для key_press)
+          'delta': int,    # для mouse_scroll
+        }
+        """
+        self.send_json({
+            'action':       CMD_REMOTE_CONTROL_EVENT,
+            'streamer_uid': int(streamer_uid),
+            'event':        event,
+        })
+
+    def send_remote_control_stop(self, streamer_uid: int) -> None:
+        """Любая из сторон останавливает управление."""
+        self.send_json({
+            'action':       CMD_REMOTE_CONTROL_STOP,
+            'streamer_uid': int(streamer_uid),
+        })
+
+    # ------------------------------------------------------------------
     # Host Mute
     # ------------------------------------------------------------------
     def send_host_mute(self, target_uid: int) -> None:
@@ -452,6 +501,35 @@ class FeaturesMixin:
                 self.draw_stroke_received.emit(
                     sender_uid_dr, nick_dr, color_dr, points_dr, width_dr
                 )
+            return True
+
+        elif act == CMD_REMOTE_CONTROL_REQUEST:
+            viewer_uid  = int(msg.get('viewer_uid', 0))
+            viewer_nick = str(msg.get('nick', '?'))
+            self.remote_control_requested.emit(viewer_uid, viewer_nick)
+            return True
+
+        elif act == CMD_REMOTE_CONTROL_RESPONSE:
+            self.remote_control_response.emit(
+                bool(msg.get('granted', False)),
+                str(msg.get('reason', '')),
+            )
+            return True
+
+        elif act == CMD_REMOTE_CONTROL_EVENT:
+            event = msg.get('event', {})
+            if isinstance(event, dict):
+                _et = event.get('type')
+                if _et != 'mouse_move':
+                    try:
+                        print(f"[RC-NET] received {_et} from server: {event}")
+                    except Exception:
+                        pass
+                self.remote_control_event.emit(event)
+            return True
+
+        elif act == CMD_REMOTE_CONTROL_STOP:
+            self.remote_control_stopped.emit()
             return True
 
         return False
