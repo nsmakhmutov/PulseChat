@@ -2703,6 +2703,7 @@ class MainWindow(WebcamMixin, QMainWindow):
         if self._rc_viewer_uid_get() is not None:
             self._rc_viewer_uid = None
             self._rc_stop_esc_watch()
+            self._rc_release_all_inputs()
             if hasattr(self, '_rc_access_banner'):
                 self._rc_access_banner.setVisible(False)
 
@@ -3042,7 +3043,34 @@ class MainWindow(WebcamMixin, QMainWindow):
             self._rc_access_banner.setVisible(False)
         self._rc_viewer_uid = None
         self._rc_stop_esc_watch()
+        self._rc_release_all_inputs()
         self.net.send_remote_control_stop(getattr(self.audio, 'my_uid', 0))
+
+    def _rc_release_all_inputs(self):
+        """
+        Отпускает все зажатые инъекцией клавиши/кнопки. КРИТИЧНО при остановке:
+        иначе у стримера «залипают» модификаторы (Shift/Ctrl/Alt/Win) и ПК
+        ведёт себя сломанно вплоть до перезагрузки.
+        """
+        try:
+            if _WIN_INPUT_AVAILABLE:
+                _win_input.release_all()
+                print("[RC-INJECT] release_all: все зажатые входы отпущены")
+            elif _PYAUTOGUI_AVAILABLE:
+                for k in ('ctrl', 'shift', 'alt', 'win',
+                          'ctrlleft', 'ctrlright', 'shiftleft', 'shiftright',
+                          'altleft', 'altright', 'winleft', 'winright'):
+                    try:
+                        pyautogui.keyUp(k, _pause=False)
+                    except Exception:
+                        pass
+                for b in ('left', 'right', 'middle'):
+                    try:
+                        pyautogui.mouseUp(button=b, _pause=False)
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"[RC-INJECT] release_all error: {e!r}")
 
     def _on_rc_event_received(self, ev: dict):
         """
@@ -3253,6 +3281,8 @@ class MainWindow(WebcamMixin, QMainWindow):
             )
 
             # Перезапускаем аудиопоток ТОЛЬКО если устройство реально сменилось.
+            # При изменении VAD, громкости, soundboard-кнопок и т.д. —
+            # stream не трогаем: слушатели не услышат провала в 100ms.
             if _dev_in_after != _dev_in_before or _dev_out_after != _dev_out_before:
                 self.audio.start(_dev_in_after, _dev_out_after)
             else:

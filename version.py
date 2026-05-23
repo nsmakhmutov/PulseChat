@@ -1,7 +1,7 @@
 # version.py
 
 APP_NAME    = "InPulse"
-APP_VERSION = "1.0.70"
+APP_VERSION = "1.0.72"
 APP_AUTHOR  = "Impulse Company"
 APP_YEAR    = "2026"
 GITHUB_REPO = "nsmakhmutov/PulseChat"

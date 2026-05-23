@@ -20,6 +20,135 @@ from .ui_dialogs import (
     CUSTOM_SOUND_SLOTS,
 )
 
+
+class _CameraPreviewCircle(QWidget):
+    """
+    Кликабельный круглый превью камеры.
+
+    • Камера выключена → по центру иконка ▶ и текст-приглашение.
+      Клик по кружку → сигнал clicked (запускаем превью).
+    • Идёт превью → рисуем кадр (setFrame). При наведении мыши поверх
+      кадра всплывает полупрозрачный оверлей: ⏸ + «Остановить».
+      Клик по кружку → сигнал clicked (останавливаем превью).
+    """
+
+    clicked = pyqtSignal()
+
+    def __init__(self, diameter: int, parent=None):
+        super().__init__(parent)
+        self._d = int(diameter)
+        self.setFixedSize(self._d, self._d)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMouseTracking(True)
+        self._active = False        # идёт ли превью
+        self._hover = False         # курсор над кружком
+        self._pixmap = None         # текущий кадр (QPixmap) или None
+        self._idle_text = "Включить превью"
+
+    # ── Внешнее API ────────────────────────────────────────────────
+    def set_active(self, active: bool):
+        """Активный режим = идёт превью (показываем кадры/оверлей)."""
+        self._active = bool(active)
+        if not self._active:
+            self._pixmap = None
+        self.update()
+
+    def set_frame(self, pixmap):
+        """Положить очередной кадр (QPixmap уже обрезан в круг)."""
+        self._pixmap = pixmap
+        self.update()
+
+    def set_idle_text(self, text: str):
+        """Текст-подсказка в выключенном состоянии (например, ошибка)."""
+        self._idle_text = text or ""
+        self.update()
+
+    def clear_frame(self):
+        self._pixmap = None
+        self.update()
+
+    # ── События ────────────────────────────────────────────────────
+    def enterEvent(self, event):
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+    # ── Отрисовка ──────────────────────────────────────────────────
+    def paintEvent(self, event):
+        from PyQt6.QtGui import QPainterPath, QFont
+        from PyQt6.QtCore import QRectF
+
+        d = self._d
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        # Круглый клип на всё содержимое.
+        clip = QPainterPath()
+        clip.addEllipse(QRectF(0, 0, d, d))
+        p.setClipPath(clip)
+
+        # Фон/кадр.
+        if self._active and self._pixmap is not None and not self._pixmap.isNull():
+            off = (d - self._pixmap.width()) // 2
+            p.drawPixmap(off, off, self._pixmap)
+        else:
+            p.fillRect(0, 0, d, d, QColor("#16181f"))
+
+        if self._active:
+            # Показываем оверлей «Остановить» только при наведении.
+            if self._hover:
+                p.fillRect(0, 0, d, d, QColor(0, 0, 0, 110))
+                self._draw_center(p, "\u23F8", "Остановить", alpha=180)
+        else:
+            # Выключено: всегда видно приглашение запустить.
+            self._draw_center(p, "\u25B6", self._idle_text, alpha=235)
+
+        # Обводка кружка.
+        p.setClipping(False)
+        pen = QPen(QColor("#2a2d3a"))
+        pen.setWidth(1)
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawEllipse(QRectF(0.5, 0.5, d - 1, d - 1))
+        p.end()
+
+    def _draw_center(self, p: QPainter, icon: str, text: str, alpha: int):
+        """Иконка над текстом по центру кружка с заданной прозрачностью."""
+        from PyQt6.QtGui import QFont
+        from PyQt6.QtCore import QRectF
+
+        d = self._d
+        col = QColor(255, 255, 255, alpha)
+        p.setPen(col)
+
+        # Иконка (крупнее).
+        f_icon = QFont()
+        f_icon.setPointSize(26)
+        p.setFont(f_icon)
+        icon_rect = QRectF(0, d * 0.30, d, d * 0.34)
+        p.drawText(icon_rect, Qt.AlignmentFlag.AlignCenter, icon)
+
+        # Подпись (мельче).
+        if text:
+            f_txt = QFont()
+            f_txt.setPointSize(10)
+            p.setFont(f_txt)
+            txt_rect = QRectF(6, d * 0.60, d - 12, d * 0.26)
+            p.drawText(txt_rect,
+                       Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop,
+                       text)
+
+
 class MicVadWidget(QWidget):
     threshold_changed = pyqtSignal(int)  # slider_val 1-50
 
@@ -1087,7 +1216,7 @@ class SettingsDialog(QDialog):
 
         vid_lay.addSpacing(16)
 
-        # ── Превью камеры (кнопка прямо на кружке) ───────────────────────
+        # ── Превью камеры (кликабельный кружок) ──────────────────────────
         preview_title = QLabel("Превью камеры")
         preview_title.setStyleSheet("font-weight: bold;")
         vid_lay.addWidget(preview_title)
@@ -1095,78 +1224,35 @@ class SettingsDialog(QDialog):
         vid_lay.addSpacing(10)
 
         _PV = 170   # диаметр превью
-
-        prev_row = QHBoxLayout()
-        prev_row.setSpacing(14)
-
-        # Круглый превью-лейбл (без кнопки поверх).
-        self.cam_preview_label = QLabel()
-        self.cam_preview_label.setFixedSize(_PV, _PV)
-        self.cam_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.cam_preview_label.setStyleSheet(
-            f"QLabel {{ background: #16181f; border: 1px solid #2a2d3a;"
-            f" border-radius: {_PV // 2}px; color: #888; font-size: 12px; }}"
-        )
         self._preview_diameter = _PV
 
-        # Кнопка СБОКУ от кружка (не оверлей — надёжно при любых стилях).
-        self.btn_cam_preview = QPushButton("▶  Запустить превью")
-        self.btn_cam_preview.setCheckable(True)
-        self.btn_cam_preview.setFixedHeight(36)
-        self.btn_cam_preview.setMinimumWidth(190)
-        self.btn_cam_preview.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_cam_preview.clicked.connect(self._toggle_camera_preview)
-        self._style_preview_btn(False)
+        # Кликабельный кружок: клик включает/выключает превью.
+        # При выключенном — иконка Play + текст; при наведении в активном
+        # режиме — полупрозрачный оверлей Pause + «Остановить».
+        self.cam_preview_circle = _CameraPreviewCircle(_PV)
+        self.cam_preview_circle.clicked.connect(self._toggle_camera_preview)
 
-        prev_row.addStretch()
-        prev_row.addWidget(self.cam_preview_label)
-        prev_row.addSpacing(6)
-        # Кнопку центрируем по вертикали рядом с кружком.
-        btn_col = QVBoxLayout()
-        btn_col.addStretch()
-        btn_col.addWidget(self.btn_cam_preview)
-        btn_col.addStretch()
-        prev_row.addLayout(btn_col)
+        # Прижимаем кружок к левому краю.
+        prev_row = QHBoxLayout()
+        prev_row.addWidget(self.cam_preview_circle, alignment=Qt.AlignmentFlag.AlignLeft)
         prev_row.addStretch()
         vid_lay.addLayout(prev_row)
 
         self._preview_thread = None
+        self._preview_active = False      # идёт ли сейчас превью
         self._preview_uses_main = False   # превью подключено к рабочей камере?
 
         vid_lay.addSpacing(12)
         vid_lay.addStretch()
         self.tabs.addTab(vid_tab, "Видео")
 
-    def _style_preview_btn(self, active: bool):
-        """Стиль боковой кнопки превью: зелёная «Запустить» / красная «Остановить»."""
-        if active:
-            self.btn_cam_preview.setText("⏸  Остановить превью")
-            self.btn_cam_preview.setStyleSheet(
-                "QPushButton {"
-                "  background: #e74c3c; color: #ffffff;"
-                "  border: none; border-radius: 8px;"
-                "  font-size: 13px; font-weight: 600; padding: 0 14px;"
-                "}"
-                "QPushButton:hover { background: #ff6151; }"
-            )
-        else:
-            self.btn_cam_preview.setText("▶  Запустить превью")
-            self.btn_cam_preview.setStyleSheet(
-                "QPushButton {"
-                "  background: #2ecc71; color: #ffffff;"
-                "  border: none; border-radius: 8px;"
-                "  font-size: 13px; font-weight: 600; padding: 0 14px;"
-                "}"
-                "QPushButton:hover { background: #3ee084; }"
-            )
-
     # ── Превью камеры в настройках ──────────────────────────────────────
-    def _toggle_camera_preview(self, checked: bool = None):
-        # Состояние берём из самой кнопки (она checkable и уже переключилась).
-        if self.btn_cam_preview.isChecked():
-            self._start_camera_preview()
-        else:
+    def _toggle_camera_preview(self):
+        # Клик по кружку: если идёт превью — останавливаем, иначе запускаем.
+        if getattr(self, "_preview_active", False):
             self._stop_camera_preview()
+        else:
+            self._start_camera_preview()
 
     def _start_camera_preview(self):
         # Если основная камера УЖЕ работает (идёт трансляция) — НЕ открываем
@@ -1179,9 +1265,8 @@ class SettingsDialog(QDialog):
             try:
                 main_cap.frame_qimage.connect(self._on_preview_frame)
                 self._preview_uses_main = True
-                self.cam_preview_label.setText("")
-                self.btn_cam_preview.setChecked(True)
-                self._style_preview_btn(True)
+                self._preview_active = True
+                self.cam_preview_circle.set_active(True)
                 return
             except Exception as e:
                 print(f"[Preview] не удалось подключиться к рабочей камере: {e}")
@@ -1191,14 +1276,10 @@ class SettingsDialog(QDialog):
         try:
             from ui_main.camera_capture import CameraCaptureThread, CV2_AVAILABLE
         except Exception as e:
-            self.cam_preview_label.setText(f"Нет OpenCV\n{e}")
-            self.btn_cam_preview.setChecked(False)
-            self._style_preview_btn(False)
+            self._fail_preview(f"Нет OpenCV")
             return
         if not CV2_AVAILABLE:
-            self.cam_preview_label.setText("OpenCV не установлен")
-            self.btn_cam_preview.setChecked(False)
-            self._style_preview_btn(False)
+            self._fail_preview("Нет OpenCV")
             return
 
         cam_index = 0
@@ -1208,8 +1289,8 @@ class SettingsDialog(QDialog):
         except Exception:
             pass
 
-        # Останавливаем прошлый поток БЕЗ сброса состояния кнопки.
-        self._stop_camera_preview(reset_button=False)
+        # Останавливаем прошлый поток БЕЗ сброса состояния кружка.
+        self._stop_camera_preview(reset_ui=False)
 
         self._preview_thread = CameraCaptureThread(
             camera_index=cam_index,
@@ -1221,27 +1302,32 @@ class SettingsDialog(QDialog):
         self._preview_thread.frame_qimage.connect(self._on_preview_frame)
         self._preview_thread.opened.connect(self._on_preview_opened)
         self._preview_thread.error.connect(
-            lambda m: self.cam_preview_label.setText(f"Ошибка:\n{m}")
+            lambda m: self._fail_preview("Камера недоступна")
         )
-        self.cam_preview_label.setText("Запуск…")
-        self.btn_cam_preview.setChecked(True)
-        self._style_preview_btn(True)
+        self._preview_active = True
+        self.cam_preview_circle.set_active(True)
         self._preview_thread.start()
+
+    def _fail_preview(self, text: str):
+        """Сбросить превью в выключенное состояние с подсказкой/ошибкой."""
+        self._preview_active = False
+        if hasattr(self, "cam_preview_circle"):
+            self.cam_preview_circle.set_active(False)
+            self.cam_preview_circle.set_idle_text(text or "Включить превью")
 
     def _on_preview_opened(self, ok: bool):
         if not ok:
-            self.cam_preview_label.setText("Камера недоступна")
-            self.btn_cam_preview.setChecked(False)
-            self._style_preview_btn(False)
+            self._stop_camera_preview(reset_ui=False)
+            self._fail_preview("Камера недоступна")
 
     def _on_preview_frame(self, q_image):
-        from PyQt6.QtGui import QPixmap, QPainter, QPainterPath
+        from PyQt6.QtGui import QPainterPath
         from PyQt6.QtCore import QRectF
         side = min(q_image.width(), q_image.height())
         sx = (q_image.width() - side) // 2
         sy = (q_image.height() - side) // 2
         cropped = q_image.copy(sx, sy, side, side)
-        D = getattr(self, "_preview_diameter", 170) - 4
+        D = getattr(self, "_preview_diameter", 170)
         scaled = cropped.scaled(D, D, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                                 Qt.TransformationMode.SmoothTransformation)
         out = QPixmap(D, D)
@@ -1253,9 +1339,10 @@ class SettingsDialog(QDialog):
         p.setClipPath(path)
         p.drawImage(0, 0, scaled)
         p.end()
-        self.cam_preview_label.setPixmap(out)
+        if hasattr(self, "cam_preview_circle"):
+            self.cam_preview_circle.set_frame(out)
 
-    def _stop_camera_preview(self, reset_button: bool = True):
+    def _stop_camera_preview(self, reset_ui: bool = True):
         # Если превью было подключено к РАБОЧЕЙ камере — только отключаем сигнал,
         # сам захват трансляции НЕ трогаем (он продолжает жить).
         if getattr(self, "_preview_uses_main", False):
@@ -1281,13 +1368,10 @@ class SettingsDialog(QDialog):
                     pass
                 self._preview_thread = None
 
-        if reset_button:
-            if hasattr(self, "cam_preview_label"):
-                self.cam_preview_label.setPixmap(QPixmap())
-                self.cam_preview_label.setText("")
-            if hasattr(self, "btn_cam_preview"):
-                self.btn_cam_preview.setChecked(False)
-                self._style_preview_btn(False)
+        self._preview_active = False
+        if reset_ui and hasattr(self, "cam_preview_circle"):
+            self.cam_preview_circle.set_active(False)
+            self.cam_preview_circle.set_idle_text("Включить превью")
 
     def setup_personalization_tab(self):
 

@@ -153,6 +153,33 @@ class CameraCaptureThread(QThread):
         self._cap = None
 
     def run(self):
+        # Внешняя защита: что бы ни случилось внутри (включая cv2.error —
+        # "Unknown C++ exception from OpenCV code"), исключение НЕ должно
+        # покидать QThread.run(), иначе подвисает/падает весь Qt event loop.
+        try:
+            self._run_impl()
+        except Exception as e:
+            print(f"[Camera] run() fatal: {e}")
+            try:
+                self.error.emit(f"Сбой камеры: {e}")
+            except Exception:
+                pass
+            try:
+                self.opened.emit(False)
+            except Exception:
+                pass
+        finally:
+            # Гарантированно освобождаем устройство при любом исходе.
+            self._running = False
+            cap = self._cap
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+            self._cap = None
+
+    def _run_impl(self):
         if not CV2_AVAILABLE:
             self.error.emit("OpenCV не установлен")
             self.opened.emit(False)
@@ -177,6 +204,10 @@ class CameraCaptureThread(QThread):
             self.opened.emit(False)
             return
 
+        # Запоминаем cap сразу — чтобы finally в run() мог его освободить,
+        # даже если что-то упадёт на этапе конфигурации ниже.
+        self._cap = cap
+
         # Просим у камеры разрешение и FPS. MJPG-кодек на многих камерах
         # позволяет выдавать высокий FPS (30/60), тогда как сырой YUY2 часто
         # ограничен ~10-15 fps на 640×480.
@@ -199,7 +230,6 @@ class CameraCaptureThread(QThread):
         except Exception:
             pass
 
-        self._cap = cap
         self._running = True
         self.opened.emit(True)
         print(f"[Camera] Камера #{self.camera_index} открыта")
@@ -208,28 +238,60 @@ class CameraCaptureThread(QThread):
         send_interval = 1.0 / self.send_fps
         last_send = 0.0
 
+        # Сколько подряд неудачных/сбойных чтений терпим, прежде чем считать
+        # камеру потерянной и корректно выйти (вместо зависания/краша).
+        MAX_CONSECUTIVE_FAILURES = 60   # ~ 0.6 c при паузе 0.01 на сбой
+        fail_count = 0
+
         while self._running:
             t0 = time.perf_counter()
-            ok, frame = cap.read()
+
+            # cap.read() на некоторых драйверах/при отключении камеры умеет
+            # бросать cv2.error ("Unknown C++ exception from OpenCV code").
+            # Этот блок ловит ВСЁ (включая cv2.error), чтобы один сбой чтения
+            # не валил QThread и не подвешивал весь Qt event loop.
+            try:
+                ok, frame = cap.read()
+            except Exception as e:
+                ok, frame = False, None
+                print(f"[Camera] cap.read() exception: {e}")
+
             if not ok or frame is None:
-                # один сбой чтения — не падаем, ждём чуть-чуть
+                fail_count += 1
+                if fail_count >= MAX_CONSECUTIVE_FAILURES:
+                    # Камера, похоже, отвалилась окончательно — выходим аккуратно.
+                    print("[Camera] Слишком много сбоев чтения — закрываю камеру")
+                    try:
+                        self.error.emit("Камера перестала отвечать")
+                    except Exception:
+                        pass
+                    break
+                # одиночный сбой — не падаем, ждём чуть-чуть
                 time.sleep(0.01)
                 continue
 
-            # Локальное превью (каждый кадр).
-            qimg = _bgr_to_qimage(frame)
-            if qimg is not None:
-                self.frame_qimage.emit(qimg)
+            # Успешный кадр — сбрасываем счётчик сбоев.
+            fail_count = 0
 
-            # Отправка в сеть — throttle до send_fps.
-            now = time.perf_counter()
-            if now - last_send >= send_interval:
-                last_send = now
-                jpeg = encode_frame_to_jpeg(
-                    frame, self.send_size, self.jpeg_quality
-                )
-                if jpeg is not None:
-                    self.frame_jpeg.emit(jpeg)
+            # Локальное превью (каждый кадр). Кодирование/конвертация тоже
+            # под защитой, т.к. encode/cvtColor могут бросить на битом кадре.
+            try:
+                qimg = _bgr_to_qimage(frame)
+                if qimg is not None:
+                    self.frame_qimage.emit(qimg)
+
+                # Отправка в сеть — throttle до send_fps.
+                now = time.perf_counter()
+                if now - last_send >= send_interval:
+                    last_send = now
+                    jpeg = encode_frame_to_jpeg(
+                        frame, self.send_size, self.jpeg_quality
+                    )
+                    if jpeg is not None:
+                        self.frame_jpeg.emit(jpeg)
+            except Exception as e:
+                # Сбой обработки одного кадра не должен ронять поток.
+                print(f"[Camera] frame processing error: {e}")
 
             # Держим частоту превью.
             dt = time.perf_counter() - t0
@@ -237,6 +299,7 @@ class CameraCaptureThread(QThread):
             if sleep_left > 0:
                 time.sleep(sleep_left)
 
+        self._running = False
         try:
             cap.release()
         except Exception:
