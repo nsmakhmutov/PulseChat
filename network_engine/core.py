@@ -95,6 +95,10 @@ class NetworkClient(WebRTCMixin, ChatMixin, FeaturesMixin, QObject):
 
     typing_received = pyqtSignal(int, str)
 
+    # Кадр чужой камеры: (uid, base64_jpeg). Эмитится из TCP-потока, доставка
+    # в Qt-поток через очередь сигналов → безопасно для UI.
+    camera_frame_received = pyqtSignal(int, str)
+
     def __init__(self, audio):
         super().__init__()
         self.audio  = audio
@@ -775,6 +779,16 @@ class NetworkClient(WebRTCMixin, ChatMixin, FeaturesMixin, QObject):
             self.running       = False
             self._is_connected = False
             self.become_host.emit()
+
+        elif act == 'camera_frame':
+            # Кадр чужой камеры: {action, uid, data(base64 jpeg)}.
+            try:
+                src_uid = int(msg.get('uid', 0))
+            except (TypeError, ValueError):
+                src_uid = 0
+            data_b64 = msg.get('data', '')
+            if src_uid and data_b64:
+                self.camera_frame_received.emit(src_uid, data_b64)
 
         elif self._process_webrtc_message(msg, act):
             pass

@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QSc
                              QLineEdit, QCheckBox, QProgressBar, QListWidget, QListWidgetItem,
                              QAbstractItemView)
 from PyQt6.QtCore import (Qt, QSize, QSettings, QTimer, pyqtSignal, QObject, QPoint)
-from PyQt6.QtGui import QIcon, QPainter, QColor, QPen, QStandardItem, QPolygon
+from PyQt6.QtGui import QIcon, QPainter, QColor, QPen, QStandardItem, QPolygon, QPixmap
 
 from config import (resource_path, USER_CONFIG_PATH, KNOWN_USERS_PATH)
 from audio_engine import PYRNNOISE_AVAILABLE
@@ -461,6 +461,8 @@ class SettingsDialog(QDialog):
 
         self.setup_audio_tab()
 
+        self.setup_video_tab()
+
         self.setup_personalization_tab()
 
         self.setup_soundboard_tab()
@@ -831,6 +833,20 @@ class SettingsDialog(QDialog):
         )
         aud_lay.addWidget(self.cb_bitrate)
 
+        # ── Ввод/вывод + кнопка «Обновить» (подхват новых устройств) ──
+        dev_hdr = QHBoxLayout()
+        dev_lbl = QLabel("Устройства ввода/вывода:")
+        dev_lbl.setStyleSheet("font-weight: bold;")
+        btn_dev_refresh = QPushButton("⟳ Обновить")
+        btn_dev_refresh.setFixedHeight(28)
+        btn_dev_refresh.setToolTip("Пересканировать аудиоустройства "
+                                   "(подхватить подключённые после запуска)")
+        btn_dev_refresh.clicked.connect(self._refresh_audio_devices_clicked)
+        dev_hdr.addWidget(dev_lbl)
+        dev_hdr.addStretch()
+        dev_hdr.addWidget(btn_dev_refresh)
+        aud_lay.addLayout(dev_hdr)
+
         aud_lay.addWidget(QLabel("Ввод:"))
         aud_lay.addWidget(self.cb_in)
         aud_lay.addWidget(QLabel("Вывод:"))
@@ -874,6 +890,404 @@ class SettingsDialog(QDialog):
 
         aud_lay.addStretch()
         self.tabs.addTab(aud_tab, "Аудио")
+
+    # ───────────────────────────────────────────────────────────────────
+    #  Вкладка «Видео» — выбор источника камеры
+    # ───────────────────────────────────────────────────────────────────
+    def _enumerate_cameras(self):
+        """
+        Возвращает список (index, human_name) доступных камер, ВКЛЮЧАЯ
+        виртуальные (OBS Virtual Camera и т.п.).
+
+        ВАЖНО: если камера СЕЙЧАС транслируется, мы НЕ открываем её повторно
+        через cv2.VideoCapture для проверки — на Windows DirectShow это
+        «крадёт» устройство и убивает живой кружок трансляции. В этом случае
+        полностью полагаемся на имена из QMediaDevices (они не открывают
+        устройство). OpenCV-проба индексов выполняется только когда камера
+        выключена.
+        """
+        import os
+
+        # Индекс камеры, которая сейчас транслируется (если есть) — его НЕ трогаем.
+        busy_index = None
+        camera_is_on = False
+        try:
+            if hasattr(self, "mw") and getattr(self.mw, "is_camera_on", False):
+                camera_is_on = True
+                busy_index = int(self.app_settings.value("camera_index", 0))
+        except Exception:
+            busy_index = None
+
+        # 1) Имена из Qt (НЕ открывают устройство — безопасно всегда).
+        qt_names: dict[int, str] = {}
+        try:
+            from PyQt6.QtMultimedia import QMediaDevices
+            for i, dev in enumerate(QMediaDevices.videoInputs()):
+                try:
+                    nm = dev.description()
+                except Exception:
+                    nm = ""
+                qt_names[i] = nm or f"Камера {i}"
+        except Exception:
+            pass
+
+        # 2) OpenCV-проба индексов — ТОЛЬКО когда камера выключена.
+        opened_idx: list[int] = []
+        if not camera_is_on:
+            try:
+                import cv2
+                backend = getattr(cv2, "CAP_DSHOW", 0) if os.name == "nt" else 0
+                consecutive_miss = 0
+                for i in range(8):
+                    if i == busy_index:
+                        # на всякий случай: занятый индекс не открываем
+                        continue
+                    cap = None
+                    found = False
+                    try:
+                        cap = cv2.VideoCapture(i, backend) if backend else cv2.VideoCapture(i)
+                        if cap is not None and cap.isOpened():
+                            ok, _ = cap.read()
+                            if ok:
+                                opened_idx.append(i)
+                                found = True
+                    except Exception:
+                        pass
+                    finally:
+                        if cap is not None:
+                            try:
+                                cap.release()
+                            except Exception:
+                                pass
+                    if found:
+                        consecutive_miss = 0
+                    else:
+                        consecutive_miss += 1
+                        if consecutive_miss >= 2 and (opened_idx or i >= 4):
+                            break
+            except Exception:
+                pass
+
+        # 3) Объединяем: индексы из Qt + реально открывшиеся + текущий занятый.
+        idx_set = set(opened_idx) | set(qt_names.keys())
+        if busy_index is not None:
+            idx_set.add(busy_index)
+        all_idx = sorted(idx_set)
+
+        cams: list[tuple[int, str]] = []
+        for i in all_idx:
+            name = qt_names.get(i, f"Камера {i}")
+            low = name.lower()
+            if ("obs" in low or "virtual" in low) and "вирт" not in low:
+                name = f"{name} (виртуальная)"
+            cams.append((i, name))
+
+        if not cams:
+            return [(0, "Камера по умолчанию")]
+        return cams
+
+    def refresh_camera_list(self):
+        """Перезаполняет combobox камер и восстанавливает сохранённый выбор."""
+        self.cb_cam.clear()
+        cams = self._enumerate_cameras()
+        for idx, name in cams:
+            self.cb_cam.addItem(name, idx)
+
+        saved_name = self.app_settings.value("camera_name", "")
+        saved_idx = self.app_settings.value("camera_index", None)
+
+        chosen = -1
+        if saved_name:
+            chosen = self.cb_cam.findText(saved_name)
+        if chosen == -1 and saved_idx is not None:
+            try:
+                chosen = self.cb_cam.findData(int(saved_idx))
+            except (ValueError, TypeError):
+                chosen = -1
+        if chosen != -1:
+            self.cb_cam.setCurrentIndex(chosen)
+
+    def setup_video_tab(self):
+        vid_tab = QWidget()
+        vid_lay = QVBoxLayout(vid_tab)
+
+        # ── Источник камеры (стиль как у «Устройства ввода/вывода») ──
+        src_hdr = QHBoxLayout()
+        src_lbl = QLabel("Выбор источника камеры")
+        src_lbl.setStyleSheet("font-weight: bold;")
+        btn_refresh = QPushButton("⟳ Обновить")
+        btn_refresh.setFixedHeight(28)
+        btn_refresh.setToolTip("Обновить список камер "
+                               "(подхватить подключённые после запуска)")
+        btn_refresh.clicked.connect(self.refresh_camera_list)
+        src_hdr.addWidget(src_lbl)
+        src_hdr.addStretch()
+        src_hdr.addWidget(btn_refresh)
+        vid_lay.addLayout(src_hdr)
+
+        self.cb_cam = QComboBox()
+        self.cb_cam.setObjectName("cb_cam")
+        self.cb_cam.setMinimumWidth(260)
+        vid_lay.addWidget(self.cb_cam)
+
+        self.refresh_camera_list()
+
+        vid_lay.addSpacing(12)
+
+        # ── Параметры трансляции камеры ──────────────────────────────────
+        from ui_main.camera_capture import (
+            CAM_SEND_FPS, CAM_JPEG_QUALITY, CAM_SEND_SIZE,
+            CAM_FPS_MIN, CAM_FPS_MAX, CAM_SIZE_MIN, CAM_SIZE_MAX,
+            CAM_QUALITY_MIN, CAM_QUALITY_MAX,
+        )
+
+        params_title = QLabel("Параметры трансляции")
+        params_title.setStyleSheet("font-weight: bold;")
+        vid_lay.addWidget(params_title)
+
+        # FPS
+        _fps0 = int(self.app_settings.value("camera_send_fps", CAM_SEND_FPS) or CAM_SEND_FPS)
+        _fps0 = max(CAM_FPS_MIN, min(CAM_FPS_MAX, _fps0))
+        self.lbl_cam_fps = QLabel(f"Частота кадров (FPS): {_fps0}")
+        self.sl_cam_fps = QSlider(Qt.Orientation.Horizontal)
+        self.sl_cam_fps.setRange(CAM_FPS_MIN, CAM_FPS_MAX)
+        self.sl_cam_fps.setValue(_fps0)
+        self.sl_cam_fps.valueChanged.connect(
+            lambda v: self.lbl_cam_fps.setText(f"Частота кадров (FPS): {v}")
+        )
+        vid_lay.addWidget(self.lbl_cam_fps)
+        vid_lay.addWidget(self.sl_cam_fps)
+
+        # Качество JPEG
+        _q0 = int(self.app_settings.value("camera_jpeg_quality", CAM_JPEG_QUALITY) or CAM_JPEG_QUALITY)
+        _q0 = max(CAM_QUALITY_MIN, min(CAM_QUALITY_MAX, _q0))
+        self.lbl_cam_q = QLabel(f"Качество (JPEG): {_q0}")
+        self.sl_cam_q = QSlider(Qt.Orientation.Horizontal)
+        self.sl_cam_q.setRange(CAM_QUALITY_MIN, CAM_QUALITY_MAX)
+        self.sl_cam_q.setValue(_q0)
+        self.sl_cam_q.valueChanged.connect(
+            lambda v: self.lbl_cam_q.setText(f"Качество (JPEG): {v}")
+        )
+        vid_lay.addWidget(self.lbl_cam_q)
+        vid_lay.addWidget(self.sl_cam_q)
+
+        # Размер кадра (разрешение кружка)
+        _sz0 = int(self.app_settings.value("camera_send_size", CAM_SEND_SIZE) or CAM_SEND_SIZE)
+        _sz0 = max(CAM_SIZE_MIN, min(CAM_SIZE_MAX, _sz0))
+        self.lbl_cam_sz = QLabel(f"Размер кадра: {_sz0}px")
+        self.sl_cam_sz = QSlider(Qt.Orientation.Horizontal)
+        self.sl_cam_sz.setRange(CAM_SIZE_MIN, CAM_SIZE_MAX)
+        self.sl_cam_sz.setSingleStep(20)
+        self.sl_cam_sz.setValue(_sz0)
+        self.sl_cam_sz.valueChanged.connect(
+            lambda v: self.lbl_cam_sz.setText(f"Размер кадра: {v}px")
+        )
+        vid_lay.addWidget(self.lbl_cam_sz)
+        vid_lay.addWidget(self.sl_cam_sz)
+
+        vid_lay.addSpacing(16)
+
+        # ── Превью камеры (кнопка прямо на кружке) ───────────────────────
+        preview_title = QLabel("Превью камеры")
+        preview_title.setStyleSheet("font-weight: bold;")
+        vid_lay.addWidget(preview_title)
+
+        vid_lay.addSpacing(10)
+
+        _PV = 170   # диаметр превью
+
+        prev_row = QHBoxLayout()
+        prev_row.setSpacing(14)
+
+        # Круглый превью-лейбл (без кнопки поверх).
+        self.cam_preview_label = QLabel()
+        self.cam_preview_label.setFixedSize(_PV, _PV)
+        self.cam_preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.cam_preview_label.setStyleSheet(
+            f"QLabel {{ background: #16181f; border: 1px solid #2a2d3a;"
+            f" border-radius: {_PV // 2}px; color: #888; font-size: 12px; }}"
+        )
+        self._preview_diameter = _PV
+
+        # Кнопка СБОКУ от кружка (не оверлей — надёжно при любых стилях).
+        self.btn_cam_preview = QPushButton("▶  Запустить превью")
+        self.btn_cam_preview.setCheckable(True)
+        self.btn_cam_preview.setFixedHeight(36)
+        self.btn_cam_preview.setMinimumWidth(190)
+        self.btn_cam_preview.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_cam_preview.clicked.connect(self._toggle_camera_preview)
+        self._style_preview_btn(False)
+
+        prev_row.addStretch()
+        prev_row.addWidget(self.cam_preview_label)
+        prev_row.addSpacing(6)
+        # Кнопку центрируем по вертикали рядом с кружком.
+        btn_col = QVBoxLayout()
+        btn_col.addStretch()
+        btn_col.addWidget(self.btn_cam_preview)
+        btn_col.addStretch()
+        prev_row.addLayout(btn_col)
+        prev_row.addStretch()
+        vid_lay.addLayout(prev_row)
+
+        self._preview_thread = None
+        self._preview_uses_main = False   # превью подключено к рабочей камере?
+
+        vid_lay.addSpacing(12)
+        vid_lay.addStretch()
+        self.tabs.addTab(vid_tab, "Видео")
+
+    def _style_preview_btn(self, active: bool):
+        """Стиль боковой кнопки превью: зелёная «Запустить» / красная «Остановить»."""
+        if active:
+            self.btn_cam_preview.setText("⏸  Остановить превью")
+            self.btn_cam_preview.setStyleSheet(
+                "QPushButton {"
+                "  background: #e74c3c; color: #ffffff;"
+                "  border: none; border-radius: 8px;"
+                "  font-size: 13px; font-weight: 600; padding: 0 14px;"
+                "}"
+                "QPushButton:hover { background: #ff6151; }"
+            )
+        else:
+            self.btn_cam_preview.setText("▶  Запустить превью")
+            self.btn_cam_preview.setStyleSheet(
+                "QPushButton {"
+                "  background: #2ecc71; color: #ffffff;"
+                "  border: none; border-radius: 8px;"
+                "  font-size: 13px; font-weight: 600; padding: 0 14px;"
+                "}"
+                "QPushButton:hover { background: #3ee084; }"
+            )
+
+    # ── Превью камеры в настройках ──────────────────────────────────────
+    def _toggle_camera_preview(self, checked: bool = None):
+        # Состояние берём из самой кнопки (она checkable и уже переключилась).
+        if self.btn_cam_preview.isChecked():
+            self._start_camera_preview()
+        else:
+            self._stop_camera_preview()
+
+    def _start_camera_preview(self):
+        # Если основная камера УЖЕ работает (идёт трансляция) — НЕ открываем
+        # второй захват (это убивает живой кружок на Windows). Вместо этого
+        # подключаем превью к кадрам уже работающего потока.
+        main_cap = getattr(self.mw, "_cam_capture", None) if hasattr(self, "mw") else None
+        main_on = bool(getattr(self.mw, "is_camera_on", False)) if hasattr(self, "mw") else False
+
+        if main_on and main_cap is not None:
+            try:
+                main_cap.frame_qimage.connect(self._on_preview_frame)
+                self._preview_uses_main = True
+                self.cam_preview_label.setText("")
+                self.btn_cam_preview.setChecked(True)
+                self._style_preview_btn(True)
+                return
+            except Exception as e:
+                print(f"[Preview] не удалось подключиться к рабочей камере: {e}")
+                self._preview_uses_main = False
+
+        # Иначе — свой отдельный поток превью.
+        try:
+            from ui_main.camera_capture import CameraCaptureThread, CV2_AVAILABLE
+        except Exception as e:
+            self.cam_preview_label.setText(f"Нет OpenCV\n{e}")
+            self.btn_cam_preview.setChecked(False)
+            self._style_preview_btn(False)
+            return
+        if not CV2_AVAILABLE:
+            self.cam_preview_label.setText("OpenCV не установлен")
+            self.btn_cam_preview.setChecked(False)
+            self._style_preview_btn(False)
+            return
+
+        cam_index = 0
+        try:
+            cam_index = int(self.cb_cam.currentData()
+                            if self.cb_cam.currentData() is not None else 0)
+        except Exception:
+            pass
+
+        # Останавливаем прошлый поток БЕЗ сброса состояния кнопки.
+        self._stop_camera_preview(reset_button=False)
+
+        self._preview_thread = CameraCaptureThread(
+            camera_index=cam_index,
+            preview_fps=self.sl_cam_fps.value(),
+            send_fps=self.sl_cam_fps.value(),
+            send_size=self.sl_cam_sz.value(),
+            jpeg_quality=self.sl_cam_q.value(),
+        )
+        self._preview_thread.frame_qimage.connect(self._on_preview_frame)
+        self._preview_thread.opened.connect(self._on_preview_opened)
+        self._preview_thread.error.connect(
+            lambda m: self.cam_preview_label.setText(f"Ошибка:\n{m}")
+        )
+        self.cam_preview_label.setText("Запуск…")
+        self.btn_cam_preview.setChecked(True)
+        self._style_preview_btn(True)
+        self._preview_thread.start()
+
+    def _on_preview_opened(self, ok: bool):
+        if not ok:
+            self.cam_preview_label.setText("Камера недоступна")
+            self.btn_cam_preview.setChecked(False)
+            self._style_preview_btn(False)
+
+    def _on_preview_frame(self, q_image):
+        from PyQt6.QtGui import QPixmap, QPainter, QPainterPath
+        from PyQt6.QtCore import QRectF
+        side = min(q_image.width(), q_image.height())
+        sx = (q_image.width() - side) // 2
+        sy = (q_image.height() - side) // 2
+        cropped = q_image.copy(sx, sy, side, side)
+        D = getattr(self, "_preview_diameter", 170) - 4
+        scaled = cropped.scaled(D, D, Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                                Qt.TransformationMode.SmoothTransformation)
+        out = QPixmap(D, D)
+        out.fill(Qt.GlobalColor.transparent)
+        p = QPainter(out)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        path = QPainterPath()
+        path.addEllipse(QRectF(0, 0, D, D))
+        p.setClipPath(path)
+        p.drawImage(0, 0, scaled)
+        p.end()
+        self.cam_preview_label.setPixmap(out)
+
+    def _stop_camera_preview(self, reset_button: bool = True):
+        # Если превью было подключено к РАБОЧЕЙ камере — только отключаем сигнал,
+        # сам захват трансляции НЕ трогаем (он продолжает жить).
+        if getattr(self, "_preview_uses_main", False):
+            main_cap = getattr(self.mw, "_cam_capture", None) if hasattr(self, "mw") else None
+            if main_cap is not None:
+                try:
+                    main_cap.frame_qimage.disconnect(self._on_preview_frame)
+                except (RuntimeError, TypeError):
+                    pass
+            self._preview_uses_main = False
+        else:
+            th = getattr(self, "_preview_thread", None)
+            if th is not None:
+                try:
+                    th.frame_qimage.disconnect()
+                    th.opened.disconnect()
+                    th.error.disconnect()
+                except (RuntimeError, TypeError):
+                    pass
+                try:
+                    th.stop()
+                except Exception:
+                    pass
+                self._preview_thread = None
+
+        if reset_button:
+            if hasattr(self, "cam_preview_label"):
+                self.cam_preview_label.setPixmap(QPixmap())
+                self.cam_preview_label.setText("")
+            if hasattr(self, "btn_cam_preview"):
+                self.btn_cam_preview.setChecked(False)
+                self._style_preview_btn(False)
 
     def setup_personalization_tab(self):
 
@@ -1550,6 +1964,44 @@ class SettingsDialog(QDialog):
         self.cb_in.setCurrentText(s_in)
         self.cb_out.setCurrentText(s_out)
 
+    def _refresh_audio_devices_clicked(self):
+        """
+        Пересканирует аудиоустройства, подхватывая подключённые ПОСЛЕ запуска.
+
+        sounddevice/PortAudio кэширует список устройств при инициализации,
+        поэтому простой повторный query_devices() вернёт старый список.
+        Принудительно ре-инициализируем PortAudio (_terminate/_initialize),
+        затем перезаполняем списки, сохраняя текущий выбор пользователя.
+        """
+        cur_in = self.cb_in.currentText()
+        cur_out = self.cb_out.currentText()
+
+        # Ре-инициализация PortAudio → актуальный список устройств.
+        try:
+            sd._terminate()
+            sd._initialize()
+        except Exception as e:
+            print(f"[Settings] PortAudio reinit: {e}")
+
+        # Перечитываем список.
+        try:
+            self.refresh_devices_list()
+        except Exception as e:
+            print(f"[Settings] refresh_devices_list error: {e}")
+            return
+
+        # Возвращаем прежний выбор, если он ещё доступен.
+        if cur_in:
+            idx = self.cb_in.findText(cur_in)
+            if idx != -1:
+                self.cb_in.setCurrentIndex(idx)
+        if cur_out:
+            idx = self.cb_out.findText(cur_out)
+            if idx != -1:
+                self.cb_out.setCurrentIndex(idx)
+
+        print("[Settings] Список аудиоустройств обновлён")
+
     def _on_vad_slider_changed(self, val: int):
         self._current_vad_val = val
         self.audio.set_vad_threshold(val)
@@ -1591,12 +2043,28 @@ class SettingsDialog(QDialog):
             self.audio.volume_level_signal.disconnect(self.mic_vad.set_level)
         except (RuntimeError, TypeError):
             pass
+        # Останавливаем превью камеры, чтобы не держать устройство и поток.
+        try:
+            self._stop_camera_preview()
+        except Exception:
+            pass
         super().done(result)
 
     def save_all(self):
         s = self.app_settings
         s.setValue("device_in_name", self.cb_in.currentText())
         s.setValue("device_out_name", self.cb_out.currentText())
+        # ── Источник камеры (вкладка «Видео») ──
+        if hasattr(self, "cb_cam") and self.cb_cam.count() > 0:
+            s.setValue("camera_name", self.cb_cam.currentText())
+            cam_data = self.cb_cam.currentData()
+            s.setValue("camera_index", int(cam_data) if cam_data is not None else 0)
+        # ── Параметры трансляции камеры ──
+        if hasattr(self, "sl_cam_fps"):
+            s.setValue("camera_send_fps", self.sl_cam_fps.value())
+            s.setValue("camera_preview_fps", self.sl_cam_fps.value())
+            s.setValue("camera_jpeg_quality", self.sl_cam_q.value())
+            s.setValue("camera_send_size", self.sl_cam_sz.value())
         s.setValue("system_sound_volume", self.sl_sys.value())
         s.setValue("soundboard_volume", self.sl_sb.value())
         s.setValue("vad_threshold_slider", self._current_vad_val)

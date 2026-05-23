@@ -47,6 +47,11 @@ from .server_webrtc import PionSfuProxy
 
 _TCP_BUFFER_MAX = 16 * 1024 * 1024
 
+# Лимит размера одного base64-кадра камеры. При высоких настройках
+# (480px / q90) один кадр может достигать ~200-270 КБ base64, поэтому
+# берём щедрый потолок 400 КБ против реальных кадров, но против мусора.
+CAMERA_FRAME_MAX_B64 = 400_000
+
 class SFUServer:
     def __init__(self, host='0.0.0.0', server_name=''):
 
@@ -857,6 +862,48 @@ class SFUServer:
                                     _sfu.close_streamer(stopped_uid)
                             self._mark_dirty()
                             self.send_global_state()
+
+                        elif action == 'camera_start':
+                            with self.clients_lock:
+                                if conn in self.clients:
+                                    self.clients[conn]['is_camera'] = True
+                                    cam_nick = self.clients[conn]['nick']
+                                    print(f"[Server] {cam_nick} включил камеру")
+                            self._mark_dirty()
+                            self.send_global_state()
+
+                        elif action == 'camera_stop':
+                            with self.clients_lock:
+                                if conn in self.clients:
+                                    self.clients[conn]['is_camera'] = False
+                                    cam_nick = self.clients[conn]['nick']
+                                    print(f"[Server] {cam_nick} выключил камеру")
+                            self._mark_dirty()
+                            self.send_global_state()
+
+                        elif action == 'camera_frame':
+                            # Кадр камеры → раздать пользователям той же комнаты.
+                            cam_b64 = msg.get('data', '')
+                            if cam_b64 and len(cam_b64) <= CAMERA_FRAME_MAX_B64:
+                                src_uid = None
+                                src_room = None
+                                with self.clients_lock:
+                                    if conn in self.clients:
+                                        src_uid  = self.clients[conn]['uid']
+                                        src_room = self.clients[conn].get('room')
+                                if src_uid is not None and src_room is not None:
+                                    out = json.dumps({
+                                        'action': 'camera_frame',
+                                        'uid':    src_uid,
+                                        'data':   cam_b64,
+                                    }).encode('utf-8')
+                                    with self.clients_lock:
+                                        peers = [
+                                            c for c, d in self.clients.items()
+                                            if d.get('room') == src_room and c is not conn
+                                        ]
+                                    for c in peers:
+                                        self._safe_send(c, out)
 
                         elif action == 'stream_watch_start':
                             streamer_uid = msg.get('streamer_uid')
@@ -1861,6 +1908,7 @@ class SFUServer:
                     'deaf':         c.get('deaf', False),
                     'ip':           c.get('ip', ''),
                     'is_streaming': c.get('is_streaming', False),
+                    'is_camera':    c.get('is_camera', False),
                     'sfu_port':     c.get('sfu_port', 7788),
                     'watchers':     watchers_list,
                     'status_icon':  c.get('status_icon', ''),

@@ -823,6 +823,131 @@ class VideoOverlay(QFrame):
     def set_fullscreen_icon(self, is_fullscreen: bool):
         self.btn_fs.setText("❐" if is_fullscreen else "⛶")
 
+class _ViewerControlOverlay(QWidget):
+    """
+    Плавающая плашка «Управление активно» на стороне ЗРИТЕЛЯ.
+
+    Это ОТДЕЛЬНОЕ top-level окно (Qt.Tool + FramelessWindowHint +
+    WindowStaysOnTopHint), поэтому:
+      • видно поверх всех окон, в т.ч. поверх фуллскрина трансляции;
+      • её кнопку НЕ перехватывает eventFilter/grabKeyboard окна стрима
+        (это другое окно — клик по «Отменить» доходит честно);
+      • плашку можно перетаскивать мышью за тело.
+
+    Сигнал stop_clicked → зритель просит остановить управление.
+    """
+    stop_clicked = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(
+            Qt.WindowType.Tool
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        # Не воровать фокус у окна стрима (иначе перехват клавиатуры собьётся)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+        self._drag_offset = None
+
+        outer = QFrame(self)
+        outer.setObjectName("vcOuter")
+        outer.setStyleSheet("""
+            QFrame#vcOuter {
+                background-color: rgba(231, 76, 60, 235);
+                border-radius: 10px;
+                border: 1px solid rgba(255,255,255,70);
+            }
+        """)
+
+        lay = QHBoxLayout(outer)
+        lay.setContentsMargins(12, 8, 12, 8)
+        lay.setSpacing(10)
+
+        self._grip = QLabel("⠿")
+        self._grip.setStyleSheet(
+            "background:transparent; border:none; color:#ffd; font-size:15px;")
+        self._grip.setToolTip("Перетащить")
+        lay.addWidget(self._grip)
+
+        ico = QLabel("🖱️")
+        ico.setStyleSheet("background:transparent; border:none; font-size:16px;")
+        lay.addWidget(ico)
+
+        col = QVBoxLayout()
+        col.setSpacing(0)
+        lbl = QLabel("Управление активно")
+        lbl.setStyleSheet(
+            "background:transparent; border:none; color:#fff;"
+            "font-size:12px; font-weight:700;")
+        hint = QLabel("3×ESC или кнопка")
+        hint.setStyleSheet(
+            "background:transparent; border:none; color:rgba(255,255,255,200);"
+            "font-size:10px;")
+        col.addWidget(lbl)
+        col.addWidget(hint)
+        lay.addLayout(col)
+
+        btn = QPushButton("Отменить")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setStyleSheet("""
+            QPushButton {
+                background: rgba(255,255,255,45);
+                border: 1px solid rgba(255,255,255,90);
+                border-radius: 6px;
+                color: #fff;
+                font-size: 12px;
+                font-weight: 600;
+                padding: 5px 12px;
+            }
+            QPushButton:hover  { background: rgba(255,255,255,80); }
+            QPushButton:pressed{ background: rgba(255,255,255,110); }
+        """)
+        btn.clicked.connect(self.stop_clicked)
+        lay.addWidget(btn)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.addWidget(outer)
+        self.adjustSize()
+
+    # ── Перетаскивание за тело плашки ────────────────────────────────────────
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._drag_offset = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            e.accept()
+
+    def mouseMoveEvent(self, e):
+        if self._drag_offset is not None and (e.buttons() & Qt.MouseButton.LeftButton):
+            self.move(e.globalPosition().toPoint() - self._drag_offset)
+            e.accept()
+
+    def mouseReleaseEvent(self, e):
+        self._drag_offset = None
+        e.accept()
+
+    def show_top_right_of(self, ref_widget):
+        """Показать у правого-верхнего угла опорного виджета (окна стрима)."""
+        self.adjustSize()
+        try:
+            if ref_widget is not None and ref_widget.isVisible():
+                g = ref_widget.frameGeometry()
+                x = g.right() - self.width() - 24
+                y = g.top() + 24
+            else:
+                from PyQt6.QtGui import QGuiApplication
+                scr = QGuiApplication.primaryScreen().availableGeometry()
+                x = scr.right() - self.width() - 40
+                y = scr.top() + 40
+            self.move(max(0, x), max(0, y))
+        except Exception:
+            pass
+        self.show()
+        self.raise_()
+
+
 class _ControlBanner(QFrame):
 
     stop_clicked = pyqtSignal()
@@ -902,6 +1027,7 @@ class VideoWindow(QWidget):
         self._sb_panel = None        # SoundboardPanel поверх стрима (toggle)
         self._control_mode = False   # True = этот зритель сейчас управляет стримером
         self._control_banner = None  # _ControlBanner у стримера
+        self._viewer_ctrl_overlay = None  # плавающая плашка управления у зрителя
 
         self._draw_canvas: DrawCanvas | None = None
 
@@ -1080,16 +1206,45 @@ class VideoWindow(QWidget):
         self.overlay.set_control_active(True)
         self._control_mode = True
         self._rc_begin_capture()
+        self._show_viewer_control_overlay()
 
     def on_control_denied(self):
         self.overlay.set_control_active(False)
         self._control_mode = False
         self._rc_end_capture()
+        self._hide_viewer_control_overlay()
 
     def on_control_stopped(self):
         self.overlay.set_control_active(False)
         self._control_mode = False
         self._rc_end_capture()
+        self._hide_viewer_control_overlay()
+
+    def _show_viewer_control_overlay(self):
+        """
+        Плавающая плашка «Управление активно» у зрителя — отдельное top-level
+        окно поверх всех, в т.ч. поверх фуллскрина. Двигается мышью, кнопка
+        «Отменить» останавливает управление (её клик не съедается grab'ом).
+        """
+        if getattr(self, '_viewer_ctrl_overlay', None) is None:
+            self._viewer_ctrl_overlay = _ViewerControlOverlay(None)
+            self._viewer_ctrl_overlay.stop_clicked.connect(self._on_viewer_overlay_stop)
+        self._viewer_ctrl_overlay.show_top_right_of(self)
+
+    def _hide_viewer_control_overlay(self):
+        ov = getattr(self, '_viewer_ctrl_overlay', None)
+        if ov is not None:
+            ov.hide()
+
+    def _on_viewer_overlay_stop(self):
+        """Зритель нажал «Отменить» на плавающей плашке."""
+        self._hide_viewer_control_overlay()
+        # Снимаем захват сразу, чтобы вернуть себе мышь/клавиатуру,
+        # и просим остановить управление (stop уйдёт стримеру через сервер).
+        self._control_mode = False
+        self._rc_end_capture()
+        self.overlay.set_control_active(False)
+        self.control_released.emit()
 
     def _rc_begin_capture(self):
         """
@@ -1430,6 +1585,20 @@ class VideoWindow(QWidget):
     def closeEvent(self, event):
         self._closing = True
         self._hide_timer.stop()
+
+        # Если окно закрывают во время управления — снять захват и плашку,
+        # иначе у зрителя останется grabKeyboard, а у стримера — активная сессия.
+        if self._control_mode:
+            self._control_mode = False
+            self._rc_end_capture()
+            self.control_released.emit()
+        ov = getattr(self, '_viewer_ctrl_overlay', None)
+        if ov is not None:
+            try:
+                ov.close()
+            except RuntimeError:
+                pass
+            self._viewer_ctrl_overlay = None
 
         try:
             if self._draw_canvas is not None:

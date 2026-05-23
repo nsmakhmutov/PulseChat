@@ -61,6 +61,10 @@ from ui_dialogs.ui_settings import SettingsDialog
 from ui_dialogs.ui_soundboard import SoundboardPanel, SoundboardDialog
 from .ui_widgets import QuickMsgBubble, CustomTitleBar, ChatPanel
 from .ui_channel import _CreateChannelDialog, _ChannelPasswordDialog
+from .ui_webcamera import CircularVideoWindow, WebcamMixin
+from .avatar_ring import (
+    make_avatar_with_pulse_ring, pulse_phase, quantize_phase,
+)
 from version import APP_VERSION, APP_NAME, GITHUB_REPO
 
 class HoldToDisconnectButton(QPushButton):
@@ -186,7 +190,7 @@ class HoldToDisconnectButton(QPushButton):
         )
 
 
-class MainWindow(QMainWindow):
+class MainWindow(WebcamMixin, QMainWindow):
     # Эмитится из потока библиотеки keyboard, когда стример нажал ESC нужное
     # число раз. Доставляется в Qt-поток через очередь сигналов.
     _rc_esc_triggered = pyqtSignal()
@@ -308,6 +312,7 @@ class MainWindow(QMainWindow):
         self.net.chat_history_received.connect(self._on_chat_history_received)
         self.net.chat_media_received.connect(self._on_chat_media_received)
         self.net.typing_received.connect(self._on_typing_received)
+        self.net.camera_frame_received.connect(self.on_network_camera_frame)
         self._chat_panel.typing_started.connect(self.net.send_typing)
         self.net.become_host.connect(self._on_become_host)
         self.net.server_migrating.connect(self._on_server_migrating)
@@ -322,6 +327,12 @@ class MainWindow(QMainWindow):
         self.setup_hotkeys()
         self.net.connect_to_server(self.ip, self.nick, self.avatar)
         self.is_streaming = False
+        # ── Веб-камера: реестр круглых окон + флаг своей камеры ──────────
+        self.init_webcam_state()
+        # Кэш аватарок с пульсирующим кольцом: ключ (avatar_name, phase_step)
+        self._avatar_ring_cache: dict = {}
+        # Время старта — для расчёта фазы пульсации по ui_timer.
+        self._cam_pulse_t0 = time.perf_counter()
         self._sb_panel = None
         self._streamer_draw_overlay: StreamerAnnotationOverlay | None = None
         self.net.draw_stroke_received.connect(self._on_draw_stroke_received)
@@ -366,6 +377,7 @@ class MainWindow(QMainWindow):
         self._px_vol_off   = QIcon(resource_path("assets/icon/volume_off.svg")).pixmap(self._icon_size)
         self._px_mic_off   = QIcon(resource_path("assets/icon/mic_off.svg")).pixmap(self._icon_size)
         self._px_ban       = QIcon(resource_path("assets/icon/ban.svg")).pixmap(self._icon_size)
+        self._px_cam       = QIcon(resource_path("assets/icon/webcamera.svg")).pixmap(self._icon_size)
         self._status_px_cache: dict = {}
         self._my_status_icon: str = self.app_settings.value("my_status_icon", "")
         self._my_status_text: str = self.app_settings.value("my_status_text", "")
@@ -431,6 +443,7 @@ class MainWindow(QMainWindow):
         header.hide()
 
         self.tree.itemDoubleClicked.connect(self.on_tree_double_click)
+        self.tree.itemClicked.connect(self._on_tree_clicked_cam)
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.show_context_menu)
 
@@ -544,6 +557,30 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(self._btn_chat_main)
 
+        # ── «Завершить» — текстом под кнопкой «Чат» (бывшая lobby.svg) ──
+        self._btn_leave_text = QPushButton("Завершить")
+        self._btn_leave_text.setFixedHeight(34)
+        self._btn_leave_text.setObjectName("btnLeaveText")
+        self._btn_leave_text.setStyleSheet("""
+            QPushButton#btnLeaveText {
+                background-color: rgba(231, 76, 60, 0.10);
+                border: 1px solid rgba(231, 76, 60, 0.30);
+                border-radius: 8px;
+                color: #e07a6e;
+                font-size: 13px;
+                font-weight: 600;
+                letter-spacing: 0.5px;
+                margin: 0px 0px 2px 0px;
+            }
+            QPushButton#btnLeaveText:hover {
+                background-color: rgba(231, 76, 60, 0.20);
+                border-color: rgba(231, 76, 60, 0.50);
+                color: #ff8c7a;
+            }
+        """)
+        self._btn_leave_text.clicked.connect(self._disconnect_and_show_lobby)
+        layout.addWidget(self._btn_leave_text)
+
         self._bottom_bar = QFrame()
         self._bottom_bar.setObjectName("bottomBar")
         self._bottom_bar.setFixedHeight(72)
@@ -583,13 +620,15 @@ class MainWindow(QMainWindow):
         self.btn_stream.setCheckable(True)
         self.btn_stream.clicked.connect(self.toggle_stream)
 
-        self.btn_lobby = HoldToDisconnectButton()
-        self.btn_lobby.setFixedSize(46, 46)
-        self.btn_lobby.setObjectName("barBtnDisconnect")
-        self.btn_lobby.setIcon(QIcon(resource_path("assets/icon/lobby.svg")))
-        self.btn_lobby.setIconSize(QSize(26, 26))
-        self.btn_lobby.set_hold_callback(self._disconnect_and_show_lobby)
-        self.btn_lobby.set_hold_sound(resource_path("assets/music/call_down_progress.wav"))
+        # ── Кнопка веб-камеры (на месте бывшей lobby.svg) ──────────────
+        self.btn_cam = QPushButton()
+        self.btn_cam.setCheckable(True)
+        self.btn_cam.setFixedSize(46, 46)
+        self.btn_cam.setObjectName("barBtnCam")
+        self.btn_cam.setIcon(QIcon(resource_path("assets/icon/webcamera.svg")))
+        self.btn_cam.setIconSize(QSize(26, 26))
+        self.btn_cam.setToolTip("Веб-камера")
+        self.btn_cam.clicked.connect(self.toggle_camera)
 
         self._stream_conn_lbl = QLabel()
         self._stream_conn_lbl.setFixedSize(22, 22)
@@ -616,7 +655,7 @@ class MainWindow(QMainWindow):
 
         btns.addWidget(self.btn_mute)
         btns.addWidget(self.btn_deafen)
-        btns.addWidget(self.btn_lobby)
+        btns.addWidget(self.btn_cam)
         btns.addWidget(self.btn_sb)
         btns.addWidget(self.btn_stream)
         btns.addWidget(self._stream_conn_lbl)
@@ -1118,6 +1157,25 @@ class MainWindow(QMainWindow):
             #btnStream:hover {{
                 background-color: {btn_hover};
                 border-color: rgba(91,142,245,0.55);
+            }}
+            /* ── Веб-камера: нейтральный фон выкл, зелёный когда вкл ── */
+            #barBtnCam {{
+                background-color: {btn_bg};
+                border: 1px solid {btn_border};
+                border-radius: 10px;
+                padding: 4px;
+            }}
+            #barBtnCam:hover {{
+                background-color: {btn_hover};
+                border-color: rgba(91,142,245,0.55);
+            }}
+            #barBtnCam:checked {{
+                background-color: rgba(46,204,113,0.30);
+                border: 1px solid rgba(46,204,113,0.60);
+            }}
+            #barBtnCam:checked:hover {{
+                background-color: rgba(46,204,113,0.45);
+                border-color: rgba(46,204,113,0.80);
             }}
 
             /* ════════════════════════════════════════════════════════════════
@@ -1888,6 +1946,8 @@ class MainWindow(QMainWindow):
     def on_video_frame(self, uid, q_image):
         if uid in self.stream_windows and self.stream_windows[uid].isVisible():
             self.stream_windows[uid].update_frame(q_image)
+        # ── камера: тот же QImage уходит в круглое PiP-окно ──
+        self.on_camera_frame(uid, q_image)
 
     def on_stream_stats_updated(self, uid: int, fps: int, loss_pct: int):
 
@@ -1920,6 +1980,12 @@ class MainWindow(QMainWindow):
             for u in users_map.get(self.current_room, [])
             if u.get('is_streaming', False)
         }
+        current_camera_uids = {
+            u['uid']
+            for u_list in users_map.values()
+            for u in u_list
+            if u.get('is_camera', False)
+        }
 
         if not room_changed and self.audio.my_uid != 0:
             if current_room_uids - self.prev_room_uids:
@@ -1934,6 +2000,13 @@ class MainWindow(QMainWindow):
                 for uid in stopped_streams:
                     if uid in self.stream_windows:
                         self._on_stream_window_closed(uid)
+
+        # Камера выключилась у кого-то → закрываем его круглое окно (если открыто).
+        stopped_cameras = getattr(self, '_prev_camera_uids', set()) - current_camera_uids
+        for uid in stopped_cameras:
+            if uid in self.cam_windows:
+                self._destroy_cam_window(uid)
+        self._prev_camera_uids = current_camera_uids
 
         self.audio.cleanup_users(all_active_uids)
         self.video.cleanup_users(all_active_uids)
@@ -1955,7 +2028,8 @@ class MainWindow(QMainWindow):
             tuple(self.default_rooms),   # ← изменение списка каналов = rebuild
             tuple(
                 (r, u['uid'], u['nick'], u.get('mute'), u.get('deaf'),
-                 u.get('is_streaming'), u.get('avatar'), u.get('status_icon'),
+                 u.get('is_streaming'), u.get('is_camera'),
+                 u.get('avatar'), u.get('status_icon'),
                  u.get('status_text'),
 
                  tuple(w.get('nick', '') for w in u.get('watchers', [])))
@@ -2032,6 +2106,8 @@ class MainWindow(QMainWindow):
                     'is_m':        u.get('mute', False),
                     'is_d':        u.get('deaf', False),
                     'is_s':        u.get('is_streaming', False),
+                    'is_cam':      u.get('is_camera', False),
+                    'avatar_name': avatar_name,
                     'status_icon': status_icon,
                     'status_text': status_text,
                 }
@@ -2084,6 +2160,10 @@ class MainWindow(QMainWindow):
             self._latency_btn.setText(f"{ping} мс")
 
             now = time.perf_counter()
+
+            # ── Фаза пульсации обводки камеры (одна на тик) ──────────────
+            _cam_phase = pulse_phase(now - self._cam_pulse_t0)
+            _cam_phase_step = quantize_phase(_cam_phase)
 
             if self._theme_dirty:
                 self._theme_dirty = False
@@ -2150,6 +2230,51 @@ class MainWindow(QMainWindow):
                     else:
                         item.setData(4, Qt.ItemDataRole.DecorationRole, None)
 
+                # ── Индикатор веб-камеры ──────────────────────────────────
+                curr_cam = self.is_camera_on if uid == my_uid else data.get('is_cam', False)
+                avatar_name = data.get('avatar_name')
+
+                if curr_cam:
+                    # 1) иконка камеры в колонке статуса (1), если там пусто
+                    if not data.get('status_icon'):
+                        item.setData(1, Qt.ItemDataRole.DecorationRole, self._px_cam)
+                    # 2) плавно пульсирующая обводка ПОВЕРХ кромки аватарки
+                    #    (колонка 0). Размер аватара НЕ меняется — кольцо
+                    #    лежит на краю, аватар занимает весь круг как обычно.
+                    if avatar_name:
+                        # Кольцо рисуем поверх аватарки ТОЧНО того же размера,
+                        # что и обычная иконка дерева — чтобы при включении
+                        # камеры аватар не уменьшался и не съезжал.
+                        _isz = self.tree.iconSize()
+                        _icon_px = _isz.width() if (_isz.isValid() and _isz.width() > 0) else 32
+                        key = (avatar_name, _cam_phase_step, _icon_px)
+                        ringed = self._avatar_ring_cache.get(key)
+                        if ringed is None:
+                            if len(self._avatar_ring_cache) > 600:
+                                self._avatar_ring_cache.clear()
+                            # База — тот же рендер, что использует дерево для
+                            # обычной аватарки: QIcon(path).pixmap(icon_size).
+                            base = QIcon(
+                                resource_path(f"assets/avatars/{avatar_name}")
+                            ).pixmap(_icon_px, _icon_px)
+                            ringed = make_avatar_with_pulse_ring(
+                                base, _icon_px, _cam_phase, ring_width=3,
+                            )
+                            self._avatar_ring_cache[key] = ringed
+                        item.setIcon(0, QIcon(ringed))
+                        data['_ring_on'] = True
+                else:
+                    # камера выключилась — вернуть обычную аватарку один раз
+                    if data.get('_ring_on') and avatar_name:
+                        item.setIcon(0, QIcon(resource_path(f"assets/avatars/{avatar_name}")))
+                        data['_ring_on'] = False
+                    # снять иконку камеры, если её ставили и статуса нет
+                    if not data.get('status_icon'):
+                        # не затираем чужой статус-значок; только наш cam-значок
+                        cur = item.data(1, Qt.ItemDataRole.DecorationRole)
+                        if cur is self._px_cam:
+                            item.setData(1, Qt.ItemDataRole.DecorationRole, None)
+
                 if talk:
                     item.setForeground(0, self._br_talk)
                 elif curr_s:
@@ -2176,6 +2301,27 @@ class MainWindow(QMainWindow):
                 self._on_join_room_denied(room_name, 'channel_auth_required')
             else:
                 self.net.send_json({"action": CMD_JOIN_ROOM, "room": room_name})
+
+    def _on_tree_clicked_cam(self, item, col):
+        """
+        Одиночный клик по пользователю с активной камерой → круглое PiP-окно.
+        Реагируем на клик по аватарке (колонка 0) и по иконке камеры (колонка 1).
+        """
+        if item is None:
+            return
+        if item.data(0, Qt.ItemDataRole.UserRole) == "ROOM_HEADER":
+            return
+        if col not in (0, 1):
+            return
+        uid = item.data(0, Qt.ItemDataRole.UserRole)
+        if not uid:
+            return
+        data = self.known_uids.get(uid)
+        if not data:
+            return
+        cam_on = self.is_camera_on if uid == self.audio.my_uid else data.get('is_cam', False)
+        if cam_on:
+            self.open_camera_window(uid, item.text(0).strip())
 
     def show_context_menu(self, pos):
         item = self.tree.itemAt(pos)
@@ -3084,20 +3230,38 @@ class MainWindow(QMainWindow):
         # Запоминаем текущие устройства ДО открытия диалога.
         _dev_in_before  = self.app_settings.value("device_in_name",  "")
         _dev_out_before = self.app_settings.value("device_out_name", "")
+        # Все параметры камеры — чтобы перезапустить захват при ЛЮБОМ изменении.
+        _cam_before = (
+            str(self.app_settings.value("camera_index", None)),
+            str(self.app_settings.value("camera_send_fps", None)),
+            str(self.app_settings.value("camera_preview_fps", None)),
+            str(self.app_settings.value("camera_send_size", None)),
+            str(self.app_settings.value("camera_jpeg_quality", None)),
+        )
 
         if SettingsDialog(self.audio, self).exec():
             self.setup_hotkeys()
 
             _dev_in_after  = self.app_settings.value("device_in_name",  "")
             _dev_out_after = self.app_settings.value("device_out_name", "")
+            _cam_after = (
+                str(self.app_settings.value("camera_index", None)),
+                str(self.app_settings.value("camera_send_fps", None)),
+                str(self.app_settings.value("camera_preview_fps", None)),
+                str(self.app_settings.value("camera_send_size", None)),
+                str(self.app_settings.value("camera_jpeg_quality", None)),
+            )
 
             # Перезапускаем аудиопоток ТОЛЬКО если устройство реально сменилось.
-            # При изменении VAD, громкости, soundboard-кнопок и т.д. —
-            # stream не трогаем: слушатели не услышат провала в 100ms.
             if _dev_in_after != _dev_in_before or _dev_out_after != _dev_out_before:
                 self.audio.start(_dev_in_after, _dev_out_after)
             else:
                 print("[Settings] Устройства не изменились — аудиопоток не перезапускается")
+
+            # Любой параметр камеры изменился И камера включена → рестарт на лету.
+            if _cam_after != _cam_before and getattr(self, "is_camera_on", False):
+                print("[Settings] Параметры камеры изменены — перезапуск захвата на лету")
+                self.restart_camera_capture()
 
     # ── Статус пользователя ────────────────────────────────────────────────────
 
@@ -3709,6 +3873,12 @@ class MainWindow(QMainWindow):
 
         # ── 5. VideoEngine.shutdown() ─────────────────────────────────────────
         try:
+            self._stop_camera_capture()
+            for _uid in list(getattr(self, 'cam_windows', {}).keys()):
+                self._destroy_cam_window(_uid)
+        except Exception as ex:
+            print(f"[UI] disconnect camera stop error: {ex}")
+        try:
             self.video.shutdown()
         except Exception as ex:
             print(f"[UI] disconnect video.shutdown() error: {ex}")
@@ -4156,6 +4326,12 @@ class MainWindow(QMainWindow):
         # ── 5. VideoEngine.shutdown() ─────────────────────────────────────────
         # Останавливает DXCamTrack и все VideoReceiver.
         # После net.stop() WebRTC треки будут закрыты, поэтому делаем ДО.
+        try:
+            self._stop_camera_capture()
+            for _uid in list(getattr(self, 'cam_windows', {}).keys()):
+                self._destroy_cam_window(_uid)
+        except Exception as ex:
+            print(f"[UI] closeEvent camera stop error: {ex}")
         try:
             self.video.shutdown()
         except Exception as ex:

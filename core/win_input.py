@@ -122,14 +122,23 @@ if sys.platform == 'win32':
     _BTN_DOWN = {1: MOUSEEVENTF_LEFTDOWN, 2: MOUSEEVENTF_RIGHTDOWN, 4: MOUSEEVENTF_MIDDLEDOWN}
     _BTN_UP   = {1: MOUSEEVENTF_LEFTUP,   2: MOUSEEVENTF_RIGHTUP,   4: MOUSEEVENTF_MIDDLEUP}
 
+    # Что сейчас «зажато» инъекцией — чтобы гарантированно отпустить при стопе.
+    _held_vks = set()        # виртуальные коды (модификаторы/спец/буквы по vk)
+    _held_buttons = set()    # кнопки мыши (1/2/4)
+
     def mouse_button(button: int, down: bool, nx: float = None, ny: float = None):
         """Нажатие/отпускание кнопки. Если заданы nx/ny — сперва двигаем туда."""
         if nx is not None and ny is not None:
             move_to(nx, ny)
-        flag = (_BTN_DOWN if down else _BTN_UP).get(int(button), 
+        b = int(button)
+        flag = (_BTN_DOWN if down else _BTN_UP).get(b,
                 MOUSEEVENTF_LEFTDOWN if down else MOUSEEVENTF_LEFTUP)
         mi = MOUSEINPUT(0, 0, 0, flag, 0, None)
         _send(INPUT(INPUT_MOUSE, _INPUTunion(mi=mi)))
+        if down:
+            _held_buttons.add(b)
+        else:
+            _held_buttons.discard(b)
 
     def mouse_scroll(delta: int):
         mi = MOUSEINPUT(0, 0, ctypes.c_int32(int(delta)).value & 0xFFFFFFFF,
@@ -146,6 +155,10 @@ if sys.platform == 'win32':
             flags |= KEYEVENTF_KEYUP
         ki = KEYBDINPUT(vk, 0, flags, 0, None)
         _send(INPUT(INPUT_KEYBOARD, _INPUTunion(ki=ki)))
+        if down:
+            _held_vks.add((vk, extended))
+        else:
+            _held_vks.discard((vk, extended))
 
     def key_named(name: str, down: bool):
         """Нажатие/отпускание спец-клавиши по имени ('ctrl','enter','f5'...)."""
@@ -169,6 +182,46 @@ if sys.platform == 'win32':
             _send(INPUT(INPUT_KEYBOARD, _INPUTunion(ki=down)),
                   INPUT(INPUT_KEYBOARD, _INPUTunion(ki=up)))
 
+    def release_all():
+        """
+        Отпускает ВСЁ, что было зажато инъекцией (кнопки мыши + клавиши/модиф.).
+        Критично вызывать при остановке управления — иначе у стримера
+        «залипают» Shift/Ctrl/Alt/Win и ПК ведёт себя сломанно до перезагрузки.
+        Дополнительно страхуемся, форсируя up для всех модификаторов.
+        """
+        # 1. Отпустить отслеженные кнопки мыши
+        for b in list(_held_buttons):
+            try:
+                flag = _BTN_UP.get(b, MOUSEEVENTF_LEFTUP)
+                mi = MOUSEINPUT(0, 0, 0, flag, 0, None)
+                _send(INPUT(INPUT_MOUSE, _INPUTunion(mi=mi)))
+            except Exception:
+                pass
+        _held_buttons.clear()
+
+        # 2. Отпустить отслеженные клавиши
+        for vk, ext in list(_held_vks):
+            try:
+                flags = KEYEVENTF_KEYUP | (KEYEVENTF_EXTENDEDKEY if ext else 0)
+                ki = KEYBDINPUT(vk, 0, flags, 0, None)
+                _send(INPUT(INPUT_KEYBOARD, _INPUTunion(ki=ki)))
+            except Exception:
+                pass
+        _held_vks.clear()
+
+        # 3. Страховка: принудительно отпускаем все модификаторы (вкл. левые/правые),
+        #    даже если по какой-то причине не попали в трекинг.
+        for vk in (0x10, 0x11, 0x12,            # Shift, Ctrl, Alt (общие)
+                   0xA0, 0xA1,                  # L/R Shift
+                   0xA2, 0xA3,                  # L/R Ctrl
+                   0xA4, 0xA5,                  # L/R Alt
+                   0x5B, 0x5C):                 # L/R Win
+            try:
+                ki = KEYBDINPUT(vk, 0, KEYEVENTF_KEYUP, 0, None)
+                _send(INPUT(INPUT_KEYBOARD, _INPUTunion(ki=ki)))
+            except Exception:
+                pass
+
 else:
     # Не-Windows: заглушки, чтобы импорт не падал.
     VK = {}
@@ -179,3 +232,4 @@ else:
     def key_vk(vk, down, extended=False): pass
     def key_named(name, down): return False
     def type_unicode(ch): pass
+    def release_all(): pass
