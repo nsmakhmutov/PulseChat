@@ -596,6 +596,7 @@ class WebcamMixin:
         )
         th.frame_qimage.connect(self._on_local_cam_frame)
         th.frame_jpeg.connect(self._on_local_cam_jpeg)
+        th.frame_bgr.connect(self._on_local_cam_bgr)
         th.opened.connect(self._on_cam_opened)
         th.error.connect(self._on_cam_error)
         return th
@@ -642,9 +643,34 @@ class WebcamMixin:
             self._cam_capture = self._make_camera_thread()
             self._cam_capture.start()
 
-            # Сообщаем серверу о включении камеры.
+            # НОВЫЙ путь: поднимаем свой камера-SFU и публикуем H.264-трек.
+            # Кадры в трек подаёт _on_local_cam_bgr (frame_bgr из захвата).
+            cam_ok = False
             try:
-                self.net.send_json({"action": "camera_start"})
+                cam_ok = self.net.start_camera_stream()
+            except Exception as e:
+                print(f"[Camera] start_camera_stream error: {e}")
+
+            if not cam_ok:
+                # Фолбэк/ошибка: WebRTC-камера не поднялась. Выключаем кнопку.
+                print("[Camera] камера-SFU/WebRTC не запустился — отмена.")
+                self.is_camera_on = False
+                try:
+                    self.btn_cam.setChecked(False)
+                except Exception:
+                    pass
+                self._stop_camera_capture()
+                if my_uid in self.cam_windows:
+                    self._destroy_cam_window(my_uid)
+                return
+
+            # Сообщаем серверу о включении камеры + порт нашего камера-SFU.
+            try:
+                cam_port = getattr(self.net, 'cam_sfu_port', 7820)
+                self.net.send_json({
+                    "action": "camera_start",
+                    "camera_sfu_port": int(cam_port),
+                })
             except Exception:
                 pass
 
@@ -653,6 +679,11 @@ class WebcamMixin:
         else:
             # Останавливаем захват.
             self._stop_camera_capture()
+            # Останавливаем публикацию камеры в SFU.
+            try:
+                self.net.stop_camera_stream()
+            except Exception:
+                pass
             try:
                 self.net.send_json({"action": "camera_stop"})
             except Exception:
@@ -701,14 +732,18 @@ class WebcamMixin:
             win.update_frame(q_image)
 
     def _on_local_cam_jpeg(self, jpeg_bytes: bytes):
-        """JPEG-кадр своей камеры → на сервер (раздаётся комнате)."""
+        """LEGACY: раньше слал JPEG на сервер. Теперь камера идёт через
+        WebRTC/SFU, поэтому JPEG в сеть больше НЕ отправляем."""
+        return
+
+    def _on_local_cam_bgr(self, frame_bgr):
+        """Сырой BGR-кадр своей камеры → в H.264-трек WebRTC (camera-SFU)."""
         if not self.is_camera_on:
             return
         try:
-            b64 = base64.b64encode(jpeg_bytes).decode("ascii")
-            self.net.send_json({"action": "camera_frame", "data": b64})
+            self.net.push_camera_frame_bgr(frame_bgr)
         except Exception as e:
-            print(f"[Camera] Ошибка отправки кадра: {e}")
+            print(f"[Camera] push_camera_frame_bgr error: {e}")
 
     def _stop_camera_capture(self):
         cap = getattr(self, "_cam_capture", None)
@@ -779,11 +814,15 @@ class WebcamMixin:
         win.show()
         win.raise_()
 
-        # Если кадры для этого uid идут через сеть — подписка не нужна:
-        # их доставит существующий on_video_frame (см. правку-роутер ниже).
-        # При желании запустить отдельный «просмотр»:
-        # try: self.net.start_watching(uid)
-        # except Exception: pass
+        # НОВЫЙ путь: если это ЧУЖАЯ камера — подписываемся через WebRTC.
+        # Поток грузится ТОЛЬКО сейчас (при открытии кружка), не раньше.
+        # Для своей камеры (локальное превью) подписка не нужна.
+        my_uid = getattr(self.audio, "my_uid", 0)
+        if uid != my_uid:
+            try:
+                self.net.start_watching_camera(uid)
+            except Exception as e:
+                print(f"[Camera] start_watching_camera({uid}) error: {e}")
         return win
 
     # ── Закрытие окна (камера ОСТАЁТСЯ включённой) ──────────────────────
@@ -792,7 +831,16 @@ class WebcamMixin:
         Закрывает круглое окно. По ТЗ статус камеры в дереве НЕ сбрасывается —
         мы лишь убираем окно из реестра. Индикатор продолжает гореть, пока
         пользователь действительно не выключит камеру.
+
+        НОВЫЙ путь: отписываемся от WebRTC-потока чужой камеры → трафик
+        перестаёт грузиться, как только кружок закрыт.
         """
+        my_uid = getattr(self.audio, "my_uid", 0)
+        if uid != my_uid:
+            try:
+                self.net.stop_watching_camera(uid)
+            except Exception as e:
+                print(f"[Camera] stop_watching_camera({uid}) error: {e}")
         self._destroy_cam_window(uid)
         # НАМЕРЕННО не трогаем known_uids[uid]['is_cam'] —
         # индикатор камеры остаётся активным.
@@ -854,6 +902,13 @@ class WebcamMixin:
         if uid in self.known_uids:
             self.known_uids[uid]["is_cam"] = bool(is_on)
         if not is_on and uid in self.cam_windows:
+            # Чужая камера выключилась → отписываемся и закрываем окно.
+            my_uid = getattr(self.audio, "my_uid", 0)
+            if uid != my_uid:
+                try:
+                    self.net.stop_watching_camera(uid)
+                except Exception:
+                    pass
             self._destroy_cam_window(uid)
         if hasattr(self, "refresh_ui"):
             self.refresh_ui()

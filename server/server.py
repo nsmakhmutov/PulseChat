@@ -47,6 +47,11 @@ from .server_webrtc import PionSfuProxy
 
 _TCP_BUFFER_MAX = 16 * 1024 * 1024
 
+
+class _ClientLeave(Exception):
+    """Клиент прислал явный 'leave' — штатное отключение, не ошибка."""
+    pass
+
 # Лимит размера одного base64-кадра камеры. При высоких настройках
 # (480px / q90) один кадр может достигать ~200-270 КБ base64, поэтому
 # берём щедрый потолок 400 КБ против реальных кадров, но против мусора.
@@ -79,6 +84,11 @@ class SFUServer:
         self.udp_map = {}
         self.uid_to_room = {}
         self.watchers = {}
+
+        # Камера-зрители: {streamer_uid: {viewer_uid: True}}.
+        # Отдельно от self.watchers (экран), т.к. камера — другой SFU.
+        self.cam_watchers = {}
+        self.cam_watchers_lock = threading.Lock()
 
         self.remote_controllers: dict = {}
         self.remote_controllers_lock  = threading.Lock()
@@ -571,6 +581,13 @@ class SFUServer:
                         buffer   = buffer[idx:].lstrip()
                         action   = msg.get('action')
 
+                        # Явное прощание клиента: немедленно завершаем обработчик,
+                        # finally-блок ниже корректно удалит клиента из списка.
+                        # Это устраняет «мёртвые» дубли при переподключении.
+                        if action == 'leave':
+                            print(f"[Server] клиент uid={uid} прислал leave → отключаем")
+                            raise _ClientLeave()
+
                         if action == CMD_QUERY_BAN:
                             q_nick = str(msg.get('nick', ''))[:16]
                             q_banned = self._is_banned(client_ip, q_nick)
@@ -619,6 +636,41 @@ class SFUServer:
                                 return
                             client_avatar = msg.get('avatar', '1.svg')
                             _gcn = self._general_channel_name
+
+                            # ── Защита от «мёртвых» дублей ────────────────────
+                            # Если в списке уже есть соединение с тем же nick+ip
+                            # (зависший призрак от прошлой сессии, чей TCP ещё не
+                            # отвалился) — выкидываем его ПЕРЕД регистрацией нового.
+                            # Иначе один и тот же пользователь висел бы дважды.
+                            ghost_conns = []
+                            with self.clients_lock:
+                                for _c, _d in list(self.clients.items()):
+                                    if _c is conn:
+                                        continue
+                                    if (_d.get('nick') == client_nick
+                                            and _d.get('ip') == client_ip):
+                                        ghost_conns.append((_c, _d.get('uid')))
+                            for _gc, _guid in ghost_conns:
+                                print(f"[Server] 🧹 удаляю призрак {client_nick} "
+                                      f"(uid={_guid}, IP={client_ip}) перед новым входом")
+                                with self.clients_lock:
+                                    self.clients.pop(_gc, None)
+                                # Чистим связанные ресурсы призрака.
+                                try:
+                                    self._cleanup_uid_resources(_guid)
+                                except Exception as _e:
+                                    print(f"[Server] cleanup ghost {_guid} err: {_e}")
+                                try:
+                                    _gc.shutdown(socket.SHUT_RDWR)
+                                except Exception:
+                                    pass
+                                try:
+                                    _gc.close()
+                                except Exception:
+                                    pass
+                            if ghost_conns:
+                                self._mark_dirty()
+
                             with self.clients_lock:
                                 self.clients[conn] = {
                                     'nick':         client_nick,
@@ -867,22 +919,112 @@ class SFUServer:
                             with self.clients_lock:
                                 if conn in self.clients:
                                     self.clients[conn]['is_camera'] = True
+                                    # Порт камера-SFU владельца (отдельный
+                                    # sidecar.exe). Зрители идут на него.
+                                    self.clients[conn]['camera_sfu_port'] = int(
+                                        msg.get('camera_sfu_port', 7820)
+                                    )
                                     cam_nick = self.clients[conn]['nick']
-                                    print(f"[Server] {cam_nick} включил камеру")
+                                    print(f"[Server] {cam_nick} включил камеру "
+                                          f"(cam-SFU порт={self.clients[conn]['camera_sfu_port']})")
                             self._mark_dirty()
                             self.send_global_state()
 
                         elif action == 'camera_stop':
+                            stopped_cam_uid = None
                             with self.clients_lock:
                                 if conn in self.clients:
                                     self.clients[conn]['is_camera'] = False
+                                    stopped_cam_uid = self.clients[conn]['uid']
                                     cam_nick = self.clients[conn]['nick']
                                     print(f"[Server] {cam_nick} выключил камеру")
+                            # Закрываем всех зрителей этой камеры.
+                            if stopped_cam_uid is not None:
+                                with self.cam_watchers_lock:
+                                    cam_viewers = list(
+                                        self.cam_watchers.pop(stopped_cam_uid, {}).keys()
+                                    )
+                                _sfu = self.sfu
+                                if _sfu:
+                                    for v_uid in cam_viewers:
+                                        _sfu.cam_close_viewer(v_uid, stopped_cam_uid)
                             self._mark_dirty()
                             self.send_global_state()
 
+                        elif action == 'camera_watch_start':
+                            # Зритель нажал на кружок аватарки → подписка на камеру.
+                            cam_streamer_uid = msg.get('streamer_uid')
+                            if cam_streamer_uid is not None:
+                                cw_uid = None
+                                with self.clients_lock:
+                                    if conn in self.clients:
+                                        cw_uid = self.clients[conn]['uid']
+                                if cw_uid is not None:
+                                    # Защита от дубликата: если этот зритель уже
+                                    # подписан на эту камеру — НЕ триггерим повторно
+                                    # (повторный offer рвал рабочий поток).
+                                    already_watching = False
+                                    with self.cam_watchers_lock:
+                                        if self.cam_watchers.get(
+                                            cam_streamer_uid, {}
+                                        ).get(cw_uid):
+                                            already_watching = True
+                                        else:
+                                            self.cam_watchers.setdefault(
+                                                cam_streamer_uid, {}
+                                            )[cw_uid] = True
+                                    if already_watching:
+                                        print(f"[Server] cam watch dup: "
+                                              f"{cw_uid}→{cam_streamer_uid}, игнор")
+                                    _sfu = self.sfu
+                                    if _sfu and not already_watching:
+                                        streamer_ip = '127.0.0.1'
+                                        cam_port = 7820
+                                        with self.clients_lock:
+                                            for _c in self.clients.values():
+                                                if _c.get('uid') == cam_streamer_uid:
+                                                    raw_ip = _c.get('ip', '127.0.0.1')
+                                                    if self._is_embedded and raw_ip == self._owner_ip:
+                                                        streamer_ip = '127.0.0.1'
+                                                    else:
+                                                        streamer_ip = raw_ip
+                                                    cam_port = _c.get('camera_sfu_port', 7820)
+                                                    break
+                                        _sfu.cam_trigger_viewer_connect(
+                                            cw_uid, cam_streamer_uid, conn,
+                                            streamer_ip=streamer_ip,
+                                            camera_sfu_port=cam_port,
+                                        )
+
+                        elif action == 'camera_watch_stop':
+                            cam_streamer_uid = msg.get('streamer_uid')
+                            if cam_streamer_uid is not None:
+                                cw_uid = None
+                                with self.clients_lock:
+                                    if conn in self.clients:
+                                        cw_uid = self.clients[conn]['uid']
+                                if cw_uid is not None:
+                                    with self.cam_watchers_lock:
+                                        if cam_streamer_uid in self.cam_watchers:
+                                            self.cam_watchers[cam_streamer_uid].pop(cw_uid, None)
+                                    _sfu = self.sfu
+                                    if _sfu:
+                                        _sfu.cam_close_viewer(cw_uid, cam_streamer_uid)
+
+                        elif action == 'camera_webrtc_offer':
+                            role = msg.get('role', '')
+                            if role == 'viewer_offer' and self.sfu:
+                                cam_streamer_uid = msg.get('streamer_uid')
+                                sdp = msg.get('sdp', '')
+                                if cam_streamer_uid is not None and sdp:
+                                    self.sfu.cam_handle_viewer_offer(
+                                        uid, int(cam_streamer_uid), sdp, conn
+                                    )
+
                         elif action == 'camera_frame':
-                            # Кадр камеры → раздать пользователям той же комнаты.
+                            # LEGACY: старый JPEG-over-TCP путь. Оставлен на
+                            # случай старых клиентов, но новые клиенты его НЕ
+                            # используют (камера идёт через WebRTC/SFU).
                             cam_b64 = msg.get('data', '')
                             if cam_b64 and len(cam_b64) <= CAMERA_FRAME_MAX_B64:
                                 src_uid = None
@@ -1182,6 +1324,8 @@ class SFUServer:
                     except json.JSONDecodeError:
                         break
 
+        except _ClientLeave:
+            pass  # штатное отключение по 'leave'
         except Exception as e:
             err_code = getattr(e, 'winerror', None) or getattr(e, 'errno', None)
             is_disconnect = err_code in (10054, 10053, 104, 32)
@@ -1262,6 +1406,22 @@ class SFUServer:
                 if _sfu and was_viewer:
                     _sfu.close_viewer(u_id)
 
+                # Камера: чистим связи где uid был стримером ИЛИ зрителем.
+                with self.cam_watchers_lock:
+                    # uid был владельцем камеры — закрываем всех его зрителей.
+                    cam_viewers_of_uid = list(self.cam_watchers.pop(u_id, {}).keys())
+                    # uid был зрителем чужих камер — снимаем его подписки.
+                    cam_streamers_uid_watched = []
+                    for s_uid in list(self.cam_watchers.keys()):
+                        if u_id in self.cam_watchers[s_uid]:
+                            self.cam_watchers[s_uid].pop(u_id, None)
+                            cam_streamers_uid_watched.append(s_uid)
+                if _sfu:
+                    for v_uid in cam_viewers_of_uid:
+                        _sfu.cam_close_viewer(v_uid, u_id)
+                    for s_uid in cam_streamers_uid_watched:
+                        _sfu.cam_close_viewer(u_id, s_uid)
+
                 print(
                     f"[Server] ✖ {nick} (комната: {room}) "
                     f"отключился | Онлайн: {remaining}"
@@ -1280,6 +1440,56 @@ class SFUServer:
                 pass
             self._mark_dirty()
             self.send_global_state()
+
+    def _cleanup_uid_resources(self, u_id) -> None:
+        """
+        Освобождает все ресурсы, привязанные к uid, не трогая self.clients
+        (вызывающий уже удалил запись). Используется для зачистки «призраков»
+        при повторном входе того же пользователя.
+        """
+        if u_id is None:
+            return
+        with self.udp_lock:
+            self.udp_map.pop(u_id, None)
+            self.uid_to_room.pop(u_id, None)
+        with self._host_order_lock:
+            if u_id in self._host_order:
+                self._host_order.remove(u_id)
+        with self._client_pings_lock:
+            self._client_pings.pop(u_id, None)
+
+        was_streamer = False
+        was_viewer = False
+        with self.watchers_lock:
+            was_streamer = u_id in self.watchers
+            was_viewer = any(u_id in ws for ws in self.watchers.values())
+            for s_uid in list(self.watchers.keys()):
+                self.watchers[s_uid].pop(u_id, None)
+            self.watchers.pop(u_id, None)
+
+        with self.remote_controllers_lock:
+            self.remote_controllers.pop(u_id, None)
+            for s_uid in [s for s, v in self.remote_controllers.items() if v == u_id]:
+                self.remote_controllers.pop(s_uid, None)
+
+        _sfu = self.sfu
+        if _sfu and was_streamer:
+            _sfu.close_streamer(u_id)
+        if _sfu and was_viewer:
+            _sfu.close_viewer(u_id)
+
+        with self.cam_watchers_lock:
+            cam_viewers_of_uid = list(self.cam_watchers.pop(u_id, {}).keys())
+            cam_streamers_watched = []
+            for s_uid in list(self.cam_watchers.keys()):
+                if u_id in self.cam_watchers[s_uid]:
+                    self.cam_watchers[s_uid].pop(u_id, None)
+                    cam_streamers_watched.append(s_uid)
+        if _sfu:
+            for v_uid in cam_viewers_of_uid:
+                _sfu.cam_close_viewer(v_uid, u_id)
+            for s_uid in cam_streamers_watched:
+                _sfu.cam_close_viewer(u_id, s_uid)
 
     def _process_nudge_vote(self, conn, uid: int, msg: dict) -> None:
         target_uid = msg.get('target_uid')

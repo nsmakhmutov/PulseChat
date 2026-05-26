@@ -50,6 +50,17 @@ class PionSfuProxy:
         self._viewer_streamer_ip: dict[int, str] = {}
         self._viewer_streamer_sfu_port: dict[int, int] = {}
 
+        # ── Камера (отдельный SFU-инстанс на стороне стримера) ──────────────
+        # Для камеры мы ВСЕГДА форвардим offer на SFU владельца камеры
+        # (streamer_ip:camera_sfu_port), даже если владелец — это хост.
+        # Локального камера-SFU у прокси нет: камера каждого юзера крутится
+        # в его собственном процессе sidecar.exe на CAM_SFU_PORT.
+        # Ключ — (viewer_uid, streamer_uid), т.к. зритель может смотреть
+        # несколько камер одновременно.
+        self._cam_viewer_conns: dict[tuple, object] = {}
+        self._cam_streamer_ip: dict[tuple, str] = {}
+        self._cam_streamer_port: dict[tuple, int] = {}
+
     @staticmethod
     def _send(conn, msg: dict) -> None:
         try:
@@ -201,6 +212,113 @@ class PionSfuProxy:
 
     def close_streamer(self, streamer_uid: int) -> None:
         pass
+
+    # ─── Камера: триггер/проксирование/закрытие (всегда remote-forward) ─────
+    def cam_trigger_viewer_connect(
+        self,
+        viewer_uid: int,
+        streamer_uid: int,
+        conn,
+        streamer_ip: str = '127.0.0.1',
+        camera_sfu_port: int = 7820,
+    ) -> None:
+        """Просим зрителя начать WebRTC-offer к камере streamer_uid."""
+        key = (viewer_uid, streamer_uid)
+        with self._lock:
+            self._cam_viewer_conns[key] = conn
+            self._cam_streamer_ip[key] = streamer_ip
+            self._cam_streamer_port[key] = camera_sfu_port
+        print(
+            f"[CamProxy] trigger: viewer={viewer_uid} → cam(streamer={streamer_uid}) "
+            f"@ {streamer_ip}:{camera_sfu_port}"
+        )
+        self._send(conn, {
+            'action':       'camera_webrtc_offer',
+            'role':         'viewer',
+            'streamer_uid': streamer_uid,
+            'sdp':          '',
+            'type':         'offer',
+        })
+
+    def cam_handle_viewer_offer(
+        self,
+        viewer_uid: int,
+        streamer_uid: int,
+        sdp: str,
+        conn,
+    ) -> None:
+        """Форвардим offer зрителя на камера-SFU владельца, шлём answer назад."""
+        if not sdp:
+            print(f"[CamProxy] ❌ пустой SDP viewer={viewer_uid} cam={streamer_uid}")
+            return
+
+        key = (viewer_uid, streamer_uid)
+        with self._lock:
+            streamer_ip = self._cam_streamer_ip.get(key, '127.0.0.1')
+            cam_port    = self._cam_streamer_port.get(key, 7820)
+
+        # viewer_id для SFU делаем уникальным на пару, чтобы один зритель мог
+        # смотреть несколько камер (у каждой камеры свой SFU, но на всякий
+        # случай различаем).
+        sfu_viewer_id = f"{viewer_uid}-{streamer_uid}"
+
+        try:
+            import urllib.request
+            import json as _json
+            url  = f"http://{streamer_ip}:{cam_port}/viewer/{sfu_viewer_id}/offer"
+            body = _json.dumps({'sdp': sdp}).encode('utf-8')
+            req  = urllib.request.Request(
+                url, data=body,
+                headers={'Content-Type': 'application/json'},
+                method='POST',
+            )
+            print(f"[CamProxy] viewer={viewer_uid}: → cam-SFU {url}")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = _json.loads(resp.read())
+            answer_sdp = data.get('sdp', '')
+            if not answer_sdp:
+                raise RuntimeError(f"cam-SFU ({streamer_ip}:{cam_port}) пустой SDP")
+        except Exception as e:
+            print(f"[CamProxy] ❌ cam viewer offer {viewer_uid}/{streamer_uid}: {e}")
+            import traceback; print(traceback.format_exc())
+            return
+
+        answer_sdp = _strip_mdns_candidates(answer_sdp)
+        self._send(conn, {
+            'action':       'camera_webrtc_answer',
+            'streamer_uid': streamer_uid,
+            'sdp':          answer_sdp,
+            'type':         'answer',
+        })
+        print(f"[CamProxy] viewer={viewer_uid}: ✅ cam answer отправлен (cam={streamer_uid})")
+
+    def cam_close_viewer(self, viewer_uid: int, streamer_uid: int) -> None:
+        key = (viewer_uid, streamer_uid)
+        with self._lock:
+            streamer_ip = self._cam_streamer_ip.pop(key, '127.0.0.1')
+            cam_port    = self._cam_streamer_port.pop(key, 7820)
+            self._cam_viewer_conns.pop(key, None)
+        sfu_viewer_id = f"{viewer_uid}-{streamer_uid}"
+        try:
+            import urllib.request
+            url = f"http://{streamer_ip}:{cam_port}/viewer/{sfu_viewer_id}"
+            req = urllib.request.Request(url, method='DELETE')
+            with urllib.request.urlopen(req, timeout=5):
+                pass
+            print(f"[CamProxy] cam_close_viewer {viewer_uid}/{streamer_uid}")
+        except Exception as e:
+            print(f"[CamProxy] cam_close_viewer error {viewer_uid}/{streamer_uid}: {e}")
+
+    def cam_close_all_for_uid(self, gone_uid: int) -> None:
+        """Юзер отключился: закрываем все его камера-связи (и как зритель,
+        и как стример со стороны зрителей)."""
+        with self._lock:
+            keys = [
+                k for k in self._cam_viewer_conns
+                if k[0] == gone_uid or k[1] == gone_uid
+            ]
+        for vk, sk in keys:
+            self.cam_close_viewer(vk, sk)
 
     def status(self) -> dict:
         if self._sfu is not None and self._sfu.is_running():

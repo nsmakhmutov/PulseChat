@@ -12,7 +12,7 @@ from PyQt6.QtGui import QImage
 from config import (
     VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_FPS, VIDEO_BITRATE, VIDEO_BITRATES,
     get_lq_resolution, get_bitrate_for_resolution,
-    VIEWER_JITTER_BUFFER_MS,
+    VIEWER_JITTER_BUFFER_MS, VIEWER_JITTER_BUFFER_MS_CONTROL,
 )
 
 try:
@@ -576,6 +576,19 @@ class VideoReceiver(QObject):
         self._pts_clock:   int          = _H264_RTP_CLOCK  # 90000 для H264
         self._pts_prev: int | None = None
 
+        # ── Low-latency режим управления ──────────────────────────────────
+        # Базовое (просмотр) и активное (управление) значения буфера.
+        # При взятии управления зрителем переключаемся на _buffer_ms_control,
+        # при отпускании — обратно на _buffer_ms_normal. _buffer_ms всегда
+        # отражает текущее активное значение, которое читает _buf_push.
+        #
+        # _buf_lock защищает совместный доступ к буферу и якорю: _buf_push
+        # вызывается из recv-потока, а set_low_latency — из Qt-потока.
+        self._buffer_ms_normal:  int = VIEWER_JITTER_BUFFER_MS
+        self._buffer_ms_control: int = VIEWER_JITTER_BUFFER_MS_CONTROL
+        self._low_latency: bool = False
+        self._buf_lock = threading.Lock()
+
         self._playback_thread: threading.Thread | None = None
         if self._buffer_ms > 0:
             self._playback_thread = threading.Thread(
@@ -602,39 +615,98 @@ class VideoReceiver(QObject):
 
         now = time.monotonic()
 
-        if frame_pts is None or not isinstance(frame_pts, int):
-            display_at = now + self._buffer_ms / 1000.0
+        # Весь доступ к буферу/якорю под _buf_lock — set_low_latency() может
+        # одновременно менять _buffer_ms и сбрасывать якорь из Qt-потока.
+        with self._buf_lock:
+            buffer_secs = self._buffer_ms / 1000.0
+
+            if frame_pts is None or not isinstance(frame_pts, int):
+                display_at = now + buffer_secs
+                self._jitter_buf.append((display_at, q_img))
+                while len(self._jitter_buf) > 200:
+                    self._jitter_buf.popleft()
+                return
+
+            if self._pts_anchor is None:
+                self._pts_anchor  = frame_pts
+                self._wall_anchor = now
+                self._pts_prev    = frame_pts
+                display_at = now + buffer_secs
+                self._jitter_buf.append((display_at, q_img))
+                return
+
+            pts_diff = frame_pts - self._pts_prev
+            if pts_diff < -0x3FFFFFFF:
+                self._pts_anchor  = frame_pts
+                self._wall_anchor = now
+                self._pts_prev    = frame_pts
+                display_at = now + buffer_secs
+                self._jitter_buf.append((display_at, q_img))
+                return
+
+            self._pts_prev = frame_pts
+
+            pts_delta_secs = (frame_pts - self._pts_anchor) / self._pts_clock
+            display_at = self._wall_anchor + pts_delta_secs + buffer_secs
+
             self._jitter_buf.append((display_at, q_img))
+
             while len(self._jitter_buf) > 200:
                 self._jitter_buf.popleft()
-            return
 
-        if self._pts_anchor is None:
-            self._pts_anchor  = frame_pts
-            self._wall_anchor = now
-            self._pts_prev    = frame_pts
-            display_at = now + self._buffer_ms / 1000.0
-            self._jitter_buf.append((display_at, q_img))
-            return
+    def set_low_latency(self, enabled: bool) -> None:
+        """
+        Переключает буфер этого зрителя между режимом просмотра и режимом
+        управления. Вызывается из Qt-потока при выдаче/снятии управления.
 
-        pts_diff = frame_pts - self._pts_prev
-        if pts_diff < -0x3FFFFFFF:
-            self._pts_anchor  = frame_pts
-            self._wall_anchor = now
-            self._pts_prev    = frame_pts
-            display_at = now + self._buffer_ms / 1000.0
-            self._jitter_buf.append((display_at, q_img))
-            return
+          enabled=True  — зритель взял управление: ужимаем буфер до
+                          VIEWER_JITTER_BUFFER_MS_CONTROL, чтобы клики
+                          отзывались почти сразу.
+          enabled=False — управление завершено: возвращаем
+                          VIEWER_JITTER_BUFFER_MS, чтобы просмотр снова был
+                          плавным на слабом интернете.
 
-        self._pts_prev = frame_pts
+        Аккуратность перехода — главное требование:
 
-        pts_delta_secs = (frame_pts - self._pts_anchor) / self._pts_clock
-        display_at = self._wall_anchor + pts_delta_secs + self._buffer_ms / 1000.0
+          • Вход в управление (700→90): кадры, уже лежащие в очереди, имеют
+            display_at, посчитанный с большим буфером. Если просто уменьшить
+            _buffer_ms, новые кадры захотят показаться на ~600 мс раньше старых —
+            порядок ломается, playback выбросит пачку (rerun-рывок). Поэтому
+            переанкориваем (сбрасываем _pts_anchor) и чистим очередь: один
+            незаметный микропропуск внутри уже идущего действия — и дальше
+            чистый low-latency.
 
-        self._jitter_buf.append((display_at, q_img))
+          • Выход из управления (90→700): тут НЕЛЬЗЯ чистить очередь и резко
+            растить буфер — playout «проголодается» на ~600 мс и зависнет.
+            Вместо этого переанкориваемся по текущему моменту: новый буфер
+            начинает действовать с этого кадра, очередь доигрывается естественно,
+            глубина буфера наполняется сама собой за следующие кадры. Без провала.
+        """
+        with self._buf_lock:
+            target = (self._buffer_ms_control if enabled
+                      else self._buffer_ms_normal)
+            if enabled == self._low_latency and target == self._buffer_ms:
+                return
 
-        while len(self._jitter_buf) > 200:
-            self._jitter_buf.popleft()
+            self._low_latency = enabled
+            self._buffer_ms   = target
+
+            # Переанкоривание: следующий кадр в _buf_push заново задаст
+            # _wall_anchor/_pts_anchor от текущего момента уже с новым буфером.
+            self._pts_anchor  = None
+            self._wall_anchor = None
+            self._pts_prev    = None
+
+            if enabled:
+                # Вход в управление: сбрасываем накопленную глубину, чтобы
+                # мгновенно догнать «настоящее». Допустим один микропропуск.
+                self._jitter_buf.clear()
+            # Выход: очередь НЕ трогаем — пусть доиграется, буфер дорастёт сам.
+
+        print(
+            f"[VideoReceiver] uid={self.uid}: буфер → {target} мс "
+            f"({'УПРАВЛЕНИЕ (low-latency)' if enabled else 'просмотр'})"
+        )
 
     def _playback_loop(self) -> None:
 
@@ -648,13 +720,14 @@ class VideoReceiver(QObject):
             now = time.monotonic()
             frame_to_show: QImage | None = None
 
-            while self._jitter_buf:
-                display_at, img = self._jitter_buf[0]
-                if display_at <= now:
-                    self._jitter_buf.popleft()
-                    frame_to_show = img
-                else:
-                    break
+            with self._buf_lock:
+                while self._jitter_buf:
+                    display_at, img = self._jitter_buf[0]
+                    if display_at <= now:
+                        self._jitter_buf.popleft()
+                        frame_to_show = img
+                    else:
+                        break
 
             if frame_to_show is not None:
                 self.frame_received.emit(self.uid, frame_to_show)
@@ -817,6 +890,19 @@ class VideoEngine(QObject):
 
     def get_lq_track(self):
         return None
+
+    def set_low_latency(self, uid: int, enabled: bool) -> None:
+        """
+        Включает/выключает low-latency режим буфера для конкретного зрителя.
+        Вызывается при выдаче/снятии удалённого управления стримером uid.
+        Безопасно вызывать, даже если приёмника для uid нет (no-op).
+        """
+        receiver = self._receivers.get(uid)
+        if receiver is not None:
+            receiver.set_low_latency(enabled)
+        else:
+            print(f"[VideoEngine] set_low_latency({uid}, {enabled}): "
+                  f"приёмник не найден — пропуск")
 
     def add_receiver(self, uid: int, track) -> VideoReceiver:
         if self._webrtc_loop is None:

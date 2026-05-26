@@ -278,6 +278,7 @@ class MainWindow(WebcamMixin, QMainWindow):
         self._tray_icon.show()
         self._force_quit = False
         self._returning_to_lobby = False
+        self._leaving = False   # защита от двойного клика «Отключиться»
         self._chat_panel.set_my_uid(0)
         self._chat_panel.message_sent.connect(self._on_chat_panel_send)
         self._chat_panel.media_send_requested.connect(self._on_chat_media_requested)
@@ -313,6 +314,8 @@ class MainWindow(WebcamMixin, QMainWindow):
         self.net.chat_media_received.connect(self._on_chat_media_received)
         self.net.typing_received.connect(self._on_typing_received)
         self.net.camera_frame_received.connect(self.on_network_camera_frame)
+        # НОВЫЙ путь: WebRTC H.264 кадры камеры (QImage) → круглое окно.
+        self.net.camera_qframe_received.connect(self.on_camera_frame)
         self._chat_panel.typing_started.connect(self.net.send_typing)
         self.net.become_host.connect(self._on_become_host)
         self.net.server_migrating.connect(self._on_server_migrating)
@@ -388,7 +391,7 @@ class MainWindow(WebcamMixin, QMainWindow):
 
     def setup_ui(self):
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — {self.nick}")
-        self.setMinimumSize(440, 500)
+        self.setMinimumSize(520, 500)
         self.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -557,33 +560,16 @@ class MainWindow(WebcamMixin, QMainWindow):
 
         layout.addWidget(self._btn_chat_main)
 
-        # ── «Завершить» — текстом под кнопкой «Чат» (бывшая lobby.svg) ──
-        self._btn_leave_text = QPushButton("Завершить")
-        self._btn_leave_text.setFixedHeight(34)
-        self._btn_leave_text.setObjectName("btnLeaveText")
-        self._btn_leave_text.setStyleSheet("""
-            QPushButton#btnLeaveText {
-                background-color: rgba(231, 76, 60, 0.10);
-                border: 1px solid rgba(231, 76, 60, 0.30);
-                border-radius: 8px;
-                color: #e07a6e;
-                font-size: 13px;
-                font-weight: 600;
-                letter-spacing: 0.5px;
-                margin: 0px 0px 2px 0px;
-            }
-            QPushButton#btnLeaveText:hover {
-                background-color: rgba(231, 76, 60, 0.20);
-                border-color: rgba(231, 76, 60, 0.50);
-                color: #ff8c7a;
-            }
-        """)
-        self._btn_leave_text.clicked.connect(self._disconnect_and_show_lobby)
-        layout.addWidget(self._btn_leave_text)
+        # Кнопка «Отключиться» теперь живёт иконкой в нижнем ряду (self.btn_leave),
+        # после stream и перед индикатором лобби. Старая текстовая кнопка убрана.
 
         self._bottom_bar = QFrame()
         self._bottom_bar.setObjectName("bottomBar")
         self._bottom_bar.setFixedHeight(72)
+        # Минимальная ширина: сумма всех кнопок (5×46 + leave 46 + индикатор 22
+        # + пинг 64 + настройки 46) + отступы/спейсинги. Ниже этого ряд НЕ
+        # сжимается, поэтому пинг и «Настройки» больше не налезают друг на друга.
+        self._bottom_bar.setMinimumWidth(500)
 
         btns = QHBoxLayout(self._bottom_bar)
         btns.setContentsMargins(12, 0, 12, 0)
@@ -619,6 +605,19 @@ class MainWindow(WebcamMixin, QMainWindow):
         self.btn_stream.setIcon(QIcon(resource_path("assets/icon/stream_off.svg")))
         self.btn_stream.setCheckable(True)
         self.btn_stream.clicked.connect(self.toggle_stream)
+
+        # ── Кнопка «Отключиться» (иконка lobby.svg) — в общем ряду,
+        #    после stream, перед индикатором лобби/соединения ────────────
+        # Используем существующий стиль #barBtnDisconnect: заливка как у
+        # остальных кнопок (btn_bg), а при наведении — красный.
+        self.btn_leave = QPushButton()
+        self.btn_leave.setFixedSize(46, 46)
+        self.btn_leave.setObjectName("barBtnDisconnect")
+        self.btn_leave.setIcon(QIcon(resource_path("assets/icon/lobby.svg")))
+        self.btn_leave.setIconSize(QSize(26, 26))
+        self.btn_leave.setToolTip("Отключиться")
+        # Защита от двойного клика по «Отключиться» (см. фикс мёртвых соединений).
+        self.btn_leave.clicked.connect(self._on_leave_clicked)
 
         # ── Кнопка веб-камеры (на месте бывшей lobby.svg) ──────────────
         self.btn_cam = QPushButton()
@@ -658,6 +657,7 @@ class MainWindow(WebcamMixin, QMainWindow):
         btns.addWidget(self.btn_cam)
         btns.addWidget(self.btn_sb)
         btns.addWidget(self.btn_stream)
+        btns.addWidget(self.btn_leave)
         btns.addWidget(self._stream_conn_lbl)
         btns.addStretch()
         btns.addWidget(self._latency_btn)
@@ -1677,7 +1677,7 @@ class MainWindow(WebcamMixin, QMainWindow):
                 return
             self._chat_panel.setVisible(False)
             if not self.isMaximized():
-                self.resize(max(400, self.width() - panel_w), self.height())
+                self.resize(max(520, self.width() - panel_w), self.height())
 
         self._btn_chat_main.blockSignals(True)
         self._btn_chat_main.setChecked(checked)
@@ -2655,6 +2655,11 @@ class MainWindow(WebcamMixin, QMainWindow):
         uid = streamer_uid or self._rc_streamer_uid_get()
         if uid:
             self.net.send_remote_control_stop(uid)
+            # Управление завершено зрителем → возвращаем плавный буфер просмотра.
+            try:
+                self.video.set_low_latency(uid, False)
+            except Exception as e:
+                print(f"[RC] set_low_latency(off) error: {e!r}")
         self._rc_streamer_uid = None
         window.on_control_stopped()
 
@@ -2669,6 +2674,15 @@ class MainWindow(WebcamMixin, QMainWindow):
         self._rc_cancel_pending_timer()
         if granted:
             window.on_control_granted()
+            # Управление получено → ужимаем jitter buffer стрима этого стримера,
+            # чтобы клики отзывались почти мгновенно. Возврат к плавному
+            # просмотру — в _on_rc_stopped / _on_viewer_rc_released.
+            sid = self._rc_streamer_uid_get()
+            if sid is not None:
+                try:
+                    self.video.set_low_latency(sid, True)
+                except Exception as e:
+                    print(f"[RC] set_low_latency(on) error: {e!r}")
             return
 
         # Отказ. Сбрасываем состояние — кнопка отжимается, можно запросить снова.
@@ -2693,6 +2707,13 @@ class MainWindow(WebcamMixin, QMainWindow):
         Здесь НЕ шлём stop обратно — иначе будет эхо.
         """
         # Сторона зрителя: управление у нас отобрали
+        sid = self._rc_streamer_uid_get()
+        if sid is not None:
+            # Возврат к плавному буферу просмотра (управление закончилось).
+            try:
+                self.video.set_low_latency(sid, False)
+            except Exception as e:
+                print(f"[RC] set_low_latency(off) error: {e!r}")
         self._rc_streamer_uid = None
         if window is not None:
             try:
@@ -3830,6 +3851,25 @@ class MainWindow(WebcamMixin, QMainWindow):
         permanent = [ch['name'] for ch in channel_list if ch.get('permanent', False)]
         temporary = [ch['name'] for ch in channel_list if not ch.get('permanent', False)]
         self.default_rooms = (permanent or ['General']) + sorted(temporary)
+
+    def _on_leave_clicked(self):
+        """
+        Обработчик кнопки «Отключиться» с защитой от повторных нажатий.
+
+        Без этого двойной клик (или клик во время уже идущего отключения)
+        запускал _disconnect_and_show_lobby несколько раз → создавалось
+        несколько процедур teardown и переподключений → на сервере висели
+        «мёртвые» дубли одного и того же клиента.
+        """
+        if getattr(self, '_leaving', False):
+            print("[UI] _on_leave_clicked: отключение уже идёт, игнор")
+            return
+        self._leaving = True
+        try:
+            self.btn_leave.setEnabled(False)
+        except Exception:
+            pass
+        self._disconnect_and_show_lobby()
 
     def _disconnect_and_show_lobby(self):
         """

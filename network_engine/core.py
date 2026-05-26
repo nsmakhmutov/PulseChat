@@ -27,6 +27,7 @@ from config import (
 )
 
 from .webrtc import WebRTCMixin
+from .camera_webrtc import CameraWebRTCMixin
 from .chat import ChatMixin
 from .features import FeaturesMixin
 
@@ -47,7 +48,7 @@ if platform.system() == "Windows":
 _TCP_BUFFER_MAX = 32 * 1024 * 1024
 
 
-class NetworkClient(WebRTCMixin, ChatMixin, FeaturesMixin, QObject):
+class NetworkClient(WebRTCMixin, CameraWebRTCMixin, ChatMixin, FeaturesMixin, QObject):
     connected           = pyqtSignal(dict)
     global_state_update = pyqtSignal(dict)
     error_occurred      = pyqtSignal(str)
@@ -97,7 +98,12 @@ class NetworkClient(WebRTCMixin, ChatMixin, FeaturesMixin, QObject):
 
     # Кадр чужой камеры: (uid, base64_jpeg). Эмитится из TCP-потока, доставка
     # в Qt-поток через очередь сигналов → безопасно для UI.
+    # СТАРЫЙ путь (JPEG over TCP) — оставлен для обратной совместимости.
     camera_frame_received = pyqtSignal(int, str)
+
+    # НОВЫЙ путь (WebRTC H.264 через камера-SFU): (uid, QImage).
+    # Эмитится из asyncio-петли камера-viewer'а, доставляется в Qt-поток.
+    camera_qframe_received = pyqtSignal(int, object)
 
     def __init__(self, audio):
         super().__init__()
@@ -127,6 +133,7 @@ class NetworkClient(WebRTCMixin, ChatMixin, FeaturesMixin, QObject):
         self._recovery_event:     threading.Event  = threading.Event()
         self._recovery_target_ip: str              = ''
         self._init_webrtc_attrs()
+        self._init_camera_webrtc_attrs()
         self._init_sockets()
 
     @property
@@ -524,11 +531,33 @@ class NetworkClient(WebRTCMixin, ChatMixin, FeaturesMixin, QObject):
 
     def stop(self) -> None:
         print("[Net] stop(): завершаем сетевые потоки...")
+
+        # ШАГ 0: пока сокет ещё жив — корректно прощаемся с сервером, чтобы он
+        # СРАЗУ убрал нас из списка клиентов, а не ждал EOF/таймаута.
+        # Без этого старое TCP-соединение «висело» на сервере, и при быстром
+        # переподключении тот же пользователь появлялся в списке дважды
+        # («мёртвые» дубли).
+        try:
+            if self._is_connected and getattr(self, 'tcp_sock', None) is not None:
+                try:
+                    self.send_json({'action': 'leave'})
+                except Exception:
+                    pass
+                # Полузакрытие на запись: сервер получит recv()==0 немедленно.
+                try:
+                    import socket as _sock
+                    self.tcp_sock.shutdown(_sock.SHUT_WR)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         self.running = False
         self._is_connected = False
         self._shutdown_event.set()
 
         self._stop_webrtc()
+        self._shutdown_camera_webrtc()
 
         for attr in ('tcp_sock', 'udp_sock'):
             sock = getattr(self, attr, None)
@@ -790,6 +819,8 @@ class NetworkClient(WebRTCMixin, ChatMixin, FeaturesMixin, QObject):
             if src_uid and data_b64:
                 self.camera_frame_received.emit(src_uid, data_b64)
 
+        elif self._process_camera_webrtc_message(msg, act):
+            pass
         elif self._process_webrtc_message(msg, act):
             pass
         elif self._process_chat_message(msg, act):

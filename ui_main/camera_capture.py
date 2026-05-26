@@ -134,6 +134,7 @@ class CameraCaptureThread(QThread):
 
     frame_qimage = pyqtSignal(QImage)
     frame_jpeg   = pyqtSignal(bytes)
+    frame_bgr    = pyqtSignal(object)   # сырой BGR ndarray → H.264-трек WebRTC
     opened       = pyqtSignal(bool)     # True если камера успешно открылась
     error        = pyqtSignal(str)
 
@@ -284,6 +285,14 @@ class CameraCaptureThread(QThread):
                 now = time.perf_counter()
                 if now - last_send >= send_interval:
                     last_send = now
+                    # НОВЫЙ путь: сырой BGR-кадр в H.264-трек WebRTC.
+                    # Эмитим тот же троттлинг, что и старый JPEG.
+                    try:
+                        self.frame_bgr.emit(frame)
+                    except Exception:
+                        pass
+                    # LEGACY путь (JPEG over TCP) — оставлен, но новые клиенты
+                    # к нему не подключаются.
                     jpeg = encode_frame_to_jpeg(
                         frame, self.send_size, self.jpeg_quality
                     )
