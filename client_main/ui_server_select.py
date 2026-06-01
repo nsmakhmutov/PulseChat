@@ -25,7 +25,7 @@ class DiscoveryWorker(QThread):
     found     = pyqtSignal(dict)   # {'ip': ..., 'port': ..., 'host_nick': ...}
     not_found = pyqtSignal()
 
-    def __init__(self, timeout: float = 2.5):
+    def __init__(self, timeout: float = 4.0):
         super().__init__()
         self._timeout = timeout
 
@@ -45,7 +45,7 @@ class DiscoveryAllWorker(QThread):
     """Запускает ServerDiscovery.discover_all() в отдельном потоке."""
     done = pyqtSignal(list)
 
-    def __init__(self, timeout: float = 2.5):
+    def __init__(self, timeout: float = 4.0):
         super().__init__()
         self._timeout = timeout
 
@@ -513,7 +513,7 @@ class MultiServerScreen(QWidget):
             self._worker.quit()
             self._worker.wait(500)
 
-        self._worker = DiscoveryAllWorker(timeout=2.5)
+        self._worker = DiscoveryAllWorker(timeout=4.0)
         self._worker.done.connect(self._on_discovery_done)
         self._worker.start()
 
@@ -865,7 +865,7 @@ class DiscoveryScreen(QWidget):
             self._worker.quit()
             self._worker.wait(500)
 
-        self._worker = DiscoveryWorker(timeout=2.5)
+        self._worker = DiscoveryWorker(timeout=4.0)
         self._worker.found.connect(self._on_server_found)
         self._worker.not_found.connect(self._on_server_not_found)
         self._worker.start()

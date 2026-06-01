@@ -80,6 +80,12 @@ class CircularVideoWindow(QWidget):
     # uid пользователя, чьё окно закрыли (для очистки в главном окне).
     window_closed = pyqtSignal(int)
 
+    # FIX (проблема #2): уведомление об изменении геометрии (позиция/размер).
+    # Главное окно (WebcamMixin) слушает его и кэширует геометрию по uid на
+    # время сессии, чтобы при повторном включении камеры собеседником кружок
+    # появился там же и того же размера. Сигнатура: (uid, x, y, diameter).
+    geometry_changed = pyqtSignal(int, int, int, int)
+
     # Размерные ограничения круга (диаметр в пикселях).
     MIN_DIAMETER = 140
     MAX_DIAMETER = 640
@@ -201,25 +207,20 @@ class CircularVideoWindow(QWidget):
         return QRect(0, 0, d, d)
 
     def _close_btn_rect(self) -> QRect:
-        """Прямоугольник кнопки × — в правом верхнем секторе круга, но так,
-        чтобы целиком оставаться внутри окружности."""
+        """Прямоугольник кнопки ×. Кнопка стоит ровно на окружности круга
+        под углом 45° (вверх-вправо), так что её центр на круге, а сама
+        кнопка наполовину выходит ЗА круг — визуально торчит «наклейкой».
+        Прямоугольник самой кнопки при этом остаётся внутри прямоугольника
+        окна (углы окна выходят за круг), поэтому клики по ней ловятся."""
         d = self._diameter()
         bd = self._CLOSE_BTN_D
         import math
         cx = cy = d / 2.0
         r = d / 2.0
-        # Половина диагонали кнопки + запас от края кольца.
-        half_diag = (bd / 2.0) * math.sqrt(2)
-        margin = 4.0
-        # Максимальный радиус центра кнопки, чтобы её угол не вылез за круг.
-        max_offset = r - half_diag - margin
-        # Желаемое — почти у края (88% радиуса), но не больше допустимого.
-        offset = min(r * 0.88, max_offset)
-        if offset < 0:
-            offset = 0
         ang = math.radians(45)   # вверх-вправо
-        bx = cx + offset * math.cos(ang) - bd / 2.0
-        by = cy - offset * math.sin(ang) - bd / 2.0
+        # Центр кнопки — на самой окружности, поэтому она наполовину «торчит» наружу.
+        bx = cx + r * math.cos(ang) - bd / 2.0
+        by = cy - r * math.sin(ang) - bd / 2.0
         return QRect(int(round(bx)), int(round(by)), bd, bd)
 
     def _dist_from_center(self, pos: QPoint) -> float:
@@ -274,6 +275,7 @@ class CircularVideoWindow(QWidget):
                 self._last_screen = wh.screen()
         except Exception:
             pass
+
         self.update()
         super().showEvent(event)
 
@@ -305,6 +307,48 @@ class CircularVideoWindow(QWidget):
         w, h = self.width(), self.height()
         if w != h:
             self.resize(min(w, h), min(w, h))
+        self.update()
+
+    # ── Сохранение/восстановление геометрии (FIX #2) ────────────────────
+    def _emit_geometry(self):
+        """Сообщает главному окну текущую позицию и диаметр для кэширования."""
+        if self._closing or self.uid is None:
+            return
+        try:
+            tl = self.frameGeometry().topLeft()
+            self.geometry_changed.emit(int(self.uid), tl.x(), tl.y(),
+                                       self._diameter())
+        except Exception:
+            pass
+
+    def apply_saved_geometry(self, x: int, y: int, diameter: int):
+        """
+        Восстанавливает ранее сохранённую геометрию (позиция + диаметр).
+        Вызывается главным окном сразу после создания окна, если для этого
+        uid в текущей сессии уже была настроена раскладка.
+        Диаметр клампится в допустимые границы; позиция корректируется,
+        чтобы окно не оказалось целиком за пределами видимых экранов.
+        """
+        d = int(max(self.MIN_DIAMETER, min(self.MAX_DIAMETER, diameter)))
+        self.resize(d, d)
+
+        x, y = int(x), int(y)
+        # Защита от «улетевшей» позиции (например, монитор отключили):
+        # если окно не пересекается ни с одним экраном — ставим дефолт.
+        try:
+            target = QRect(x, y, d, d)
+            on_screen = False
+            for scr in QApplication.screens():
+                if scr.availableGeometry().intersects(target):
+                    on_screen = True
+                    break
+            if not on_screen:
+                scr = self._current_screen_geometry()
+                x = scr.right() - d - 40
+                y = scr.bottom() - d - 80
+        except Exception:
+            pass
+        self.move(x, y)
         self.update()
 
     # ── Отрисовка ───────────────────────────────────────────────────────
@@ -486,6 +530,7 @@ class CircularVideoWindow(QWidget):
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             was_drag = self._drag_active
+            was_resize = self._resize_active
             self._drag_active = False
             self._resize_active = False
             self.setCursor(Qt.CursorShape.OpenHandCursor)
@@ -493,6 +538,10 @@ class CircularVideoWindow(QWidget):
                 # После переноса (возможно, на другой монитор) — перерисовать.
                 self._maybe_handle_screen_change()
                 self.update()
+            # FIX #2: после завершения перетаскивания/ресайза фиксируем
+            # геометрию в кэш сессии (по uid).
+            if was_drag or was_resize:
+                self._emit_geometry()
         super().mouseReleaseEvent(event)
 
     def _do_resize(self, gpos: QPoint):
@@ -559,6 +608,46 @@ class WebcamMixin:
             self.is_camera_on = False
         if not hasattr(self, "_cam_capture"):
             self._cam_capture = None        # CameraCaptureThread (своя камера)
+        # FIX #2: кэш геометрии кружков в пределах ОДНОЙ сессии сервера.
+        # Ключ — uid собеседника, значение — (x, y, diameter). Живёт только в
+        # памяти текущего запуска приложения: при перезапуске словарь пуст,
+        # поэтому камера на следующий раз сама не включается и раскладка не
+        # «всплывает» — ровно по ТЗ. Очищается при разрыве сессии/реконнекте
+        # (см. reset_webcam_session()).
+        if not hasattr(self, "_cam_geometry"):
+            self._cam_geometry: dict[int, tuple[int, int, int]] = {}
+        # Uid'ы собеседников, чьё круглое окно мы ВРУЧНУЮ закрыли в этой
+        # сессии. Пока uid в этом множестве — авто-открытие при следующем
+        # включении его камеры подавляется. Снимается из множества, когда:
+        #   • собеседник выключил камеру (тогда при следующем включении окно
+        #     снова откроется автоматически — это "новое" событие включения);
+        #   • мы сами вручную открыли его окно через клик в дереве;
+        #   • сброс сессии (полный disconnect / reconnect).
+        if not hasattr(self, "_cam_manually_closed"):
+            self._cam_manually_closed: set[int] = set()
+
+    def reset_webcam_session(self):
+        """
+        Сбрасывает запомненную раскладку кружков. Вызывать при смене сессии:
+        полное отключение от сервера, выход/повторный вход. После сброса
+        раскладка собеседников начнётся «с нуля».
+        НЕ вызывать при простом тумблере камеры у собеседника в рамках той же
+        сессии — тогда раскладка как раз и должна сохраниться.
+        """
+        if hasattr(self, "_cam_geometry"):
+            self._cam_geometry.clear()
+        if hasattr(self, "_cam_manually_closed"):
+            self._cam_manually_closed.clear()
+        # Кадры миниатюр тоже сбрасываем — после реконнекта uid'ы могут
+        # быть переиспользованы для других пользователей, нельзя оставлять
+        # старые кадры.
+        if hasattr(self, "_cam_last_frame"):
+            self._cam_last_frame.clear()
+
+    def _remember_cam_geometry(self, uid: int, x: int, y: int, diameter: int):
+        """Слот для CircularVideoWindow.geometry_changed — пишет в кэш сессии."""
+        self.init_webcam_state()
+        self._cam_geometry[int(uid)] = (int(x), int(y), int(diameter))
 
     def _read_camera_settings(self):
         """Читает параметры камеры из настроек с клампом в допустимые границы."""
@@ -676,6 +765,10 @@ class WebcamMixin:
 
             # Сразу открываем своё круглое превью.
             self.open_camera_window(my_uid, "Моя камера")
+
+            # Звук включения своей камеры (как mute/unmute — на своё действие).
+            if hasattr(self, "play_notification"):
+                self.play_notification("webcam_on")
         else:
             # Останавливаем захват.
             self._stop_camera_capture()
@@ -691,6 +784,10 @@ class WebcamMixin:
             # Своё локальное превью закрываем вместе с камерой.
             if my_uid in self.cam_windows:
                 self._destroy_cam_window(my_uid)
+
+            # Звук выключения своей камеры.
+            if hasattr(self, "play_notification"):
+                self.play_notification("webcam_off")
 
         # Обновляем индикатор в дереве для самого себя.
         if my_uid in self.known_uids:
@@ -727,6 +824,13 @@ class WebcamMixin:
     def _on_local_cam_frame(self, q_image: QImage):
         """Локальное превью своей камеры → своё круглое окно."""
         my_uid = getattr(self.audio, "my_uid", 0)
+        # Кэшируем кадр своей камеры, чтобы в дереве пользователей вместо
+        # статичной аватарки крутилась живая миниатюра. См. _cam_last_frame
+        # в ui_main и его использование в update_user_tree.
+        try:
+            self._cam_last_frame[my_uid] = q_image
+        except Exception:
+            pass
         win = self.cam_windows.get(my_uid)
         if win is not None and win.isVisible():
             win.update_frame(q_image)
@@ -810,19 +914,25 @@ class WebcamMixin:
 
         win = CircularVideoWindow(uid, nick)
         win.window_closed.connect(self.close_camera_window)
+        # FIX #2: слушаем изменения геометрии и сразу восстанавливаем ранее
+        # сохранённую раскладку этого uid (если в текущей сессии уже была).
+        win.geometry_changed.connect(self._remember_cam_geometry)
         self.cam_windows[uid] = win
+
+        saved = self._cam_geometry.get(uid)
+        if saved is not None:
+            try:
+                win.apply_saved_geometry(*saved)
+            except Exception as e:
+                print(f"[Camera] apply_saved_geometry({uid}) error: {e}")
+
         win.show()
         win.raise_()
 
-        # НОВЫЙ путь: если это ЧУЖАЯ камера — подписываемся через WebRTC.
-        # Поток грузится ТОЛЬКО сейчас (при открытии кружка), не раньше.
-        # Для своей камеры (локальное превью) подписка не нужна.
-        my_uid = getattr(self.audio, "my_uid", 0)
-        if uid != my_uid:
-            try:
-                self.net.start_watching_camera(uid)
-            except Exception as e:
-                print(f"[Camera] start_watching_camera({uid}) error: {e}")
+        # ИЗМЕНЕНО: подписка на чужой видео-трек теперь живёт в
+        # presence-diff (см. update_user_tree в ui_main.py): подписываемся,
+        # как только пир включил камеру (для миниатюры в дереве), и не
+        # завязываемся на открытие/закрытие большого круглого окна.
         return win
 
     # ── Закрытие окна (камера ОСТАЁТСЯ включённой) ──────────────────────
@@ -832,15 +942,18 @@ class WebcamMixin:
         мы лишь убираем окно из реестра. Индикатор продолжает гореть, пока
         пользователь действительно не выключит камеру.
 
-        НОВЫЙ путь: отписываемся от WebRTC-потока чужой камеры → трафик
-        перестаёт грузиться, как только кружок закрыт.
+        ИЗМЕНЕНО: от чужого видео-трека больше НЕ отписываемся при закрытии
+        большого окна — миниатюра в дереве пользователя должна оставаться
+        живой, пока пир показывает камеру. Отписка происходит только когда
+        пир выключит камеру (см. stopped_cameras в update_user_tree).
         """
         my_uid = getattr(self.audio, "my_uid", 0)
         if uid != my_uid:
-            try:
-                self.net.stop_watching_camera(uid)
-            except Exception as e:
-                print(f"[Camera] stop_watching_camera({uid}) error: {e}")
+            # Ручное закрытие чужого кружка — запоминаем, чтобы он не
+            # открывался автоматически при следующем кадре. Снимется,
+            # когда собеседник выключит камеру или мы сами откроем окно.
+            self.init_webcam_state()
+            self._cam_manually_closed.add(int(uid))
         self._destroy_cam_window(uid)
         # НАМЕРЕННО не трогаем known_uids[uid]['is_cam'] —
         # индикатор камеры остаётся активным.
@@ -866,10 +979,19 @@ class WebcamMixin:
     # ── Роутинг входящих кадров камеры ──────────────────────────────────
     def on_camera_frame(self, uid: int, q_image: QImage):
         """
-        Доставка кадра камеры (QImage) в круглое окно. Используется как для
-        кадров, пришедших через существующий on_video_frame, так и из
-        декодированных JPEG (см. on_network_camera_frame).
+        Доставка кадра ВЕБ-КАМЕРЫ (QImage) в круглое окно. Источник —
+        ТОЛЬКО отдельный WebRTC-трек камеры (camera_qframe_received) или
+        декодированный JPEG (on_network_camera_frame). Кадры трансляции
+        экрана сюда НЕ попадают — иначе в кружок «залетала» бы картинка
+        стрима (см. on_video_frame в ui_main.py).
         """
+        # Кэшируем последний кадр для миниатюры в дереве пользователей.
+        # Делаем это ВСЕГДА, а не только при открытом большом окне — иначе
+        # миниатюра не оживёт, если пользователь не открывал большой кружок.
+        try:
+            self._cam_last_frame[uid] = q_image
+        except Exception:
+            pass
         win = self.cam_windows.get(uid)
         if win is not None and win.isVisible():
             win.update_frame(q_image)
@@ -901,14 +1023,20 @@ class WebcamMixin:
         """
         if uid in self.known_uids:
             self.known_uids[uid]["is_cam"] = bool(is_on)
-        if not is_on and uid in self.cam_windows:
-            # Чужая камера выключилась → отписываемся и закрываем окно.
+        if not is_on:
+            # Чужая камера выключилась → отписываемся, закрываем окно (если
+            # открыто) и чистим кадр-кэш, чтобы миниатюра вернулась к аватару.
             my_uid = getattr(self.audio, "my_uid", 0)
             if uid != my_uid:
                 try:
                     self.net.stop_watching_camera(uid)
                 except Exception:
                     pass
-            self._destroy_cam_window(uid)
+            try:
+                self._cam_last_frame.pop(uid, None)
+            except Exception:
+                pass
+            if uid in self.cam_windows:
+                self._destroy_cam_window(uid)
         if hasattr(self, "refresh_ui"):
             self.refresh_ui()

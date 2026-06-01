@@ -35,10 +35,10 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QPushButton, QTreeWidget, QTreeWidgetItem,
                              QHeaderView, QMessageBox, QStackedWidget,
                              QFrame, QSizeGrip, QFileDialog, QLineEdit,
-                             QScrollArea, QDialog, QCheckBox,
+                             QScrollArea, QDialog, QCheckBox, QSizePolicy,
                              QMenu, QApplication, QSystemTrayIcon)
 from PyQt6.QtCore import Qt, QTimer, QSize, QSettings, QRect, QPoint, QEvent, QThread, pyqtSignal, QPropertyAnimation, QEasingCurve
-from PyQt6.QtGui import QIcon, QFont, QFontDatabase, QBrush, QColor, QCursor, QFontMetrics
+from PyQt6.QtGui import QIcon, QFont, QFontDatabase, QBrush, QColor, QCursor, QFontMetrics, QPixmap, QImage
 
 from config import (
     resource_path,
@@ -223,6 +223,8 @@ class MainWindow(WebcamMixin, QMainWindow):
             "unmute":     resource_path("assets/music/unmute.wav"),
             "stream_on":      resource_path("assets/music/stream_on.wav"),
             "stream_off":     resource_path("assets/music/stream_off.wav"),
+            "webcam_on":      resource_path("assets/music/webcam_on.wav"),
+            "webcam_off":     resource_path("assets/music/webcam_off.wav"),
             "quick_msg":      resource_path("assets/music/message.wav"),
             "friend_connect": resource_path("assets/music/friend_connect.wav"),
             "file_received":  resource_path("assets/music/file.wav"),
@@ -231,6 +233,7 @@ class MainWindow(WebcamMixin, QMainWindow):
         }
         self.prev_room_uids: set = set()
         self.prev_streaming_uids: set = set()
+        self._prev_room_camera_uids: set = set()  # FIX #1: для звука вкл/выкл камеры
 
         self.prev_all_uids: set = set()
         self._server_users_initialized: bool = False
@@ -295,6 +298,10 @@ class MainWindow(WebcamMixin, QMainWindow):
         self.video.frame_received.connect(self.on_video_frame)
         self.video.stream_stats_updated.connect(self.on_stream_stats_updated)
         self.net.soundboard_played.connect(self._on_soundboard_played)
+        self.net.join_sound_received.connect(self._on_join_sound_received)
+        # uid → монотонное время приёма кастомного звука входа. Используется
+        # для подавления дефолтного other_join у тех, кто прислал свой звук.
+        self._join_sound_recent: dict[int, float] = {}
         self.net.nudge_received.connect(self._on_nudge_received)
         self.net.nudge_triggered.connect(self._on_nudge_triggered)
         self.net.force_muted.connect(self._on_force_muted)
@@ -336,6 +343,21 @@ class MainWindow(WebcamMixin, QMainWindow):
         self._avatar_ring_cache: dict = {}
         # Время старта — для расчёта фазы пульсации по ui_timer.
         self._cam_pulse_t0 = time.perf_counter()
+        # Кэш последних кадров чужих/своей вебкамер для отображения миниатюрой
+        # вместо аватара в дереве пользователей. Кадры пишутся в on_camera_frame
+        # / _on_local_cam_frame и читаются в update_user_tree при рендере иконки
+        # колонки 0. uid → QImage (последний полученный кадр).
+        self._cam_last_frame: dict = {}
+
+        # Лёгкий таймер ~15 fps, который перерисовывает ТОЛЬКО иконки в
+        # колонке 0 у пользователей с включённой камерой. sync_users
+        # приходит 3-5 раз в секунду — этого мало для ощущения «живой
+        # миниатюры», и пульс кольца тоже выглядел бы дискретно. Таймер
+        # делает плавно без полного update_user_tree.
+        self._cam_thumb_timer = QTimer(self)
+        self._cam_thumb_timer.setInterval(66)   # ~15 fps
+        self._cam_thumb_timer.timeout.connect(self._refresh_cam_thumbnails)
+        self._cam_thumb_timer.start()
         self._sb_panel = None
         self._streamer_draw_overlay: StreamerAnnotationOverlay | None = None
         self.net.draw_stroke_received.connect(self._on_draw_stroke_received)
@@ -391,7 +413,10 @@ class MainWindow(WebcamMixin, QMainWindow):
 
     def setup_ui(self):
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — {self.nick}")
-        self.setMinimumSize(520, 500)
+        # Минимум окна = ширина нижнего бара (466) + margin'ы main_page (12+12)
+        # = 490. При таком минимуме слева и справа от бара одинаковые 12 px,
+        # бар вписывается без зазора, и видимые отступы симметричны.
+        self.setMinimumSize(490, 500)
         self.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
@@ -566,13 +591,31 @@ class MainWindow(WebcamMixin, QMainWindow):
         self._bottom_bar = QFrame()
         self._bottom_bar.setObjectName("bottomBar")
         self._bottom_bar.setFixedHeight(72)
-        # Минимальная ширина: сумма всех кнопок (5×46 + leave 46 + индикатор 22
-        # + пинг 64 + настройки 46) + отступы/спейсинги. Ниже этого ряд НЕ
-        # сжимается, поэтому пинг и «Настройки» больше не налезают друг на друга.
-        self._bottom_bar.setMinimumWidth(500)
+        # FIX #3: ширину больше НЕ форсируем большим минимумом под растяжку.
+        # Ряд кнопок сам задаёт свой минимальный размер (sizeHint), а пинг и
+        # Минимум ровно по ширине содержимого бара:
+        # margins(12+12) + 7 кнопок 46px + latency 64px + 7 промежутков по 8px
+        # = 12 + 7*46 + 64 + 7*8 + 12 = 466 px.
+        # Если поставить больше — между правой кнопкой и правым margin
+        # появится пустое место (стретч его съест и сделает справа шире,
+        # чем слева). Делаем впритык — тогда при минимальной ширине окна
+        # отступы слева/справа от внешней рамки одинаковые (= main_page margins).
+        self._bottom_bar.setMinimumWidth(466)
 
-        btns = QHBoxLayout(self._bottom_bar)
-        btns.setContentsMargins(12, 0, 12, 0)
+        # Внешний layout бара — почти пустой: содержит ОДИН группу-контейнер
+        # с кнопками и трейлинг-стретч. Так как сам контейнер фиксированной
+        # ширины, при resize окна Qt не пытается перераспределять пиксели
+        # между его внутренними виджетами — позиция «Настроек» остаётся
+        # пиксельно стабильной (раньше она дёргалась на ±1 px из-за
+        # дробных значений в стретче).
+        outer_btns = QHBoxLayout(self._bottom_bar)
+        outer_btns.setContentsMargins(12, 0, 12, 0)
+        outer_btns.setSpacing(0)
+
+        _btns_group = QWidget(self._bottom_bar)
+        _btns_group.setObjectName("bottomBarGroup")
+        btns = QHBoxLayout(_btns_group)
+        btns.setContentsMargins(0, 0, 0, 0)
         btns.setSpacing(8)
 
         self.btn_mute = QPushButton()
@@ -659,9 +702,25 @@ class MainWindow(WebcamMixin, QMainWindow):
         btns.addWidget(self.btn_stream)
         btns.addWidget(self.btn_leave)
         btns.addWidget(self._stream_conn_lbl)
-        btns.addStretch()
+        # Все промежутки между кнопками одинаковые (общий setSpacing(8));
+        # отдельного увеличенного зазора перед пингом больше нет.
         btns.addWidget(self._latency_btn)
         btns.addWidget(btn_set)
+
+        # Контейнер с кнопками — фиксированной ширины. Это гарантирует,
+        # что позиции виджетов внутри (включая «Настройки») НЕ меняются при
+        # resize окна — растёт только трейлинг-спейсер во внешнем layout.
+        # Считаем по-факту: 7 кнопок 46px + latency 64px + 7 промежутков 8px
+        # = 322 + 64 + 56 = 442 px. _stream_conn_lbl (22 px) скрыт по
+        # умолчанию и в скрытом состоянии layout его не учитывает.
+        _btns_group.setSizePolicy(QSizePolicy.Policy.Fixed,
+                                  QSizePolicy.Policy.Preferred)
+        _btns_group.setFixedWidth(442)
+
+        outer_btns.addWidget(_btns_group)
+        # Трейлинг-стретч во ВНЕШНЕМ layout: при расширении окна растёт он,
+        # а не промежутки внутри группы.
+        outer_btns.addStretch(1)
 
         layout.addWidget(self._bottom_bar)
 
@@ -1381,6 +1440,43 @@ class MainWindow(WebcamMixin, QMainWindow):
         self._br_def    = QBrush(self._c_def)
         self._br_gray   = QBrush(QColor("#6e7a96"))
 
+    def _safe_hk(self, fn, label: str = ""):
+        """
+        Обёртка для хоткей-колбэков: ловит ЛЮБОЕ исключение и гасит его на
+        месте. Без этого необработанная ошибка внутри колбэка keyboard может
+        убить keyboard-поток (и иногда сам процесс) — особенно если хоткей
+        нажат в момент высокой системной нагрузки (например, во время игры).
+        """
+        def _w():
+            try:
+                fn()
+            except Exception as ex:
+                print(f"[HK] callback error ({label}): {ex}")
+        return _w
+
+    def _gui_hk(self, fn, label: str = ""):
+        """
+        Обёртка для хоткей-колбэков, ТРОГАЮЩИХ GUI (resize/show/click).
+        Колбэки библиотеки keyboard вызываются из её фонового потока, а
+        Qt-виджеты обязаны меняться ТОЛЬКО в главном потоке. Если этого не
+        делать, на Windows возможны непредсказуемые эффекты — окно может
+        свернуться, зависнуть или процесс упадёт. Поэтому маршалим вызов
+        через QTimer.singleShot(0, ...) — он гарантированно отработает в
+        главном event-loop. Снаружи также оборачиваем в try/except, чтобы
+        ни одна ошибка не утекла обратно в keyboard-поток.
+        """
+        def _w():
+            def _runner():
+                try:
+                    fn()
+                except Exception as ex:
+                    print(f"[HK] gui callback error ({label}): {ex}")
+            try:
+                QTimer.singleShot(0, _runner)
+            except Exception as ex:
+                print(f"[HK] gui marshal error ({label}): {ex}")
+        return _w
+
     def setup_hotkeys(self):
 
         try:
@@ -1390,19 +1486,33 @@ class MainWindow(WebcamMixin, QMainWindow):
             d = self.app_settings.value("hk_deafen", "alt+]")
             if m:
                 try:
-                    keyboard.add_hotkey(m, lambda: self.btn_mute.click())
+                    keyboard.add_hotkey(m, self._gui_hk(lambda: self.btn_mute.click(),
+                                                        "mute hotkey"))
                 except Exception as e:
                     print(f"[HK] mute hotkey error: {e}")
             if d:
                 try:
-                    keyboard.add_hotkey(d, lambda: self.btn_deafen.click())
+                    keyboard.add_hotkey(d, self._gui_hk(lambda: self.btn_deafen.click(),
+                                                        "deafen hotkey"))
                 except Exception as e:
                     print(f"[HK] deafen hotkey error: {e}")
 
             try:
-                keyboard.add_hotkey("ctrl+t", lambda: self._toggle_chat_panel())
+                keyboard.add_hotkey("ctrl+t", self._gui_hk(
+                    lambda: self._toggle_chat_panel(), "chat hotkey"))
             except Exception as e:
                 print(f"[HK] chat hotkey error: {e}")
+
+            # ── Whisper PTT ───────────────────────────────────────────────
+            # ВАЖНО: раньше для КАЖДОГО whisper-слота ставился отдельный
+            # глобальный keyboard.hook — при 3-5 слотах это давало 3-5
+            # хуков на каждый keyboard-event ОС. Под нагрузкой (например, в
+            # игре) Windows может убрать запоздавший low-level hook, а
+            # необработанное исключение внутри хук-колбэка способно убить
+            # поток keyboard и в итоге закрыть всё приложение. Поэтому
+            # теперь СОБИРАЕМ один общий hook, который по trigger_key
+            # останавливает активный whisper нужного слота.
+            whisper_states: list[dict] = []   # каждый dict: trigger_key, active[bool], stop()
 
             for i in range(5):
                 ip   = self.app_settings.value(f"whisper_slot_{i}_ip",   "")
@@ -1413,61 +1523,84 @@ class MainWindow(WebcamMixin, QMainWindow):
                 if (not ip and not nick) or not hk:
                     continue
 
-                def _make_ptt(target_ip: str, target_nick: str, hotkey_str: str,
-                              anonymous: bool = False):
-                    active = [False]
+                trigger_key = hk.replace(" ", "").split("+")[-1].lower()
+                state = {"trigger_key": trigger_key, "active": [False],
+                         "nick": nick, "ip": ip}
 
-                    trigger_key = hotkey_str.replace(" ", "").split("+")[-1].lower()
-
+                def _make_press(target_ip, target_nick, anonymous, st):
                     def _press():
-                        if active[0]:
-                            return
-                        uid = None
-                        if target_ip:
-                            with self.audio.users_lock:
-                                for u_uid, u_ip in self.audio.uid_to_ip.items():
-                                    if u_ip == target_ip:
-                                        uid = u_uid
-                                        break
-                        if uid is None and target_nick:
-                            for u_uid, data in self.known_uids.items():
-                                try:
-                                    if data['item'].text(0).strip() == target_nick:
-                                        uid = u_uid
-                                        break
-                                except Exception:
-                                    pass
-                        if uid is not None:
-                            active[0] = True
-                            self.audio.start_whisper(uid, anonymous=anonymous)
-                            display = target_nick or target_ip
-                            mark = " [anon]" if anonymous else ""
-                            print(f"[HK] Whisper PTT START → {display} (uid={uid}){mark}")
-                        else:
-                            display = target_nick or target_ip
-                            print(f"[HK] Whisper PTT: '{display}' не найден онлайн")
+                        try:
+                            if st["active"][0]:
+                                return
+                            uid = None
+                            if target_ip:
+                                with self.audio.users_lock:
+                                    for u_uid, u_ip in self.audio.uid_to_ip.items():
+                                        if u_ip == target_ip:
+                                            uid = u_uid
+                                            break
+                            if uid is None and target_nick:
+                                for u_uid, data in self.known_uids.items():
+                                    try:
+                                        if data['item'].text(0).strip() == target_nick:
+                                            uid = u_uid
+                                            break
+                                    except Exception:
+                                        pass
+                            if uid is not None:
+                                st["active"][0] = True
+                                self.audio.start_whisper(uid, anonymous=anonymous)
+                                display = target_nick or target_ip
+                                mark = " [anon]" if anonymous else ""
+                                print(f"[HK] Whisper PTT START → {display} (uid={uid}){mark}")
+                            else:
+                                display = target_nick or target_ip
+                                print(f"[HK] Whisper PTT: '{display}' не найден онлайн")
+                        except Exception as ex:
+                            # Любая ошибка ВНУТРИ колбэка остаётся внутри —
+                            # не убивает keyboard-поток / процесс.
+                            print(f"[HK] Whisper PTT _press exception: {ex}")
+                            try:
+                                st["active"][0] = False
+                            except Exception:
+                                pass
+                    return _press
 
-                    def _raw_key_up(e):
-
-                        if (active[0]
-                                and e.event_type == 'up'
-                                and e.name
-                                and e.name.lower() == trigger_key):
-                            active[0] = False
-                            self.audio.stop_whisper()
-                            display = target_nick or target_ip
-                            print(f"[HK] Whisper PTT STOP  ← {display}")
-
-                    return _press, _raw_key_up
-
-                _press, _raw_key_up = _make_ptt(ip, nick, hk, anonymous=anon)
+                _press = _make_press(ip, nick, anon, state)
                 try:
-                    keyboard.add_hotkey(hk, _press, trigger_on_release=False, suppress=False)
-                    keyboard.hook(_raw_key_up, suppress=False)
+                    keyboard.add_hotkey(hk, _press, trigger_on_release=False,
+                                        suppress=False)
+                    whisper_states.append(state)
                     print(f"[HK] Whisper slot {i}: ip='{ip}' nick='{nick}' anon={anon} "
-                          f"→ '{hk}' (trigger_key='{hk.replace(' ','').split('+')[-1].lower()}')")
+                          f"→ '{hk}' (trigger_key='{trigger_key}')")
                 except Exception as e:
                     print(f"[HK] Whisper slot {i} error ({hk!r}): {e}")
+
+            # Один общий глобальный hook — обрабатывает release-события для
+            # всех whisper-слотов сразу. Все исключения проглатываем.
+            if whisper_states:
+                def _whisper_global_hook(e):
+                    try:
+                        if e.event_type != 'up' or not e.name:
+                            return
+                        ename = e.name.lower()
+                        for st in whisper_states:
+                            if st["active"][0] and ename == st["trigger_key"]:
+                                st["active"][0] = False
+                                try:
+                                    self.audio.stop_whisper()
+                                except Exception as ex:
+                                    print(f"[HK] stop_whisper exception: {ex}")
+                                display = st["nick"] or st["ip"]
+                                print(f"[HK] Whisper PTT STOP  ← {display}")
+                                break
+                    except Exception as ex:
+                        print(f"[HK] whisper global hook exception: {ex}")
+
+                try:
+                    keyboard.hook(_whisper_global_hook, suppress=False)
+                except Exception as e:
+                    print(f"[HK] whisper global hook install error: {e}")
 
             hk_count = int(self.app_settings.value("hk_table_count", 0))
             for i in range(hk_count):
@@ -1507,6 +1640,8 @@ class MainWindow(WebcamMixin, QMainWindow):
                             })
                             print(f"[HK] Sound fired: '{name}'")
                         except Exception as ex:
+                            # Любая ошибка остаётся внутри — keyboard-поток
+                            # и сам процесс не должны падать из-за неё.
                             print(f"[HK] Sound play error '{name}': {ex}")
                     return _play
 
@@ -1542,10 +1677,22 @@ class MainWindow(WebcamMixin, QMainWindow):
             except Exception:
                 pass
         else:
+            # Для веб-камеры не пищим бипером, если mp3 не удалось загрузить
+            # (например, старый libsndfile без поддержки MP3) — просто тишина.
+            if stype in ("webcam_on", "webcam_off"):
+                return
             if vol > 0:
                 winsound.Beep(600 if stype == "self_move" else 400, 150)
 
     def _on_whisper_received(self, sender_uid: int):
+        # FIX (проблема #3): защита от ложного баннера в первые мгновения
+        # после входа. Легитимный шёпот в этот момент невозможен (собеседник
+        # должен сначала увидеть вас в комнате и зажать кнопку шёпота), а
+        # «хвостовой» UDP-пакет — вполне. Окно подавления — 1.2 c.
+        _ct = getattr(self, '_connect_ts', None)
+        if _ct is not None and (time.perf_counter() - _ct) < 1.2:
+            return
+
         self._whisper_end_timer.stop()
         self._whisper_end_timer.start()
 
@@ -1919,6 +2066,12 @@ class MainWindow(WebcamMixin, QMainWindow):
                 pass
 
             self.audio.my_uid = msg['uid']
+            # FIX (проблема #3): метка времени входа. Сразу после подключения
+            # короткое время игнорируем whisper-баннеры — за этот интервал
+            # никто физически не успеет нажать «шёпот» именно вам, а вот
+            # «хвостовой»/буферизованный UDP-датаграмма от прошлой сессии под
+            # тем же портом может прилететь и вызвать ложное «Вам кто-то шепчет».
+            self._connect_ts = time.perf_counter()
             self.audio.start(
                 self.app_settings.value("device_in_name"),
                 self.app_settings.value("device_out_name")
@@ -1927,7 +2080,11 @@ class MainWindow(WebcamMixin, QMainWindow):
             self._chat_panel.set_my_uid(self.audio.my_uid)
             self._chat_panel.update_room_label(self.current_room)
 
-            self.play_notification("self_move")
+            # Звук собственного входа: если задан кастомный — играем его и у
+            # себя, и широковещанием для собеседников. Стандартный self_move
+            # в этом случае НЕ играем (требование: кастомный полностью заменяет
+            # стандартный). Если кастомный не задан — стандартное поведение.
+            self._play_own_join_sound()
 
             self.prev_all_uids = set()
             self._server_users_initialized = False
@@ -1944,10 +2101,17 @@ class MainWindow(WebcamMixin, QMainWindow):
             print(f"[on_connected] EXCEPTION:\n{traceback.format_exc()}", flush=True)
 
     def on_video_frame(self, uid, q_image):
+        # ВАЖНО: это обработчик кадров ТРАНСЛЯЦИИ ЭКРАНА (screen-share).
+        # Кадр уходит ТОЛЬКО в окно стрима. Раньше тот же кадр ошибочно
+        # отправлялся и в круглое окно камеры (self.on_camera_frame), из-за
+        # чего у зрителя в кружок вашей камеры на мгновение «залетала»
+        # картинка самой трансляции (особенно заметно на динамике в кадре),
+        # ведь при активном стриме окно стрима и кружок камеры имели один
+        # и тот же uid (ваш). Камера приходит ОТДЕЛЬНЫМ WebRTC-треком и
+        # роутится через camera_qframe_received → on_camera_frame, поэтому
+        # здесь камеру трогать НЕ нужно.
         if uid in self.stream_windows and self.stream_windows[uid].isVisible():
             self.stream_windows[uid].update_frame(q_image)
-        # ── камера: тот же QImage уходит в круглое PiP-окно ──
-        self.on_camera_frame(uid, q_image)
 
     def on_stream_stats_updated(self, uid: int, fps: int, loss_pct: int):
 
@@ -1967,8 +2131,11 @@ class MainWindow(WebcamMixin, QMainWindow):
         room_changed = (my_new_room != self.current_room)
         if room_changed:
             self.current_room = my_new_room
-            self.play_notification("self_move")
             self._chat_panel.update_room_label(self.current_room)
+            # Сменили комнату — кастомный звук (если есть) играем у себя
+            # ЛОКАЛЬНО и шлём собеседникам новой комнаты. Иначе — стандартный
+            # self_move. Никогда не оба сразу.
+            self._play_own_join_sound()
 
         current_room_uids = {
             u['uid']
@@ -1988,8 +2155,36 @@ class MainWindow(WebcamMixin, QMainWindow):
         }
 
         if not room_changed and self.audio.my_uid != 0:
-            if current_room_uids - self.prev_room_uids:
-                self.play_notification("other_join")
+            new_uids = current_room_uids - self.prev_room_uids
+            if new_uids:
+                # Дефолтный other_join.wav может конфликтовать с кастомным
+                # «звуком при входе»: sync_users и CMD_SOUNDBOARD приходят
+                # независимо. На больших файлах (до 1 МБ → ~1.3 МБ base64)
+                # joinsound может задержаться. Поэтому откладываем дефолт
+                # на 1.5 c: если за это время хоть один новичок прислал
+                # свой звук — дефолт для него пропускаем. Если ВСЕ новички
+                # без кастомного — играем дефолт как раньше (один раз).
+                now = time.perf_counter()
+                # Чистим протухшие записи (>15 сек) — буфер не растёт.
+                self._join_sound_recent = {
+                    u: t for u, t in self._join_sound_recent.items()
+                    if now - t < 15.0
+                }
+                pending_uids = set(new_uids)
+
+                def _maybe_play_default(_uids=pending_uids):
+                    try:
+                        t_now = time.perf_counter()
+                        any_without_custom = any(
+                            (t_now - self._join_sound_recent.get(u, -1e9)) > 5.0
+                            for u in _uids
+                        )
+                        if any_without_custom:
+                            self.play_notification("other_join")
+                    except Exception:
+                        pass
+
+                QTimer.singleShot(1500, _maybe_play_default)
             if self.prev_room_uids - current_room_uids:
                 self.play_notification("other_exit")
             if current_streaming_uids - self.prev_streaming_uids:
@@ -2001,11 +2196,101 @@ class MainWindow(WebcamMixin, QMainWindow):
                     if uid in self.stream_windows:
                         self._on_stream_window_closed(uid)
 
+        my_uid = getattr(self.audio, 'my_uid', 0)
+
         # Камера выключилась у кого-то → закрываем его круглое окно (если открыто).
         stopped_cameras = getattr(self, '_prev_camera_uids', set()) - current_camera_uids
         for uid in stopped_cameras:
             if uid in self.cam_windows:
                 self._destroy_cam_window(uid)
+            # Отписываемся от его видео-трека — больше не нужны его кадры
+            # ни для большого окна, ни для миниатюры. Чистим кадр-кэш, чтобы
+            # миниатюра вернулась к обычному аватару.
+            if uid != my_uid:
+                try:
+                    self.net.stop_watching_camera(uid)
+                except Exception as e:
+                    print(f"[Camera] stop_watching_camera({uid}) error: {e}")
+            self._cam_last_frame.pop(uid, None)
+            # ВАЖНО: флаг "ручного закрытия" НЕ снимаем при остановке камеры
+            # собеседником. Иначе цикл "закрыл → он выключил → он снова
+            # включил" вернул бы авто-открытие, чего пользователь не хочет.
+            # Флаг снимается только когда пользователь сам ВРУЧНУЮ откроет
+            # окно (клик по нику в дереве).
+
+        # FIX #2: камера ВКЛЮЧИЛАСЬ у собеседника (переход выкл→вкл) в рамках
+        # той же сессии. Если ранее в этой сессии мы уже открывали и
+        # располагали его кружок (есть сохранённая геометрия) — открываем окно
+        # автоматически на том же месте и того же размера. Если кружок ни разу
+        # не открывали (геометрии нет) — НЕ открываем сами: пользователь сам
+        # решит, показывать ли камеру.
+        started_cameras = current_camera_uids - getattr(self, '_prev_camera_uids', set())
+
+        # Звук вкл/выкл веб-камеры — чтобы все слышали, когда друг включает или
+        # выключает камеру. Те же условия, что и для звуков join/stream: только
+        # после инициализации, не на смене комнаты и не на собственные действия.
+        # Звук ограничиваем ТЕКУЩЕЙ комнатой (как join/stream): нет смысла
+        # пищать на камеры людей из других комнат. Сами окна камер при этом
+        # по-прежнему могут открываться независимо от комнаты.
+        if not room_changed and my_uid != 0:
+            _cur_room_cam = {
+                u['uid']
+                for u in users_map.get(self.current_room, [])
+                if u.get('is_camera', False) and u['uid'] != my_uid
+            }
+            _prev_room_cam = getattr(self, '_prev_room_camera_uids', set())
+            if _cur_room_cam - _prev_room_cam:
+                self.play_notification("webcam_on")
+            if _prev_room_cam - _cur_room_cam:
+                self.play_notification("webcam_off")
+            self._prev_room_camera_uids = _cur_room_cam
+        else:
+            # держим базлайн в актуальном состоянии, чтобы при первом входе/
+            # смене комнаты не прилетела пачка звуков
+            self._prev_room_camera_uids = {
+                u['uid']
+                for u in users_map.get(self.current_room, [])
+                if u.get('is_camera', False) and u['uid'] != my_uid
+            }
+
+        # ── Подписка на ВИДЕО-ТРЕКИ камер собеседников ─────────────────────
+        # Подписываемся, как только у пира включается камера — нужно для
+        # ЖИВОЙ МИНИАТЮРЫ вместо аватара в дереве. Это независимо от того,
+        # открыто ли большое круглое окно. Отписка — в блоке stopped_cameras
+        # выше (когда пир выключит камеру или уйдёт с сервера). Если в этой
+        # же итерации авто-открывается большое окно — повторная подписка не
+        # делается, потому что open_camera_window больше не подписывается
+        # сам (см. ui_webcamera.py).
+        for uid in started_cameras:
+            if uid == my_uid:
+                continue
+            try:
+                self.net.start_watching_camera(uid)
+            except Exception as e:
+                print(f"[Camera] start_watching_camera({uid}) error: {e}")
+
+        for uid in started_cameras:
+            if uid == my_uid:
+                continue
+            if uid in self.cam_windows:
+                continue  # окно уже открыто
+            # Если пользователь сам закрыл этот кружок в текущей сессии —
+            # больше не открываем автоматически. Авто-открытие восстановится,
+            # когда собеседник выключит и снова включит камеру (тогда uid
+            # уйдёт из _cam_manually_closed выше), либо когда пользователь
+            # вручную откроет окно кликом по нику в дереве.
+            if uid in getattr(self, '_cam_manually_closed', set()):
+                continue
+            if getattr(self, '_cam_geometry', {}).get(uid) is not None:
+                nick = ""
+                d = self.known_uids.get(uid)
+                if d and d.get('item') is not None:
+                    try:
+                        nick = d['item'].text(0).strip()
+                    except Exception:
+                        nick = ""
+                self.open_camera_window(uid, nick)
+
         self._prev_camera_uids = current_camera_uids
 
         self.audio.cleanup_users(all_active_uids)
@@ -2127,6 +2412,137 @@ class MainWindow(WebcamMixin, QMainWindow):
 
         self._reposition_quick_bubbles()
 
+    def _make_circle_pixmap(self, src: QPixmap, size: int) -> QPixmap:
+        """
+        Возвращает КРУГЛУЮ маску квадратного pixmap'а размером size×size.
+        Альфа-канал у края — со сглаживанием. Работает корректно на High-DPI
+        мониторах (2K, 4K, дробные масштабирования Windows 125/150 %).
+
+        Почему НЕ через setClipPath: Qt клиппит по бинарной маске без
+        анти-алиасинга, и контур получается «лесенкой». Вместо клиппинга —
+        QBrush(scaled_pixmap) + drawEllipse: рисуется ЗАЛИВКА эллипса
+        текстурой, и Qt честно сглаживает по альфа-каналу.
+
+        Для High-DPI: DPR берём не от источника (там обычно 1.0 — сырые кадры
+        с вебкамеры или из QImage), а от самого окна — это реальный DPR
+        экрана, на котором будет показано. Дополнительно делаем 2x
+        супер-сэмплинг (рисуем в удвоенном физическом размере и Qt при
+        выводе сжимает): на дробных DPR это ощутимо снимает остатки лесенки.
+        """
+        if src is None or src.isNull() or size <= 0:
+            return QPixmap()
+        from PyQt6.QtCore import QRectF
+        from PyQt6.QtGui import QPainter, QBrush
+
+        # DPR экрана, а не источника. На 2K со 125% будет ~1.25, на 4K — 2.0.
+        try:
+            screen_dpr = float(self.devicePixelRatioF())
+        except Exception:
+            screen_dpr = 1.0
+        if screen_dpr <= 0:
+            screen_dpr = 1.0
+
+        # 2x супер-сэмплинг сверху физических пикселей экрана: рисуем мельче,
+        # потом downscale сглаживает остаточные «зубцы» на дробных масштабах.
+        SS = 2
+        phys = max(1, int(round(size * screen_dpr * SS)))
+
+        # 1) Масштабируем источник в физический квадрат — гладко.
+        scaled = src.scaled(
+            phys, phys,
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        scaled.setDevicePixelRatio(1.0)   # работаем в физ. координатах
+
+        # 2) Готовим прозрачный холст и КИСТЬ-текстуру.
+        canvas = QImage(phys, phys, QImage.Format.Format_ARGB32_Premultiplied)
+        canvas.fill(Qt.GlobalColor.transparent)
+
+        p = QPainter(canvas)
+        try:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            brush = QBrush(scaled)
+            p.setBrush(brush)
+            p.setPen(Qt.PenStyle.NoPen)
+            p.drawEllipse(QRectF(0, 0, phys, phys))
+        finally:
+            p.end()
+
+        # 3) Downscale в реальный размер с учётом DPR экрана. Это даёт
+        # эффект супер-сэмплинга — лесенки практически исчезают.
+        final_phys = max(1, int(round(size * screen_dpr)))
+        final_img = canvas.scaled(
+            final_phys, final_phys,
+            Qt.AspectRatioMode.IgnoreAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        final_img.setDevicePixelRatio(screen_dpr)
+        return QPixmap.fromImage(final_img)
+
+    def _refresh_cam_thumbnails(self):
+        """
+        Лёгкая перерисовка ТОЛЬКО иконок колонки 0 у пиров с включённой
+        камерой. Зовётся таймером ~15 fps. sync_users приходит реже (3-5 раз
+        в секунду), и при опоре только на него миниатюра выглядела бы
+        прерывистой, а пульс кольца — дискретным. Полный update_user_tree
+        не вызываем — он много чего пересчитывает; здесь только setIcon на
+        живых кадрах. Если у пира кадра ещё нет — иконку не трогаем
+        (статичный аватар с кольцом уже стоит и тикает по sync_users).
+        """
+        try:
+            if not self.known_uids:
+                return
+            tree = self.tree
+            if tree is None:
+                return
+            _isz = tree.iconSize()
+            _icon_px = _isz.width() if (_isz.isValid() and _isz.width() > 0) else 32
+
+            now = time.perf_counter()
+            _phase = pulse_phase(now - self._cam_pulse_t0)
+
+            my_uid = getattr(self.audio, "my_uid", 0)
+            for uid, data in self.known_uids.items():
+                item = data.get('item') if isinstance(data, dict) else None
+                if item is None:
+                    continue
+                if uid == my_uid:
+                    cam_on = bool(getattr(self, 'is_camera_on', False))
+                else:
+                    cam_on = bool(data.get('is_cam', False))
+                if not cam_on:
+                    continue
+
+                qimg = self._cam_last_frame.get(uid)
+                if qimg is None or qimg.isNull():
+                    continue   # кадра нет — пусть статичный аватар тикает на sync_users
+
+                fw, fh = qimg.width(), qimg.height()
+                side = min(fw, fh)
+                if side <= 0:
+                    continue
+                cx = (fw - side) // 2
+                cy = (fh - side) // 2
+                cropped = qimg.copy(cx, cy, side, side)
+                # Обрезаем кадр в круг, чтобы он не «выступал» из-под
+                # пульсирующего кольца квадратными углами.
+                base_pix = self._make_circle_pixmap(
+                    QPixmap.fromImage(cropped), _icon_px
+                )
+                ringed = make_avatar_with_pulse_ring(
+                    base_pix, _icon_px, _phase, ring_width=3,
+                )
+                try:
+                    item.setIcon(0, QIcon(ringed))
+                except RuntimeError:
+                    # Виджет уже удалён — пропускаем.
+                    pass
+                data['_ring_on'] = True
+        except Exception as e:
+            print(f"[UI] _refresh_cam_thumbnails error: {e}")
+
     def refresh_ui(self):
         try:
             self._refresh_ui_impl()
@@ -2238,22 +2654,52 @@ class MainWindow(WebcamMixin, QMainWindow):
                     # 1) иконка камеры в колонке статуса (1), если там пусто
                     if not data.get('status_icon'):
                         item.setData(1, Qt.ItemDataRole.DecorationRole, self._px_cam)
-                    # 2) плавно пульсирующая обводка ПОВЕРХ кромки аватарки
-                    #    (колонка 0). Размер аватара НЕ меняется — кольцо
-                    #    лежит на краю, аватар занимает весь круг как обычно.
-                    if avatar_name:
-                        # Кольцо рисуем поверх аватарки ТОЧНО того же размера,
-                        # что и обычная иконка дерева — чтобы при включении
-                        # камеры аватар не уменьшался и не съезжал.
-                        _isz = self.tree.iconSize()
-                        _icon_px = _isz.width() if (_isz.isValid() and _isz.width() > 0) else 32
+
+                    # 2) Аватар колонки 0:
+                    #    • если уже пришёл кадр камеры (свой или чужой) —
+                    #      рисуем ЖИВУЮ МИНИАТЮРУ (последний кадр, обрезанный
+                    #      в квадрат по центру) с тем же пульсирующим кольцом;
+                    #    • если кадров ещё нет (камера только что включилась,
+                    #      первый кадр не дошёл) — fallback: статичный аватар
+                    #      с кольцом, как раньше.
+                    _isz = self.tree.iconSize()
+                    _icon_px = _isz.width() if (_isz.isValid() and _isz.width() > 0) else 32
+
+                    live_qimg = self._cam_last_frame.get(uid)
+                    if live_qimg is not None and not live_qimg.isNull():
+                        # Center-crop кадра в квадрат — иначе KeepAspectRatio
+                        # внутри make_avatar_with_pulse_ring оставит прозрачные
+                        # поля по бокам широкого 16:9 кадра.
+                        fw = live_qimg.width()
+                        fh = live_qimg.height()
+                        side = min(fw, fh)
+                        if side <= 0:
+                            base_pix = QIcon(
+                                resource_path(f"assets/avatars/{avatar_name}")
+                            ).pixmap(_icon_px, _icon_px) if avatar_name else QPixmap()
+                        else:
+                            cx = (fw - side) // 2
+                            cy = (fh - side) // 2
+                            cropped = live_qimg.copy(cx, cy, side, side)
+                            # Обрезаем кадр в круг — иначе из-под кольца
+                            # торчат квадратные углы (см. отчёт пользователя).
+                            base_pix = self._make_circle_pixmap(
+                                QPixmap.fromImage(cropped), _icon_px
+                            )
+                        ringed = make_avatar_with_pulse_ring(
+                            base_pix, _icon_px, _cam_phase, ring_width=3,
+                        )
+                        item.setIcon(0, QIcon(ringed))
+                        data['_ring_on'] = True
+                    elif avatar_name:
+                        # Fallback — статичный аватар с кольцом (как раньше).
+                        # Этот вариант кэшируем по (avatar_name, phase, size),
+                        # потому что вход детерминирован.
                         key = (avatar_name, _cam_phase_step, _icon_px)
                         ringed = self._avatar_ring_cache.get(key)
                         if ringed is None:
                             if len(self._avatar_ring_cache) > 600:
                                 self._avatar_ring_cache.clear()
-                            # База — тот же рендер, что использует дерево для
-                            # обычной аватарки: QIcon(path).pixmap(icon_size).
                             base = QIcon(
                                 resource_path(f"assets/avatars/{avatar_name}")
                             ).pixmap(_icon_px, _icon_px)
@@ -2277,11 +2723,13 @@ class MainWindow(WebcamMixin, QMainWindow):
 
                 if talk:
                     item.setForeground(0, self._br_talk)
-                elif curr_s:
-                    item.setForeground(0, self._br_stream)
                 elif curr_d or is_m or (uid != my_uid and u_vals and (is_locally_muted or is_vol_zero)):
                     item.setForeground(0, self._br_mute)
                 else:
+                    # Стример НЕ красится в отдельный цвет: ник как у всех —
+                    # белый по умолчанию (или золотой у хоста), а при активном
+                    # микрофоне загорается зелёным (ветка talk выше). Факт
+                    # стрима показывает отдельная «live»-иконка в колонке 2.
                     if host_uid and uid == host_uid:
                         item.setForeground(0, self._br_gold)
                     else:
@@ -2321,6 +2769,9 @@ class MainWindow(WebcamMixin, QMainWindow):
             return
         cam_on = self.is_camera_on if uid == self.audio.my_uid else data.get('is_cam', False)
         if cam_on:
+            # Ручное открытие — снимаем подавление авто-открытия для этого uid.
+            if hasattr(self, '_cam_manually_closed'):
+                self._cam_manually_closed.discard(uid)
             self.open_camera_window(uid, item.text(0).strip())
 
     def show_context_menu(self, pos):
@@ -3363,6 +3814,52 @@ class MainWindow(WebcamMixin, QMainWindow):
             px = win_pos.right() + 4
         panel.move(px, py)
         panel.show()
+
+    def _play_own_join_sound(self):
+        """
+        Звук СВОЕГО входа (вход на сервер или смена комнаты):
+          • если задан кастомный «звук при входе» — играем его у себя
+            ЛОКАЛЬНО + широковещанием собеседникам. Стандартный self_move
+            при этом НЕ играем (кастомный полностью заменяет стандартный).
+          • если кастомного нет — обычный self_move как раньше.
+        """
+        path = ""
+        try:
+            path = self.app_settings.value("join_sound_path", "") or ""
+        except Exception:
+            path = ""
+
+        if path and os.path.exists(path):
+            try:
+                # Громкость — как у системных звуков (по требованию).
+                raw = int(self.app_settings.value("system_sound_volume", 30)) / 100.0
+                vol = raw ** 2
+                data, sr = sf.read(path, dtype='float32')
+                if hasattr(self.audio, 'play_internal_sound') and getattr(self.audio, 'stream', None):
+                    self.audio.play_internal_sound(data, sr, vol)
+                else:
+                    sd.play(data * vol, sr)
+            except Exception as e:
+                print(f"[JoinSound] local play error: {e}")
+            try:
+                self.net.broadcast_join_sound()
+            except Exception as e:
+                print(f"[JoinSound] broadcast error: {e}")
+            return
+
+        # Кастомный не задан — обычный сигнал входа.
+        self.play_notification("self_move")
+
+    def _on_join_sound_received(self, src_uid: int):
+        """
+        Получили кастомный «звук при входе» от другого пользователя.
+        Запоминаем uid → время, чтобы presence-diff пропустил для него
+        дефолтный user_join.wav (наш custom уже играется).
+        """
+        try:
+            self._join_sound_recent[int(src_uid)] = time.perf_counter()
+        except (TypeError, ValueError):
+            pass
 
     def _on_soundboard_played(self, from_nick: str):
         """

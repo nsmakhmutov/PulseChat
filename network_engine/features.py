@@ -34,7 +34,8 @@ class FeaturesMixin:
     # ------------------------------------------------------------------
     # Soundboard
     # ------------------------------------------------------------------
-    def play_soundboard_file(self, filename, data_b64=None, from_nick=None):
+    def play_soundboard_file(self, filename, data_b64=None, from_nick=None,
+                             src_uid=None):
         """
         Воспроизвести soundboard-файл через sounddevice.
         Разрешён одновременный запуск нескольких звуков.
@@ -43,7 +44,26 @@ class FeaturesMixin:
             _gs = getattr(self.audio, 'global_settings', None)
             if _gs is None:
                 _gs = QSettings("MyVoiceChat", "GlobalSettings")
-            raw = int(_gs.value("soundboard_volume", 40)) / 100.0
+
+            # Звук при входе (__joinsound__) — это персональный звук входа
+            # пользователя. Громкость берём от «Системные звуки», тост автора
+            # НЕ показываем (это не обычный soundboard).
+            is_join_sound = bool(filename and filename.startswith("__joinsound__:"))
+
+            # Свой собственный звук входа НЕ проигрываем у себя — его слышат
+            # только собеседники (сервер рассылает CMD_SOUNDBOARD всем, включая
+            # отправителя, поэтому отсекаем по src_uid == my_uid).
+            if is_join_sound and src_uid is not None:
+                try:
+                    if int(src_uid) == int(getattr(self.audio, 'my_uid', 0)):
+                        return
+                except (TypeError, ValueError):
+                    pass
+
+            if is_join_sound:
+                raw = int(_gs.value("system_sound_volume", 30)) / 100.0
+            else:
+                raw = int(_gs.value("soundboard_volume", 40)) / 100.0
             vol = raw ** 2
 
             if data_b64:
@@ -54,7 +74,8 @@ class FeaturesMixin:
                     print(f"[Net] Soundboard base64 decode error: {e}")
                     return
             else:
-                if filename and filename.startswith("__custom__:"):
+                if filename and (filename.startswith("__custom__:")
+                                 or filename.startswith("__joinsound__:")):
                     print("[Net] Soundboard: кастомный звук без data_b64 — пропущен")
                     return
                 path = resource_path(os.path.join("assets/panel", filename))
@@ -63,8 +84,19 @@ class FeaturesMixin:
                     return
                 audio_source = path
 
-            if from_nick:
+            if from_nick and not is_join_sound:
                 self.soundboard_played.emit(from_nick)
+
+            # Уведомляем UI, что от другого пользователя пришёл «звук при входе».
+            # UI использует это, чтобы не проигрывать дефолтный user_join.wav
+            # для этого uid (наш кастомный звук уже выполняет эту роль).
+            if is_join_sound and src_uid is not None:
+                try:
+                    _su = int(src_uid)
+                    if _su != int(getattr(self.audio, 'my_uid', 0) or 0):
+                        self.join_sound_received.emit(_su)
+                except (TypeError, ValueError):
+                    pass
 
             def _play():
                 try:
@@ -88,6 +120,44 @@ class FeaturesMixin:
             )
         except Exception as e:
             print(f"[Net] Soundboard error: {e}")
+
+    def broadcast_join_sound(self) -> bool:
+        """
+        Транслируем свой «звук при входе» всем в текущей комнате через
+        существующий механизм soundboard-broadcast (CMD_SOUNDBOARD). На стороне
+        получателей сработает play_soundboard_file по маркеру __joinsound__:
+        играется на громкости системных звуков, без тоста. Свой собственный
+        звук у себя не играем (фильтр по src_uid в receive-пути).
+
+        Возвращает True, если файл валиден и широковещание отправлено —
+        вызывающая сторона использует этот флаг для подавления дефолтного
+        user_join.wav (его роль выполнит наш кастомный звук).
+        """
+        try:
+            from PyQt6.QtCore import QSettings
+            gs = QSettings("MyVoiceChat", "GlobalSettings")
+            path = gs.value("join_sound_path", "") or ""
+            if not path or not os.path.exists(path):
+                return False
+            size = os.path.getsize(path)
+            # Тот же лимит, что у кастомных soundboard-звуков: 1 МБ.
+            if size <= 0 or size > 1 * 1024 * 1024:
+                return False
+            with open(path, 'rb') as f:
+                raw_bytes = f.read()
+            data_b64 = base64.b64encode(raw_bytes).decode('ascii')
+            my_uid = int(getattr(self.audio, 'my_uid', 0) or 0)
+            self.send_json({
+                "action":   "play_soundboard",
+                "file":     f"__joinsound__:{os.path.basename(path)}",
+                "data_b64": data_b64,
+                "src_uid":  my_uid,
+            })
+            print(f"[Net] broadcast_join_sound: отправлен ({size} bytes)")
+            return True
+        except Exception as e:
+            print(f"[Net] broadcast_join_sound error: {e}")
+            return False
 
     # ------------------------------------------------------------------
     # File Transfer P2P — только сигнализация через сервер
@@ -436,7 +506,8 @@ class FeaturesMixin:
 
         if act == 'play_soundboard':
             self.play_soundboard_file(
-                msg.get('file'), msg.get('data_b64'), msg.get('from_nick')
+                msg.get('file'), msg.get('data_b64'), msg.get('from_nick'),
+                src_uid=msg.get('src_uid')
             )
             return True
 

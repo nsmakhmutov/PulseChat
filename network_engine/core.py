@@ -58,6 +58,7 @@ class NetworkClient(WebRTCMixin, CameraWebRTCMixin, ChatMixin, FeaturesMixin, QO
     reconnect_failed    = pyqtSignal()
 
     soundboard_played   = pyqtSignal(str)
+    join_sound_received = pyqtSignal(int)   # src_uid: чей это звук входа
 
     nudge_received  = pyqtSignal()
     nudge_triggered = pyqtSignal(str, str)
@@ -628,6 +629,20 @@ class NetworkClient(WebRTCMixin, CameraWebRTCMixin, ChatMixin, FeaturesMixin, QO
 
                 elif flags & FLAG_WHISPER:
                     if len(data) < UDP_HEADER_SIZE + STREAM_VOICE_HEADER_SIZE:
+                        continue
+                    # FIX (проблема #3): payload начинается с target_uid (кому
+                    # адресован шёпот). Сервер пересылает whisper только цели,
+                    # но при первом входе/реконнекте возможен «хвостовой» пакет
+                    # по устаревшей записи udp_map (старый адрес под тем же
+                    # портом из прошлой сессии) → ложное «Вам кто-то шепчет».
+                    # Поэтому СВЕРЯЕМ адресата с собой и игнорируем чужое.
+                    (target_uid,) = STREAM_VOICE_HEADER_STRUCT.unpack(
+                        data[UDP_HEADER_SIZE: UDP_HEADER_SIZE + STREAM_VOICE_HEADER_SIZE]
+                    )
+                    my_uid = getattr(self.audio, 'my_uid', 0)
+                    # Пока свой uid не присвоен (ранняя стадия подключения) —
+                    # никаких whisper-баннеров: это заведомо не наш пакет.
+                    if not my_uid or target_uid != my_uid:
                         continue
                     opus_payload = data[UDP_HEADER_SIZE + STREAM_VOICE_HEADER_SIZE:]
                     self.audio.add_incoming_whisper_packet(uid, seq, opus_payload)
