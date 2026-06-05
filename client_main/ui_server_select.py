@@ -679,14 +679,14 @@ class MultiServerScreen(QWidget):
         self._connecting_in_progress = False
 
         try:
-            from network_engine.server_discovery import get_local_radmin_ip
-            local_ip = get_local_radmin_ip()
+            from network_engine.server_discovery import get_all_local_ips
+            _local_ips = set(get_all_local_ips()) | {'127.0.0.1'}
         except Exception:
-            local_ip = '127.0.0.1'
+            _local_ips = {'127.0.0.1'}
 
         from server import EmbeddedServerManager
         own_server_running = (
-            ip in ('127.0.0.1', local_ip)
+            ip in _local_ips
             and EmbeddedServerManager.get().is_running()
         )
 
@@ -976,14 +976,14 @@ class DiscoveryScreen(QWidget):
         self._connecting_in_progress = False
 
         try:
-            from network_engine.server_discovery import get_local_radmin_ip
-            local_ip = get_local_radmin_ip()
+            from network_engine.server_discovery import get_all_local_ips
+            _local_ips = set(get_all_local_ips()) | {'127.0.0.1'}
         except Exception:
-            local_ip = '127.0.0.1'
+            _local_ips = {'127.0.0.1'}
 
         from server import EmbeddedServerManager
         own_server_running = (
-            ip in ('127.0.0.1', local_ip)
+            ip in _local_ips
             and EmbeddedServerManager.get().is_running()
         )
 

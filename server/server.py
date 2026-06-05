@@ -119,6 +119,13 @@ class SFUServer:
         self._accepting:   bool = True
         self._announcer         = None
         self._owner_ip:    str  = ''
+        # Множество ВСЕХ локальных IP хоста (+loopback). Используется вместо
+        # сравнения с единственным _owner_ip: друг мог подключиться к хосту
+        # по любому туннелю (Radmin 26.x / ZeroTier 10.x / Tailscale 100.x)
+        # или физическому LAN, и со стороны хоста его собственные соединения
+        # приходят с РАЗНЫХ локальных адресов. Один _owner_ip не покрывал все
+        # интерфейсы → маршрутизация «локальный ли стример» могла ошибиться.
+        self._owner_ips:   set  = {'127.0.0.1', '::1', 'localhost'}
 
         self._server_name = server_name or SERVER_NAME_DEFAULT
 
@@ -214,9 +221,19 @@ class SFUServer:
             return True
         if ip in self._BAN_LOOPBACK_IPS:
             return True
-        if self._owner_ip and ip == self._owner_ip:
+        if self._is_owner_ip(ip):
             return True
         return False
+
+    def _is_owner_ip(self, ip: str) -> bool:
+        """True, если ip принадлежит самому хосту (любой его интерфейс)."""
+        if not ip:
+            return False
+        if ip in self._owner_ips:
+            return True
+        # Подстраховка на случай, если набор адресов хоста изменился уже
+        # после старта (включили туннель позже): держим и единичный _owner_ip.
+        return bool(self._owner_ip and ip == self._owner_ip)
 
     def _load_bans(self) -> None:
         try:
@@ -685,7 +702,7 @@ class SFUServer:
                                 self.uid_to_room[uid] = _gcn
                             with self._host_order_lock:
                                 if uid not in self._host_order:
-                                    if self._is_embedded and client_ip == self._owner_ip:
+                                    if self._is_embedded and self._is_owner_ip(client_ip):
                                         self._host_order.insert(0, uid)
                                         print(f"[Server] host_order: владелец {client_nick} "
                                               f"(uid={uid}) → position 0 (приоритет по IP)")
@@ -984,7 +1001,7 @@ class SFUServer:
                                             for _c in self.clients.values():
                                                 if _c.get('uid') == cam_streamer_uid:
                                                     raw_ip = _c.get('ip', '127.0.0.1')
-                                                    if self._is_embedded and raw_ip == self._owner_ip:
+                                                    if self._is_embedded and self._is_owner_ip(raw_ip):
                                                         streamer_ip = '127.0.0.1'
                                                     else:
                                                         streamer_ip = raw_ip
@@ -1080,7 +1097,7 @@ class SFUServer:
                                             for _c in self.clients.values():
                                                 if _c.get('uid') == streamer_uid:
                                                     raw_ip = _c.get('ip', '127.0.0.1')
-                                                    if self._is_embedded and raw_ip == self._owner_ip:
+                                                    if self._is_embedded and self._is_owner_ip(raw_ip):
                                                         streamer_ip = '127.0.0.1'
                                                     else:
                                                         streamer_ip = raw_ip
@@ -2153,6 +2170,19 @@ class SFUServer:
             except Exception as e:
                 print(f"[Server] ChatDB init error: {e}")
         self._owner_ip = host_ip
+        # Собираем ВСЕ локальные адреса хоста (по всем интерфейсам/туннелям),
+        # чтобы корректно опознавать собственные соединения независимо от
+        # того, по какому интерфейсу подключился друг. Loopback уже включён.
+        try:
+            from network_engine.server_discovery import get_all_local_ips
+            self._owner_ips = {'127.0.0.1', '::1', 'localhost'}
+            self._owner_ips.update(get_all_local_ips())
+            if host_ip:
+                self._owner_ips.add(host_ip)
+            print(f"[Server] Локальные IP хоста: {sorted(self._owner_ips)}")
+        except Exception as e:
+            print(f"[Server] get_all_local_ips error: {e}")
+            self._owner_ips = {'127.0.0.1', '::1', 'localhost', host_ip}
 
         try:
             from network_engine.sfu_bridge import get_shared as _get_sfu
