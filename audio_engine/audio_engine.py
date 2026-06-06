@@ -20,6 +20,7 @@ from config import (
     OPUS_APPLICATION, DEFAULT_BITRATE,
     UDP_HEADER_STRUCT, UDP_HEADER_SIZE,
     FLAG_STREAM_VOICES, FLAG_WHISPER, FLAG_ANONYMOUS,
+    FLAG_SPEAK_PARENT,
     STREAM_VOICE_HEADER_STRUCT, STREAM_VOICE_HEADER_SIZE,
     ANONYMOUS_UID,
     AUDIO_DIAG_ENABLED,
@@ -250,7 +251,14 @@ class AudioHandler(QObject):
         self.last_voice_time = 0
         self.my_uid = 0
         self.my_sequence = 0
+        self._channel_master_gain: float = 1.0
+        self._parent_channel_gain: float = 1.0
+        self._uid_room: dict = {}
+        self._my_room = None
+        self._parent_of_my_room = None
+        self._room_map_lock = threading.Lock()
         self.whisper_target_uid: int = 0
+        self._speak_parent_active: bool = False
         self._whisper_sequence: int = 0
         self._whisper_anonymous: bool = False
         self._anon_last_incoming_ts: float = 0.0
@@ -657,6 +665,8 @@ class AudioHandler(QObject):
             mute_flag = 1 if self._is_muted.is_set() else 0
             deaf_flag = 2 if self._is_deafened.is_set() else 0
             flags = mute_flag | deaf_flag
+            if self._speak_parent_active:
+                flags |= FLAG_SPEAK_PARENT
             whisper_uid = self.whisper_target_uid
 
             try:
@@ -762,7 +772,11 @@ class AudioHandler(QObject):
                                     self._active_whispers.pop(uid, None)
                                     self._whisper_states.pop(uid, None)
 
-                                self.mix_buffer += s * (user.volume * _speaker_gain)
+                                _grp_gain = self._channel_master_gain
+                                if self._parent_of_my_room is not None:
+                                    if self._uid_room.get(uid) == self._parent_of_my_room:
+                                        _grp_gain = self._parent_channel_gain
+                                self.mix_buffer += s * (user.volume * _speaker_gain * _grp_gain)
                                 if AUDIO_DIAG_ENABLED:
                                     _diag_voice_frame += float(np.dot(s, s)) / CHUNK_SIZE
                             else:
@@ -860,6 +874,18 @@ class AudioHandler(QObject):
                 else:
                     self.pending_volumes[uid] = saved_vol
 
+    def set_channel_master_gain(self, vol: float):
+        self._channel_master_gain = max(0.0, min(2.0, float(vol)))
+
+    def set_parent_channel_gain(self, vol: float):
+        self._parent_channel_gain = max(0.0, min(2.0, float(vol)))
+
+    def update_room_map(self, uid_room: dict, my_room, channel_parents: dict):
+        with self._room_map_lock:
+            self._uid_room = dict(uid_room)
+            self._my_room = my_room
+            self._parent_of_my_room = channel_parents.get(my_room) if my_room else None
+
     def set_user_volume(self, uid, vol):
 
         vol = max(0.0, min(20.0, float(vol)))
@@ -905,6 +931,12 @@ class AudioHandler(QObject):
               f"anon={self._whisper_anonymous}), seq_sync={self.my_sequence}")
         self.whisper_target_uid = 0
         self._whisper_anonymous = False
+
+    def start_speak_parent(self):
+        self._speak_parent_active = True
+
+    def stop_speak_parent(self):
+        self._speak_parent_active = False
 
     def add_incoming_packet(self, uid, seq, data, flags=0):
         try:

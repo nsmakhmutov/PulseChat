@@ -767,15 +767,27 @@ class NetworkClient(WebRTCMixin, CameraWebRTCMixin, ChatMixin, FeaturesMixin, QO
 
             all_users = msg.get('all_users', {})
             new_ips: dict[int, str] = {}
-            for users_in_room in all_users.values():
+            uid_room: dict[int, str] = {}
+            my_uid = getattr(self.audio, 'my_uid', 0)
+            my_room = None
+            for room_name, users_in_room in all_users.items():
                 for u in users_in_room:
                     u_uid = u.get('uid', 0)
                     u_ip  = u.get('ip',  '')
                     if u_uid and u_ip:
                         new_ips[u_uid] = u_ip
+                    if u_uid:
+                        uid_room[u_uid] = room_name
+                        if u_uid == my_uid:
+                            my_room = room_name
             self._host_order_ips = new_ips
 
             channel_list = msg.get('channel_list', [])
+            channel_parents = {
+                ch['name']: ch.get('parent') for ch in channel_list
+            }
+            if hasattr(self.audio, 'update_room_map'):
+                self.audio.update_room_map(uid_room, my_room, channel_parents)
             if channel_list:
                 self.channel_list_updated.emit(channel_list)
             self.global_state_update.emit(all_users)

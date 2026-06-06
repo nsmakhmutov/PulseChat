@@ -29,13 +29,14 @@ _DIALOG_CHANNEL_SS = """
 
 class _CreateChannelDialog(QDialog):
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, parent_name=None):
         super().__init__(parent)
+        self._parent_name = parent_name
         self.setWindowTitle("Создать канал")
         self.setModal(True)
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setFixedSize(320, 230)
+        self.setFixedSize(320, 250 if parent_name else 230)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -49,12 +50,23 @@ class _CreateChannelDialog(QDialog):
         lay.setContentsMargins(22, 18, 22, 18)
         lay.setSpacing(10)
 
-        lbl_title = QLabel("🔊  Создать временный канал")
+        if parent_name:
+            title = f"⤷  Дочерний канал для «{parent_name}»"
+        else:
+            title = "🔊  Создать временный канал"
+        lbl_title = QLabel(title)
+        lbl_title.setWordWrap(True)
         lbl_title.setStyleSheet(
             "font-size: 15px; font-weight: bold; color: #cdd6f4;"
             "background: transparent; border: none;"
         )
         lay.addWidget(lbl_title)
+
+        if parent_name:
+            lbl_hint = QLabel("Слышит родительский канал. Родитель не слышит дочерний.")
+            lbl_hint.setWordWrap(True)
+            lbl_hint.setStyleSheet("font-size: 11px; color: #6f7da0;")
+            lay.addWidget(lbl_hint)
 
         lbl_name = QLabel("Название канала:")
         lbl_name.setStyleSheet("font-size: 12px; color: #8899bb;")
@@ -110,7 +122,8 @@ class _CreateChannelDialog(QDialog):
         self._inp_pass.setVisible(checked)
         if checked:
             self._inp_pass.setFocus()
-        self.setFixedHeight(260 if checked else 230)
+        base = 250 if self._parent_name else 230
+        self.setFixedHeight(base + 30 if checked else base)
 
     def _on_ok(self):
         name = self._inp_name.text().strip()
@@ -122,6 +135,9 @@ class _CreateChannelDialog(QDialog):
 
     def get_channel_name(self) -> str:
         return self._inp_name.text().strip()
+
+    def get_parent_name(self):
+        return self._parent_name
 
     def get_password(self):
         if self._cb_pass.isChecked():

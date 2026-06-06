@@ -37,8 +37,8 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QFrame, QSizeGrip, QFileDialog, QLineEdit,
                              QScrollArea, QDialog, QCheckBox, QSizePolicy,
                              QMenu, QApplication, QSystemTrayIcon)
-from PyQt6.QtCore import Qt, QTimer, QSize, QSettings, QRect, QPoint, QEvent, QThread, pyqtSignal, QPropertyAnimation, QEasingCurve
-from PyQt6.QtGui import QIcon, QFont, QFontDatabase, QBrush, QColor, QCursor, QFontMetrics, QPixmap, QImage
+from PyQt6.QtCore import Qt, QTimer, QSize, QSettings, QRect, QPoint, QEvent, QThread, pyqtSignal, QPropertyAnimation, QEasingCurve, QMimeData
+from PyQt6.QtGui import QIcon, QFont, QFontDatabase, QBrush, QColor, QCursor, QFontMetrics, QPixmap, QImage, QDrag
 
 from config import (
     resource_path,
@@ -212,7 +212,7 @@ class MainWindow(WebcamMixin, QMainWindow):
         self.current_room = "General"
         self.default_rooms = ["General"]
         self._channel_list: list = [
-            {'name': 'General', 'has_password': False, 'permanent': True}
+            {'name': 'General', 'has_password': False, 'permanent': True, 'parent': None}
         ]
         self._pending_channel_join: str | None = None
         self.sound_files = {
@@ -474,6 +474,16 @@ class MainWindow(WebcamMixin, QMainWindow):
         self.tree.itemClicked.connect(self._on_tree_clicked_cam)
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.show_context_menu)
+
+        # Host drag-and-drop: перенос участника между каналами.
+        # Реализовано через event-filter на viewport, чтобы не менять
+        # NoSelection/NoFocus-настройки дерева.
+        self.tree.setAcceptDrops(True)
+        self.tree.viewport().setAcceptDrops(True)
+        self.tree.viewport().installEventFilter(self)
+        self._drag_press_pos = None
+        self._drag_press_uid = None
+        self._drag_active = False
 
         layout.addWidget(self.tree, stretch=1)
 
@@ -936,6 +946,11 @@ class MainWindow(WebcamMixin, QMainWindow):
 
     def eventFilter(self, obj, event):
 
+        if hasattr(self, 'tree') and obj is self.tree.viewport():
+            handled = self._tree_drag_event_filter(event)
+            if handled:
+                return True
+
         if (event.type() == QEvent.Type.MouseMove
                 and not self._resize_direction
                 and not self.isMaximized()):
@@ -946,6 +961,127 @@ class MainWindow(WebcamMixin, QMainWindow):
             else:
                 self.unsetCursor()
         return False
+
+    def _tree_drag_event_filter(self, event) -> bool:
+        """
+        Host-only drag-and-drop участников между каналами.
+        Возвращает True, если событие поглощено.
+        Не-хост: ничего не делает (return False) — обычное поведение дерева.
+        """
+        et = event.type()
+
+        if et == QEvent.Type.MouseButtonPress:
+            self._drag_press_pos = None
+            self._drag_press_uid = None
+            if event.button() != Qt.MouseButton.LeftButton:
+                return False
+            if not self._is_server_host():
+                return False
+            item = self.tree.itemAt(event.pos())
+            if item is None:
+                return False
+            if item.data(0, Qt.ItemDataRole.UserRole) == "ROOM_HEADER":
+                return False
+            uid = item.data(0, Qt.ItemDataRole.UserRole)
+            if not uid or not isinstance(uid, int):
+                return False
+            # Себя не перетаскиваем.
+            if uid == getattr(self.audio, 'my_uid', 0):
+                return False
+            self._drag_press_pos = event.pos()
+            self._drag_press_uid = uid
+            return False
+
+        if et == QEvent.Type.MouseMove:
+            if self._drag_press_uid is None or self._drag_press_pos is None:
+                return False
+            if not (event.buttons() & Qt.MouseButton.LeftButton):
+                return False
+            from PyQt6.QtWidgets import QApplication
+            dist = (event.pos() - self._drag_press_pos).manhattanLength()
+            if dist < QApplication.startDragDistance():
+                return False
+            self._start_user_drag(self._drag_press_uid)
+            self._drag_press_pos = None
+            self._drag_press_uid = None
+            return True
+
+        if et in (QEvent.Type.DragEnter, QEvent.Type.DragMove):
+            md = event.mimeData()
+            if md is not None and md.hasFormat('application/x-inpulse-uid'):
+                item = self.tree.itemAt(event.position().toPoint())
+                dest = self._room_of_item(item)
+                if dest is not None:
+                    event.setDropAction(Qt.DropAction.MoveAction)
+                    event.accept()
+                    return True
+            event.ignore()
+            return True
+
+        if et == QEvent.Type.Drop:
+            md = event.mimeData()
+            if md is None or not md.hasFormat('application/x-inpulse-uid'):
+                return False
+            try:
+                moved_uid = int(bytes(md.data('application/x-inpulse-uid')).decode())
+            except (ValueError, TypeError):
+                return True
+            item = self.tree.itemAt(event.position().toPoint())
+            dest_room = self._room_of_item(item)
+            if dest_room is not None and self._is_server_host():
+                self._do_host_move(moved_uid, dest_room)
+                event.acceptProposedAction()
+            return True
+
+        return False
+
+    def _room_of_item(self, item):
+        """Возвращает имя канала для item (заголовок канала или строка участника)."""
+        if item is None:
+            return None
+        if item.data(0, Qt.ItemDataRole.UserRole) == "ROOM_HEADER":
+            return item.data(1, Qt.ItemDataRole.UserRole)
+        # Брошено на участника → берём его канал (родительский item-заголовок).
+        parent = item.parent()
+        while parent is not None:
+            if parent.data(0, Qt.ItemDataRole.UserRole) == "ROOM_HEADER":
+                return parent.data(1, Qt.ItemDataRole.UserRole)
+            parent = parent.parent()
+        return None
+
+    def _start_user_drag(self, uid: int):
+        drag = QDrag(self.tree)
+        md = QMimeData()
+        md.setData('application/x-inpulse-uid', str(uid).encode())
+        drag.setMimeData(md)
+        info = self.known_uids.get(uid, {})
+        nick = ''
+        item = info.get('item')
+        if item is not None:
+            nick = item.text(0).strip()
+        if nick:
+            pm = QPixmap(160, 26)
+            pm.fill(QColor(91, 142, 245, 220))
+            from PyQt6.QtGui import QPainter
+            p = QPainter(pm)
+            p.setPen(QColor('#ffffff'))
+            p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, f"➡ {nick}")
+            p.end()
+            drag.setPixmap(pm)
+        drag.exec(Qt.DropAction.MoveAction)
+
+    def _do_host_move(self, target_uid: int, dest_room: str):
+        info = self.known_uids.get(target_uid, {})
+        cur_room = self._room_of_item(info.get('item')) if info.get('item') else None
+        if cur_room == dest_room:
+            return
+        if hasattr(self.net, 'send_host_move'):
+            self.net.send_host_move(target_uid, dest_room)
+            nick = ''
+            if info.get('item') is not None:
+                nick = info['item'].text(0).strip()
+            print(f"[UI] Хост перемещает {nick or target_uid} → '{dest_room}'")
+
 
     def mouseReleaseEvent(self, e):
         self._resize_direction = None
@@ -1602,6 +1738,47 @@ class MainWindow(WebcamMixin, QMainWindow):
                 except Exception as e:
                     print(f"[HK] whisper global hook install error: {e}")
 
+            # ── Speak-to-parent PTT ────────────────────────────────────────
+            sp_hk = self.app_settings.value("speak_parent_hk", "")
+            if sp_hk:
+                sp_trigger = sp_hk.replace(" ", "").split("+")[-1].lower()
+                self._sp_hk_active = [False]
+
+                def _sp_press():
+                    try:
+                        if self._sp_hk_active[0]:
+                            return
+                        # Только если мы в дочернем канале.
+                        if self._parent_of(self.current_room) is None:
+                            print("[HK] Speak-to-parent: текущий канал не дочерний")
+                            return
+                        self._sp_hk_active[0] = True
+                        self.audio.start_speak_parent()
+                        print(f"[HK] Speak-to-parent START (room='{self.current_room}')")
+                    except Exception as ex:
+                        print(f"[HK] speak-parent press exception: {ex}")
+                        self._sp_hk_active[0] = False
+
+                try:
+                    keyboard.add_hotkey(sp_hk, _sp_press,
+                                        trigger_on_release=False, suppress=False)
+
+                    def _sp_release_hook(e):
+                        try:
+                            if e.event_type != 'up' or not e.name:
+                                return
+                            if self._sp_hk_active[0] and e.name.lower() == sp_trigger:
+                                self._sp_hk_active[0] = False
+                                self.audio.stop_speak_parent()
+                                print("[HK] Speak-to-parent STOP")
+                        except Exception as ex:
+                            print(f"[HK] speak-parent release exception: {ex}")
+
+                    keyboard.hook(_sp_release_hook, suppress=False)
+                    print(f"[HK] Speak-to-parent hotkey → '{sp_hk}' (trigger='{sp_trigger}')")
+                except Exception as e:
+                    print(f"[HK] speak-parent hotkey error ({sp_hk!r}): {e}")
+
             hk_count = int(self.app_settings.value("hk_table_count", 0))
             for i in range(hk_count):
                 ftype = self.app_settings.value(f"hk_table_{i}_type", "none")
@@ -2072,6 +2249,9 @@ class MainWindow(WebcamMixin, QMainWindow):
             # «хвостовой»/буферизованный UDP-датаграмма от прошлой сессии под
             # тем же портом может прилететь и вызвать ложное «Вам кто-то шепчет».
             self._connect_ts = time.perf_counter()
+            # Гасим ложный звук «смены комнаты» на первом sync_users после входа
+            # (звук самого входа играется ниже через _play_own_join_sound).
+            self._join_sound_synced = False
             self.audio.start(
                 self.app_settings.value("device_in_name"),
                 self.app_settings.value("device_out_name")
@@ -2132,10 +2312,23 @@ class MainWindow(WebcamMixin, QMainWindow):
         if room_changed:
             self.current_room = my_new_room
             self._chat_panel.update_room_label(self.current_room)
-            # Сменили комнату — кастомный звук (если есть) играем у себя
-            # ЛОКАЛЬНО и шлём собеседникам новой комнаты. Иначе — стандартный
-            # self_move. Никогда не оба сразу.
-            self._play_own_join_sound()
+            self._apply_channel_volume_for_room(self.current_room)
+            self._close_speak_overlay()
+            # Звук смены комнаты НЕ играем на первом sync_users после входа:
+            # on_connected уже сыграл звук входа, а первый sync приносит реальную
+            # комнату и ложно выглядит как «смена» (дефолт current_room='General').
+            if getattr(self, '_join_sound_synced', True):
+                # Сменили комнату — кастомный звук (если есть) играем у себя
+                # ЛОКАЛЬНО и шлём собеседникам новой комнаты. Иначе — стандартный
+                # self_move. Никогда не оба сразу.
+                self._play_own_join_sound()
+            else:
+                self._join_sound_synced = True
+        else:
+            # Первый sync пришёл с той же комнатой (например уже 'General') —
+            # тоже считаем синхронизацию состоявшейся, чтобы следующая реальная
+            # смена комнаты не была ошибочно заглушена.
+            self._join_sound_synced = True
 
         current_room_uids = {
             u['uid']
@@ -2311,6 +2504,10 @@ class MainWindow(WebcamMixin, QMainWindow):
 
         _new_sig = (
             tuple(self.default_rooms),   # ← изменение списка каналов = rebuild
+            tuple(sorted(
+                (ch['name'], ch.get('parent'))
+                for ch in self._channel_list
+            )),
             tuple(
                 (r, u['uid'], u['nick'], u.get('mute'), u.get('deaf'),
                  u.get('is_streaming'), u.get('is_camera'),
@@ -2332,15 +2529,34 @@ class MainWindow(WebcamMixin, QMainWindow):
         font_r = self._font_room
         font_u = self._font_user
 
-        all_rooms = sorted(list(set(users_map.keys()).union(set(self.default_rooms))),
-                           key=lambda x: (x not in self.default_rooms, x))
+        _parent_map = {ch['name']: ch.get('parent') for ch in self._channel_list}
+        _base_rooms = set(users_map.keys()).union(set(self.default_rooms))
+        _roots = sorted(
+            [r for r in _base_rooms if not _parent_map.get(r)],
+            key=lambda x: (x not in self.default_rooms, x)
+        )
+        all_rooms = []
+        for r in _roots:
+            all_rooms.append(r)
+            for c in sorted(x for x in _base_rooms if _parent_map.get(x) == r):
+                all_rooms.append(c)
+        for r in sorted(_base_rooms):
+            if r not in all_rooms:
+                all_rooms.append(r)
 
         for room in all_rooms:
             cl_room = room.replace("#", "").strip()
-            item_r = QTreeWidgetItem(self.tree, [f"# {cl_room.upper()}", "", "", ""])
+            _is_child = bool(_parent_map.get(room))
+            if _is_child:
+                header_txt = f"    ⤷ {cl_room.upper()}"
+            else:
+                header_txt = f"# {cl_room.upper()}"
+            item_r = QTreeWidgetItem(self.tree, [header_txt, "", "", ""])
             item_r.setFirstColumnSpanned(True)
             item_r.setFont(0, font_r)
             item_r.setForeground(0, self._br_gray)
+            if _is_child:
+                item_r.setToolTip(0, f"Слышит «{_parent_map.get(room)}». Родитель не слышит дочерний.")
             item_r.setFlags(item_r.flags() & ~Qt.ItemFlag.ItemIsSelectable)
             item_r.setData(0, Qt.ItemDataRole.UserRole, "ROOM_HEADER")
             item_r.setData(1, Qt.ItemDataRole.UserRole, room)
@@ -2778,31 +2994,64 @@ class MainWindow(WebcamMixin, QMainWindow):
         item = self.tree.itemAt(pos)
 
         if not item or item.data(0, Qt.ItemDataRole.UserRole) == "ROOM_HEADER":
-            if self._is_server_host():
-                menu = QMenu(self)
-                menu.setStyleSheet(
-                    "QMenu { background: rgba(20,22,35,245); border: 1px solid rgba(255,255,255,0.14);"
-                    " border-radius: 8px; padding: 4px; color: #c8d0e0; font-size: 13px; }"
-                    "QMenu::item { padding: 6px 18px; border-radius: 5px; }"
-                    "QMenu::item:selected { background: rgba(91,142,245,0.30); color: #fff; }"
-                )
+            clicked_room = None
+            if item and item.data(0, Qt.ItemDataRole.UserRole) == "ROOM_HEADER":
+                clicked_room = item.data(1, Qt.ItemDataRole.UserRole)
+
+            is_host = self._is_server_host()
+            if not clicked_room and not is_host:
+                return
+
+            menu = QMenu(self)
+            menu.setStyleSheet(
+                "QMenu { background: rgba(20,22,35,245); border: 1px solid rgba(255,255,255,0.14);"
+                " border-radius: 8px; padding: 4px; color: #c8d0e0; font-size: 13px; }"
+                "QMenu::item { padding: 6px 18px; border-radius: 5px; }"
+                "QMenu::item:selected { background: rgba(91,142,245,0.30); color: #fff; }"
+            )
+
+            act_vol = None
+            act_speak = None
+            if clicked_room:
+                parent_of = self._parent_of(clicked_room)
+                vol_label = ("🔉  Громкость родителя"
+                             if parent_of else "🔉  Громкость канала")
+                act_vol = menu.addAction(vol_label)
+                # «Сказать» доступно, если кликнут родитель моего текущего канала.
+                if clicked_room == self._parent_of(self.current_room):
+                    act_speak = menu.addAction("🎙  Сказать (зажать)")
+
+            act_create = act_child = act_rename = None
+            if is_host:
+                if act_vol is not None:
+                    menu.addSeparator()
                 act_create = menu.addAction("🔊  Создать временный канал")
+                if clicked_room:
+                    ch_info = next(
+                        (c for c in self._channel_list if c['name'] == clicked_room),
+                        None
+                    )
+                    if ch_info is not None and ch_info.get('parent') is None:
+                        act_child = menu.addAction("⤷  Создать дочерний канал")
+                    if ch_info is not None and ch_info.get('permanent', False):
+                        menu.addSeparator()
+                        act_rename = menu.addAction("✏️  Переименовать канал")
 
-                act_rename = None
-                clicked_room = None
-                if item and item.data(0, Qt.ItemDataRole.UserRole) == "ROOM_HEADER":
-                    clicked_room = item.data(1, Qt.ItemDataRole.UserRole)
-                    for ch in self._channel_list:
-                        if ch['name'] == clicked_room and ch.get('permanent', False):
-                            menu.addSeparator()
-                            act_rename = menu.addAction("✏️  Переименовать канал")
-                            break
-
-                chosen = menu.exec(self.tree.viewport().mapToGlobal(pos))
-                if chosen == act_create:
-                    self._on_create_channel_requested()
-                elif act_rename is not None and chosen == act_rename:
-                    self._on_rename_permanent_channel(clicked_room)
+            chosen = menu.exec(self.tree.viewport().mapToGlobal(pos))
+            if chosen is None:
+                return
+            if act_vol is not None and chosen == act_vol:
+                self._show_channel_volume_popup(
+                    clicked_room, self.tree.viewport().mapToGlobal(pos))
+            elif act_speak is not None and chosen == act_speak:
+                self._show_speak_parent_overlay(
+                    clicked_room, self.tree.viewport().mapToGlobal(pos))
+            elif chosen == act_create:
+                self._on_create_channel_requested()
+            elif act_child is not None and chosen == act_child:
+                self._on_create_channel_requested(parent_name=clicked_room)
+            elif act_rename is not None and chosen == act_rename:
+                self._on_rename_permanent_channel(clicked_room)
             return
 
         uid = item.data(0, Qt.ItemDataRole.UserRole)
@@ -4215,19 +4464,191 @@ class MainWindow(WebcamMixin, QMainWindow):
     # Методы управления каналами
     # ══════════════════════════════════════════════════════════════════════════
 
-    def _on_create_channel_requested(self):
-        """Хост открывает диалог создания временного канала."""
-        dlg = _CreateChannelDialog(parent=self)
+    def _on_create_channel_requested(self, parent_name=None):
+        """Хост открывает диалог создания временного канала (опц. дочернего)."""
+        dlg = _CreateChannelDialog(parent=self, parent_name=parent_name)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         name     = dlg.get_channel_name()
         password = dlg.get_password()
-        self.net.send_json({
+        payload = {
             'action':       'create_channel',
             'channel_name': name,
             'password':     password or '',
-        })
-        print(f"[UI] Запрос создания канала: '{name}' (пароль: {'да' if password else 'нет'})")
+        }
+        if parent_name:
+            payload['parent'] = parent_name
+        self.net.send_json(payload)
+        print(f"[UI] Запрос создания канала: '{name}'"
+              f"{f' (дочерний от {parent_name})' if parent_name else ''}"
+              f" (пароль: {'да' if password else 'нет'})")
+
+    def _parent_of(self, room_name):
+        for ch in self._channel_list:
+            if ch['name'] == room_name:
+                return ch.get('parent')
+        return None
+
+    def _apply_channel_volume_for_room(self, room_name):
+        """Применяет сохранённую громкость канала и обновляет режим слайдера."""
+        parent = self._parent_of(room_name)
+        key = f"channel_vol_{room_name}"
+        try:
+            vol = int(self.app_settings.value(key, 100))
+        except (TypeError, ValueError):
+            vol = 100
+        g = (vol / 100.0) ** 2
+        if parent:
+            self.audio.set_parent_channel_gain(g)
+            self.audio.set_channel_master_gain(1.0)
+        else:
+            self.audio.set_channel_master_gain(g)
+            self.audio.set_parent_channel_gain(1.0)
+
+    def _on_channel_volume_changed(self, room_name, vol_pct):
+        self.app_settings.setValue(f"channel_vol_{room_name}", int(vol_pct))
+        if room_name == self.current_room:
+            self._apply_channel_volume_for_room(room_name)
+
+    def _show_channel_volume_popup(self, room_name, global_pos):
+        from PyQt6.QtWidgets import QSlider, QWidgetAction, QMenu, QLabel, QWidget, QVBoxLayout
+        parent = self._parent_of(room_name)
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu { background: rgba(20,22,35,245); border: 1px solid rgba(255,255,255,0.14);"
+            " border-radius: 8px; padding: 8px; }"
+        )
+        box = QWidget()
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(10, 6, 10, 6)
+        lay.setSpacing(6)
+        if parent:
+            cap = f"Громкость «{parent}» (родитель)"
+        else:
+            cap = "Громкость канала"
+        lbl = QLabel(cap)
+        lbl.setStyleSheet("color:#c8d0e0; font-size:12px; background:transparent;")
+        lay.addWidget(lbl)
+        try:
+            cur = int(self.app_settings.value(f"channel_vol_{room_name}", 100))
+        except (TypeError, ValueError):
+            cur = 100
+        sld = QSlider(Qt.Orientation.Horizontal)
+        sld.setMinimum(0)
+        sld.setMaximum(140)
+        sld.setValue(cur)
+        sld.setFixedWidth(180)
+        val = QLabel(f"{cur}%")
+        val.setStyleSheet("color:#9aa5bb; font-size:11px; background:transparent;")
+        lay.addWidget(sld)
+        lay.addWidget(val)
+
+        def _on_change(v):
+            val.setText(f"{v}%")
+            self._on_channel_volume_changed(room_name, v)
+        sld.valueChanged.connect(_on_change)
+
+        act = QWidgetAction(menu)
+        act.setDefaultWidget(box)
+        menu.addAction(act)
+        menu.exec(global_pos)
+
+    def _close_speak_overlay(self):
+        """Принудительно закрыть оверлей «Сказать» и снять speak-parent."""
+        ov = getattr(self, '_speak_overlay', None)
+        self._speak_overlay = None
+        try:
+            self.audio.stop_speak_parent()
+        except Exception:
+            pass
+        if ov is not None:
+            try:
+                ov.close()
+            except Exception:
+                pass
+
+    def _show_speak_parent_overlay(self, parent_room, global_pos):
+        """
+        Плавающая кнопка push-to-talk: пока зажата — голос идёт и в дочерний,
+        и в родительский канал. Окно закрывается автоматически — при отпускании
+        кнопки, клике вне окна или смене/удалении текущего канала.
+        """
+        from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QPushButton
+
+        # Закрыть прошлую, если висит.
+        self._close_speak_overlay()
+
+        ov = QWidget(self)
+        # Popup сам закрывается при клике вне окна и не оставляет «висящих» окон.
+        ov.setWindowFlags(
+            Qt.WindowType.Popup
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+        )
+        ov.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        ov.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        ov.setFixedSize(190, 92)
+
+        lay = QVBoxLayout(ov)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        card = QWidget()
+        card.setStyleSheet(
+            "background: rgba(22,24,35,250); border: 1px solid rgba(91,142,245,0.55);"
+            " border-radius: 12px;"
+        )
+        lay.addWidget(card)
+        clay = QVBoxLayout(card)
+        clay.setContentsMargins(12, 10, 12, 12)
+        clay.setSpacing(7)
+
+        cap = QLabel(f"Сказать в «{parent_room}»")
+        cap.setStyleSheet("color:#c8d0e0; font-size:12px; background:transparent; border:none;")
+        cap.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        clay.addWidget(cap)
+
+        btn = QPushButton("🎙  Зажми и говори")
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setStyleSheet(
+            "QPushButton { background: rgba(91,142,245,0.30); color:#dbe4ff;"
+            " border:1px solid rgba(91,142,245,0.65); border-radius:8px;"
+            " font-size:13px; font-weight:bold; padding:8px 0; }"
+            "QPushButton:pressed { background: rgba(46,204,113,0.55); color:#fff;"
+            " border-color: rgba(46,204,113,0.9); }"
+        )
+        clay.addWidget(btn)
+
+        def _press():
+            if self._parent_of(self.current_room) != parent_room:
+                # Я уже не в дочернем этого родителя — не активируем и закрываем.
+                self._close_speak_overlay()
+                return
+            self.audio.start_speak_parent()
+            cap.setText(f"🔴 Говорю в «{parent_room}»")
+
+        def _release():
+            self.audio.stop_speak_parent()
+            cap.setText(f"Сказать в «{parent_room}»")
+            # Отпустил — окно больше не нужно, закрываем после короткой паузы,
+            # чтобы клик-релиз корректно обработался.
+            QTimer.singleShot(120, self._close_speak_overlay)
+
+        btn.pressed.connect(_press)
+        btn.released.connect(_release)
+
+        def _on_close(ev):
+            try:
+                self.audio.stop_speak_parent()
+            except Exception:
+                pass
+            if getattr(self, '_speak_overlay', None) is ov:
+                self._speak_overlay = None
+            ev.accept()
+        ov.closeEvent = _on_close
+
+        ov.move(global_pos)
+        ov.show()
+        self._speak_overlay = ov
 
     def _on_rename_permanent_channel(self, old_name: str):
         """
@@ -4281,6 +4702,7 @@ class MainWindow(WebcamMixin, QMainWindow):
                 'name':         channel_name,
                 'has_password': False,
                 'permanent':    False,
+                'parent':       None,
             })
         # FIX CHANNELS: немедленно обновляем default_rooms чтобы следующий
         # вызов refresh_ui (через ≤100 мс) увидел изменение в подписи дерева
@@ -4298,6 +4720,7 @@ class MainWindow(WebcamMixin, QMainWindow):
         # FIX CHANNELS: то же — немедленный sync default_rooms → rebuild дерева
         self._sync_default_rooms_from_channel_list()
         print(f"[UI] Канал удалён: '{channel_name}'")
+        self._close_speak_overlay()
         if self.current_room == channel_name:
             self.net.send_json({'action': 'join_room', 'room': 'General'})
 

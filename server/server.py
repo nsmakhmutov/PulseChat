@@ -15,6 +15,7 @@ from config import (
     UDP_RECV_BUFFER_SIZE, UDP_SEND_BUFFER_SIZE,
     UDP_HEADER_STRUCT, UDP_HEADER_SIZE,
     FLAG_STREAM_VOICES, FLAG_WHISPER, FLAG_ANONYMOUS,
+    FLAG_SPEAK_PARENT,
     STREAM_VOICE_HEADER_STRUCT, STREAM_VOICE_HEADER_SIZE,
     ANONYMOUS_UID,
     CMD_LOGIN, CMD_JOIN_ROOM, CMD_STREAM_START, CMD_STREAM_STOP,
@@ -30,6 +31,7 @@ from config import (
     CMD_JOIN_CHANNEL_AUTH, CHANNEL_NAME_MAX_LEN, CHANNEL_PASS_MAX_LEN,
     SERVER_NAME_DEFAULT,
     CMD_HOST_MUTE, CMD_FORCE_MUTED,
+    CMD_HOST_MOVE,
     CMD_HOST_KICK, CMD_HOST_BAN, CMD_HOST_UNBAN,
     CMD_BAN_LIST_REQ, CMD_BAN_LIST,
     CMD_KICKED, CMD_BANNED, BAN_LIST_PATH,
@@ -147,7 +149,7 @@ class SFUServer:
             pass
         self._general_channel_name: str = _general_name
         self._channels: dict = {
-            _general_name: {'password': None, 'permanent': True},
+            _general_name: {'password': None, 'permanent': True, 'parent': None},
         }
         self._channels_lock = threading.Lock()
 
@@ -399,16 +401,34 @@ class SFUServer:
                     'name':         name,
                     'has_password': ch['password'] is not None,
                     'permanent':    ch['permanent'],
+                    'parent':       ch.get('parent'),
                 }
                 for name, ch in self._channels.items()
             ]
 
-    def _create_temp_channel(self, name: str, password) -> bool:
+    def _can_hear(self, listener_room, speaker_room) -> bool:
+        if not listener_room or not speaker_room:
+            return False
+        if listener_room == speaker_room:
+            return True
+        with self._channels_lock:
+            ch = self._channels.get(listener_room)
+            return bool(ch and ch.get('parent') == speaker_room)
+
+    def _create_temp_channel(self, name: str, password, parent=None) -> bool:
         with self._channels_lock:
             if name in self._channels:
                 return False
-            self._channels[name] = {'password': password, 'permanent': False}
-        print(f"[Server] 📢 Создан канал '{name}' (пароль: {'да' if password else 'нет'})")
+            if parent is not None:
+                p = self._channels.get(parent)
+                if p is None or p.get('parent') is not None:
+                    return False
+            self._channels[name] = {
+                'password': password, 'permanent': False, 'parent': parent,
+            }
+        print(f"[Server] 📢 Создан канал '{name}'"
+              f"{f' (дочерний от {parent})' if parent else ''}"
+              f" (пароль: {'да' if password else 'нет'})")
         return True
 
     def _cleanup_temp_channels(self, leaving_room: str):
@@ -425,6 +445,7 @@ class SFUServer:
         if occupants > 0:
             return
 
+        orphans = []
         with self._channels_lock:
             ch = self._channels.get(leaving_room)
             if not ch or ch['permanent']:
@@ -436,21 +457,37 @@ class SFUServer:
                 )
                 if occupants_final > 0:
                     return
-                self._channels.pop(leaving_room, None)
+            children = [
+                n for n, cd in self._channels.items()
+                if cd.get('parent') == leaving_room
+            ]
+            with self.clients_lock:
+                child_occupied = any(
+                    c.get('room') in children for c in self.clients.values()
+                )
+            if child_occupied:
+                return
+            orphans = children
+            for n in children:
+                self._channels.pop(n, None)
+            self._channels.pop(leaving_room, None)
 
+        removed = orphans + [leaving_room]
         with self._channel_auth_lock:
             for auth_set in self._channel_auth.values():
-                auth_set.discard(leaving_room)
+                for r in removed:
+                    auth_set.discard(r)
 
-        print(f"[Server] 🗑 Временный канал '{leaving_room}' удалён (пустой)")
-        payload = json.dumps({
-            'action':       CMD_CHANNEL_DELETED,
-            'channel_name': leaving_room,
-        }).encode('utf-8')
         with self.clients_lock:
             conns = list(self.clients.keys())
-        for c in conns:
-            self._safe_send(c, payload)
+        for r in removed:
+            print(f"[Server] 🗑 Временный канал '{r}' удалён (пустой)")
+            payload = json.dumps({
+                'action':       CMD_CHANNEL_DELETED,
+                'channel_name': r,
+            }).encode('utf-8')
+            for c in conns:
+                self._safe_send(c, payload)
 
     def _check_channel_auth(self, conn, channel_name: str) -> bool:
         with self._channels_lock:
@@ -542,12 +579,23 @@ class SFUServer:
                     self._send_to_watchers(sender_uid, data)
 
                 else:
+                    speak_parent = bool(flags & FLAG_SPEAK_PARENT)
+                    parent_room = None
+                    if speak_parent:
+                        with self._channels_lock:
+                            _ch = self._channels.get(sender_room)
+                            parent_room = _ch.get('parent') if _ch else None
+
                     with self.clients_lock:
                         target_uids = [
                             c_data['uid']
                             for c_data in self.clients.values()
                             if c_data['uid'] != sender_uid
-                               and c_data['room'] == sender_room
+                               and (
+                                   self._can_hear(c_data['room'], sender_room)
+                                   or (parent_room is not None
+                                       and c_data['room'] == parent_room)
+                               )
                         ]
 
                     with self.udp_lock:
@@ -793,12 +841,15 @@ class SFUServer:
                             else:
                                 ch_name = msg.get('channel_name', '').strip()[:CHANNEL_NAME_MAX_LEN]
                                 ch_pass = msg.get('password', '').strip()[:CHANNEL_PASS_MAX_LEN] or None
+                                ch_parent = msg.get('parent') or None
+                                if ch_parent:
+                                    ch_parent = str(ch_parent).strip()[:CHANNEL_NAME_MAX_LEN]
                                 if not ch_name or ch_name.lower() == 'general':
                                     self._safe_send(conn, json.dumps({
                                         'action': 'create_channel_result',
                                         'ok': False, 'reason': 'invalid_name',
                                     }).encode('utf-8'))
-                                elif self._create_temp_channel(ch_name, ch_pass):
+                                elif self._create_temp_channel(ch_name, ch_pass, ch_parent):
                                     self._safe_send(conn, json.dumps({
                                         'action': 'create_channel_result',
                                         'ok': True, 'channel_name': ch_name,
@@ -1171,8 +1222,12 @@ class SFUServer:
 
                         elif action == CMD_SOUNDBOARD:
                             with self.clients_lock:
+                                sender_room = self.clients[conn]['room'] if conn in self.clients else None
                                 sender_nick = self.clients[conn]['nick'] if conn in self.clients else '?'
-                                conns = list(self.clients.keys())
+                                conns = [
+                                    c for c, d in self.clients.items()
+                                    if self._can_hear(d.get('room'), sender_room)
+                                ]
                             msg['from_nick'] = sender_nick
                             payload = json.dumps(msg).encode('utf-8')
                             for c in conns:
@@ -1273,7 +1328,49 @@ class SFUServer:
                                             'action': CMD_FORCE_MUTED,
                                         }).encode('utf-8'))
 
-                        elif action == CMD_HOST_KICK:
+                        elif action == CMD_HOST_MOVE:
+                            with self._host_order_lock:
+                                is_host_mv = bool(
+                                    self._host_order and self._host_order[0] == uid
+                                )
+                            if is_host_mv:
+                                target_uid_mv = int(msg.get('target_uid', 0))
+                                dest_room_mv = msg.get('room', '')[:CHANNEL_NAME_MAX_LEN]
+                                _gcn_mv = self._general_channel_name
+                                with self._channels_lock:
+                                    dest_exists = (
+                                        dest_room_mv == _gcn_mv
+                                        or dest_room_mv in self._channels
+                                    )
+                                if target_uid_mv and dest_room_mv and dest_exists:
+                                    target_conn_mv = None
+                                    old_room_mv = None
+                                    with self.clients_lock:
+                                        for c, d in self.clients.items():
+                                            if d.get('uid') == target_uid_mv:
+                                                target_conn_mv = c
+                                                old_room_mv = d.get('room')
+                                                break
+                                        if target_conn_mv and old_room_mv != dest_room_mv:
+                                            self.clients[target_conn_mv]['room'] = dest_room_mv
+                                    if target_conn_mv and old_room_mv != dest_room_mv:
+                                        with self.udp_lock:
+                                            self.uid_to_room[target_uid_mv] = dest_room_mv
+                                        # Хост — администратор: даём доступ к
+                                        # паролю-каналу принудительно, чтобы при
+                                        # последующем ручном входе не спрашивало.
+                                        with self._channel_auth_lock:
+                                            self._channel_auth.setdefault(
+                                                target_conn_mv, set()
+                                            ).add(dest_room_mv)
+                                        if old_room_mv and old_room_mv != dest_room_mv:
+                                            self._cleanup_temp_channels(old_room_mv)
+                                        print(f"[Server] ➡ Хост переместил uid={target_uid_mv}: "
+                                              f"'{old_room_mv}' → '{dest_room_mv}'")
+                                        self._mark_dirty()
+                                        self.send_global_state()
+
+
                             with self._host_order_lock:
                                 is_host_k = bool(
                                     self._host_order and self._host_order[0] == uid

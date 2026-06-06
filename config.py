@@ -104,6 +104,7 @@ UDP_HEADER_SIZE   = UDP_HEADER_STRUCT.size
 
 # ── UDP Flags
 
+FLAG_SPEAK_PARENT   = 8     # из дочернего: голос идёт и в дочерний, и в родительский
 FLAG_LOOPBACK_AUDIO = 16
 FLAG_STREAM_VOICES  = 32
 FLAG_WHISPER        = 64
@@ -211,6 +212,7 @@ CHAT_MEDIA_MAX_B64   = 10_000_000
 
 CMD_HOST_MUTE   = 'host_mute'
 CMD_FORCE_MUTED = 'force_muted'
+CMD_HOST_MOVE   = 'host_move'
 
 # ── Хост: кик/бан участника
 CMD_HOST_KICK     = 'host_kick'

@@ -1732,6 +1732,7 @@ class SettingsDialog(QDialog):
             ("— не задано —",                  "none",     ""),
             ("🎙  Замутить микрофон",           "mute_mic", ""),
             ("🔇  Замутить динамики (Deafen)",  "deafen",   ""),
+            ("🎙  Сказать в родительский канал", "speak_parent", ""),
         ]
 
         try:
@@ -2519,6 +2520,7 @@ class SettingsDialog(QDialog):
 
         s.setValue("hk_mute", "")
         s.setValue("hk_deafen", "")
+        s.setValue("speak_parent_hk", "")
 
         for i in range(8):
             s.setValue(f"whisper_slot_{i}_nick", "")
@@ -2554,6 +2556,8 @@ class SettingsDialog(QDialog):
                 s.setValue("hk_mute", hk)
             elif ftype == "deafen" and not s.value("hk_deafen", ""):
                 s.setValue("hk_deafen", hk)
+            elif ftype == "speak_parent" and hk and not s.value("speak_parent_hk", ""):
+                s.setValue("speak_parent_hk", hk)
             elif ftype == "whisper" and whisper_slot_idx < 8 and hk:
                 nick = ""
                 try:

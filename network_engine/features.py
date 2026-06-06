@@ -18,7 +18,7 @@ from config import (
     CMD_NUDGE_VOTE, CMD_PLAY_NUDGE, CMD_NUDGE_TRIGGERED, NUDGE_SOUND_PATH,
     CMD_FILE_OFFER, CMD_FILE_OFFER_ROOM,
     CMD_QUICK_MSG, QUICK_MSG_MAX_LEN,
-    CMD_HOST_MUTE, CMD_FORCE_MUTED,
+    CMD_HOST_MUTE, CMD_FORCE_MUTED, CMD_HOST_MOVE,
     CMD_HOST_KICK, CMD_HOST_BAN, CMD_HOST_UNBAN,
     CMD_BAN_LIST_REQ, CMD_BAN_LIST,
     CMD_KICKED, CMD_BANNED,
@@ -470,6 +470,14 @@ class FeaturesMixin:
     # ------------------------------------------------------------------
     def send_host_mute(self, target_uid: int) -> None:
         self.send_json({'action': CMD_HOST_MUTE, 'target_uid': int(target_uid)})
+
+    def send_host_move(self, target_uid: int, room: str) -> None:
+        """Хост → сервер: переместить участника в другой канал."""
+        self.send_json({
+            'action':     CMD_HOST_MOVE,
+            'target_uid': int(target_uid),
+            'room':       str(room),
+        })
 
     # ------------------------------------------------------------------
     # Host Kick / Ban / Unban
