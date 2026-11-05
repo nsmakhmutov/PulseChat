@@ -51,6 +51,8 @@ from config import (
     CMD_DRAW_STROKE,
     RC_ESC_STOP_COUNT, RC_ESC_WINDOW_SEC,
     is_anonymous_uid,
+    PLAYER_ALLOWED_EXT,
+    PLAYER_MAX_B64_SIZE,
 )
 from audio_engine import AudioHandler
 from network_engine import NetworkClient
@@ -62,10 +64,15 @@ from ui_dialogs.ui_soundboard import SoundboardPanel, SoundboardDialog
 from .ui_widgets import QuickMsgBubble, CustomTitleBar, ChatPanel
 from .ui_channel import _CreateChannelDialog, _ChannelPasswordDialog
 from .ui_webcamera import CircularVideoWindow, WebcamMixin
+from .ui_player import PlayerBar
 from .avatar_ring import (
     make_avatar_with_pulse_ring, pulse_phase, quantize_phase,
 )
 from version import APP_VERSION, APP_NAME, GITHUB_REPO
+
+# ─── Лимит base64 для общего плеера (legacy, но оставлен для проверок) ────
+_PLAYER_MAX_B64_SAFE = PLAYER_MAX_B64_SIZE
+
 
 class HoldToDisconnectButton(QPushButton):
 
@@ -148,7 +155,7 @@ class HoldToDisconnectButton(QPushButton):
             self._tick_timer.stop()
             self._stop_hold_sound()
             self._progress = 0.0
-            self.setStyleSheet("")          # вернуть стиль из родительского QSS
+            self.setStyleSheet("")
 
     def _on_hold_complete(self):
         self._tick_timer.stop()
@@ -191,9 +198,11 @@ class HoldToDisconnectButton(QPushButton):
 
 
 class MainWindow(WebcamMixin, QMainWindow):
-    # Эмитится из потока библиотеки keyboard, когда стример нажал ESC нужное
-    # число раз. Доставляется в Qt-поток через очередь сигналов.
     _rc_esc_triggered = pyqtSignal()
+
+    # ── Общий плеер: сигналы для перехода из фонового потока в GUI-поток ──
+    _player_loaded_ready = pyqtSignal(object, int, str)
+    _player_load_failed  = pyqtSignal(str)
 
     def __init__(self, ip, nick, avatar):
         super().__init__()
@@ -233,7 +242,7 @@ class MainWindow(WebcamMixin, QMainWindow):
         }
         self.prev_room_uids: set = set()
         self.prev_streaming_uids: set = set()
-        self._prev_room_camera_uids: set = set()  # FIX #1: для звука вкл/выкл камеры
+        self._prev_room_camera_uids: set = set()
 
         self.prev_all_uids: set = set()
         self._server_users_initialized: bool = False
@@ -263,6 +272,15 @@ class MainWindow(WebcamMixin, QMainWindow):
         self.net.set_video_engine(self.video)
         self.stream_windows = {}
 
+        # ── Общий плеер (UDP + Opus, FLAG_PLAYER) ──────────────────────
+        self._player_playlist: list[str] = []
+        self._player_index: int = -1
+        self._player_owner_uid: int = 0
+        self._player_playing: bool = False
+        self._player_volume = (
+            int(self.app_settings.value("player_volume", 70)) / 100.0
+        )
+
         self.setup_ui()
         self.apply_theme(self.app_settings.value("theme", "Темная"))
 
@@ -281,7 +299,7 @@ class MainWindow(WebcamMixin, QMainWindow):
         self._tray_icon.show()
         self._force_quit = False
         self._returning_to_lobby = False
-        self._leaving = False   # защита от двойного клика «Отключиться»
+        self._leaving = False
         self._chat_panel.set_my_uid(0)
         self._chat_panel.message_sent.connect(self._on_chat_panel_send)
         self._chat_panel.media_send_requested.connect(self._on_chat_media_requested)
@@ -297,10 +315,28 @@ class MainWindow(WebcamMixin, QMainWindow):
         self.audio.user_volume_zero.connect(self._on_user_volume_zero)
         self.video.frame_received.connect(self.on_video_frame)
         self.video.stream_stats_updated.connect(self.on_stream_stats_updated)
+        # ── Общий плеер: сигналы от сетевого клиента ───────────────────
+        self.net.player_loaded.connect(self._on_player_loaded_legacy)
+        self.net.player_paused.connect(self._on_player_paused)
+        self.net.player_resumed.connect(self._on_player_resumed)
+        self.net.player_stopped.connect(self._on_player_stopped)
+        self._player_loaded_ready.connect(self._on_player_load_ready)
+        self._player_load_failed.connect(self._on_player_load_failed)
+        self._update_player_visibility()
+        self._restore_player_playlist()
+        self._sync_player_volume_from_audio()
+        try:
+            self._player_bar.set_volume(self.audio._player_vol)
+        except Exception:
+            pass
+
+        self._player_end_timer = QTimer(self)
+        self._player_end_timer.setInterval(200)
+        self._player_end_timer.timeout.connect(self._poll_player_ended)
+        self._player_end_timer.start()
+
         self.net.soundboard_played.connect(self._on_soundboard_played)
         self.net.join_sound_received.connect(self._on_join_sound_received)
-        # uid → монотонное время приёма кастомного звука входа. Используется
-        # для подавления дефолтного other_join у тех, кто прислал свой звук.
         self._join_sound_recent: dict[int, float] = {}
         self.net.nudge_received.connect(self._on_nudge_received)
         self.net.nudge_triggered.connect(self._on_nudge_triggered)
@@ -309,10 +345,9 @@ class MainWindow(WebcamMixin, QMainWindow):
         self.net.banned.connect(self._on_banned_by_host)
         self.net.remote_control_requested.connect(self._on_rc_request_global)
         self.net.remote_control_event.connect(self._on_rc_event_received)
-        # 3×ESC у стримера → остановка управления (сигнал из keyboard-потока)
         self._rc_esc_triggered.connect(self._on_rc_esc_stop)
-        self._rc_esc_times: list = []     # ts последних нажатий ESC
-        self._rc_esc_hook = None          # хендл keyboard-хука (None = не активен)
+        self._rc_esc_times: list = []
+        self._rc_esc_hook = None
         self.net.file_offer_received.connect(self._on_file_offer_received)
         self.net.quick_msg_received.connect(self._on_quick_msg_received)
         self._quick_bubbles: dict[int, tuple] = {}
@@ -321,7 +356,6 @@ class MainWindow(WebcamMixin, QMainWindow):
         self.net.chat_media_received.connect(self._on_chat_media_received)
         self.net.typing_received.connect(self._on_typing_received)
         self.net.camera_frame_received.connect(self.on_network_camera_frame)
-        # НОВЫЙ путь: WebRTC H.264 кадры камеры (QImage) → круглое окно.
         self.net.camera_qframe_received.connect(self.on_camera_frame)
         self._chat_panel.typing_started.connect(self.net.send_typing)
         self.net.become_host.connect(self._on_become_host)
@@ -337,25 +371,13 @@ class MainWindow(WebcamMixin, QMainWindow):
         self.setup_hotkeys()
         self.net.connect_to_server(self.ip, self.nick, self.avatar)
         self.is_streaming = False
-        # ── Веб-камера: реестр круглых окон + флаг своей камеры ──────────
         self.init_webcam_state()
-        # Кэш аватарок с пульсирующим кольцом: ключ (avatar_name, phase_step)
         self._avatar_ring_cache: dict = {}
-        # Время старта — для расчёта фазы пульсации по ui_timer.
         self._cam_pulse_t0 = time.perf_counter()
-        # Кэш последних кадров чужих/своей вебкамер для отображения миниатюрой
-        # вместо аватара в дереве пользователей. Кадры пишутся в on_camera_frame
-        # / _on_local_cam_frame и читаются в update_user_tree при рендере иконки
-        # колонки 0. uid → QImage (последний полученный кадр).
         self._cam_last_frame: dict = {}
 
-        # Лёгкий таймер ~15 fps, который перерисовывает ТОЛЬКО иконки в
-        # колонке 0 у пользователей с включённой камерой. sync_users
-        # приходит 3-5 раз в секунду — этого мало для ощущения «живой
-        # миниатюры», и пульс кольца тоже выглядел бы дискретно. Таймер
-        # делает плавно без полного update_user_tree.
         self._cam_thumb_timer = QTimer(self)
-        self._cam_thumb_timer.setInterval(66)   # ~15 fps
+        self._cam_thumb_timer.setInterval(66)
         self._cam_thumb_timer.timeout.connect(self._refresh_cam_thumbnails)
         self._cam_thumb_timer.start()
         self._sb_panel = None
@@ -396,8 +418,8 @@ class MainWindow(WebcamMixin, QMainWindow):
         self._br_mute   = QBrush(self._c_mute)
         self._br_stream = QBrush(self._c_stream)
         self._br_def    = QBrush(self._c_def)
-        self._br_gray   = QBrush(QColor("#888888"))   # для заголовков комнат и watchers
-        self._br_gold   = QBrush(QColor("#f5c518"))   # золотой — для ника хоста
+        self._br_gray   = QBrush(QColor("#888888"))
+        self._br_gold   = QBrush(QColor("#f5c518"))
         self._px_live      = QIcon(resource_path("assets/icon/live.svg")).pixmap(25, 25)
         self._px_vol_off   = QIcon(resource_path("assets/icon/volume_off.svg")).pixmap(self._icon_size)
         self._px_mic_off   = QIcon(resource_path("assets/icon/mic_off.svg")).pixmap(self._icon_size)
@@ -411,11 +433,15 @@ class MainWindow(WebcamMixin, QMainWindow):
         self._font_user    = QFont(self.custom_font_family, 14)
         self._font_watcher = QFont(self.custom_font_family, 11)
 
+    def _sync_player_volume_from_audio(self) -> None:
+        try:
+            vol = float(getattr(self.audio, "_player_vol", 0.70))
+            self._player_volume = max(0.0, min(1.0, vol))
+        except Exception:
+            self._player_volume = 0.70
+
     def setup_ui(self):
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION} — {self.nick}")
-        # Минимум окна = ширина нижнего бара (466) + margin'ы main_page (12+12)
-        # = 490. При таком минимуме слева и справа от бара одинаковые 12 px,
-        # бар вписывается без зазора, и видимые отступы симметричны.
         self.setMinimumSize(490, 500)
         self.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
@@ -460,11 +486,11 @@ class MainWindow(WebcamMixin, QMainWindow):
         header = self.tree.header()
         header.setStretchLastSection(False)
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)  # статус дела
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)  # live/stream
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)  # deaf/vol_off
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)  # mute/mic_off
-        header.resizeSection(1, 30)   # статус — чуть уже (иконка 20×20)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        header.resizeSection(1, 30)
         header.resizeSection(2, 35)
         header.resizeSection(3, 35)
         header.resizeSection(4, 35)
@@ -475,9 +501,6 @@ class MainWindow(WebcamMixin, QMainWindow):
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.show_context_menu)
 
-        # Host drag-and-drop: перенос участника между каналами.
-        # Реализовано через event-filter на viewport, чтобы не менять
-        # NoSelection/NoFocus-настройки дерева.
         self.tree.setAcceptDrops(True)
         self.tree.viewport().setAcceptDrops(True)
         self.tree.viewport().installEventFilter(self)
@@ -490,7 +513,7 @@ class MainWindow(WebcamMixin, QMainWindow):
         self._update_banner = QPushButton()
         self._update_banner.setObjectName("updateBanner")
         self._update_banner.setVisible(False)
-        self._update_banner.clicked.connect(self.open_settings)  # откроет вкладку Версия
+        self._update_banner.clicked.connect(self.open_settings)
         layout.addWidget(self._update_banner)
 
         self._whisper_banner = QLabel()
@@ -504,7 +527,6 @@ class MainWindow(WebcamMixin, QMainWindow):
         self._whisper_banner.setFixedHeight(40)
         layout.addWidget(self._whisper_banner)
 
-        # Баннер «Управление активно» — встроен в дерево над кнопкой Чат
         self._rc_access_banner = QFrame()
         self._rc_access_banner.setObjectName("rcAccessBanner")
         self._rc_access_banner.setVisible(False)
@@ -542,6 +564,16 @@ class MainWindow(WebcamMixin, QMainWindow):
         _rc_banner_lay.addWidget(_rc_lbl, stretch=1)
         _rc_banner_lay.addWidget(_rc_stop_btn)
         layout.addWidget(self._rc_access_banner)
+
+        self._player_bar = PlayerBar()
+        self._player_bar.setVisible(False)
+        self._player_bar.prev_clicked.connect(self._on_player_prev)
+        self._player_bar.play_pause_clicked.connect(self._on_player_play_pause)
+        self._player_bar.next_clicked.connect(self._on_player_next)
+        self._player_bar.browse_clicked.connect(self._on_player_browse)
+        self._player_bar.volume_changed.connect(self._on_player_volume_changed)
+        self._player_bar.seek_changed.connect(self._on_player_seek)
+        layout.addWidget(self._player_bar)
 
         self._btn_chat_main = QPushButton("💬  Чат")
         self._btn_chat_main.setCheckable(True)
@@ -595,29 +627,11 @@ class MainWindow(WebcamMixin, QMainWindow):
 
         layout.addWidget(self._btn_chat_main)
 
-        # Кнопка «Отключиться» теперь живёт иконкой в нижнем ряду (self.btn_leave),
-        # после stream и перед индикатором лобби. Старая текстовая кнопка убрана.
-
         self._bottom_bar = QFrame()
         self._bottom_bar.setObjectName("bottomBar")
         self._bottom_bar.setFixedHeight(72)
-        # FIX #3: ширину больше НЕ форсируем большим минимумом под растяжку.
-        # Ряд кнопок сам задаёт свой минимальный размер (sizeHint), а пинг и
-        # Минимум ровно по ширине содержимого бара:
-        # margins(12+12) + 7 кнопок 46px + latency 64px + 7 промежутков по 8px
-        # = 12 + 7*46 + 64 + 7*8 + 12 = 466 px.
-        # Если поставить больше — между правой кнопкой и правым margin
-        # появится пустое место (стретч его съест и сделает справа шире,
-        # чем слева). Делаем впритык — тогда при минимальной ширине окна
-        # отступы слева/справа от внешней рамки одинаковые (= main_page margins).
         self._bottom_bar.setMinimumWidth(466)
 
-        # Внешний layout бара — почти пустой: содержит ОДИН группу-контейнер
-        # с кнопками и трейлинг-стретч. Так как сам контейнер фиксированной
-        # ширины, при resize окна Qt не пытается перераспределять пиксели
-        # между его внутренними виджетами — позиция «Настроек» остаётся
-        # пиксельно стабильной (раньше она дёргалась на ±1 px из-за
-        # дробных значений в стретче).
         outer_btns = QHBoxLayout(self._bottom_bar)
         outer_btns.setContentsMargins(12, 0, 12, 0)
         outer_btns.setSpacing(0)
@@ -659,20 +673,14 @@ class MainWindow(WebcamMixin, QMainWindow):
         self.btn_stream.setCheckable(True)
         self.btn_stream.clicked.connect(self.toggle_stream)
 
-        # ── Кнопка «Отключиться» (иконка lobby.svg) — в общем ряду,
-        #    после stream, перед индикатором лобби/соединения ────────────
-        # Используем существующий стиль #barBtnDisconnect: заливка как у
-        # остальных кнопок (btn_bg), а при наведении — красный.
         self.btn_leave = QPushButton()
         self.btn_leave.setFixedSize(46, 46)
         self.btn_leave.setObjectName("barBtnDisconnect")
         self.btn_leave.setIcon(QIcon(resource_path("assets/icon/lobby.svg")))
         self.btn_leave.setIconSize(QSize(26, 26))
         self.btn_leave.setToolTip("Отключиться")
-        # Защита от двойного клика по «Отключиться» (см. фикс мёртвых соединений).
         self.btn_leave.clicked.connect(self._on_leave_clicked)
 
-        # ── Кнопка веб-камеры (на месте бывшей lobby.svg) ──────────────
         self.btn_cam = QPushButton()
         self.btn_cam.setCheckable(True)
         self.btn_cam.setFixedSize(46, 46)
@@ -712,24 +720,14 @@ class MainWindow(WebcamMixin, QMainWindow):
         btns.addWidget(self.btn_stream)
         btns.addWidget(self.btn_leave)
         btns.addWidget(self._stream_conn_lbl)
-        # Все промежутки между кнопками одинаковые (общий setSpacing(8));
-        # отдельного увеличенного зазора перед пингом больше нет.
         btns.addWidget(self._latency_btn)
         btns.addWidget(btn_set)
 
-        # Контейнер с кнопками — фиксированной ширины. Это гарантирует,
-        # что позиции виджетов внутри (включая «Настройки») НЕ меняются при
-        # resize окна — растёт только трейлинг-спейсер во внешнем layout.
-        # Считаем по-факту: 7 кнопок 46px + latency 64px + 7 промежутков 8px
-        # = 322 + 64 + 56 = 442 px. _stream_conn_lbl (22 px) скрыт по
-        # умолчанию и в скрытом состоянии layout его не учитывает.
         _btns_group.setSizePolicy(QSizePolicy.Policy.Fixed,
                                   QSizePolicy.Policy.Preferred)
         _btns_group.setFixedWidth(442)
 
         outer_btns.addWidget(_btns_group)
-        # Трейлинг-стретч во ВНЕШНЕМ layout: при расширении окна растёт он,
-        # а не промежутки внутри группы.
         outer_btns.addStretch(1)
 
         layout.addWidget(self._bottom_bar)
@@ -963,11 +961,6 @@ class MainWindow(WebcamMixin, QMainWindow):
         return False
 
     def _tree_drag_event_filter(self, event) -> bool:
-        """
-        Host-only drag-and-drop участников между каналами.
-        Возвращает True, если событие поглощено.
-        Не-хост: ничего не делает (return False) — обычное поведение дерева.
-        """
         et = event.type()
 
         if et == QEvent.Type.MouseButtonPress:
@@ -985,7 +978,6 @@ class MainWindow(WebcamMixin, QMainWindow):
             uid = item.data(0, Qt.ItemDataRole.UserRole)
             if not uid or not isinstance(uid, int):
                 return False
-            # Себя не перетаскиваем.
             if uid == getattr(self.audio, 'my_uid', 0):
                 return False
             self._drag_press_pos = event.pos()
@@ -1036,12 +1028,10 @@ class MainWindow(WebcamMixin, QMainWindow):
         return False
 
     def _room_of_item(self, item):
-        """Возвращает имя канала для item (заголовок канала или строка участника)."""
         if item is None:
             return None
         if item.data(0, Qt.ItemDataRole.UserRole) == "ROOM_HEADER":
             return item.data(1, Qt.ItemDataRole.UserRole)
-        # Брошено на участника → берём его канал (родительский item-заголовок).
         parent = item.parent()
         while parent is not None:
             if parent.data(0, Qt.ItemDataRole.UserRole) == "ROOM_HEADER":
@@ -1106,15 +1096,11 @@ class MainWindow(WebcamMixin, QMainWindow):
 
         win_bg       = "rgba(22, 25, 40, 255)"
         surface      = "rgba(255,255,255,0.07)"
-        surface_solid= "#1e2240"
         text         = "#e8edf8"
         text_dim     = "#7888aa"
         border       = "rgba(255,255,255,0.11)"
-        border_solid = "#2e3458"
-        hover        = "rgba(255,255,255,0.09)"
         hover_solid  = "#2a2f50"
         accent       = "#5b8ef5"
-        accent_red   = "#e74c3c"
         title_bg     = "rgba(10, 12, 22, 255)"
         title_text   = "#c8d4f0"
         title_sep    = "rgba(255,255,255,0.08)"
@@ -1126,23 +1112,16 @@ class MainWindow(WebcamMixin, QMainWindow):
         btn_border   = "rgba(255,255,255,0.20)"
         scrollbar    = "rgba(255,255,255,0.20)"
         sb_track     = "rgba(255,255,255,0.05)"
-        tree_room_bg = "rgba(255,255,255,0.05)"
 
         self.setStyleSheet(f"""
             * {{ font-family: '{font_f}'; font-size: 15px; color: {text}; }}
 
-            /* ════════════════════════════════════════════════════════════════
-               Корневой контейнер окна — матовое стекло
-            ════════════════════════════════════════════════════════════════ */
             #windowRoot {{
                 background-color: {win_bg};
                 border: 1px solid {win_border};
                 border-radius: 12px;
             }}
 
-            /* ════════════════════════════════════════════════════════════════
-               Кастомный title bar — тёмная подложка, тонкий сепаратор
-            ════════════════════════════════════════════════════════════════ */
             #customTitleBar {{
                 background-color: {title_bg};
                 border: none;
@@ -1192,16 +1171,10 @@ class MainWindow(WebcamMixin, QMainWindow):
                 border: none;
             }}
 
-            /* ════════════════════════════════════════════════════════════════
-               Главная область
-            ════════════════════════════════════════════════════════════════ */
             QMainWindow, #centralWidget {{
                 background-color: transparent;
             }}
 
-            /* ════════════════════════════════════════════════════════════════
-               Дерево пользователей — «стеклянная» панель
-            ════════════════════════════════════════════════════════════════ */
             QTreeWidget {{
                 background-color: {surface};
                 color: {text};
@@ -1266,9 +1239,6 @@ class MainWindow(WebcamMixin, QMainWindow):
             QTreeWidget QScrollBar::add-line:vertical,
             QTreeWidget QScrollBar::sub-line:vertical {{ height: 0; }}
 
-            /* ════════════════════════════════════════════════════════════════
-               Нижняя панель — «матовая» подложка
-            ════════════════════════════════════════════════════════════════ */
             #bottomBar {{
                 background-color: {bottom_bg};
                 border: 1px solid {bottom_sep};
@@ -1280,7 +1250,6 @@ class MainWindow(WebcamMixin, QMainWindow):
                 border-radius: 14px;
             }}
 
-            /* ── Кнопки в bottomBar ────────────────────────────────────── */
             #barBtn {{
                 background-color: {btn_bg};
                 border: 1px solid {btn_border};
@@ -1295,7 +1264,6 @@ class MainWindow(WebcamMixin, QMainWindow):
                 background-color: rgba(231,76,60,0.35);
                 border-color: rgba(231,76,60,0.65);
             }}
-            /* ── Микрофон: зелёный когда работает, красный когда замьючен ── */
             #barBtnMic {{
                 background-color: rgba(46,204,113,0.25);
                 border: 1px solid rgba(46,204,113,0.50);
@@ -1314,7 +1282,6 @@ class MainWindow(WebcamMixin, QMainWindow):
                 background-color: rgba(231,76,60,0.50);
                 border-color: rgba(231,76,60,0.80);
             }}
-            /* ── Динамики: зелёный когда работают, красный когда замьючены ── */
             #barBtnDeafen {{
                 background-color: rgba(46,204,113,0.25);
                 border: 1px solid rgba(46,204,113,0.50);
@@ -1353,7 +1320,6 @@ class MainWindow(WebcamMixin, QMainWindow):
                 background-color: {btn_hover};
                 border-color: rgba(91,142,245,0.55);
             }}
-            /* ── Веб-камера: нейтральный фон выкл, зелёный когда вкл ── */
             #barBtnCam {{
                 background-color: {btn_bg};
                 border: 1px solid {btn_border};
@@ -1373,9 +1339,6 @@ class MainWindow(WebcamMixin, QMainWindow):
                 border-color: rgba(46,204,113,0.80);
             }}
 
-            /* ════════════════════════════════════════════════════════════════
-               Баннер обновления
-            ════════════════════════════════════════════════════════════════ */
             QPushButton#updateBanner {{
                 background-color: rgba(46,204,113,0.18);
                 color: #82e0aa;
@@ -1390,9 +1353,6 @@ class MainWindow(WebcamMixin, QMainWindow):
                 border-color: rgba(46,204,113,0.65);
             }}
 
-            /* ════════════════════════════════════════════════════════════════
-               Fallback QPushButton
-            ════════════════════════════════════════════════════════════════ */
             QPushButton {{
                 background-color: {btn_bg};
                 border: 1px solid {btn_border};
@@ -1410,7 +1370,6 @@ class MainWindow(WebcamMixin, QMainWindow):
                 color: #ff9090;
             }}
 
-            /* Кнопка переподключения */
             #btn_reconnect_green {{
                 background-color: rgba(46,204,113,0.22);
                 color: #82e0aa;
@@ -1425,9 +1384,6 @@ class MainWindow(WebcamMixin, QMainWindow):
 
             QDialog {{ background: transparent; }}
 
-            /* ════════════════════════════════════════════════════════════════
-               Быстрый чат
-            ════════════════════════════════════════════════════════════════ */
             #quickChatInput {{
                 background-color: {btn_bg};
                 border: 1px solid {btn_border};
@@ -1461,9 +1417,6 @@ class MainWindow(WebcamMixin, QMainWindow):
                 background-color: rgba(91,142,245,0.35);
             }}
 
-            /* ════════════════════════════════════════════════════════════════
-               ChatPanel — стеклянная боковая панель
-            ════════════════════════════════════════════════════════════════ */
             #chatPanel {{
                 background-color: {win_bg};
                 border-left: 1px solid {border};
@@ -1518,8 +1471,6 @@ class MainWindow(WebcamMixin, QMainWindow):
             #chatMsgContainer, #chatMsgWidget {{
                 background: transparent;
             }}
-            /* Чужие и свои пузыри — base-стиль (border-radius переопределяется
-               напрямую на каждом QFrame в ChatMessageWidget по позиции в группе) */
             #chatBubbleOther {{
                 background-color: rgba(255,255,255,0.07);
                 border: 1px solid rgba(255,255,255,0.10);
@@ -1577,12 +1528,6 @@ class MainWindow(WebcamMixin, QMainWindow):
         self._br_gray   = QBrush(QColor("#6e7a96"))
 
     def _safe_hk(self, fn, label: str = ""):
-        """
-        Обёртка для хоткей-колбэков: ловит ЛЮБОЕ исключение и гасит его на
-        месте. Без этого необработанная ошибка внутри колбэка keyboard может
-        убить keyboard-поток (и иногда сам процесс) — особенно если хоткей
-        нажат в момент высокой системной нагрузки (например, во время игры).
-        """
         def _w():
             try:
                 fn()
@@ -1591,16 +1536,6 @@ class MainWindow(WebcamMixin, QMainWindow):
         return _w
 
     def _gui_hk(self, fn, label: str = ""):
-        """
-        Обёртка для хоткей-колбэков, ТРОГАЮЩИХ GUI (resize/show/click).
-        Колбэки библиотеки keyboard вызываются из её фонового потока, а
-        Qt-виджеты обязаны меняться ТОЛЬКО в главном потоке. Если этого не
-        делать, на Windows возможны непредсказуемые эффекты — окно может
-        свернуться, зависнуть или процесс упадёт. Поэтому маршалим вызов
-        через QTimer.singleShot(0, ...) — он гарантированно отработает в
-        главном event-loop. Снаружи также оборачиваем в try/except, чтобы
-        ни одна ошибка не утекла обратно в keyboard-поток.
-        """
         def _w():
             def _runner():
                 try:
@@ -1639,16 +1574,7 @@ class MainWindow(WebcamMixin, QMainWindow):
             except Exception as e:
                 print(f"[HK] chat hotkey error: {e}")
 
-            # ── Whisper PTT ───────────────────────────────────────────────
-            # ВАЖНО: раньше для КАЖДОГО whisper-слота ставился отдельный
-            # глобальный keyboard.hook — при 3-5 слотах это давало 3-5
-            # хуков на каждый keyboard-event ОС. Под нагрузкой (например, в
-            # игре) Windows может убрать запоздавший low-level hook, а
-            # необработанное исключение внутри хук-колбэка способно убить
-            # поток keyboard и в итоге закрыть всё приложение. Поэтому
-            # теперь СОБИРАЕМ один общий hook, который по trigger_key
-            # останавливает активный whisper нужного слота.
-            whisper_states: list[dict] = []   # каждый dict: trigger_key, active[bool], stop()
+            whisper_states: list[dict] = []
 
             for i in range(5):
                 ip   = self.app_settings.value(f"whisper_slot_{i}_ip",   "")
@@ -1693,8 +1619,6 @@ class MainWindow(WebcamMixin, QMainWindow):
                                 display = target_nick or target_ip
                                 print(f"[HK] Whisper PTT: '{display}' не найден онлайн")
                         except Exception as ex:
-                            # Любая ошибка ВНУТРИ колбэка остаётся внутри —
-                            # не убивает keyboard-поток / процесс.
                             print(f"[HK] Whisper PTT _press exception: {ex}")
                             try:
                                 st["active"][0] = False
@@ -1712,8 +1636,6 @@ class MainWindow(WebcamMixin, QMainWindow):
                 except Exception as e:
                     print(f"[HK] Whisper slot {i} error ({hk!r}): {e}")
 
-            # Один общий глобальный hook — обрабатывает release-события для
-            # всех whisper-слотов сразу. Все исключения проглатываем.
             if whisper_states:
                 def _whisper_global_hook(e):
                     try:
@@ -1738,7 +1660,6 @@ class MainWindow(WebcamMixin, QMainWindow):
                 except Exception as e:
                     print(f"[HK] whisper global hook install error: {e}")
 
-            # ── Speak-to-parent PTT ────────────────────────────────────────
             sp_hk = self.app_settings.value("speak_parent_hk", "")
             if sp_hk:
                 sp_trigger = sp_hk.replace(" ", "").split("+")[-1].lower()
@@ -1748,7 +1669,6 @@ class MainWindow(WebcamMixin, QMainWindow):
                     try:
                         if self._sp_hk_active[0]:
                             return
-                        # Только если мы в дочернем канале.
                         if self._parent_of(self.current_room) is None:
                             print("[HK] Speak-to-parent: текущий канал не дочерний")
                             return
@@ -1784,7 +1704,7 @@ class MainWindow(WebcamMixin, QMainWindow):
                 ftype = self.app_settings.value(f"hk_table_{i}_type", "none")
                 if ftype != "sound":
                     continue
-                fdata = self.app_settings.value(f"hk_table_{i}_data", "")  # имя звука
+                fdata = self.app_settings.value(f"hk_table_{i}_data", "")
                 hk    = self.app_settings.value(f"hk_table_{i}_key",  "")
                 if not fdata or not hk:
                     continue
@@ -1817,8 +1737,6 @@ class MainWindow(WebcamMixin, QMainWindow):
                             })
                             print(f"[HK] Sound fired: '{name}'")
                         except Exception as ex:
-                            # Любая ошибка остаётся внутри — keyboard-поток
-                            # и сам процесс не должны падать из-за неё.
                             print(f"[HK] Sound play error '{name}': {ex}")
                     return _play
 
@@ -1832,10 +1750,8 @@ class MainWindow(WebcamMixin, QMainWindow):
         except Exception as e:
             print(f"[HK] setup_hotkeys error: {e}")
 
-        # setup_hotkeys() начинается с keyboard.unhook_all() — это сносит и наш
-        # ESC-хук. Если управление сейчас активно, вешаем его заново.
         if self._rc_viewer_uid_get() is not None:
-            self._rc_esc_hook = None      # старый хендл уже невалиден
+            self._rc_esc_hook = None
             self._rc_start_esc_watch()
 
     def play_notification(self, stype="self_move"):
@@ -1850,22 +1766,16 @@ class MainWindow(WebcamMixin, QMainWindow):
                 if hasattr(self.audio, 'play_internal_sound') and self.audio.stream:
                     self.audio.play_internal_sound(data, sr, vol)
                 else:
-                    sd.play(data * vol, sr)  # fallback если поток не запущен
+                    sd.play(data * vol, sr)
             except Exception:
                 pass
         else:
-            # Для веб-камеры не пищим бипером, если mp3 не удалось загрузить
-            # (например, старый libsndfile без поддержки MP3) — просто тишина.
             if stype in ("webcam_on", "webcam_off"):
                 return
             if vol > 0:
                 winsound.Beep(600 if stype == "self_move" else 400, 150)
 
     def _on_whisper_received(self, sender_uid: int):
-        # FIX (проблема #3): защита от ложного баннера в первые мгновения
-        # после входа. Легитимный шёпот в этот момент невозможен (собеседник
-        # должен сначала увидеть вас в комнате и зажать кнопку шёпота), а
-        # «хвостовой» UDP-пакет — вполне. Окно подавления — 1.2 c.
         _ct = getattr(self, '_connect_ts', None)
         if _ct is not None and (time.perf_counter() - _ct) < 1.2:
             return
@@ -1917,7 +1827,7 @@ class MainWindow(WebcamMixin, QMainWindow):
 
     def _show_chat_badge(self) -> None:
         if self._chat_has_unread:
-            return  # уже показан
+            return
         self._chat_has_unread = True
         self._position_chat_badge()
         self._chat_badge.setVisible(True)
@@ -2243,14 +2153,7 @@ class MainWindow(WebcamMixin, QMainWindow):
                 pass
 
             self.audio.my_uid = msg['uid']
-            # FIX (проблема #3): метка времени входа. Сразу после подключения
-            # короткое время игнорируем whisper-баннеры — за этот интервал
-            # никто физически не успеет нажать «шёпот» именно вам, а вот
-            # «хвостовой»/буферизованный UDP-датаграмма от прошлой сессии под
-            # тем же портом может прилететь и вызвать ложное «Вам кто-то шепчет».
             self._connect_ts = time.perf_counter()
-            # Гасим ложный звук «смены комнаты» на первом sync_users после входа
-            # (звук самого входа играется ниже через _play_own_join_sound).
             self._join_sound_synced = False
             self.audio.start(
                 self.app_settings.value("device_in_name"),
@@ -2260,10 +2163,6 @@ class MainWindow(WebcamMixin, QMainWindow):
             self._chat_panel.set_my_uid(self.audio.my_uid)
             self._chat_panel.update_room_label(self.current_room)
 
-            # Звук собственного входа: если задан кастомный — играем его и у
-            # себя, и широковещанием для собеседников. Стандартный self_move
-            # в этом случае НЕ играем (требование: кастомный полностью заменяет
-            # стандартный). Если кастомный не задан — стандартное поведение.
             self._play_own_join_sound()
 
             self.prev_all_uids = set()
@@ -2281,15 +2180,6 @@ class MainWindow(WebcamMixin, QMainWindow):
             print(f"[on_connected] EXCEPTION:\n{traceback.format_exc()}", flush=True)
 
     def on_video_frame(self, uid, q_image):
-        # ВАЖНО: это обработчик кадров ТРАНСЛЯЦИИ ЭКРАНА (screen-share).
-        # Кадр уходит ТОЛЬКО в окно стрима. Раньше тот же кадр ошибочно
-        # отправлялся и в круглое окно камеры (self.on_camera_frame), из-за
-        # чего у зрителя в кружок вашей камеры на мгновение «залетала»
-        # картинка самой трансляции (особенно заметно на динамике в кадре),
-        # ведь при активном стриме окно стрима и кружок камеры имели один
-        # и тот же uid (ваш). Камера приходит ОТДЕЛЬНЫМ WebRTC-треком и
-        # роутится через camera_qframe_received → on_camera_frame, поэтому
-        # здесь камеру трогать НЕ нужно.
         if uid in self.stream_windows and self.stream_windows[uid].isVisible():
             self.stream_windows[uid].update_frame(q_image)
 
@@ -2314,20 +2204,13 @@ class MainWindow(WebcamMixin, QMainWindow):
             self._chat_panel.update_room_label(self.current_room)
             self._apply_channel_volume_for_room(self.current_room)
             self._close_speak_overlay()
-            # Звук смены комнаты НЕ играем на первом sync_users после входа:
-            # on_connected уже сыграл звук входа, а первый sync приносит реальную
-            # комнату и ложно выглядит как «смена» (дефолт current_room='General').
+            if self._player_playing:
+                self._player_stop_local()
             if getattr(self, '_join_sound_synced', True):
-                # Сменили комнату — кастомный звук (если есть) играем у себя
-                # ЛОКАЛЬНО и шлём собеседникам новой комнаты. Иначе — стандартный
-                # self_move. Никогда не оба сразу.
                 self._play_own_join_sound()
             else:
                 self._join_sound_synced = True
         else:
-            # Первый sync пришёл с той же комнатой (например уже 'General') —
-            # тоже считаем синхронизацию состоявшейся, чтобы следующая реальная
-            # смена комнаты не была ошибочно заглушена.
             self._join_sound_synced = True
 
         current_room_uids = {
@@ -2350,15 +2233,7 @@ class MainWindow(WebcamMixin, QMainWindow):
         if not room_changed and self.audio.my_uid != 0:
             new_uids = current_room_uids - self.prev_room_uids
             if new_uids:
-                # Дефолтный other_join.wav может конфликтовать с кастомным
-                # «звуком при входе»: sync_users и CMD_SOUNDBOARD приходят
-                # независимо. На больших файлах (до 1 МБ → ~1.3 МБ base64)
-                # joinsound может задержаться. Поэтому откладываем дефолт
-                # на 1.5 c: если за это время хоть один новичок прислал
-                # свой звук — дефолт для него пропускаем. Если ВСЕ новички
-                # без кастомного — играем дефолт как раньше (один раз).
                 now = time.perf_counter()
-                # Чистим протухшие записи (>15 сек) — буфер не растёт.
                 self._join_sound_recent = {
                     u: t for u, t in self._join_sound_recent.items()
                     if now - t < 15.0
@@ -2391,40 +2266,19 @@ class MainWindow(WebcamMixin, QMainWindow):
 
         my_uid = getattr(self.audio, 'my_uid', 0)
 
-        # Камера выключилась у кого-то → закрываем его круглое окно (если открыто).
         stopped_cameras = getattr(self, '_prev_camera_uids', set()) - current_camera_uids
         for uid in stopped_cameras:
             if uid in self.cam_windows:
                 self._destroy_cam_window(uid)
-            # Отписываемся от его видео-трека — больше не нужны его кадры
-            # ни для большого окна, ни для миниатюры. Чистим кадр-кэш, чтобы
-            # миниатюра вернулась к обычному аватару.
             if uid != my_uid:
                 try:
                     self.net.stop_watching_camera(uid)
                 except Exception as e:
                     print(f"[Camera] stop_watching_camera({uid}) error: {e}")
             self._cam_last_frame.pop(uid, None)
-            # ВАЖНО: флаг "ручного закрытия" НЕ снимаем при остановке камеры
-            # собеседником. Иначе цикл "закрыл → он выключил → он снова
-            # включил" вернул бы авто-открытие, чего пользователь не хочет.
-            # Флаг снимается только когда пользователь сам ВРУЧНУЮ откроет
-            # окно (клик по нику в дереве).
 
-        # FIX #2: камера ВКЛЮЧИЛАСЬ у собеседника (переход выкл→вкл) в рамках
-        # той же сессии. Если ранее в этой сессии мы уже открывали и
-        # располагали его кружок (есть сохранённая геометрия) — открываем окно
-        # автоматически на том же месте и того же размера. Если кружок ни разу
-        # не открывали (геометрии нет) — НЕ открываем сами: пользователь сам
-        # решит, показывать ли камеру.
         started_cameras = current_camera_uids - getattr(self, '_prev_camera_uids', set())
 
-        # Звук вкл/выкл веб-камеры — чтобы все слышали, когда друг включает или
-        # выключает камеру. Те же условия, что и для звуков join/stream: только
-        # после инициализации, не на смене комнаты и не на собственные действия.
-        # Звук ограничиваем ТЕКУЩЕЙ комнатой (как join/stream): нет смысла
-        # пищать на камеры людей из других комнат. Сами окна камер при этом
-        # по-прежнему могут открываться независимо от комнаты.
         if not room_changed and my_uid != 0:
             _cur_room_cam = {
                 u['uid']
@@ -2438,22 +2292,12 @@ class MainWindow(WebcamMixin, QMainWindow):
                 self.play_notification("webcam_off")
             self._prev_room_camera_uids = _cur_room_cam
         else:
-            # держим базлайн в актуальном состоянии, чтобы при первом входе/
-            # смене комнаты не прилетела пачка звуков
             self._prev_room_camera_uids = {
                 u['uid']
                 for u in users_map.get(self.current_room, [])
                 if u.get('is_camera', False) and u['uid'] != my_uid
             }
 
-        # ── Подписка на ВИДЕО-ТРЕКИ камер собеседников ─────────────────────
-        # Подписываемся, как только у пира включается камера — нужно для
-        # ЖИВОЙ МИНИАТЮРЫ вместо аватара в дереве. Это независимо от того,
-        # открыто ли большое круглое окно. Отписка — в блоке stopped_cameras
-        # выше (когда пир выключит камеру или уйдёт с сервера). Если в этой
-        # же итерации авто-открывается большое окно — повторная подписка не
-        # делается, потому что open_camera_window больше не подписывается
-        # сам (см. ui_webcamera.py).
         for uid in started_cameras:
             if uid == my_uid:
                 continue
@@ -2466,12 +2310,7 @@ class MainWindow(WebcamMixin, QMainWindow):
             if uid == my_uid:
                 continue
             if uid in self.cam_windows:
-                continue  # окно уже открыто
-            # Если пользователь сам закрыл этот кружок в текущей сессии —
-            # больше не открываем автоматически. Авто-открытие восстановится,
-            # когда собеседник выключит и снова включит камеру (тогда uid
-            # уйдёт из _cam_manually_closed выше), либо когда пользователь
-            # вручную откроет окно кликом по нику в дереве.
+                continue
             if uid in getattr(self, '_cam_manually_closed', set()):
                 continue
             if getattr(self, '_cam_geometry', {}).get(uid) is not None:
@@ -2503,7 +2342,7 @@ class MainWindow(WebcamMixin, QMainWindow):
             self.prev_all_uids = all_server_uids
 
         _new_sig = (
-            tuple(self.default_rooms),   # ← изменение списка каналов = rebuild
+            tuple(self.default_rooms),
             tuple(sorted(
                 (ch['name'], ch.get('parent'))
                 for ch in self._channel_list
@@ -2513,7 +2352,6 @@ class MainWindow(WebcamMixin, QMainWindow):
                  u.get('is_streaming'), u.get('is_camera'),
                  u.get('avatar'), u.get('status_icon'),
                  u.get('status_text'),
-
                  tuple(w.get('nick', '') for w in u.get('watchers', [])))
                 for r, u_list in sorted(users_map.items())
                 for u in sorted(u_list, key=lambda x: x['uid'])
@@ -2586,7 +2424,6 @@ class MainWindow(WebcamMixin, QMainWindow):
                 status_text = u.get('status_text', '')
                 if status_icon:
                     if status_icon not in self._status_px_cache:
-
                         if len(self._status_px_cache) >= 200:
                             self._status_px_cache.clear()
                         icon_path = resource_path(f"assets/status/{status_icon}")
@@ -2598,9 +2435,9 @@ class MainWindow(WebcamMixin, QMainWindow):
                 else:
                     item_u.setData(1, Qt.ItemDataRole.DecorationRole, None)
 
-                item_u.setTextAlignment(2, Qt.AlignmentFlag.AlignCenter)  # live
-                item_u.setTextAlignment(3, Qt.AlignmentFlag.AlignCenter)  # deaf
-                item_u.setTextAlignment(4, Qt.AlignmentFlag.AlignCenter)  # mute
+                item_u.setTextAlignment(2, Qt.AlignmentFlag.AlignCenter)
+                item_u.setTextAlignment(3, Qt.AlignmentFlag.AlignCenter)
+                item_u.setTextAlignment(4, Qt.AlignmentFlag.AlignCenter)
 
                 self.known_uids[uid] = {
                     'item':        item_u,
@@ -2629,28 +2466,11 @@ class MainWindow(WebcamMixin, QMainWindow):
         self._reposition_quick_bubbles()
 
     def _make_circle_pixmap(self, src: QPixmap, size: int) -> QPixmap:
-        """
-        Возвращает КРУГЛУЮ маску квадратного pixmap'а размером size×size.
-        Альфа-канал у края — со сглаживанием. Работает корректно на High-DPI
-        мониторах (2K, 4K, дробные масштабирования Windows 125/150 %).
-
-        Почему НЕ через setClipPath: Qt клиппит по бинарной маске без
-        анти-алиасинга, и контур получается «лесенкой». Вместо клиппинга —
-        QBrush(scaled_pixmap) + drawEllipse: рисуется ЗАЛИВКА эллипса
-        текстурой, и Qt честно сглаживает по альфа-каналу.
-
-        Для High-DPI: DPR берём не от источника (там обычно 1.0 — сырые кадры
-        с вебкамеры или из QImage), а от самого окна — это реальный DPR
-        экрана, на котором будет показано. Дополнительно делаем 2x
-        супер-сэмплинг (рисуем в удвоенном физическом размере и Qt при
-        выводе сжимает): на дробных DPR это ощутимо снимает остатки лесенки.
-        """
         if src is None or src.isNull() or size <= 0:
             return QPixmap()
         from PyQt6.QtCore import QRectF
         from PyQt6.QtGui import QPainter, QBrush
 
-        # DPR экрана, а не источника. На 2K со 125% будет ~1.25, на 4K — 2.0.
         try:
             screen_dpr = float(self.devicePixelRatioF())
         except Exception:
@@ -2658,20 +2478,16 @@ class MainWindow(WebcamMixin, QMainWindow):
         if screen_dpr <= 0:
             screen_dpr = 1.0
 
-        # 2x супер-сэмплинг сверху физических пикселей экрана: рисуем мельче,
-        # потом downscale сглаживает остаточные «зубцы» на дробных масштабах.
         SS = 2
         phys = max(1, int(round(size * screen_dpr * SS)))
 
-        # 1) Масштабируем источник в физический квадрат — гладко.
         scaled = src.scaled(
             phys, phys,
             Qt.AspectRatioMode.IgnoreAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
-        scaled.setDevicePixelRatio(1.0)   # работаем в физ. координатах
+        scaled.setDevicePixelRatio(1.0)
 
-        # 2) Готовим прозрачный холст и КИСТЬ-текстуру.
         canvas = QImage(phys, phys, QImage.Format.Format_ARGB32_Premultiplied)
         canvas.fill(Qt.GlobalColor.transparent)
 
@@ -2686,8 +2502,6 @@ class MainWindow(WebcamMixin, QMainWindow):
         finally:
             p.end()
 
-        # 3) Downscale в реальный размер с учётом DPR экрана. Это даёт
-        # эффект супер-сэмплинга — лесенки практически исчезают.
         final_phys = max(1, int(round(size * screen_dpr)))
         final_img = canvas.scaled(
             final_phys, final_phys,
@@ -2698,15 +2512,6 @@ class MainWindow(WebcamMixin, QMainWindow):
         return QPixmap.fromImage(final_img)
 
     def _refresh_cam_thumbnails(self):
-        """
-        Лёгкая перерисовка ТОЛЬКО иконок колонки 0 у пиров с включённой
-        камерой. Зовётся таймером ~15 fps. sync_users приходит реже (3-5 раз
-        в секунду), и при опоре только на него миниатюра выглядела бы
-        прерывистой, а пульс кольца — дискретным. Полный update_user_tree
-        не вызываем — он много чего пересчитывает; здесь только setIcon на
-        живых кадрах. Если у пира кадра ещё нет — иконку не трогаем
-        (статичный аватар с кольцом уже стоит и тикает по sync_users).
-        """
         try:
             if not self.known_uids:
                 return
@@ -2733,7 +2538,7 @@ class MainWindow(WebcamMixin, QMainWindow):
 
                 qimg = self._cam_last_frame.get(uid)
                 if qimg is None or qimg.isNull():
-                    continue   # кадра нет — пусть статичный аватар тикает на sync_users
+                    continue
 
                 fw, fh = qimg.width(), qimg.height()
                 side = min(fw, fh)
@@ -2742,8 +2547,6 @@ class MainWindow(WebcamMixin, QMainWindow):
                 cx = (fw - side) // 2
                 cy = (fh - side) // 2
                 cropped = qimg.copy(cx, cy, side, side)
-                # Обрезаем кадр в круг, чтобы он не «выступал» из-под
-                # пульсирующего кольца квадратными углами.
                 base_pix = self._make_circle_pixmap(
                     QPixmap.fromImage(cropped), _icon_px
                 )
@@ -2753,7 +2556,6 @@ class MainWindow(WebcamMixin, QMainWindow):
                 try:
                     item.setIcon(0, QIcon(ringed))
                 except RuntimeError:
-                    # Виджет уже удалён — пропускаем.
                     pass
                 data['_ring_on'] = True
         except Exception as e:
@@ -2772,7 +2574,7 @@ class MainWindow(WebcamMixin, QMainWindow):
 
             ping_tier = 0 if ping < 60 else (1 if ping < 150 else 2)
             if not hasattr(self, '_ping_tier_cache'):
-                self._ping_tier_cache = -1   # форсируем первый рендер
+                self._ping_tier_cache = -1
             tier_changed = (ping_tier != self._ping_tier_cache)
             self._ping_tier_cache = ping_tier
 
@@ -2793,7 +2595,6 @@ class MainWindow(WebcamMixin, QMainWindow):
 
             now = time.perf_counter()
 
-            # ── Фаза пульсации обводки камеры (одна на тик) ──────────────
             _cam_phase = pulse_phase(now - self._cam_pulse_t0)
             _cam_phase_step = quantize_phase(_cam_phase)
 
@@ -2862,30 +2663,18 @@ class MainWindow(WebcamMixin, QMainWindow):
                     else:
                         item.setData(4, Qt.ItemDataRole.DecorationRole, None)
 
-                # ── Индикатор веб-камеры ──────────────────────────────────
                 curr_cam = self.is_camera_on if uid == my_uid else data.get('is_cam', False)
                 avatar_name = data.get('avatar_name')
 
                 if curr_cam:
-                    # 1) иконка камеры в колонке статуса (1), если там пусто
                     if not data.get('status_icon'):
                         item.setData(1, Qt.ItemDataRole.DecorationRole, self._px_cam)
 
-                    # 2) Аватар колонки 0:
-                    #    • если уже пришёл кадр камеры (свой или чужой) —
-                    #      рисуем ЖИВУЮ МИНИАТЮРУ (последний кадр, обрезанный
-                    #      в квадрат по центру) с тем же пульсирующим кольцом;
-                    #    • если кадров ещё нет (камера только что включилась,
-                    #      первый кадр не дошёл) — fallback: статичный аватар
-                    #      с кольцом, как раньше.
                     _isz = self.tree.iconSize()
                     _icon_px = _isz.width() if (_isz.isValid() and _isz.width() > 0) else 32
 
                     live_qimg = self._cam_last_frame.get(uid)
                     if live_qimg is not None and not live_qimg.isNull():
-                        # Center-crop кадра в квадрат — иначе KeepAspectRatio
-                        # внутри make_avatar_with_pulse_ring оставит прозрачные
-                        # поля по бокам широкого 16:9 кадра.
                         fw = live_qimg.width()
                         fh = live_qimg.height()
                         side = min(fw, fh)
@@ -2897,8 +2686,6 @@ class MainWindow(WebcamMixin, QMainWindow):
                             cx = (fw - side) // 2
                             cy = (fh - side) // 2
                             cropped = live_qimg.copy(cx, cy, side, side)
-                            # Обрезаем кадр в круг — иначе из-под кольца
-                            # торчат квадратные углы (см. отчёт пользователя).
                             base_pix = self._make_circle_pixmap(
                                 QPixmap.fromImage(cropped), _icon_px
                             )
@@ -2908,9 +2695,6 @@ class MainWindow(WebcamMixin, QMainWindow):
                         item.setIcon(0, QIcon(ringed))
                         data['_ring_on'] = True
                     elif avatar_name:
-                        # Fallback — статичный аватар с кольцом (как раньше).
-                        # Этот вариант кэшируем по (avatar_name, phase, size),
-                        # потому что вход детерминирован.
                         key = (avatar_name, _cam_phase_step, _icon_px)
                         ringed = self._avatar_ring_cache.get(key)
                         if ringed is None:
@@ -2926,13 +2710,10 @@ class MainWindow(WebcamMixin, QMainWindow):
                         item.setIcon(0, QIcon(ringed))
                         data['_ring_on'] = True
                 else:
-                    # камера выключилась — вернуть обычную аватарку один раз
                     if data.get('_ring_on') and avatar_name:
                         item.setIcon(0, QIcon(resource_path(f"assets/avatars/{avatar_name}")))
                         data['_ring_on'] = False
-                    # снять иконку камеры, если её ставили и статуса нет
                     if not data.get('status_icon'):
-                        # не затираем чужой статус-значок; только наш cam-значок
                         cur = item.data(1, Qt.ItemDataRole.DecorationRole)
                         if cur is self._px_cam:
                             item.setData(1, Qt.ItemDataRole.DecorationRole, None)
@@ -2942,10 +2723,6 @@ class MainWindow(WebcamMixin, QMainWindow):
                 elif curr_d or is_m or (uid != my_uid and u_vals and (is_locally_muted or is_vol_zero)):
                     item.setForeground(0, self._br_mute)
                 else:
-                    # Стример НЕ красится в отдельный цвет: ник как у всех —
-                    # белый по умолчанию (или золотой у хоста), а при активном
-                    # микрофоне загорается зелёным (ветка talk выше). Факт
-                    # стрима показывает отдельная «live»-иконка в колонке 2.
                     if host_uid and uid == host_uid:
                         item.setForeground(0, self._br_gold)
                     else:
@@ -2967,10 +2744,6 @@ class MainWindow(WebcamMixin, QMainWindow):
                 self.net.send_json({"action": CMD_JOIN_ROOM, "room": room_name})
 
     def _on_tree_clicked_cam(self, item, col):
-        """
-        Одиночный клик по пользователю с активной камерой → круглое PiP-окно.
-        Реагируем на клик по аватарке (колонка 0) и по иконке камеры (колонка 1).
-        """
         if item is None:
             return
         if item.data(0, Qt.ItemDataRole.UserRole) == "ROOM_HEADER":
@@ -2985,7 +2758,6 @@ class MainWindow(WebcamMixin, QMainWindow):
             return
         cam_on = self.is_camera_on if uid == self.audio.my_uid else data.get('is_cam', False)
         if cam_on:
-            # Ручное открытие — снимаем подавление авто-открытия для этого uid.
             if hasattr(self, '_cam_manually_closed'):
                 self._cam_manually_closed.discard(uid)
             self.open_camera_window(uid, item.text(0).strip())
@@ -3017,7 +2789,6 @@ class MainWindow(WebcamMixin, QMainWindow):
                 vol_label = ("🔉  Громкость родителя"
                              if parent_of else "🔉  Громкость канала")
                 act_vol = menu.addAction(vol_label)
-                # «Сказать» доступно, если кликнут родитель моего текущего канала.
                 if clicked_room == self._parent_of(self.current_room):
                     act_speak = menu.addAction("🎙  Сказать (зажать)")
 
@@ -3237,9 +3008,6 @@ class MainWindow(WebcamMixin, QMainWindow):
                 self.audio.status_changed.disconnect(w.sync_audio_state)
             except (RuntimeError, TypeError):
                 pass
-            # RC-сигналы — глобальные (self.net.*), не умирают с окном.
-            # Без disconnect лямбда с захваченным _w=w дёргается после
-            # deleteLater() → RuntimeError "wrapped C++ object has been deleted".
             for _sig in (
                 self.net.remote_control_requested,
                 self.net.remote_control_response,
@@ -3250,7 +3018,6 @@ class MainWindow(WebcamMixin, QMainWindow):
                     _sig.disconnect()
                 except (RuntimeError, TypeError):
                     pass
-            # Сброс RC-состояния при закрытии окна
             if self._rc_streamer_uid_get() == uid:
                 self._rc_streamer_uid = None
             if self._rc_viewer_uid_get() is not None:
@@ -3258,12 +3025,6 @@ class MainWindow(WebcamMixin, QMainWindow):
                 self._rc_stop_esc_watch()
         self.stream_windows.pop(uid, None)
 
-        # stop_watching() закрывает _viewer_pc (WebRTC) в asyncio-потоке,
-        # сбрасывает _watching_streamer_uid, отправляет stream_watch_stop серверу
-        # и вызывает video.stop_viewer_for_uid() — всё в одном методе.
-        # Нельзя использовать send_json напрямую: _viewer_pc остаётся открытым
-        # на клиенте → повторное открытие стрима не получает новый on("track")
-        # и показывает «Ожидание видео...» вместо картинки.
         self.net.stop_watching()
 
         if w is not None:
@@ -3274,9 +3035,6 @@ class MainWindow(WebcamMixin, QMainWindow):
 
         gc.collect()
 
-        # Откладываем ещё один GC на 2.5 сек: к этому моменту decode_worker
-        # гарантированно завершился и его decoder/буферы готовы к сборке.
-        # Windows heap trim выполним здесь же — после декодера.
         def _deferred_cleanup():
             gc.collect()
             try:
@@ -3292,33 +3050,16 @@ class MainWindow(WebcamMixin, QMainWindow):
                 pass
         QTimer.singleShot(2500, _deferred_cleanup)
 
-    # ==================================================================
-    # Remote Control — методы MainWindow
-    # ==================================================================
-
-    # ------------------------------------------------------------------
-    # Состояние (хранится в MainWindow, не в VideoWindow)
-    # ------------------------------------------------------------------
-    # _rc_viewer_uid  — uid зрителя, которому стример выдал управление (сторона стримера)
-    # _rc_streamer_uid — uid стримера, у которого этот клиент берёт управление (сторона зрителя)
-    # Инициализируются лениво при первом использовании.
-
     def _rc_viewer_uid_get(self):
         return getattr(self, '_rc_viewer_uid', None)
 
     def _rc_streamer_uid_get(self):
         return getattr(self, '_rc_streamer_uid', None)
 
-    # ------------------------------------------------------------------
-    # Сторона ЗРИТЕЛЯ
-    # ------------------------------------------------------------------
     def _on_viewer_rc_requested(self, streamer_uid: int, window):
-        """Зритель нажал кнопку Control → отправить запрос стримеру."""
         self._rc_streamer_uid = streamer_uid
         self.net.send_remote_control_request(streamer_uid, self.nick)
 
-        # Если ответа нет N секунд (cooldown → сервер молча дропнул запрос,
-        # либо стример игнорирует диалог) — отжимаем кнопку обратно.
         self._rc_pending_window = window
         if getattr(self, '_rc_pending_timer', None) is None:
             self._rc_pending_timer = QTimer(self)
@@ -3327,10 +3068,8 @@ class MainWindow(WebcamMixin, QMainWindow):
         self._rc_pending_timer.start(12000)
 
     def _on_rc_request_timeout(self):
-        """Ответа на запрос управления не было — сбрасываем кнопку."""
         w = getattr(self, '_rc_pending_window', None)
         self._rc_pending_window = None
-        # Управление так и не активировалось → отжать кнопку
         if w is not None and not (
             getattr(w, '_control_mode', False)
         ):
@@ -3347,15 +3086,10 @@ class MainWindow(WebcamMixin, QMainWindow):
         self._rc_pending_window = None
 
     def _on_viewer_rc_released(self, streamer_uid: int, window):
-        """
-        Зритель отжал кнопку Control / нажал кнопку отмены в баннере стримера.
-        Отправляем stop, сбрасываем состояние.
-        """
         self._rc_cancel_pending_timer()
         uid = streamer_uid or self._rc_streamer_uid_get()
         if uid:
             self.net.send_remote_control_stop(uid)
-            # Управление завершено зрителем → возвращаем плавный буфер просмотра.
             try:
                 self.video.set_low_latency(uid, False)
             except Exception as e:
@@ -3364,9 +3098,6 @@ class MainWindow(WebcamMixin, QMainWindow):
         window.on_control_stopped()
 
     def _on_rc_response(self, window, granted: bool, reason: str = ''):
-        """Сервер relay-нул ответ стримера на запрос управления."""
-        # При нескольких открытых окнах сигнал прилетает во все лямбды.
-        # Реагирует только то окно, что реально ждёт ответа или уже управляет.
         pending = getattr(self, '_rc_pending_window', None)
         if window is not pending and not getattr(window, '_control_mode', False):
             return
@@ -3374,9 +3105,6 @@ class MainWindow(WebcamMixin, QMainWindow):
         self._rc_cancel_pending_timer()
         if granted:
             window.on_control_granted()
-            # Управление получено → ужимаем jitter buffer стрима этого стримера,
-            # чтобы клики отзывались почти мгновенно. Возврат к плавному
-            # просмотру — в _on_rc_stopped / _on_viewer_rc_released.
             sid = self._rc_streamer_uid_get()
             if sid is not None:
                 try:
@@ -3385,31 +3113,19 @@ class MainWindow(WebcamMixin, QMainWindow):
                     print(f"[RC] set_low_latency(on) error: {e!r}")
             return
 
-        # Отказ. Сбрасываем состояние — кнопка отжимается, можно запросить снова.
         window.on_control_denied()
         self._rc_streamer_uid = None
 
         if reason == 'cooldown':
-            # 3 отказа подряд → cooldown. Зрителю показываем мягкое уведомление
-            # один раз; дальнейшие нажатия кнопки сервер молча игнорирует.
             self._show_rc_cooldown_dialog(window)
         elif reason == 'busy':
-            # Управление уже у кого-то — тихо, без диалога.
             pass
         else:
             self._show_rc_denied_dialog(window)
 
     def _on_rc_stopped(self, window):
-        """
-        Сервер сообщил об остановке управления.
-        Может прийти как стримеру (зритель нажал «Отменить управление»),
-        так и зрителю (стример нажал «Отменить» / 3×ESC).
-        Здесь НЕ шлём stop обратно — иначе будет эхо.
-        """
-        # Сторона зрителя: управление у нас отобрали
         sid = self._rc_streamer_uid_get()
         if sid is not None:
-            # Возврат к плавному буферу просмотра (управление закончилось).
             try:
                 self.video.set_low_latency(sid, False)
             except Exception as e:
@@ -3420,7 +3136,6 @@ class MainWindow(WebcamMixin, QMainWindow):
                 window.on_control_stopped()
             except RuntimeError:
                 pass
-        # Сторона стримера: гасим ESC-вотч и баннер без повторного send_stop
         if self._rc_viewer_uid_get() is not None:
             self._rc_viewer_uid = None
             self._rc_stop_esc_watch()
@@ -3428,25 +3143,10 @@ class MainWindow(WebcamMixin, QMainWindow):
             if hasattr(self, '_rc_access_banner'):
                 self._rc_access_banner.setVisible(False)
 
-    # ------------------------------------------------------------------
-    # Сторона СТРИМЕРА
-    # ------------------------------------------------------------------
     def _on_rc_request_global(self, viewer_uid: int, viewer_nick: str):
-        """
-        Глобальный обработчик запроса управления (подключён в __init__).
-        Когда мы сами стримим — VideoWindow нашего стрима не существует,
-        поэтому показываем диалог поверх главного окна (self).
-        """
-        # window=None → _on_rc_request_received покажет диалог поверх MainWindow
         self._on_rc_request_received(None, viewer_uid, viewer_nick)
 
     def _on_rc_request_received(self, window, viewer_uid: int, viewer_nick: str):
-        """
-        Сервер relay-нул запрос зрителя.
-        window — VideoWindow если мы смотрим чужой стрим, None если мы сами стримим.
-        Показываем диалог поверх window или поверх MainWindow (self).
-        """
-        # Защита от "wrapped C++ object has been deleted"
         if window is not None:
             try:
                 is_visible = window.isVisible()
@@ -3457,12 +3157,10 @@ class MainWindow(WebcamMixin, QMainWindow):
                 self.net.send_remote_control_response(viewer_uid, False)
                 return
 
-        # Если уже есть активный контролёр — отклоняем без диалога
         if self._rc_viewer_uid_get() is not None:
             self.net.send_remote_control_response(viewer_uid, False)
             return
 
-        # Показываем диалог: поверх VideoWindow (если есть) или поверх MainWindow
         parent_widget = window if window is not None else self
         granted = self._show_rc_dialog(parent_widget, viewer_nick)
         self.net.send_remote_control_response(viewer_uid, granted)
@@ -3476,10 +3174,6 @@ class MainWindow(WebcamMixin, QMainWindow):
                 self._show_rc_streamer_banner()
 
     def _show_rc_dialog(self, parent, viewer_nick: str) -> bool:
-        """
-        Диалог запроса управления в стиле приложения (поверх всех окон).
-        Возвращает True если стример нажал «Да».
-        """
         from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
                                      QLabel, QPushButton)
         from PyQt6.QtCore import Qt
@@ -3521,7 +3215,6 @@ class MainWindow(WebcamMixin, QMainWindow):
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         v.addWidget(title)
 
-        # Имя экранируем, чтобы ник не сломал разметку
         safe_nick = (
             str(viewer_nick).replace('&', '&amp;')
                             .replace('<', '&lt;')
@@ -3593,7 +3286,6 @@ class MainWindow(WebcamMixin, QMainWindow):
         dlg.setMinimumWidth(340)
         dlg.adjustSize()
 
-        # По центру родителя/экрана и поверх всех окон
         try:
             dlg.raise_()
             dlg.activateWindow()
@@ -3603,7 +3295,6 @@ class MainWindow(WebcamMixin, QMainWindow):
         return dlg.exec() == QDialog.DialogCode.Accepted
 
     def _show_rc_denied_dialog(self, parent):
-        """Кастомный диалог «управление отклонено» в стиле приложения."""
         from PyQt6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
         from PyQt6.QtCore import Qt
 
@@ -3677,7 +3368,6 @@ class MainWindow(WebcamMixin, QMainWindow):
         dlg.exec()
 
     def _show_rc_cooldown_dialog(self, parent):
-        """Диалог «запросы временно заблокированы» (cooldown после 3 отказов)."""
         from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton
         from PyQt6.QtCore import Qt
 
@@ -3754,12 +3444,10 @@ class MainWindow(WebcamMixin, QMainWindow):
         dlg.exec()
 
     def _show_rc_streamer_banner(self):
-        """Показывает встроенный баннер управления над кнопкой «Чат»."""
         if hasattr(self, '_rc_access_banner'):
             self._rc_access_banner.setVisible(True)
 
     def _hide_rc_streamer_banner(self):
-        """Стример нажал «Отменить» в баннере — скрываем, останавливаем управление."""
         if hasattr(self, '_rc_access_banner'):
             self._rc_access_banner.setVisible(False)
         self._rc_viewer_uid = None
@@ -3768,11 +3456,6 @@ class MainWindow(WebcamMixin, QMainWindow):
         self.net.send_remote_control_stop(getattr(self.audio, 'my_uid', 0))
 
     def _rc_release_all_inputs(self):
-        """
-        Отпускает все зажатые инъекцией клавиши/кнопки. КРИТИЧНО при остановке:
-        иначе у стримера «залипают» модификаторы (Shift/Ctrl/Alt/Win) и ПК
-        ведёт себя сломанно вплоть до перезагрузки.
-        """
         try:
             if _WIN_INPUT_AVAILABLE:
                 _win_input.release_all()
@@ -3794,11 +3477,6 @@ class MainWindow(WebcamMixin, QMainWindow):
             print(f"[RC-INJECT] release_all error: {e!r}")
 
     def _on_rc_event_received(self, ev: dict):
-        """
-        Стример получил событие мыши/клавиатуры от зрителя.
-        Применяем через WinAPI SendInput (надёжно, Unicode), fallback — pyautogui.
-        Координаты нормализованы (0.0–1.0).
-        """
         ev_type = ev.get('type', '')
         if ev_type != 'mouse_move':
             print(f"[RC-INJECT] got {ev_type} ev={ev} "
@@ -3806,7 +3484,7 @@ class MainWindow(WebcamMixin, QMainWindow):
                   f"viewer={self._rc_viewer_uid_get()}")
 
         if self._rc_viewer_uid_get() is None:
-            return  # управление не активно
+            return
 
         try:
             nx = float(ev.get('x', 0))
@@ -3857,41 +3535,25 @@ class MainWindow(WebcamMixin, QMainWindow):
             traceback.print_exc()
 
     def _rc_inject_key(self, ev: dict, down: bool):
-        """
-        Инъекция одной клавиши на стороне стримера.
-
-        Приоритет — WinAPI SendInput:
-          • спец-клавиши и модификаторы → по виртуальному коду (нужно для
-            удержания и комбинаций Ctrl+C, Alt+Tab, Win и т.д.);
-          • если зажат Ctrl/Alt/Win (комбинация) → шлём латинский аналог
-            клавиши по VK (комбо срабатывает независимо от раскладки);
-          • обычный ввод символа → Unicode (печатает кириллицу/латиницу/!@#
-            на нажатии; релиз игнорируем, т.к. type_unicode делает down+up).
-        fallback — pyautogui (как раньше).
-        """
         qt_key = int(ev.get('key', 0))
         text   = ev.get('text', '') or ''
         mods   = int(ev.get('modifiers', 0))
 
-        special  = _qt_key_to_special(qt_key)          # 'ctrl','enter','f5'...
+        special  = _qt_key_to_special(qt_key)
         combo    = bool(mods & (_RC_MOD_CTRL | _RC_MOD_ALT | _RC_MOD_META))
-        key_name = _qt_key_to_basic(qt_key, text)       # 'a'..'z','0'..'9'
+        key_name = _qt_key_to_basic(qt_key, text)
 
-        # ── Путь WinAPI ──────────────────────────────────────────────────────
         if _WIN_INPUT_AVAILABLE:
             if special:
                 print(f"[RC-INJECT] win special='{special}' down={down}")
                 _win_input.key_named(special, down)
                 return
             if combo:
-                # Комбинация: шлём базовую клавишу по VK (для a-z/0-9), модификатор
-                # уже зажат отдельным special-событием.
                 vk = _basic_to_vk(key_name)
                 print(f"[RC-INJECT] win combo name='{key_name}' vk={vk} down={down}")
                 if vk:
                     _win_input.key_vk(vk, down)
                 return
-            # Обычный символ: печатаем Unicode на нажатии, релиз игнорим.
             if down and text and text.isprintable():
                 print(f"[RC-INJECT] win unicode text={text!r}")
                 _win_input.type_unicode(text)
@@ -3903,7 +3565,6 @@ class MainWindow(WebcamMixin, QMainWindow):
                     _win_input.key_vk(vk, False)
             return
 
-        # ── Fallback: pyautogui ──────────────────────────────────────────────
         if not _PYAUTOGUI_AVAILABLE:
             return
         if special:
@@ -3918,15 +3579,7 @@ class MainWindow(WebcamMixin, QMainWindow):
         elif key_name and down:
             pyautogui.press(key_name, _pause=False)
 
-    # ------------------------------------------------------------------
-    # 3×ESC — экстренная остановка управления (сторона стримера)
-    # ------------------------------------------------------------------
     def _rc_start_esc_watch(self):
-        """
-        Вешает глобальный keyboard-хук на ESC. Колбэк выполняется в потоке
-        библиотеки keyboard, поэтому реальную остановку диспатчим в Qt-поток
-        через сигнал _rc_esc_triggered.
-        """
         if self._rc_esc_hook is not None:
             return
         self._rc_esc_times = []
@@ -3939,7 +3592,6 @@ class MainWindow(WebcamMixin, QMainWindow):
             self._rc_esc_hook = None
 
     def _rc_stop_esc_watch(self):
-        """Снимает ESC-хук (управление завершено)."""
         hook = self._rc_esc_hook
         self._rc_esc_hook = None
         self._rc_esc_times = []
@@ -3950,36 +3602,25 @@ class MainWindow(WebcamMixin, QMainWindow):
                 pass
 
     def _rc_on_esc_press(self, event):
-        """
-        Колбэк keyboard (НЕ Qt-поток!). Считаем нажатия ESC в окне времени.
-        Достигли RC_ESC_STOP_COUNT → эмитим сигнал в Qt-поток.
-        """
-        # управление уже не активно — игнор
         if self._rc_viewer_uid_get() is None:
             return
         now = time.monotonic()
-        # отбрасываем устаревшие отметки за пределами окна
         self._rc_esc_times = [
             t for t in self._rc_esc_times if now - t <= RC_ESC_WINDOW_SEC
         ]
         self._rc_esc_times.append(now)
         if len(self._rc_esc_times) >= RC_ESC_STOP_COUNT:
             self._rc_esc_times = []
-            # маршалим в Qt-поток
             self._rc_esc_triggered.emit()
 
     def _on_rc_esc_stop(self):
-        """Qt-поток: стример трижды нажал ESC → останавливаем управление."""
         if self._rc_viewer_uid_get() is None:
             return
-        # Скрываем баннер, снимаем хук и шлём stop зрителю.
         self._hide_rc_streamer_banner()
 
     def open_settings(self):
-        # Запоминаем текущие устройства ДО открытия диалога.
         _dev_in_before  = self.app_settings.value("device_in_name",  "")
         _dev_out_before = self.app_settings.value("device_out_name", "")
-        # Все параметры камеры — чтобы перезапустить захват при ЛЮБОМ изменении.
         _cam_before = (
             str(self.app_settings.value("camera_index", None)),
             str(self.app_settings.value("camera_send_fps", None)),
@@ -4001,26 +3642,18 @@ class MainWindow(WebcamMixin, QMainWindow):
                 str(self.app_settings.value("camera_jpeg_quality", None)),
             )
 
-            # Перезапускаем аудиопоток ТОЛЬКО если устройство реально сменилось.
-            # При изменении VAD, громкости, soundboard-кнопок и т.д. —
-            # stream не трогаем: слушатели не услышат провала в 100ms.
             if _dev_in_after != _dev_in_before or _dev_out_after != _dev_out_before:
                 self.audio.start(_dev_in_after, _dev_out_after)
             else:
                 print("[Settings] Устройства не изменились — аудиопоток не перезапускается")
 
-            # Любой параметр камеры изменился И камера включена → рестарт на лету.
             if _cam_after != _cam_before and getattr(self, "is_camera_on", False):
                 print("[Settings] Параметры камеры изменены — перезапуск захвата на лету")
                 self.restart_camera_capture()
 
-    # ── Статус пользователя ────────────────────────────────────────────────────
+            self._sync_player_volume_from_audio()
 
     def open_status_dialog(self):
-        """
-        Программный вызов выбора статуса (резервный метод).
-        Основной UX — правый клик по своему нику в дереве (SelfStatusOverlayPanel).
-        """
         from ui_dialogs import StatusDialog
         dlg = StatusDialog(self._my_status_icon, self._my_status_text, parent=self)
         if dlg.exec():
@@ -4034,44 +3667,30 @@ class MainWindow(WebcamMixin, QMainWindow):
     def open_soundboard(self):
         from ui_dialogs.ui_soundboard import SoundboardPanel
 
-        # Проверяем состояние существующей панели с защитой от RuntimeError
-        # (возникает если C++ объект уже уничтожен Qt — крайний случай)
         try:
             if self._sb_panel is not None:
                 if self._sb_panel.isVisible():
-                    # Панель открыта → toggle: закрываем и выходим
                     self._sb_panel.close()
                     self._sb_panel = None
                     return
                 else:
-                    # Панель существует но скрыта → удаляем старый объект
                     self._sb_panel.deleteLater()
                     self._sb_panel = None
         except RuntimeError:
-            # C++ объект уже мёртв — просто сбрасываем ссылку
             self._sb_panel = None
 
         panel = SoundboardPanel(self.net, self)
         self._sb_panel = panel
-        # Позиция: слева от главного окна
         panel.adjustSize()
         win_pos = self.frameGeometry()
         px = win_pos.left() - panel.width() - 4
         py = win_pos.top()
-        # Если не помещается слева — показываем справа
         if px < 0:
             px = win_pos.right() + 4
         panel.move(px, py)
         panel.show()
 
     def _play_own_join_sound(self):
-        """
-        Звук СВОЕГО входа (вход на сервер или смена комнаты):
-          • если задан кастомный «звук при входе» — играем его у себя
-            ЛОКАЛЬНО + широковещанием собеседникам. Стандартный self_move
-            при этом НЕ играем (кастомный полностью заменяет стандартный).
-          • если кастомного нет — обычный self_move как раньше.
-        """
         path = ""
         try:
             path = self.app_settings.value("join_sound_path", "") or ""
@@ -4080,7 +3699,6 @@ class MainWindow(WebcamMixin, QMainWindow):
 
         if path and os.path.exists(path):
             try:
-                # Громкость — как у системных звуков (по требованию).
                 raw = int(self.app_settings.value("system_sound_volume", 30)) / 100.0
                 vol = raw ** 2
                 data, sr = sf.read(path, dtype='float32')
@@ -4096,30 +3714,17 @@ class MainWindow(WebcamMixin, QMainWindow):
                 print(f"[JoinSound] broadcast error: {e}")
             return
 
-        # Кастомный не задан — обычный сигнал входа.
         self.play_notification("self_move")
 
     def _on_join_sound_received(self, src_uid: int):
-        """
-        Получили кастомный «звук при входе» от другого пользователя.
-        Запоминаем uid → время, чтобы presence-diff пропустил для него
-        дефолтный user_join.wav (наш custom уже играется).
-        """
         try:
             self._join_sound_recent[int(src_uid)] = time.perf_counter()
         except (TypeError, ValueError):
             pass
 
     def _on_soundboard_played(self, from_nick: str):
-        """
-        Показывает жёлтый тост «🎵 [nick] включил звук» над кнопкой soundboard.
-        Также обновляет метку автора в открытой soundboard-панели (главное окно
-        и все открытые окна стримов).
-        """
-        # ── Тост поверх главного окна ─────────────────────────────────────────
         self._sb_toast.setText(f"🎵  {from_nick}  включил звук")
         self._sb_toast.adjustSize()
-        # Центрируем по ширине ОСНОВНОЙ области (без ChatPanel).
         _main_w = self.width()
         if self._chat_panel.isVisible():
             _main_w -= ChatPanel.PANEL_WIDTH
@@ -4131,14 +3736,11 @@ class MainWindow(WebcamMixin, QMainWindow):
         self._sb_toast.setVisible(True)
         self._sb_toast_timer.start()
 
-        # ── Метка автора в открытых soundboard-панелях ────────────────────────
-        # Главное окно
         try:
             if self._sb_panel is not None and self._sb_panel.isVisible():
                 self._sb_panel.flash_from_nick(from_nick)
         except (RuntimeError, AttributeError):
             pass
-        # Окна стримов
         for w in list(self.stream_windows.values()):
             try:
                 if w.isVisible() and w._sb_panel is not None and w._sb_panel.isVisible():
@@ -4146,28 +3748,13 @@ class MainWindow(WebcamMixin, QMainWindow):
             except (RuntimeError, AttributeError):
                 pass
 
-    # ── Слоты фичи «Пнуть» ───────────────────────────────────────────────────
-
     def _on_nudge_received(self):
-        """
-        Нас пнули — показать красный тост.
-        Звук уже воспроизводится в потоке NetworkClient._play_nudge_sound().
-        """
         self._show_nudge_toast("👟  Тебя пнули!")
 
     def _on_nudge_triggered(self, target_nick: str, voter_nick: str):
-        """
-        Broadcast: кого-то пнули в нашей комнате.
-        Показываем информационный тост у ВСЕХ участников, включая инициатора.
-        """
         self._show_nudge_toast(f"👟  {voter_nick} пнул {target_nick}!")
 
     def _show_nudge_toast(self, text: str):
-        """
-        Красный тост в правом нижнем углу главного окна на 4 секунды.
-        Создаётся один раз (lazy init) — не аллоцирует при каждом вызове.
-        Если тост уже виден — обновляем текст и перезапускаем таймер.
-        """
         if not hasattr(self, '_nudge_toast_lbl'):
             lbl = QLabel(self)
             lbl.setObjectName("nudgeToast")
@@ -4196,27 +3783,13 @@ class MainWindow(WebcamMixin, QMainWindow):
         mh = self.height()
         tw = self._nudge_toast_lbl.width()
         th = self._nudge_toast_lbl.height()
-        # Правый нижний угол, над панелью управления
         self._nudge_toast_lbl.move(mw - tw - 14, mh - th - 60)
         self._nudge_toast_lbl.raise_()
         self._nudge_toast_lbl.show()
         self._nudge_toast_timer.stop()
         self._nudge_toast_timer.start(4000)
 
-    # ------------------------------------------------------------------
-    # Файловая передача P2P — приём входящего предложения
-    # ------------------------------------------------------------------
     def _on_file_offer_received(self, msg: dict):
-        """
-        Входящий file_offer / file_offer_room от другого клиента.
-
-        Показывает компактный toast-диалог «Принять / Отклонить».
-        Если пользователь принимает — открывает QFileDialog для выбора
-        папки назначения и запускает FileReceiverWorker в отдельном потоке.
-
-        Метод вызывается в GUI-потоке (сигнал из tcp_listen подключён
-        через прямое соединение Qt → автоматически queued при cross-thread).
-        """
         filename  = msg.get('filename', 'file')
         filesize  = msg.get('filesize', 0)
         sender_ip = msg.get('sender_ip', '')
@@ -4227,8 +3800,6 @@ class MainWindow(WebcamMixin, QMainWindow):
             print(f"[UI] file_offer: неполные данные — игнорируем ({msg})")
             return
 
-        # Звуковое оповещение о входящем файле — до показа toast,
-        # чтобы пользователь услышал сигнал даже если окно не в фокусе.
         self.play_notification("file_received")
 
         size_str = _format_size(filesize)
@@ -4237,12 +3808,6 @@ class MainWindow(WebcamMixin, QMainWindow):
     def _show_file_offer_toast(self, filename: str, size_str: str,
                                sender_ip: str, port: int,
                                token: str, filesize: int):
-        """
-        Показывает компактный toast с кнопками «Принять» / «Отклонить».
-        Позиционируется в правом нижнем углу главного окна.
-        Автоматически скрывается через 30 секунд если нет реакции.
-        """
-        # ── Создаём виджет предложения ────────────────────────────────────────
         toast = QFrame(self)
         toast.setObjectName("fileOfferToast")
         toast.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
@@ -4259,20 +3824,17 @@ class MainWindow(WebcamMixin, QMainWindow):
         lay.setContentsMargins(14, 10, 14, 10)
         lay.setSpacing(6)
 
-        # Заголовок
         lbl_title = QLabel(f"📁  Входящий файл")
         lbl_title.setStyleSheet(
             "font-size: 12px; font-weight: bold; color: #8ab4f8;"
         )
         lay.addWidget(lbl_title)
 
-        # Имя и размер файла
         lbl_file = QLabel(f"{filename}  ({size_str})")
         lbl_file.setStyleSheet("font-size: 11px; color: rgba(200,205,225,0.85);")
         lbl_file.setWordWrap(True)
         lay.addWidget(lbl_file)
 
-        # Кнопки
         btn_row = QHBoxLayout()
         btn_row.setSpacing(8)
 
@@ -4311,7 +3873,6 @@ class MainWindow(WebcamMixin, QMainWindow):
         toast.adjustSize()
         toast.setFixedSize(toast.sizeHint())
 
-        # Позиционируем в правом нижнем углу главного окна
         mw, mh = self.width(), self.height()
         tx = mw - toast.width() - 14
         ty = mh - toast.height() - 60
@@ -4319,19 +3880,16 @@ class MainWindow(WebcamMixin, QMainWindow):
         toast.raise_()
         toast.show()
 
-        # Авто-скрытие через 30 секунд
         auto_hide = QTimer(self)
         auto_hide.setSingleShot(True)
         auto_hide.setInterval(30_000)
         auto_hide.timeout.connect(toast.hide)
         auto_hide.start()
 
-        # ── Обработчики кнопок ────────────────────────────────────────────────
         def _on_accept():
             auto_hide.stop()
             toast.hide()
 
-            # Выбор пути сохранения
             default_dir = os.path.join(os.path.expanduser("~"), "Downloads")
             os.makedirs(default_dir, exist_ok=True)
             save_path, _ = QFileDialog.getSaveFileName(
@@ -4341,15 +3899,13 @@ class MainWindow(WebcamMixin, QMainWindow):
                 "Все файлы (*)",
             )
             if not save_path:
-                return   # пользователь отменил диалог сохранения
+                return
 
-            # Запускаем приёмник
             worker = FileReceiverWorker(sender_ip, port, token,
                                         save_path, filesize)
             prog = FileTransferProgressWidget(filename, filesize, is_sender=False)
             prog.set_worker(worker)
 
-            # FIX #1: держим жёсткую ссылку на worker чтобы GC не убил поток
             prog._worker_strong_ref = worker
 
             worker.progress.connect(lambda r, t: prog.update_progress(r, t))
@@ -4357,17 +3913,14 @@ class MainWindow(WebcamMixin, QMainWindow):
             def _on_transfer_done(p):
                 prog.set_done(p)
                 print(f"[UI] 📥 Файл сохранён: {p}")
-                # FIX #1: автоматически скрываем оверлей через 3 сек после успеха
                 QTimer.singleShot(3000, prog.hide)
 
             def _on_transfer_error(m):
                 prog.set_error(m)
-                # FIX #1: скрываем через 4 сек после ошибки
                 QTimer.singleShot(4000, prog.hide)
 
             worker.finished.connect(_on_transfer_done)
             worker.error.connect(_on_transfer_error)
-            # FIX #1: при отмене сразу скрываем (уже было, убеждаемся что hide, не close)
             worker.cancelled.connect(lambda: prog.hide())
 
             _show_float_widget(prog)
@@ -4381,20 +3934,8 @@ class MainWindow(WebcamMixin, QMainWindow):
         btn_decline.clicked.connect(_on_decline)
 
     def _update_known_users_registry(self, users_map):
-        """
-        Обновляет реестр известных пользователей (known_users.json).
-
-        FIX MEM: раньше этот метод читал JSON-файл с диска при КАЖДОМ вызове
-        update_user_tree() — а сервер шлёт sync_users несколько раз в секунду.
-        Каждый вызов создавал новый dict, строки, объекты → постоянный мусор.
-
-        Теперь реестр кэшируется в self._known_users_cache и читается с диска
-        только один раз при первом вызове. На диск записывается только при реальных
-        изменениях данных. Это устраняет постоянную аллокацию/GC-давление.
-        """
         REGISTRY_FILE = KNOWN_USERS_PATH
 
-        # Ленивая загрузка кэша (один раз за время жизни приложения)
         if not hasattr(self, '_known_users_cache'):
             try:
                 if os.path.exists(REGISTRY_FILE):
@@ -4430,21 +3971,13 @@ class MainWindow(WebcamMixin, QMainWindow):
             except Exception as e:
                 print(f"[UI] known_users.json write error: {e}")
 
-    # ── Автообновление ─────────────────────────────────────────────────────────
-
     def _start_silent_update_check(self):
-        """
-        Запускает проверку обновлений в фоне сразу после старта.
-        При обнаружении новой версии показывает зелёный баннер внизу окна.
-        Никаких всплывающих окон — всё тихо.
-        """
         if not GITHUB_REPO:
-            return  # репо не настроено — молча пропускаем
+            return
 
         try:
             from core.updater import check_for_updates_async
         except ImportError:
-            # updater.py не в sys.path (dev-режим без сборки PyInstaller) — пропускаем.
             print("[Update] updater module не найден — автопроверка отключена")
             return
 
@@ -4454,18 +3987,12 @@ class MainWindow(WebcamMixin, QMainWindow):
         check_for_updates_async(on_update_found=_on_found)
 
     def _show_update_banner(self, version: str):
-        """Показывает зелёный баннер-кнопку с сообщением об обновлении."""
         self._update_banner.setText(
             f"🎉 Доступна новая версия v{version}  —  нажмите чтобы обновить"
         )
         self._update_banner.setVisible(True)
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # Методы управления каналами
-    # ══════════════════════════════════════════════════════════════════════════
-
     def _on_create_channel_requested(self, parent_name=None):
-        """Хост открывает диалог создания временного канала (опц. дочернего)."""
         dlg = _CreateChannelDialog(parent=self, parent_name=parent_name)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
@@ -4490,7 +4017,6 @@ class MainWindow(WebcamMixin, QMainWindow):
         return None
 
     def _apply_channel_volume_for_room(self, room_name):
-        """Применяет сохранённую громкость канала и обновляет режим слайдера."""
         parent = self._parent_of(room_name)
         key = f"channel_vol_{room_name}"
         try:
@@ -4554,7 +4080,6 @@ class MainWindow(WebcamMixin, QMainWindow):
         menu.exec(global_pos)
 
     def _close_speak_overlay(self):
-        """Принудительно закрыть оверлей «Сказать» и снять speak-parent."""
         ov = getattr(self, '_speak_overlay', None)
         self._speak_overlay = None
         try:
@@ -4568,18 +4093,11 @@ class MainWindow(WebcamMixin, QMainWindow):
                 pass
 
     def _show_speak_parent_overlay(self, parent_room, global_pos):
-        """
-        Плавающая кнопка push-to-talk: пока зажата — голос идёт и в дочерний,
-        и в родительский канал. Окно закрывается автоматически — при отпускании
-        кнопки, клике вне окна или смене/удалении текущего канала.
-        """
         from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QPushButton
 
-        # Закрыть прошлую, если висит.
         self._close_speak_overlay()
 
         ov = QWidget(self)
-        # Popup сам закрывается при клике вне окна и не оставляет «висящих» окон.
         ov.setWindowFlags(
             Qt.WindowType.Popup
             | Qt.WindowType.FramelessWindowHint
@@ -4620,7 +4138,6 @@ class MainWindow(WebcamMixin, QMainWindow):
 
         def _press():
             if self._parent_of(self.current_room) != parent_room:
-                # Я уже не в дочернем этого родителя — не активируем и закрываем.
                 self._close_speak_overlay()
                 return
             self.audio.start_speak_parent()
@@ -4629,8 +4146,6 @@ class MainWindow(WebcamMixin, QMainWindow):
         def _release():
             self.audio.stop_speak_parent()
             cap.setText(f"Сказать в «{parent_room}»")
-            # Отпустил — окно больше не нужно, закрываем после короткой паузы,
-            # чтобы клик-релиз корректно обработался.
             QTimer.singleShot(120, self._close_speak_overlay)
 
         btn.pressed.connect(_press)
@@ -4651,11 +4166,6 @@ class MainWindow(WebcamMixin, QMainWindow):
         self._speak_overlay = ov
 
     def _on_rename_permanent_channel(self, old_name: str):
-        """
-        FIX #4: Хост переименовывает постоянный канал (например General).
-        Диалог ввода нового имени. Сохраняем в USER_CONFIG_PATH и применяем на сервере.
-        Имя сохраняется между сессиями — при следующем старте сервер прочитает из конфига.
-        """
         from PyQt6.QtWidgets import QInputDialog
         new_name, ok = QInputDialog.getText(
             self,
@@ -4670,7 +4180,6 @@ class MainWindow(WebcamMixin, QMainWindow):
         if new_name == old_name:
             return
 
-        # Сохраняем в конфиг — будет применено при следующем старте сервера
         try:
             import json as _json
             from config import USER_CONFIG_PATH
@@ -4678,7 +4187,6 @@ class MainWindow(WebcamMixin, QMainWindow):
             if os.path.exists(USER_CONFIG_PATH):
                 with open(USER_CONFIG_PATH, 'r', encoding='utf-8') as f:
                     cfg = _json.load(f)
-            # Сохраняем имя главного канала под ключом 'general_channel_name'
             cfg['general_channel_name'] = new_name
             with open(USER_CONFIG_PATH, 'w', encoding='utf-8') as f:
                 _json.dump(cfg, f, ensure_ascii=False, indent=2)
@@ -4686,7 +4194,6 @@ class MainWindow(WebcamMixin, QMainWindow):
         except Exception as e:
             print(f"[UI] Ошибка сохранения имени канала: {e}")
 
-        # Отправляем команду переименования на сервер (горячее применение)
         self.net.send_json({
             'action':    'rename_channel',
             'old_name':  old_name,
@@ -4695,7 +4202,6 @@ class MainWindow(WebcamMixin, QMainWindow):
         print(f"[UI] Запрос переименования канала: '{old_name}' → '{new_name}'")
 
     def _on_channel_created(self, channel_name: str):
-        """Сервер создал новый канал — обновляем список и сразу перестраиваем дерево."""
         names = [ch['name'] for ch in self._channel_list]
         if channel_name not in names:
             self._channel_list.append({
@@ -4704,20 +4210,14 @@ class MainWindow(WebcamMixin, QMainWindow):
                 'permanent':    False,
                 'parent':       None,
             })
-        # FIX CHANNELS: немедленно обновляем default_rooms чтобы следующий
-        # вызов refresh_ui (через ≤100 мс) увидел изменение в подписи дерева
-        # и перерисовал его. Без этого новый канал появлялся только после
-        # следующего события (mute/connect другого пользователя).
         self._sync_default_rooms_from_channel_list()
         print(f"[UI] Канал создан: '{channel_name}'")
 
     def _on_channel_deleted(self, channel_name: str):
-        """Сервер удалил временный канал (он опустел) — немедленно убираем из дерева."""
         self._channel_list = [
             ch for ch in self._channel_list
             if ch['name'] != channel_name
         ]
-        # FIX CHANNELS: то же — немедленный sync default_rooms → rebuild дерева
         self._sync_default_rooms_from_channel_list()
         print(f"[UI] Канал удалён: '{channel_name}'")
         self._close_speak_overlay()
@@ -4725,13 +4225,11 @@ class MainWindow(WebcamMixin, QMainWindow):
             self.net.send_json({'action': 'join_room', 'room': 'General'})
 
     def _sync_default_rooms_from_channel_list(self):
-        """Синхронизирует default_rooms из _channel_list без ожидания sync_users."""
         permanent = [ch['name'] for ch in self._channel_list if ch.get('permanent', False)]
         temporary = [ch['name'] for ch in self._channel_list if not ch.get('permanent', False)]
         self.default_rooms = (permanent or ['General']) + sorted(temporary)
 
     def _on_join_room_denied(self, room: str, reason: str):
-        """Вход в канал отклонён — запрашиваем пароль или показываем ошибку."""
         if reason == 'channel_auth_required':
             dlg = _ChannelPasswordDialog(channel_name=room, parent=self)
             if dlg.exec() != QDialog.DialogCode.Accepted:
@@ -4749,38 +4247,17 @@ class MainWindow(WebcamMixin, QMainWindow):
             print(f"[UI] Канал '{room}' не найден")
 
     def _on_channel_auth_ok(self, channel_name: str):
-        """Авторизация прошла — входим в канал."""
         if self._pending_channel_join == channel_name:
             self._pending_channel_join = None
             self.net.send_json({'action': 'join_room', 'room': channel_name})
 
     def _on_channel_list_updated(self, channel_list: list):
-        """Получен актуальный список каналов от сервера."""
         self._channel_list = channel_list
-
-        # Строим список каналов для отображения в дереве.
-        #
-        # БЫЛО (баг): только permanent-каналы (General и т.п.).
-        # Временный пустой канал не попадал ни в users_map.keys() (никого нет),
-        # ни в default_rooms → дерево его не показывало вообще, пользователь
-        # не мог никуда кликнуть чтобы зайти в созданный канал.
-        #
-        # СТАЛО: все каналы идут в default_rooms.
-        # Порядок: сначала постоянные (General…), потом временные (по алфавиту).
-        # Временный канал виден сразу после создания, даже если он пустой.
         permanent = [ch['name'] for ch in channel_list if ch.get('permanent', False)]
         temporary = [ch['name'] for ch in channel_list if not ch.get('permanent', False)]
         self.default_rooms = (permanent or ['General']) + sorted(temporary)
 
     def _on_leave_clicked(self):
-        """
-        Обработчик кнопки «Отключиться» с защитой от повторных нажатий.
-
-        Без этого двойной клик (или клик во время уже идущего отключения)
-        запускал _disconnect_and_show_lobby несколько раз → создавалось
-        несколько процедур teardown и переподключений → на сервере висели
-        «мёртвые» дубли одного и того же клиента.
-        """
         if getattr(self, '_leaving', False):
             print("[UI] _on_leave_clicked: отключение уже идёт, игнор")
             return
@@ -4792,36 +4269,19 @@ class MainWindow(WebcamMixin, QMainWindow):
         self._disconnect_and_show_lobby()
 
     def _disconnect_and_show_lobby(self):
-        """
-        Отключение от сервера и возврат на экран выбора серверов (лобби).
-
-        Логика:
-          1. Останавливаем UI-таймеры и keyboard-хуки.
-          2. Закрываем вспомогательные окна (стримы, оверлеи).
-          3. Останавливаем audio, video, net.
-          4. Если мы хост — EmbeddedServerManager.stop() делает graceful
-             миграцию (рассылает CMD_SERVER_MIGRATE), точно так же как при
-             резком отключении хоста.
-          5. Создаём свежий MultiServerScreen (лобби) — стандартный flow:
-             выбор сервера → ConnectingScreen → новый MainWindow.
-          6. Закрываем текущее главное окно без выхода из приложения.
-        """
         print("[UI] _disconnect_and_show_lobby: начинаем отключение...")
 
-        # ── 1. Останавливаем UI-таймеры ───────────────────────────────────────
         try:
             self.ui_timer.stop()
         except Exception:
             pass
 
-        # ── 2. Снимаем keyboard-хуки ──────────────────────────────────────────
         try:
             import keyboard as _kb
             _kb.unhook_all()
         except Exception:
             pass
 
-        # ── 3. Закрываем вспомогательные UI-элементы ──────────────────────────
         if hasattr(self, '_lobby_screen') and self._lobby_screen is not None:
             try:
                 self._lobby_screen.close()
@@ -4848,20 +4308,17 @@ class MainWindow(WebcamMixin, QMainWindow):
                 pass
         self.stream_windows.clear()
 
-        # Очищаем кэш медиафайлов чата
         try:
             from .ui_widgets import clear_media_cache
             clear_media_cache()
         except Exception:
             pass
 
-        # ── 4. AudioHandler.stop() ────────────────────────────────────────────
         try:
             self.audio.stop()
         except Exception as ex:
             print(f"[UI] disconnect audio.stop() error: {ex}")
 
-        # ── 5. VideoEngine.shutdown() ─────────────────────────────────────────
         try:
             self._stop_camera_capture()
             for _uid in list(getattr(self, 'cam_windows', {}).keys()):
@@ -4873,10 +4330,6 @@ class MainWindow(WebcamMixin, QMainWindow):
         except Exception as ex:
             print(f"[UI] disconnect video.shutdown() error: {ex}")
 
-        # ── 6. EmbeddedServer — ПЕРВЫМ (ему нужен живой SFU для миграции) ────
-        # FIX: был шаг 7, после net.stop(). Но net.stop() раньше убивал SFU
-        # singleton → stop_gracefully() не мог отправить CMD_SERVER_MIGRATE
-        # через SFU → клиенты не получали миграцию → висели 12 сек в reconnect.
         try:
             from server import EmbeddedServerManager
             mgr = EmbeddedServerManager.get()
@@ -4885,20 +4338,15 @@ class MainWindow(WebcamMixin, QMainWindow):
         except Exception as ex:
             print(f"[UI] disconnect EmbeddedServer stop error: {ex}")
 
-        # ── 7. NetworkClient.stop() — после сервера ───────────────────────────
-        # Блокируем _on_connection_lost: ставим recovery state != IDLE.
-        # tcp_listen проверяет _recovery_state перед вызовом _on_connection_lost.
         with self.net._recovery_lock:
-            self.net._recovery_state = 'recovering'   # блокируем auto-recovery
+            self.net._recovery_state = 'recovering'
         try:
             self.net.stop()
         except Exception as ex:
             print(f"[UI] disconnect net.stop() error: {ex}")
-        # Сбрасываем state обратно — мы уходим в лобби, recovery не нужен.
         with self.net._recovery_lock:
             self.net._recovery_state = 'idle'
 
-        # ── 7b. Финальная страховка: убиваем SFU если ещё жив ────────────────
         try:
             from network_engine.sfu_bridge import get_shared as _get_sfu_final
             _sfu_final = _get_sfu_final()
@@ -4907,7 +4355,6 @@ class MainWindow(WebcamMixin, QMainWindow):
         except Exception:
             pass
 
-        # ── 8. Открываем свежий экран выбора серверов ─────────────────────────
         try:
             from client_main.ui_server_select import MultiServerScreen
             from client_main.ui_login import load_server_name, LoginWindow
@@ -4915,7 +4362,6 @@ class MainWindow(WebcamMixin, QMainWindow):
             screen = MultiServerScreen(self.nick, self.avatar, server_name=server_name)
             screen.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
 
-            # Привязываем «Ввести вручную» → LoginWindow (стандартный flow)
             def _fallback_to_login(f_ip: str, f_nick: str, f_avatar: str):
                 login_win = LoginWindow(
                     ip=f_ip, nick=f_nick, avatar=f_avatar,
@@ -4925,7 +4371,7 @@ class MainWindow(WebcamMixin, QMainWindow):
                     ) if f_ip else "",
                 )
                 login_win.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
-                # Кнопка «Назад» из LoginWindow → снова открыть MultiServerScreen
+
                 def _back_to_servers():
                     s2 = MultiServerScreen(self.nick, self.avatar, server_name=server_name)
                     s2.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
@@ -4939,8 +4385,12 @@ class MainWindow(WebcamMixin, QMainWindow):
         except Exception as e:
             print(f"[UI] _disconnect_and_show_lobby lobby error: {e}")
 
-        # ── 9. Убираем трей и закрываем MainWindow (без QApplication.quit) ───
         self._tray_icon.hide()
+        try:
+            if getattr(self, "_player_playing", False):
+                self._player_stop_local()
+        except Exception:
+            pass
         self._returning_to_lobby = True
         self._force_quit = True
         self.close()
@@ -4948,36 +4398,19 @@ class MainWindow(WebcamMixin, QMainWindow):
         print("[UI] _disconnect_and_show_lobby: завершено")
 
     def _disconnect_and_show_banned(self, server_ip: str, reason: str):
-        """
-        Disconnect + открыть BannedScreen вместо MultiServerScreen.
-
-        Логика полностью повторяет _disconnect_and_show_lobby до шага 8.
-        На шаге 8 вместо списка серверов открывается экран «Вы забанены».
-        Кнопка «Назад» на нём открывает обычный MultiServerScreen —
-        забаненный сервер в списке будет помечен иконкой «стоп».
-
-        Мы НЕ делаем рефакторинг _disconnect_and_show_lobby в общую
-        teardown-функцию намеренно: метод работающий, в нём много нюансов
-        с порядком (EmbeddedServer → net.stop → SFU-страховка), и любое
-        изменение порядка ломает миграцию хоста. Копируем шаги 1–7b
-        буквально, расходимся только на шаге 8.
-        """
         print(f"[UI] _disconnect_and_show_banned: ip={server_ip!r}")
 
-        # ── 1. UI-таймеры ─────────────────────────────────────────────────────
         try:
             self.ui_timer.stop()
         except Exception:
             pass
 
-        # ── 2. keyboard-хуки ──────────────────────────────────────────────────
         try:
             import keyboard as _kb
             _kb.unhook_all()
         except Exception:
             pass
 
-        # ── 3. Вспомогательные окна ───────────────────────────────────────────
         if hasattr(self, '_lobby_screen') and self._lobby_screen is not None:
             try:
                 self._lobby_screen.close()
@@ -5010,22 +4443,16 @@ class MainWindow(WebcamMixin, QMainWindow):
         except Exception:
             pass
 
-        # ── 4. Audio ──────────────────────────────────────────────────────────
         try:
             self.audio.stop()
         except Exception as ex:
             print(f"[UI] banned-teardown audio.stop() error: {ex}")
 
-        # ── 5. Video ──────────────────────────────────────────────────────────
         try:
             self.video.shutdown()
         except Exception as ex:
             print(f"[UI] banned-teardown video.shutdown() error: {ex}")
 
-        # ── 6. EmbeddedServer ────────────────────────────────────────────────
-        # Нас забанили как клиента — но мы могли сами держать свой сервер
-        # параллельно (такое возможно, если мы хостим ОДИН сервер, а к
-        # другому подключались как клиент). stop() на всякий случай.
         try:
             from server import EmbeddedServerManager
             mgr = EmbeddedServerManager.get()
@@ -5034,9 +4461,6 @@ class MainWindow(WebcamMixin, QMainWindow):
         except Exception as ex:
             print(f"[UI] banned-teardown EmbeddedServer stop error: {ex}")
 
-        # ── 7. NetworkClient.stop() ──────────────────────────────────────────
-        # Reconnect уже заблокирован (_kicked_flag=True + running=False в
-        # features.py). Но для надёжности блокируем recovery через state.
         with self.net._recovery_lock:
             self.net._recovery_state = 'recovering'
         try:
@@ -5046,7 +4470,6 @@ class MainWindow(WebcamMixin, QMainWindow):
         with self.net._recovery_lock:
             self.net._recovery_state = 'idle'
 
-        # ── 7b. SFU-страховка ─────────────────────────────────────────────────
         try:
             from network_engine.sfu_bridge import get_shared as _get_sfu_final
             _sfu_final = _get_sfu_final()
@@ -5055,14 +4478,11 @@ class MainWindow(WebcamMixin, QMainWindow):
         except Exception:
             pass
 
-        # ── 8. Открываем BannedScreen вместо лобби ───────────────────────────
         try:
             from client_main.ui_banned import BannedScreen
             from client_main.ui_server_select import MultiServerScreen
             from client_main.ui_login import load_server_name, LoginWindow
 
-            # Имя сервера для красивого заголовка: берём то, что отдавал
-            # announcer при последнем sync_users. Если не знаем — IP.
             srv_name_display = getattr(self, '_connected_server_name', '') or server_ip
             server_name = load_server_name()
 
@@ -5073,9 +4493,6 @@ class MainWindow(WebcamMixin, QMainWindow):
             )
             banned.setWindowIcon(QIcon(resource_path("assets/icon/logo.ico")))
 
-            # Фабрика перехода «Назад» → MultiServerScreen с fallback на LoginWindow.
-            # Ровно повторяем связку что в _disconnect_and_show_lobby — чтобы
-            # поведение было предсказуемым и пользователь не видел разницы.
             def _open_server_list(_ip: str = ''):
                 screen = MultiServerScreen(self.nick, self.avatar,
                                            server_name=server_name)
@@ -5105,8 +4522,6 @@ class MainWindow(WebcamMixin, QMainWindow):
 
                 screen.open_login.connect(_fallback_to_login)
                 screen.show()
-                # Закрываем banned screen ПОСЛЕ того как список появился —
-                # иначе event loop может завершиться (если нет других окон).
                 try:
                     banned.close()
                 except Exception:
@@ -5116,7 +4531,6 @@ class MainWindow(WebcamMixin, QMainWindow):
             banned.show()
         except Exception as e:
             print(f"[UI] _disconnect_and_show_banned screen error: {e}")
-            # Fallback: если BannedScreen почему-то упал — показываем лобби
             try:
                 from client_main.ui_server_select import MultiServerScreen
                 from client_main.ui_login import load_server_name
@@ -5129,7 +4543,6 @@ class MainWindow(WebcamMixin, QMainWindow):
             except Exception as e2:
                 print(f"[UI] fallback lobby error: {e2}")
 
-        # ── 9. Закрываем MainWindow ──────────────────────────────────────────
         self._tray_icon.hide()
         self._returning_to_lobby = True
         self._force_quit = True
@@ -5138,16 +4551,8 @@ class MainWindow(WebcamMixin, QMainWindow):
         print("[UI] _disconnect_and_show_banned: завершено")
 
     def _on_switch_server(self, info: dict):
-        """
-        Переключение на другой сервер из лобби.
-
-        ВАЖНО: использует fast_switch_to() вместо _reconnect_loop.
-        fast_switch_to() не ждёт RECONNECT_DELAY (3 сек) между попытками —
-        сервер уже работает, сеть жива, нужно просто быстро переподключиться.
-        """
         new_ip = info.get('ip', '')
         if not new_ip or new_ip == self.ip:
-            # Закрываем лобби если пользователь выбрал текущий сервер
             if hasattr(self, '_lobby_screen') and self._lobby_screen is not None:
                 try:
                     self._lobby_screen.hide()
@@ -5156,7 +4561,6 @@ class MainWindow(WebcamMixin, QMainWindow):
                 self._lobby_screen = None
             return
 
-        # Закрываем лобби при успешном переключении
         if hasattr(self, '_lobby_screen') and self._lobby_screen is not None:
             try:
                 self._lobby_screen.hide()
@@ -5164,21 +4568,12 @@ class MainWindow(WebcamMixin, QMainWindow):
                 pass
             self._lobby_screen = None
 
-        # Устанавливаем новый IP в network client ДО любых остановок.
         self.net._ip = new_ip
 
-        # Блокируем recovery: ставим state != IDLE чтобы tcp_listen при
-        # закрытии старого сокета не запустил _on_connection_lost.
-        # fast_switch_to ниже сам сбросит state=IDLE и стартует новый recovery.
         with self.net._recovery_lock:
             self.net._recovery_state = 'migrating'
         self.net.running = False
 
-        # Останавливаем/передаём встроенный сервер если мы хост.
-        # stop_gracefully сам выбирает нового хоста по минимальному пингу
-        # и рассылает CMD_SERVER_MIGRATE остальным участникам.
-        # send_server_transfer(0) УДАЛЁН — он создавал ДВОЙНУЮ миграцию:
-        # server_transfer → broadcast, затем stop_gracefully → снова broadcast.
         if self._is_server_host():
             try:
                 from server import EmbeddedServerManager
@@ -5190,7 +4585,6 @@ class MainWindow(WebcamMixin, QMainWindow):
 
         self.ip = new_ip
 
-        # Показываем экран переключения
         self._lost_title_lbl.setText("Переключение сервера")
         self._lost_status_lbl.setText(
             f"Подключение к {info.get('server_name', 'Сервер')}\n{new_ip}..."
@@ -5198,44 +4592,327 @@ class MainWindow(WebcamMixin, QMainWindow):
         self._btn_reconnect.setEnabled(False)
         self._stack.setCurrentIndex(1)
 
-        # fast_switch_to: без задержки RECONNECT_DELAY, быстрые попытки 0.35 сек
         self.net.fast_switch_to(new_ip)
 
-    # ------------------------------------------------------------------
-    # System Tray
-    # ------------------------------------------------------------------
     def _tray_show(self):
-        """Показать окно из трея."""
         self.showNormal()
         self.activateWindow()
         self.raise_()
 
     def _tray_quit(self):
-        """Полный выход из трея."""
         self._force_quit = True
         self.close()
 
     def _on_tray_activated(self, reason):
-        """Двойной клик по иконке трея — показать окно."""
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
             self._tray_show()
 
-    def closeEvent(self, e):
-        """
-        Крестик → сворачиваем в трей. Полный выход — через меню трея.
-        Возврат в лобби → закрываем окно без QApplication.quit().
-        """
+    # ═══════════════════════════════════════════════════════════════════
+    # Общий плеер (UDP + Opus): GUI-часть
+    # ═══════════════════════════════════════════════════════════════════
+    #
+    # Трек идёт через UDP + Opus (FLAG_PLAYER), НЕ через TCP base64.
+    # Кнопки в PlayerBar: prev / play-pause / next / browse.
+    # «Стоп» = повторное нажатие play-pause (пауза) или next/prev (переход).
+    # Полной остановки отдельной кнопкой нет — при желании пользователь
+    # может нажать паузу и затем переключить трек.
 
-        # ── Возврат в лобби (отключение от сервера) ────────────────────────
-        # Cleanup уже выполнен в _disconnect_and_show_lobby. Просто закрываем
-        # окно и НЕ завершаем Qt — лобби уже показан.
+    def _player_enabled(self) -> bool:
+        return self.app_settings.value("player_enabled", "false") == "true"
+
+    def _update_player_visibility(self) -> None:
+        if hasattr(self, "_player_bar"):
+            self._player_bar.setVisible(self._player_enabled())
+
+    def _restore_player_playlist(self) -> None:
+        saved_folder = self.app_settings.value("player_folder", "") or ""
+        if not saved_folder or not os.path.isdir(saved_folder):
+            return
+        try:
+            files = sorted([
+                os.path.join(saved_folder, f)
+                for f in os.listdir(saved_folder)
+                if os.path.splitext(f)[1].lower() in PLAYER_ALLOWED_EXT
+            ])
+        except Exception as e:
+            print(f"[Player] restore playlist error: {e}")
+            return
+        self._player_playlist = files
+        if files:
+            try:
+                self._player_bar.set_track_name(
+                    f"Папка: {os.path.basename(saved_folder)} — "
+                    f"{len(files)} трек(ов)")
+            except Exception:
+                pass
+        self._player_index = -1
+        print(f"[Player] Плейлист восстановлен: {saved_folder} "
+              f"({len(files)} трек(ов))")
+
+    def _player_is_owner(self) -> bool:
+        return (self.audio.my_uid != 0
+                and self._player_owner_uid == self.audio.my_uid)
+
+    def _on_player_browse(self) -> None:
+        from PyQt6.QtWidgets import QFileDialog
+        last = self.app_settings.value("player_folder", "") or ""
+        folder = QFileDialog.getExistingDirectory(
+            self, "Выбрать папку с музыкой", last)
+        if not folder:
+            return
+        self.app_settings.setValue("player_folder", folder)
+        try:
+            files = sorted([
+                os.path.join(folder, f)
+                for f in os.listdir(folder)
+                if os.path.splitext(f)[1].lower() in PLAYER_ALLOWED_EXT
+            ])
+        except Exception as e:
+            print(f"[Player] scan folder error: {e}")
+            files = []
+        self._player_playlist = files
+        if files:
+            self._player_bar.set_track_name(
+                f"Папка: {os.path.basename(folder)} — {len(files)} трек(ов)")
+        else:
+            self._player_bar.set_track_name(
+                "В выбранной папке нет поддерживаемых аудиофайлов")
+        self._player_index = -1
+
+    def _on_player_play_pause(self) -> None:
+        if not self._player_is_owner() and not self._player_playlist:
+            self._player_bar.set_track_name(
+                "Сначала выберите папку с музыкой (📂)")
+            return
+
+        if self._player_is_owner():
+            if self._player_playing:
+                pos_ms = self.audio.player_get_pos_ms()
+                self.audio.player_pause(pos_ms)
+                self._player_playing = False
+                self._player_bar.set_playing(False)
+                self.net.send_player_pause(pos_ms)
+            else:
+                pos_ms = self.audio.player_get_pos_ms()
+                self.audio.player_play(pos_ms)
+                self._player_playing = True
+                self._player_bar.set_playing(True)
+                self.net.send_player_resume(pos_ms)
+        else:
+            self._player_index = -1
+            self._player_load_track(0)
+
+    def _on_player_prev(self) -> None:
+        if not self._player_is_owner() or not self._player_playlist:
+            return
+        new_idx = self._player_index - 1
+        if new_idx < 0:
+            new_idx = len(self._player_playlist) - 1
+        self._player_load_track(new_idx)
+
+    def _on_player_volume_changed(self, vol: float) -> None:
+        """Слайдер громкости плеера. vol: 0.0 – 2.0 (0% – 200%)."""
+        try:
+            self.audio.set_player_volume(vol)
+        except Exception as e:
+            print(f"[Player] set_player_volume error: {e}")
+        # Сохраняем в настройки (в UI хранится 0..1 — делим на 2, если >1)
+        try:
+            ui_val = int(min(1.0, vol) * 100)
+            self.app_settings.setValue("player_volume", ui_val)
+        except Exception:
+            pass
+        self._player_volume = max(0.0, min(1.0, vol))
+        print(f"[Player] volume → {vol*100:.0f}%")
+
+    def _on_player_seek(self, ratio: float) -> None:
+        """Перемотка полосой seek. ratio: 0.0 – 1.0 от длительности."""
+        if not self._player_is_owner():
+            return   # только DJ может перематывать
+        # Позиция в мс у DJ (позиция broadcast-потока)
+        dur_ms = 0
+        try:
+            pcm = getattr(self.audio, '_player_broadcast_pcm', None)
+            if pcm is not None:
+                dur_ms = int(len(pcm) / 48000 * 1000)
+        except Exception:
+            dur_ms = 0
+        if dur_ms <= 0:
+            return
+        pos_ms = int(ratio * dur_ms)
+        try:
+            # player_play(pos_ms) ставит позицию и снимает pause
+            self.audio.player_play(pos_ms)
+        except Exception as e:
+            print(f"[Player] seek error: {e}")
+        try:
+            self.net.send_player_resume(pos_ms)
+        except Exception:
+            pass
+        self._player_playing = True
+        self._player_bar.set_playing(True)
+        print(f"[Player] seek → {pos_ms/1000:.1f}s / {dur_ms/1000:.1f}s")
+
+    def _on_player_next(self) -> None:
+        if not self._player_is_owner() or not self._player_playlist:
+            return
+        new_idx = self._player_index + 1
+        if new_idx >= len(self._player_playlist):
+            new_idx = 0
+        self._player_load_track(new_idx)
+
+    def _player_load_track(self, index: int) -> None:
+        if not self._player_playlist:
+            return
+        if index < 0 or index >= len(self._player_playlist):
+            return
+        path = self._player_playlist[index]
+
+        try:
+            fsize = os.path.getsize(path)
+        except OSError as e:
+            print(f"[Player] stat error {path}: {e}")
+            return
+        if fsize > 200 * 1024 * 1024:
+            self._player_bar.set_track_name(
+                f"Файл слишком большой: {os.path.basename(path)}")
+            return
+
+        name = os.path.basename(path)
+        self._player_bar.set_track_name(f"Загрузка: {name}…")
+        self._player_bar.set_playing(False)
+        self._player_owner_uid = self.audio.my_uid
+        self._player_bar.set_owner_mode(True)
+        self._player_index = index
+
+        def _load_worker():
+            try:
+                import soundfile as sf
+                audio_data, sr = sf.read(path, dtype="float32")
+            except Exception as e:
+                self._player_load_failed.emit(f"Ошибка декодирования: {name} ({e})")
+                return
+
+            if audio_data is None or len(audio_data) == 0:
+                self._player_load_failed.emit(f"Пустой файл: {name}")
+                return
+
+            self._player_loaded_ready.emit(audio_data, sr, name)
+
+        import threading
+        threading.Thread(target=_load_worker, daemon=True,
+                         name="player-load").start()
+
+    def _on_player_load_ready(self, audio_data, sr: int, name: str) -> None:
+        try:
+            self.audio.player_load(audio_data, sr, vol=None)
+        except Exception as e:
+            print(f"[Player] audio.player_load error: {e}")
+            self._player_bar.set_track_name(f"Ошибка воспроизведения: {name}")
+            return
+
+        self._player_playing = True
+        self._player_bar.set_playing(True)
+        self._player_bar.set_track_name(name)
+        self._player_bar.set_position(0.0)
+        self._player_bar.set_volume(self.audio._player_vol)
+
+        print(f"[Player] broadcast UDP START: '{name}' "
+              f"({len(audio_data)/sr:.1f}s)")
+
+    def _on_player_load_failed(self, error_msg: str) -> None:
+        print(f"[Player] load failed: {error_msg}")
+        self._player_bar.set_track_name(error_msg)
+        self._player_bar.set_playing(False)
+
+    def _on_player_loaded_legacy(self, msg: dict) -> None:
+        # Legacy TCP-путь. Сервер больше не шлёт player_loaded.
+        print(f"[PLAYER-DIAG] legacy _on_player_loaded: "
+              f"src_uid={msg.get('src_uid')} my_uid={self.audio.my_uid}")
+
+    def _on_player_paused(self, pos_ms: int) -> None:
+        if self._player_owner_uid == self.audio.my_uid:
+            return
+        self._player_playing = False
+        self._player_bar.set_playing(False)
+
+    def _on_player_resumed(self, pos_ms: int) -> None:
+        if self._player_owner_uid == self.audio.my_uid:
+            return
+        self._player_playing = True
+        self._player_bar.set_playing(True)
+
+    def _on_player_stopped(self) -> None:
+        if self._player_owner_uid == self.audio.my_uid:
+            return
+        self._player_playing   = False
+        self._player_owner_uid = 0
+        self._player_bar.set_playing(False)
+        self._player_bar.set_track_name("Трек остановлен")
+        self._player_bar.set_owner_mode(False)
+
+    def _poll_player_ended(self) -> None:
+        try:
+            if self.audio.player_consume_ended_flag():
+                self._on_player_track_ended()
+        except Exception as e:
+            print(f"[Player] poll ended error: {e}")
+        # ── Позиция полосы seek (у DJ и у слушателя) ───────────────────
+        try:
+            if self._player_playing:
+                dur_ms = 0
+                cur_ms = 0
+                if self._player_is_owner():
+                    pcm = getattr(self.audio, '_player_broadcast_pcm', None)
+                    if pcm is not None:
+                        dur_ms = int(len(pcm) / 48000 * 1000)
+                        cur_ms = int(getattr(self.audio, '_player_broadcast_pos', 0) / 48000 * 1000)
+                # У слушателя точно позицию не знаем — оставляем 0
+                if dur_ms > 0:
+                    ratio = max(0.0, min(1.0, cur_ms / dur_ms))
+                    self._player_bar.set_position(ratio)
+        except Exception:
+            pass
+
+    def _on_player_track_ended(self) -> None:
+        if not self._player_is_owner():
+            return
+        if not self._player_playlist:
+            self._player_playing = False
+            self._player_bar.set_playing(False)
+            self._player_bar.set_track_name("Трек закончился")
+            self.net.send_player_stop()
+            return
+        new_idx = self._player_index + 1
+        if new_idx >= len(self._player_playlist):
+            self._player_playing = False
+            self._player_bar.set_playing(False)
+            self._player_bar.set_track_name("Плейлист завершён")
+            self.net.send_player_stop()
+            return
+        self._player_load_track(new_idx)
+
+    def _player_stop_local(self) -> None:
+        try:
+            if self._player_is_owner():
+                self.net.send_player_stop()
+            self.audio.player_stop()
+        except Exception:
+            pass
+        self._player_playing   = False
+        self._player_owner_uid = 0
+        if hasattr(self, "_player_bar"):
+            self._player_bar.set_playing(False)
+            self._player_bar.set_track_name("Трек не выбран")
+            self._player_bar.set_owner_mode(False)
+
+    def closeEvent(self, e):
         if self._returning_to_lobby:
             print("[UI] closeEvent: возврат в лобби, закрываем MainWindow")
             e.accept()
             self.deleteLater()
             return
 
-        # ── Сворачиваем в трей (если не запрошен полный выход) ────────────
         if not self._force_quit:
             e.ignore()
             self.hide()
@@ -5247,35 +4924,25 @@ class MainWindow(WebcamMixin, QMainWindow):
             )
             return
 
-        # ── Полное завершение (из трея) ──────────────────────────────────
         print("[UI] closeEvent: начинаем shutdown...")
 
-        # Очищаем кэш медиафайлов чата (конвертированные GIF→MP4, temp-видео)
         try:
             from .ui_widgets import clear_media_cache
             clear_media_cache()
         except Exception:
             pass
 
-        # ── 1. Останавливаем UI-таймеры ПЕРВЫМИ ──────────────────────────────
-        # ui_timer (100ms) продолжает дёргать refresh_ui во время teardown —
-        # может обращаться к уже закрытым объектам → RuntimeError / краш.
         try:
             self.ui_timer.stop()
         except Exception:
             pass
 
-        # ── 2. Снимаем keyboard-хуки ──────────────────────────────────────────
-        # Без unhook_all() глобальные хуки продолжают перехватывать ввод даже
-        # после закрытия окна — до полного завершения процесса. На Windows это
-        # приводит к тому что другие приложения не получают определённые клавиши.
         try:
             import keyboard as _kb
             _kb.unhook_all()
         except Exception:
             pass
 
-        # ── 3. Закрываем вспомогательные UI-элементы ─────────────────────────
         if hasattr(self, '_lobby_screen') and self._lobby_screen is not None:
             try:
                 self._lobby_screen.close()
@@ -5289,7 +4956,6 @@ class MainWindow(WebcamMixin, QMainWindow):
         except Exception:
             pass
 
-        # Закрываем оверлей аннотаций стримера если активен
         try:
             if self._streamer_draw_overlay is not None:
                 self._streamer_draw_overlay.close()
@@ -5297,7 +4963,6 @@ class MainWindow(WebcamMixin, QMainWindow):
         except Exception:
             pass
 
-        # Закрываем все открытые VideoWindow (стримы зрителей)
         for uid, w in list(self.stream_windows.items()):
             try:
                 w.close()
@@ -5305,17 +4970,11 @@ class MainWindow(WebcamMixin, QMainWindow):
                 pass
         self.stream_windows.clear()
 
-        # ── 4. AudioHandler.stop() ────────────────────────────────────────────
-        # Закрывает PortAudio поток (stream.stop/close) и _pkt_thread.
-        # Должен идти до net.stop() — audio использует send_queue сети.
         try:
             self.audio.stop()
         except Exception as ex:
             print(f"[UI] closeEvent audio.stop() error: {ex}")
 
-        # ── 5. VideoEngine.shutdown() ─────────────────────────────────────────
-        # Останавливает DXCamTrack и все VideoReceiver.
-        # После net.stop() WebRTC треки будут закрыты, поэтому делаем ДО.
         try:
             self._stop_camera_capture()
             for _uid in list(getattr(self, 'cam_windows', {}).keys()):
@@ -5327,11 +4986,6 @@ class MainWindow(WebcamMixin, QMainWindow):
         except Exception as ex:
             print(f"[UI] closeEvent video.shutdown() error: {ex}")
 
-        # ── 6. EmbeddedServer — ПЕРВЫМ (ему нужен живой SFU для миграции) ────
-        # FIX: был шаг 7, после net.stop(). Но net.stop() раньше убивал SFU
-        # singleton → stop_gracefully() не мог отправить CMD_SERVER_MIGRATE.
-        # stop_gracefully(): broadcast CMD_SERVER_MIGRATE → 350мс → close сокеты.
-        # Другие клиенты успевают получить команду и переподключиться.
         try:
             from server import EmbeddedServerManager
             mgr = EmbeddedServerManager.get()
@@ -5340,15 +4994,11 @@ class MainWindow(WebcamMixin, QMainWindow):
         except Exception as ex:
             print(f"[UI] closeEvent EmbeddedServer stop error: {ex}")
 
-        # ── 7. NetworkClient.stop() — после сервера ───────────────────────────
-        # Закрывает RTCPeerConnection, asyncio loop, TCP/UDP сокеты.
-        # После этого все сетевые потоки выйдут из блокирующих recv().
         try:
             self.net.stop()
         except Exception as ex:
             print(f"[UI] closeEvent net.stop() error: {ex}")
 
-        # ── 7b. Финальная страховка: убиваем SFU если ещё жив ────────────────
         try:
             from network_engine.sfu_bridge import get_shared as _get_sfu_final
             _sfu_final = _get_sfu_final()
@@ -5357,8 +5007,12 @@ class MainWindow(WebcamMixin, QMainWindow):
         except Exception:
             pass
 
-        # ── 8. Убираем иконку из трея и завершаем Qt ────────────────────
         print("[UI] closeEvent: shutdown завершён")
+        try:
+            if getattr(self, "_player_playing", False):
+                self._player_stop_local()
+        except Exception:
+            pass
         self._tray_icon.hide()
         from PyQt6.QtWidgets import QApplication
         QApplication.quit()
@@ -5379,16 +5033,10 @@ class MainWindow(WebcamMixin, QMainWindow):
         else:
             path = resource_path("assets/icon/stream_off.svg")
             self.btn_stream.setIcon(QIcon(path))
-            self.btn_stream.setStyleSheet("")  # вернуть к CSS из apply_theme
-            # Скрываем индикатор плохого соединения при остановке трансляции
+            self.btn_stream.setStyleSheet("")
             self._stream_conn_lbl.setVisible(False)
 
     def _on_bitrate_adjusted(self, bitrate: int):
-        """
-        STUB — ABR через UDP удалён. WebRTC управляет битрейтом автоматически (TWCC).
-        Метод сохранён: _stream_conn_lbl остаётся в UI и будет подключён
-        к WebRTC pc.getStats() в следующей итерации (ui_video.py, Шаг 7).
-        """
         pass
 
     def toggle_stream(self):
@@ -5398,18 +5046,6 @@ class MainWindow(WebcamMixin, QMainWindow):
             if dialog.exec():
                 settings = dialog.get_settings()
 
-                # Порядок операций (важен для WebRTC signaling):
-                #   1. CMD_STREAM_START → сервер помечает нас как стримера.
-                #      Сервер должен знать о стриме ДО получения webrtc_offer,
-                #      иначе он не сможет связать offer с конкретным стримером.
-                #   2. net.start_streaming_webrtc(settings):
-                #        — создаёт DXCamTrack через VideoEngine или запускает Rust-мост
-                #        — создаёт RTCPeerConnection
-                #        — добавляет видео/аудио треки
-                #        — создаёт SDP offer → ждёт ICE gathering → отправляет серверу
-                # Передаём реальный порт SFU серверу — он рассылает его клиентам
-                # через global_state → sfu_port, чтобы удалённые зрители знали
-                # на какой порт идти (динамический, не всегда 7788).
                 _sfu_port = 7788
                 try:
                     _sb = getattr(self.net, '_sfu_bridge', None)
@@ -5420,8 +5056,6 @@ class MainWindow(WebcamMixin, QMainWindow):
                 self.net.send_json({"action": CMD_STREAM_START, "sfu_port": _sfu_port})
                 self.net.start_streaming_webrtc(settings)
 
-                # Синхронная проверка успеха:
-                # v3: Rust Media Engine — стрим OK, если процесс жив.
                 _rust_ok = (
                         hasattr(self.net, '_media_bridge')
                         and self.net._media_bridge is not None
@@ -5436,10 +5070,6 @@ class MainWindow(WebcamMixin, QMainWindow):
 
                 self.is_streaming = True
 
-                # ── Создаём прозрачный оверлей аннотаций для стримера ────────
-                # Показывает мазки зрителей поверх захватываемого экрана.
-                # WA_TransparentForMouseEvents → DXCam и мышь работают нормально.
-                # Уничтожается при остановке стрима (ниже).
                 try:
                     if self._streamer_draw_overlay is not None:
                         self._streamer_draw_overlay.close()
@@ -5457,24 +5087,13 @@ class MainWindow(WebcamMixin, QMainWindow):
             self.is_streaming = False
             self.net.send_json({"action": CMD_STREAM_STOP})
 
-            # Если в момент остановки трансляции кто-то нами управлял —
-            # снимаем управление, гасим баннер и ESC-хук.
             if self._rc_viewer_uid_get() is not None:
                 self._hide_rc_streamer_banner()
 
-            # FIX LEAK #1: stop_streaming_webrtc() закрывает RTCPeerConnection
-            # стримера и SystemAudioTrack. Без этого вызова _streamer_pc оставался
-            # открытым после каждого стрима → H264 encoder + DTLS/SRTP буферы
-            # (~50 МБ) никогда не освобождались.
-            # Порядок: сначала CMD_STREAM_STOP на сервер (он убирает нас из стримеров),
-            # затем закрываем PC (чтобы SFU успел разорвать соединение корректно).
             self.net.stop_streaming_webrtc()
 
-            # v3: VideoEngine.stop_streaming() выполняет GC + heap trim.
-            # Вызываем после stop_streaming_webrtc() для корректного порядка очистки.
             self.video.stop_streaming()
 
-            # ── Уничтожаем оверлей аннотаций стримера ───────────────────────
             try:
                 if self._streamer_draw_overlay is not None:
                     self._streamer_draw_overlay.close()
@@ -5490,12 +5109,8 @@ class MainWindow(WebcamMixin, QMainWindow):
 # Remote Control — вспомогательные функции конвертации Qt → pyautogui
 # ===========================================================================
 
-# Qt.Key.Key_Escape == 0x01000000. Держим как модульную константу, чтобы не
-# импортировать Qt внутри горячего цикла инъекции событий.
 _RC_QT_KEY_ESCAPE = 0x01000000
 
-# Qt.KeyboardModifier значения (битовая маска). Держим как константы, чтобы
-# не импортировать Qt в горячем пути инъекции.
 _RC_MOD_SHIFT = 0x02000000
 _RC_MOD_CTRL  = 0x04000000
 _RC_MOD_ALT   = 0x08000000
@@ -5503,21 +5118,11 @@ _RC_MOD_META  = 0x10000000
 
 
 def _qt_button_to_pyautogui(qt_button: int) -> str:
-    """
-    Конвертирует Qt.MouseButton int в строку pyautogui.
-    Значения Qt.MouseButton стабильны: Left=1, Right=2, Middle=4.
-    Используем числовые литералы, т.к. int(Qt.MouseButton.X) в PyQt6
-    бросает TypeError.
-    """
     mapping = {1: 'left', 2: 'right', 4: 'middle'}
     return mapping.get(int(qt_button), 'left')
 
 
 def _basic_to_vk(name: str) -> int:
-    """
-    VK-код для базовой клавиши 'a'..'z' / '0'..'9' (для комбинаций через WinAPI).
-    VK букв == ASCII заглавной (A=0x41), VK цифр == ASCII ('0'=0x30).
-    """
     if not name or len(name) != 1:
         return 0
     c = name.lower()
@@ -5529,36 +5134,31 @@ def _basic_to_vk(name: str) -> int:
 
 
 def _build_special_key_map() -> dict:
-    """
-    Карта Qt.Key → имя клавиши pyautogui для НЕпечатных/спец-клавиш.
-    Значения Qt.Key стабильны между версиями; задаём их числовыми литералами,
-    т.к. int(Qt.Key.X) в PyQt6 бросает TypeError.
-    """
     return {
-        0x01000004: 'enter',       # Key_Return
-        0x01000005: 'enter',       # Key_Enter
-        0x01000003: 'backspace',   # Key_Backspace
-        0x01000007: 'delete',      # Key_Delete
-        0x01000001: 'tab',         # Key_Tab
-        0x01000000: 'esc',         # Key_Escape
-        0x00000020: 'space',       # Key_Space
-        0x01000012: 'left',        # Key_Left
-        0x01000014: 'right',       # Key_Right
-        0x01000013: 'up',          # Key_Up
-        0x01000015: 'down',        # Key_Down
-        0x01000010: 'home',        # Key_Home
-        0x01000011: 'end',         # Key_End
-        0x01000016: 'pageup',      # Key_PageUp
-        0x01000017: 'pagedown',    # Key_PageDown
-        0x01000006: 'insert',      # Key_Insert
-        0x01000009: 'printscreen', # Key_Print
-        0x01000024: 'capslock',    # Key_CapsLock
-        0x01000025: 'numlock',     # Key_NumLock
-        0x01000026: 'scrolllock',  # Key_ScrollLock
-        0x01000021: 'ctrl',        # Key_Control
-        0x01000020: 'shift',       # Key_Shift
-        0x01000023: 'alt',         # Key_Alt
-        0x01000022: 'win',         # Key_Meta
+        0x01000004: 'enter',
+        0x01000005: 'enter',
+        0x01000003: 'backspace',
+        0x01000007: 'delete',
+        0x01000001: 'tab',
+        0x01000000: 'esc',
+        0x00000020: 'space',
+        0x01000012: 'left',
+        0x01000014: 'right',
+        0x01000013: 'up',
+        0x01000015: 'down',
+        0x01000010: 'home',
+        0x01000011: 'end',
+        0x01000016: 'pageup',
+        0x01000017: 'pagedown',
+        0x01000006: 'insert',
+        0x01000009: 'printscreen',
+        0x01000024: 'capslock',
+        0x01000025: 'numlock',
+        0x01000026: 'scrolllock',
+        0x01000021: 'ctrl',
+        0x01000020: 'shift',
+        0x01000023: 'alt',
+        0x01000022: 'win',
         0x01000030: 'f1',  0x01000031: 'f2',
         0x01000032: 'f3',  0x01000033: 'f4',
         0x01000034: 'f5',  0x01000035: 'f6',
@@ -5568,12 +5168,10 @@ def _build_special_key_map() -> dict:
     }
 
 
-# Кэш карты спец-клавиш (строится один раз при первом обращении).
 _RC_SPECIAL_KEY_MAP: dict | None = None
 
 
 def _qt_key_to_special(qt_key: int) -> str:
-    """Возвращает имя спец-клавиши pyautogui или '' если это печатный символ."""
     global _RC_SPECIAL_KEY_MAP
     if _RC_SPECIAL_KEY_MAP is None:
         _RC_SPECIAL_KEY_MAP = _build_special_key_map()
@@ -5581,22 +5179,15 @@ def _qt_key_to_special(qt_key: int) -> str:
 
 
 def _qt_key_to_basic(qt_key: int, text: str = '') -> str:
-    """
-    Имя «обычной» клавиши для keyDown/keyUp (нужно для комбинаций Ctrl+X
-    и для случаев, когда text пустой).
-    Qt.Key_A..Key_Z == 0x41..0x5A, Qt.Key_0..Key_9 == 0x30..0x39 — совпадают
-    с ASCII, поэтому маппим напрямую.
-    """
-    if 0x41 <= qt_key <= 0x5A:            # A-Z
+    if 0x41 <= qt_key <= 0x5A:
         return chr(qt_key).lower()
-    if 0x30 <= qt_key <= 0x39:            # 0-9
+    if 0x30 <= qt_key <= 0x39:
         return chr(qt_key)
     if text and len(text) == 1 and text.isprintable():
         return text.lower()
     return ''
 
 
-# Совместимость со старым именем (на случай внешних вызовов).
 def _qt_key_to_pyautogui(qt_key: int, text: str = '') -> str:
     special = _qt_key_to_special(qt_key)
     if special:

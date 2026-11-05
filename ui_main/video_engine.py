@@ -4,11 +4,9 @@ import gc
 import threading
 import time
 from fractions import Fraction
-
 import numpy as np
 from PyQt6.QtCore import QObject, pyqtSignal
 from PyQt6.QtGui import QImage
-
 from config import (
     VIDEO_WIDTH, VIDEO_HEIGHT, VIDEO_FPS, VIDEO_BITRATE, VIDEO_BITRATES,
     get_lq_resolution, get_bitrate_for_resolution,
@@ -17,6 +15,7 @@ from config import (
 
 try:
     import av
+
     AV_AVAILABLE = True
 except ImportError:
     AV_AVAILABLE = False
@@ -24,6 +23,7 @@ except ImportError:
 
 try:
     import dxcam
+
     DXCAM_AVAILABLE = True
 except ImportError:
     DXCAM_AVAILABLE = False
@@ -31,6 +31,7 @@ except ImportError:
 
 try:
     from aiortc import VideoStreamTrack as _AiortcVideoStreamTrack
+
     AIORTC_AVAILABLE = True
 except ImportError:
     AIORTC_AVAILABLE = False
@@ -39,6 +40,7 @@ except ImportError:
 
 try:
     import cv2 as _cv2
+
     _CV2_AVAILABLE = True
 except ImportError:
     _CV2_AVAILABLE = False
@@ -48,15 +50,15 @@ _encoder_state = {'bitrate': VIDEO_BITRATE, 'lq_bitrate': 1_000_000}
 
 
 def set_encoder_bitrate(bitrate: int, lq_bitrate: int = 0) -> None:
-    _encoder_state['bitrate']    = max(500_000, min(int(bitrate), 20_000_000))
+    _encoder_state['bitrate'] = max(500_000, min(int(bitrate), 20_000_000))
     _encoder_state['lq_bitrate'] = max(300_000, min(int(lq_bitrate or bitrate // 4), 4_000_000))
     print(
-        f"[Video] Битрейт энкодера: HQ={_encoder_state['bitrate']//1000} kbps, "
-        f"LQ={_encoder_state['lq_bitrate']//1000} kbps"
+        f"[Video] Битрейт энкодера: HQ={_encoder_state['bitrate'] // 1000} kbps, "
+        f"LQ={_encoder_state['lq_bitrate'] // 1000} kbps"
     )
 
-def patch_aiortc_nvenc(force: bool = False) -> bool:
 
+def patch_aiortc_nvenc(force: bool = False) -> bool:
     if not force:
         print(
             "[Video] WARNING: patch_aiortc_nvenc() вызвана в v3, где Rust делает "
@@ -71,41 +73,39 @@ def patch_aiortc_nvenc(force: bool = False) -> bool:
     hw_profiles = [
         {
             'codec': 'h264_nvenc',
-            'name':  'NVIDIA NVENC',
+            'name': 'NVIDIA NVENC',
             'options': {
-
-                'preset':      'p5',
-                'tune':        'hq',
-                'rc':          'vbr',
-
-                'cq':          '18',
-                'bf':          '2',
-                'profile':     'high',
-                'spatial-aq':  '1',
+                'preset': 'p5',
+                'tune': 'hq',
+                'rc': 'vbr',
+                'cq': '18',
+                'bf': '2',
+                'profile': 'high',
+                'spatial-aq': '1',
                 'aq-strength': '10',
-                'g':           '30',
-                'forced-idr':  '1',
+                'g': '30',
+                'forced-idr': '1',
             },
         },
         {
             'codec': 'h264_amf',
-            'name':  'AMD AMF',
+            'name': 'AMD AMF',
             'options': {
-                'usage':   'transcoding',
+                'usage': 'transcoding',
                 'quality': 'quality',
                 'profile': 'high',
-                'bf':      '2',
-                'rc':      'vbr_peak',
-                'g':       '30',
+                'bf': '2',
+                'rc': 'vbr_peak',
+                'g': '30',
             },
         },
         {
             'codec': 'h264_mf',
-            'name':  'Windows MF (GPU)',
+            'name': 'Windows MF (GPU)',
             'options': {
-                'scenario':         'livestreaming',
+                'scenario': 'livestreaming',
                 'quality_vs_speed': '100',
-                'g':                '30',
+                'g': '30',
             },
         },
     ]
@@ -114,8 +114,8 @@ def patch_aiortc_nvenc(force: bool = False) -> bool:
     for profile in hw_profiles:
         try:
             _test_ctx = av.CodecContext.create(profile['codec'], 'w')
-            _test_ctx.width   = 128
-            _test_ctx.height  = 128
+            _test_ctx.width = 128
+            _test_ctx.height = 128
             _test_ctx.pix_fmt = 'yuv420p'
             _test_ctx.open()
             del _test_ctx
@@ -126,16 +126,16 @@ def patch_aiortc_nvenc(force: bool = False) -> bool:
 
     x264_profile = {
         'codec': 'libx264',
-        'name':  'libx264 (CPU)',
+        'name': 'libx264 (CPU)',
         'options': {
-            'preset':       'medium',
-            'profile':      'high',
-            'level':        '4.1',
-            'g':            '30',
+            'preset': 'medium',
+            'profile': 'high',
+            'level': '4.1',
+            'g': '30',
             'sc_threshold': '40',
-            'crf':          '18',
+            'crf': '18',
             'x264-params': (
-                'rc-lookahead=30:'      
+                'rc-lookahead=30:'
                 'bframes=3:'
                 'b-adapt=2:'
                 'no-fast-pskip=1:'
@@ -153,13 +153,12 @@ def patch_aiortc_nvenc(force: bool = False) -> bool:
 
     try:
         import aiortc.codecs.h264 as _h264_mod
-
         _OrigEncoder = _h264_mod.H264Encoder
         _orig_encode = _OrigEncoder.encode
 
         _CODEC_ATTRS = ('_codec', '_encoder', '_context', '_av_codec')
         _active_flag = [False]
-        _warn_flag   = [False]
+        _warn_flag = [False]
 
         def _patched_encode(self_enc, frame, force_keyframe: bool = False):
             codec_attr = next(
@@ -167,6 +166,7 @@ def patch_aiortc_nvenc(force: bool = False) -> bool:
                  if hasattr(self_enc, a) and getattr(self_enc, a) is None),
                 None,
             )
+
             if codec_attr is None and not _active_flag[0]:
                 codec_attr = next(
                     (a for a in _CODEC_ATTRS
@@ -181,11 +181,11 @@ def patch_aiortc_nvenc(force: bool = False) -> bool:
                     runtime_options = dict(selected_profile['options'])
 
                     if selected_profile['codec'] == 'h264_nvenc':
-                        runtime_options['b']       = str(cur_bitrate * 2 // 3)
+                        runtime_options['b'] = str(cur_bitrate * 2 // 3)
                         runtime_options['maxrate'] = str(cur_bitrate)
                         runtime_options['bufsize'] = str(cur_bitrate * 2)
                     elif selected_profile['codec'] in ('h264_amf', 'h264_mf'):
-                        runtime_options['b']       = str(cur_bitrate * 2 // 3)
+                        runtime_options['b'] = str(cur_bitrate * 2 // 3)
                         runtime_options['maxrate'] = str(cur_bitrate)
                         runtime_options['bufsize'] = str(cur_bitrate * 2)
                     elif selected_profile['codec'] == 'libx264':
@@ -193,10 +193,10 @@ def patch_aiortc_nvenc(force: bool = False) -> bool:
                         runtime_options['bufsize'] = str(cur_bitrate * 2)
 
                     ctx = av.CodecContext.create(selected_profile['codec'], 'w')
-                    ctx.options   = runtime_options
-                    ctx.width     = frame.width
-                    ctx.height    = frame.height
-                    ctx.pix_fmt   = 'yuv420p'
+                    ctx.options = runtime_options
+                    ctx.width = frame.width
+                    ctx.height = frame.height
+                    ctx.pix_fmt = 'yuv420p'
                     ctx.time_base = frame.time_base
 
                     if selected_profile['codec'] == 'libx264':
@@ -217,10 +217,8 @@ def patch_aiortc_nvenc(force: bool = False) -> bool:
                             f"{mode}, {frame.width}×{frame.height}, "
                             f"limited-range bt709"
                         )
-
                 except Exception as e:
                     print(f"[Video] H264Encoder: ошибка контекста ({e}) — fallback")
-
             else:
                 if not _warn_flag[0]:
                     _warn_flag[0] = True
@@ -234,43 +232,39 @@ def patch_aiortc_nvenc(force: bool = False) -> bool:
 
         _OrigEncoder.encode = _patched_encode
         return bool(working_profile)
-
     except Exception as e:
         print(f"[Video] patch_aiortc_nvenc: ошибка патча — {e}")
         return False
 
-class DXCamTrack(_AiortcVideoStreamTrack):
 
+class DXCamTrack(_AiortcVideoStreamTrack):
     kind = "video"
     _QUEUE_MAXSIZE = 4
 
     def __init__(
-        self,
-        monitor_idx: int = 0,
-        fps:         int = VIDEO_FPS,
-        width:       int = VIDEO_WIDTH,
-        height:      int = VIDEO_HEIGHT,
+            self,
+            monitor_idx: int = 0,
+            fps: int = VIDEO_FPS,
+            width: int = VIDEO_WIDTH,
+            height: int = VIDEO_HEIGHT,
     ):
         super().__init__()
         self._monitor_idx = monitor_idx
-        self._fps         = fps
-        self._width       = width
-        self._height      = height
-
+        self._fps = fps
+        self._width = width
+        self._height = height
         self._queue: asyncio.Queue | None = None
-        self._loop:  asyncio.AbstractEventLoop | None = None
-
+        self._loop: asyncio.AbstractEventLoop | None = None
         self._capture_thread: threading.Thread | None = None
         self._running = False
         self._last_frame: 'av.VideoFrame | None' = None
-
         self._lq_track: 'DXCamTrackLQ | None' = None
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
         if self._running:
             return
-        self._loop    = loop
-        self._queue   = asyncio.Queue(maxsize=self._QUEUE_MAXSIZE)
+        self._loop = loop
+        self._queue = asyncio.Queue(maxsize=self._QUEUE_MAXSIZE)
         self._running = True
         self._capture_thread = threading.Thread(
             target=self._capture_loop,
@@ -290,8 +284,8 @@ class DXCamTrack(_AiortcVideoStreamTrack):
 
     async def recv(self) -> 'av.VideoFrame':
         pts, time_base = await self.next_timestamp()
-
         av_frame = None
+
         if self._queue is not None:
             try:
                 av_frame = self._queue.get_nowait()
@@ -302,7 +296,7 @@ class DXCamTrack(_AiortcVideoStreamTrack):
         if av_frame is None:
             av_frame = av.VideoFrame(self._width, self._height, 'yuv420p')
 
-        av_frame.pts       = pts
+        av_frame.pts = pts
         av_frame.time_base = time_base
         return av_frame
 
@@ -318,11 +312,12 @@ class DXCamTrack(_AiortcVideoStreamTrack):
                            frame_np.shape[0] != self._height)
 
             if need_resize and _CV2_AVAILABLE:
-                resized     = self._downscale_rgb(frame_np, self._width, self._height)
-                av_frame    = av.VideoFrame.from_ndarray(resized, format='rgb24')
+                resized = self._downscale_rgb(frame_np, self._width, self._height)
+                av_frame = av.VideoFrame.from_ndarray(resized, format='rgb24')
                 need_resize = False
             else:
                 av_frame = av.VideoFrame.from_ndarray(frame_np, format='rgb24')
+
             try:
                 av_frame.colorspace = 1
             except (AttributeError, Exception):
@@ -334,8 +329,9 @@ class DXCamTrack(_AiortcVideoStreamTrack):
                 )
             else:
                 yuv_frame = av_frame.reformat(format='yuv420p')
+
             try:
-                yuv_frame.colorspace = 1   # BT.709
+                yuv_frame.colorspace = 1  # BT.709
             except (AttributeError, Exception):
                 pass
 
@@ -389,7 +385,6 @@ class DXCamTrack(_AiortcVideoStreamTrack):
                 if frame_np is not None and self._loop is not None:
                     if self._lq_track is not None and self._lq_track._running:
                         self._lq_track._on_raw_frame(frame_np)
-
                     av_frame = self._convert_to_yuv(frame_np)
                     if av_frame is not None:
                         self._loop.call_soon_threadsafe(
@@ -403,11 +398,13 @@ class DXCamTrack(_AiortcVideoStreamTrack):
             camera.stop()
         except Exception:
             pass
+
         try:
             camera.release()
             print("[DXCamTrack] D3D11 ресурсы освобождены")
         except Exception:
             pass
+
         del camera
 
         try:
@@ -444,32 +441,32 @@ class DXCamTrack(_AiortcVideoStreamTrack):
             camera.release()
         except Exception:
             pass
+
         del camera
 
-class DXCamTrackLQ(_AiortcVideoStreamTrack):
 
+class DXCamTrackLQ(_AiortcVideoStreamTrack):
     kind = "video"
     _QUEUE_MAXSIZE = 4
 
     def __init__(self, hq_width: int, hq_height: int):
         super().__init__()
         lq_w, lq_h = get_lq_resolution(hq_width, hq_height)
-        self._width  = lq_w
+        self._width = lq_w
         self._height = lq_h
-
         self._queue: asyncio.Queue | None = None
-        self._loop:  asyncio.AbstractEventLoop | None = None
-        self._running    = False
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._running = False
         self._last_frame: 'av.VideoFrame | None' = None
 
     def start(self, loop: asyncio.AbstractEventLoop) -> None:
-        self._loop    = loop
-        self._queue   = asyncio.Queue(maxsize=self._QUEUE_MAXSIZE)
+        self._loop = loop
+        self._queue = asyncio.Queue(maxsize=self._QUEUE_MAXSIZE)
         self._running = True
         print(f"[DXCamTrackLQ] LQ-трек запущен: {self._width}×{self._height}")
 
     def stop(self) -> None:
-        self._running    = False
+        self._running = False
         self._last_frame = None
 
     def _on_raw_frame(self, frame_np: np.ndarray) -> None:
@@ -505,11 +502,13 @@ class DXCamTrackLQ(_AiortcVideoStreamTrack):
                 av_frame.colorspace = 1
             except Exception:
                 pass
+
             yuv = av_frame.reformat(format='yuv420p')
             try:
                 yuv.colorspace = 1
             except Exception:
                 pass
+
             return yuv
         except Exception as e:
             print(f"[DXCamTrackLQ] Ошибка конвертации: {e}")
@@ -530,8 +529,8 @@ class DXCamTrackLQ(_AiortcVideoStreamTrack):
 
     async def recv(self) -> 'av.VideoFrame':
         pts, time_base = await self.next_timestamp()
-
         av_frame = None
+
         if self._queue is not None:
             try:
                 av_frame = self._queue.get_nowait()
@@ -542,38 +541,37 @@ class DXCamTrackLQ(_AiortcVideoStreamTrack):
         if av_frame is None:
             av_frame = av.VideoFrame(self._width, self._height, 'yuv420p')
 
-        av_frame.pts       = pts
+        av_frame.pts = pts
         av_frame.time_base = time_base
         return av_frame
+
 
 _H264_RTP_CLOCK = 90000
 
 
 class VideoReceiver(QObject):
-
-    frame_received       = pyqtSignal(int, QImage)
+    frame_received = pyqtSignal(int, QImage)
     stream_stats_updated = pyqtSignal(int, int, int)
-
     _STATS_INTERVAL = 2.0
 
     def __init__(
-        self,
-        uid:   int,
-        track,
-        loop:  asyncio.AbstractEventLoop,
+            self,
+            uid: int,
+            track,
+            loop: asyncio.AbstractEventLoop,
     ):
         super().__init__()
-        self.uid      = uid
-        self._track   = track
-        self._loop    = loop
+        self.uid = uid
+        self._track = track
+        self._loop = loop
         self._running = True
-        self._stats_decoded   = 0
+        self._stats_decoded = 0
         self._stats_last_time = time.monotonic()
         self._buffer_ms = VIEWER_JITTER_BUFFER_MS
         self._jitter_buf: collections.deque = collections.deque()
-        self._pts_anchor:  int   | None = None   # RTP timestamp первого кадра
-        self._wall_anchor: float | None = None   # monotonic time первого кадра
-        self._pts_clock:   int          = _H264_RTP_CLOCK  # 90000 для H264
+        self._pts_anchor: int | None = None  # RTP timestamp первого кадра
+        self._wall_anchor: float | None = None  # monotonic time первого кадра
+        self._pts_clock: int = _H264_RTP_CLOCK  # 90000 для H264
         self._pts_prev: int | None = None
 
         # ── Low-latency режим управления ──────────────────────────────────
@@ -584,12 +582,12 @@ class VideoReceiver(QObject):
         #
         # _buf_lock защищает совместный доступ к буферу и якорю: _buf_push
         # вызывается из recv-потока, а set_low_latency — из Qt-потока.
-        self._buffer_ms_normal:  int = VIEWER_JITTER_BUFFER_MS
+        self._buffer_ms_normal: int = VIEWER_JITTER_BUFFER_MS
         self._buffer_ms_control: int = VIEWER_JITTER_BUFFER_MS_CONTROL
         self._low_latency: bool = False
         self._buf_lock = threading.Lock()
-
         self._playback_thread: threading.Thread | None = None
+
         if self._buffer_ms > 0:
             self._playback_thread = threading.Thread(
                 target=self._playback_loop,
@@ -612,7 +610,6 @@ class VideoReceiver(QObject):
     _first_frame_logged: bool = False
 
     def _buf_push(self, q_img: QImage, frame_pts: int | None) -> None:
-
         now = time.monotonic()
 
         # Весь доступ к буферу/якорю под _buf_lock — set_low_latency() может
@@ -628,18 +625,18 @@ class VideoReceiver(QObject):
                 return
 
             if self._pts_anchor is None:
-                self._pts_anchor  = frame_pts
+                self._pts_anchor = frame_pts
                 self._wall_anchor = now
-                self._pts_prev    = frame_pts
+                self._pts_prev = frame_pts
                 display_at = now + buffer_secs
                 self._jitter_buf.append((display_at, q_img))
                 return
 
             pts_diff = frame_pts - self._pts_prev
             if pts_diff < -0x3FFFFFFF:
-                self._pts_anchor  = frame_pts
+                self._pts_anchor = frame_pts
                 self._wall_anchor = now
-                self._pts_prev    = frame_pts
+                self._pts_prev = frame_pts
                 display_at = now + buffer_secs
                 self._jitter_buf.append((display_at, q_img))
                 return
@@ -648,7 +645,6 @@ class VideoReceiver(QObject):
 
             pts_delta_secs = (frame_pts - self._pts_anchor) / self._pts_clock
             display_at = self._wall_anchor + pts_delta_secs + buffer_secs
-
             self._jitter_buf.append((display_at, q_img))
 
             while len(self._jitter_buf) > 200:
@@ -667,41 +663,40 @@ class VideoReceiver(QObject):
                           плавным на слабом интернете.
 
         Аккуратность перехода — главное требование:
-
-          • Вход в управление (700→90): кадры, уже лежащие в очереди, имеют
-            display_at, посчитанный с большим буфером. Если просто уменьшить
-            _buffer_ms, новые кадры захотят показаться на ~600 мс раньше старых —
-            порядок ломается, playback выбросит пачку (rerun-рывок). Поэтому
-            переанкориваем (сбрасываем _pts_anchor) и чистим очередь: один
-            незаметный микропропуск внутри уже идущего действия — и дальше
-            чистый low-latency.
-
-          • Выход из управления (90→700): тут НЕЛЬЗЯ чистить очередь и резко
-            растить буфер — playout «проголодается» на ~600 мс и зависнет.
-            Вместо этого переанкориваемся по текущему моменту: новый буфер
-            начинает действовать с этого кадра, очередь доигрывается естественно,
-            глубина буфера наполняется сама собой за следующие кадры. Без провала.
+          • Вход в управление (150→80): FIX #47 (v0.3.3) — больше НЕ чистим
+            очередь. Вместо этого пересчитываем display_at для всех кадров
+            в очереди с новым буфером. Это даёт плавный переход без чёрного
+            экрана или freeze.
+          • Выход из управления (80→150): очередь НЕ трогаем — пусть доиграется,
+            буфер дорастёт сам.
         """
         with self._buf_lock:
             target = (self._buffer_ms_control if enabled
                       else self._buffer_ms_normal)
+
             if enabled == self._low_latency and target == self._buffer_ms:
                 return
 
+            old_buffer_ms = self._buffer_ms
             self._low_latency = enabled
-            self._buffer_ms   = target
+            self._buffer_ms = target
+
+            # FIX #47 (v0.3.3): пересчитываем display_at для всех кадров в очереди
+            # вместо очистки. Разница буферов = сколько нужно сдвинуть все кадры.
+            buffer_diff_secs = (target - old_buffer_ms) / 1000.0
+
+            # Пересчитываем display_at для всех элементов в очереди
+            new_jitter_buf = collections.deque()
+            for display_at, img in self._jitter_buf:
+                new_display_at = display_at + buffer_diff_secs
+                new_jitter_buf.append((new_display_at, img))
+            self._jitter_buf = new_jitter_buf
 
             # Переанкоривание: следующий кадр в _buf_push заново задаст
             # _wall_anchor/_pts_anchor от текущего момента уже с новым буфером.
-            self._pts_anchor  = None
+            self._pts_anchor = None
             self._wall_anchor = None
-            self._pts_prev    = None
-
-            if enabled:
-                # Вход в управление: сбрасываем накопленную глубину, чтобы
-                # мгновенно догнать «настоящее». Допустим один микропропуск.
-                self._jitter_buf.clear()
-            # Выход: очередь НЕ трогаем — пусть доиграется, буфер дорастёт сам.
+            self._pts_prev = None
 
         print(
             f"[VideoReceiver] uid={self.uid}: буфер → {target} мс "
@@ -709,8 +704,10 @@ class VideoReceiver(QObject):
         )
 
     def _playback_loop(self) -> None:
+        # Поллинг ~200 Гц — с запасом покрывает 60 fps. Раньше было 30 Гц,
+        # и 60-fps поток «терял» каждый второй кадр на выходе.
+        poll_interval = 0.005
 
-        poll_interval = max(0.005, 0.5 / VIDEO_FPS)
 
         while self._running:
             time.sleep(poll_interval)
@@ -733,11 +730,9 @@ class VideoReceiver(QObject):
                 self.frame_received.emit(self.uid, frame_to_show)
 
     async def _recv_loop(self) -> None:
-
         _loop = asyncio.get_running_loop()
         _use_buffer = self._buffer_ms > 0
         _rtp_diag_count = 0
-
         _clock_detected = False
 
         try:
@@ -789,7 +784,7 @@ class VideoReceiver(QObject):
                         None,
                         lambda f=frame: f.to_ndarray(format='rgb24')
                     )
-                    img_np = np.ascontiguousarray(img_np)
+
                     h, w, _ = img_np.shape
                     bytes_per_line = img_np.strides[0]
 
@@ -819,7 +814,7 @@ class VideoReceiver(QObject):
                         elapsed = max(now - self._stats_last_time, 0.001)
                         fps = int(self._stats_decoded / elapsed)
                         self.stream_stats_updated.emit(self.uid, fps, 0)
-                        self._stats_decoded   = 0
+                        self._stats_decoded = 0
                         self._stats_last_time = now
 
                 except Exception as e:
@@ -841,18 +836,17 @@ class VideoReceiver(QObject):
         except Exception:
             pass
 
+
 class VideoEngine(QObject):
-    frame_received       = pyqtSignal(int, QImage)
+    frame_received = pyqtSignal(int, QImage)
     stream_stats_updated = pyqtSignal(int, int, int)
 
     def __init__(self, net_client):
         super().__init__()
         self.net = net_client
-
-        self._dxcam_track:    None = None
+        self._dxcam_track: None = None
         self._dxcam_track_lq: None = None
         self._receivers: dict[int, VideoReceiver] = {}
-
         self._webrtc_loop: asyncio.AbstractEventLoop | None = None
 
     def set_webrtc_loop(self, loop: asyncio.AbstractEventLoop) -> None:
@@ -864,14 +858,12 @@ class VideoEngine(QObject):
         return True
 
     def stop_streaming(self) -> None:
-        self._dxcam_track    = None
+        self._dxcam_track = None
         self._dxcam_track_lq = None
-
         gc.collect(0)
         gc.collect(1)
         gc.collect(2)
         gc.collect(0)
-
         try:
             import ctypes
             kernel32 = ctypes.windll.kernel32
@@ -924,7 +916,6 @@ class VideoEngine(QObject):
         receiver.frame_received.connect(self.frame_received)
         receiver.stream_stats_updated.connect(self.stream_stats_updated)
         self._receivers[uid] = receiver
-
         print(f"[VideoEngine] VideoReceiver создан для uid={uid}")
         return receiver
 
@@ -938,7 +929,6 @@ class VideoEngine(QObject):
                 pass
             receiver.stop()
         print(f"[VideoEngine] stop_viewer_for_uid({uid})")
-
 
     def process_incoming_packet(self, uid, data, is_lq: bool = False) -> None:
         pass
@@ -962,10 +952,8 @@ class VideoEngine(QObject):
 
     def shutdown(self) -> None:
         print("[VideoEngine] shutdown()")
-
-        self._dxcam_track    = None
+        self._dxcam_track = None
         self._dxcam_track_lq = None
-
         for uid in list(self._receivers.keys()):
             try:
                 self._receivers[uid].stop()

@@ -20,10 +20,11 @@ from config import (
     OPUS_APPLICATION, DEFAULT_BITRATE,
     UDP_HEADER_STRUCT, UDP_HEADER_SIZE,
     FLAG_STREAM_VOICES, FLAG_WHISPER, FLAG_ANONYMOUS,
-    FLAG_SPEAK_PARENT,
+    FLAG_SPEAK_PARENT, FLAG_PLAYER,
     STREAM_VOICE_HEADER_STRUCT, STREAM_VOICE_HEADER_SIZE,
     ANONYMOUS_UID,
     AUDIO_DIAG_ENABLED,
+    PLAYER_DEFAULT_VOL,
 )
 from .audio_processing import (
     DeepFilterEngine,
@@ -31,10 +32,43 @@ from .audio_processing import (
     butter, sosfilt, sosfilt_zi, _WLP_SOS, _ANON_LP_SOS,
 )
 from .audio_capture import StreamAudioCapture, MicrophoneTrack, SystemAudioTrack, get_dll
+from .voice_filters import VoiceFilterBank, FILTER_NONE
 try:
     from pyrnnoise import RNNoise
 except ImportError:
     RNNoise = None
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# ОБЩИЙ ПЛЕЕР (v2): музыка транслируется В ГОЛОСОВОЙ КАНАЛ через UDP + Opus
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Раньше трек шёл как base64 в JSON-сообщении TCP (10 МБ → 30-40 сек на VPN).
+# Теперь: DJ режет PCM на 20-мс чанки, кодирует Opus 96 kbps, шлёт UDP с
+# FLAG_PLAYER. Сервер релеит такие пакеты всем в комнате (см. udp_handler в
+# server.py — они попадают в отдельную ветку и рассылаются по равенству комнат).
+#
+# На слушателе _output_callback декодирует пакеты из отдельного JitterBuffer и
+# добавляет к общему mix_buffer — рядом с голосами собеседников.
+#
+# У DJ локальное воспроизведение идёт напрямую из _player_broadcast_pcm с
+# задержкой 2 чанка (40 мс), чтобы «догонять» то, что уже отправлено в сеть.
+# При паузе позиция НЕ двигается — resume продолжает ровно с того же места.
+# ════════════════════════════════════════════════════════════════════════════
+
+# Битрейт Opus для музыки. Для речи хватает 64k, для музыки — 96k.
+# Выше 128k смысла мало: Opus на 96k для большинства треков звучит «прозрачно».
+PLAYER_OPUS_BITRATE = 160000
+
+# Сколько чанков может накопиться во входной очереди плеера. 200 чанков =
+# 4 секунды буфера. Если сеть сильно тормозит — старое дропаем, чтобы не
+# накапливать задержку.
+_PLAYER_IN_QUEUE_MAX = 200
+
+# Сколько сэмплов из JitterBuffer доставать за один вызов _output_callback.
+# CHUNK_SIZE=960 сэмплов на вызов. Немного больше на случай догона — но не
+# безгранично, иначе накопим джиттер.
+_PLAYER_IN_JITTER_TARGET = 2
 
 
 class JitterBuffer:
@@ -62,12 +96,8 @@ class JitterBuffer:
         with self._lock:
             if self.last_seq != -1:
                 if seq + self.SEQ_JUMP_RESET_BACK < self.last_seq:
-                    print(f"[JB] seq reset (was last={self.last_seq}, got={seq}) — "
-                          f"смена сессии, сброс буфера", flush=True)
                     self._reset_locked()
                 elif seq > self.last_seq + self.SEQ_JUMP_RESET_FORWARD:
-                    print(f"[JB] seq jump forward (last={self.last_seq}, got={seq}) — "
-                          f"reset", flush=True)
                     self._reset_locked()
 
             if seq <= self.last_seq and self.last_seq != -1:
@@ -80,7 +110,6 @@ class JitterBuffer:
                     if self.buffer[i][0] > max_seq:
                         max_seq = self.buffer[i][0]
                         max_idx = i
-                # Swap с последним и pop — избегает сдвига на O(n)
                 last_idx = len(self.buffer) - 1
                 if max_idx != last_idx:
                     self.buffer[max_idx] = self.buffer[last_idx]
@@ -105,7 +134,6 @@ class JitterBuffer:
             return data
 
 
-
 class RemoteUser:
     def __init__(self, uid):
         self.uid = uid
@@ -126,9 +154,9 @@ class AudioHandler(QObject):
     whisper_ended = pyqtSignal()
 
     user_volume_zero = pyqtSignal(int, bool)
+    player_track_ended = pyqtSignal()
 
     def _apply_anonymous_voice_effect(self, s: np.ndarray, state: dict) -> np.ndarray:
-
         N = len(s)
         max_delay = 1440
         speed = 2.0 ** (-4.0 / 12.0)
@@ -259,6 +287,7 @@ class AudioHandler(QObject):
         self._room_map_lock = threading.Lock()
         self.whisper_target_uid: int = 0
         self._speak_parent_active: bool = False
+        self.voice_filter = VoiceFilterBank(SAMPLE_RATE)
         self._whisper_sequence: int = 0
         self._whisper_anonymous: bool = False
         self._anon_last_incoming_ts: float = 0.0
@@ -272,6 +301,33 @@ class AudioHandler(QObject):
         self._whisper_effect_reset: bool = False
         self.vad_pre_buffer = deque(maxlen=5)
         self.was_talking = False
+
+        # ════════════════════════════════════════════════════════════════
+        # Общий плеер (UDP + Opus, FLAG_PLAYER)
+        # ════════════════════════════════════════════════════════════════
+        # Broadcast-сторона (DJ):
+        self._player_broadcast_thread: threading.Thread | None = None
+        self._player_broadcast_stop    = threading.Event()
+        self._player_broadcast_pause   = threading.Event()
+        self._player_broadcast_lock    = threading.Lock()
+        self._player_broadcast_pcm: np.ndarray | None = None
+        self._player_broadcast_pos: int = 0
+        self._player_broadcast_seq: int = 0
+        # Отдельный энкодер — чтобы не мешать основному голосовому (разный
+        # битрейт и настройки; основной оптимизирован под речь).
+        self._player_encoder = opuslib.Encoder(SAMPLE_RATE, CHANNELS, OPUS_APPLICATION)
+        self._player_encoder.bitrate = PLAYER_OPUS_BITRATE
+        self._player_encoder.complexity = 7   # музыка — качество важнее CPU
+
+        # Receive-сторона (слушатель):
+        self._player_packets: queue.Queue = queue.Queue(maxsize=_PLAYER_IN_QUEUE_MAX)
+        self._player_decoder = opuslib.Decoder(SAMPLE_RATE, CHANNELS)
+        self._player_in_jb = JitterBuffer(target_delay=_PLAYER_IN_JITTER_TARGET)
+
+        # Громкость плеера — ЛОКАЛЬНАЯ у каждого (настраивается в «Фичах»).
+        self._player_vol: float = PLAYER_DEFAULT_VOL
+        # Флаг окончания трека — читается GUI-таймером (player_consume_ended_flag).
+        self._player_ended_flag: bool = False
 
         self.stream = None
         self._in_stream = None
@@ -300,7 +356,6 @@ class AudioHandler(QObject):
         self._audio_users_snapshot: dict = {}
 
     def enable_dll_render(self, active: bool, raw_mode: bool = False) -> None:
-
         pass
 
     def set_bitrate(self, bitrate_kbps):
@@ -317,7 +372,6 @@ class AudioHandler(QObject):
     def play_internal_sound(self, data: np.ndarray, sr: int, vol: float = 1.0):
         try:
             data = np.asarray(data, dtype=np.float32)
-            # Стерео → моно
             if data.ndim > 1 and data.shape[1] > 1:
                 data = np.mean(data, axis=1)
             elif data.ndim > 1:
@@ -335,7 +389,6 @@ class AudioHandler(QObject):
             print(f"[Audio] play_internal_sound error: {e}")
 
     def add_stream_audio(self, data: np.ndarray, sr: int, vol: float = 1.0) -> None:
-
         try:
             data = np.asarray(data, dtype=np.float32)
             if data.ndim == 2:
@@ -389,11 +442,206 @@ class AudioHandler(QObject):
     def set_stream_volume(self, vol: float) -> None:
         self._stream_vol = max(0.0, min(float(vol), 2.0))
 
+    # ════════════════════════════════════════════════════════════════════
+    # Общий плеер (UDP + Opus): публичное API
+    # ════════════════════════════════════════════════════════════════════
+    def player_load(self, data: np.ndarray, sr: int,
+                    vol: float | None = None) -> None:
+        """
+        Начать трансляцию трека В ГОЛОСОВОЙ КАНАЛ (UDP + Opus).
+
+        Запускает фоновый поток _player_broadcast_loop, который режет PCM
+        на 20-мс чанки, кодирует Opus и кладёт в send_queue с FLAG_PLAYER.
+        Сервер релеит эти пакеты всем в комнате как обычный голос.
+
+        vol=None оставлен для совместимости со старым API. Громкость
+        воспроизведения у каждого слушателя ЛОКАЛЬНАЯ (audio._player_vol)
+        и настраивается в «Фичах» независимо от DJ.
+        """
+        try:
+            data = np.asarray(data, dtype=np.float32)
+            if data.ndim > 1:
+                data = (np.mean(data, axis=1) if data.shape[1] > 1
+                        else data[:, 0])
+            if len(data) == 0:
+                print("[Player] player_load: пустые данные — пропуск")
+                return
+            if sr != SAMPLE_RATE:
+                target_len = int(round(len(data) * SAMPLE_RATE / sr))
+                x_old = np.linspace(0.0, 1.0, len(data), dtype=np.float64)
+                x_new = np.linspace(0.0, 1.0, target_len, dtype=np.float64)
+                data = np.interp(x_new, x_old, data).astype(np.float32)
+
+            # Останавливаем предыдущий broadcast (если был)
+            self._player_stop_broadcast()
+
+            with self._player_broadcast_lock:
+                self._player_broadcast_pcm = data
+                self._player_broadcast_pos = 0
+                self._player_broadcast_seq = 0
+                self._player_ended_flag    = False
+                self._player_broadcast_stop.clear()
+                self._player_broadcast_pause.clear()
+
+            self._player_broadcast_thread = threading.Thread(
+                target=self._player_broadcast_loop,
+                daemon=True,
+                name="player-broadcast",
+            )
+            self._player_broadcast_thread.start()
+            print(f"[Player] Broadcast START: {len(data)} сэмплов "
+                  f"({len(data)/SAMPLE_RATE:.1f}с) @ {PLAYER_OPUS_BITRATE//1000} kbps")
+        except Exception as e:
+            print(f"[Player] player_load error: {e}")
+
+    def _player_broadcast_loop(self) -> None:
+        """
+        Фоновый поток DJ: режет PCM на 20-мс чанки, кодирует Opus, шлёт в
+        send_queue с FLAG_PLAYER. Спит ровно 20 мс между чанками — реальный
+        темп воспроизведения.
+
+        ВАЖНО про паузу: проверка флага _player_broadcast_pause стоит в самом
+        начале цикла, ДО инкремента _player_broadcast_pos. Иначе при паузе
+        позиция продолжала бы уезжать вперёд (чанк «проглатывался»), и после
+        resume воспроизведение начиналось бы не с того места.
+        """
+        pcm_int16 = np.zeros(CHUNK_SIZE, dtype=np.int16)
+        next_send = time.perf_counter()
+        _first = True
+
+        while not self._player_broadcast_stop.is_set():
+            # ── ПАУЗА: не двигаем позицию, просто ждём ───────────────
+            if self._player_broadcast_pause.is_set():
+                time.sleep(0.02)
+                next_send = time.perf_counter()
+                continue
+
+            with self._player_broadcast_lock:
+                pcm = self._player_broadcast_pcm
+                if pcm is None:
+                    break
+                pos = self._player_broadcast_pos
+                if pos >= len(pcm):
+                    print("[Player] Broadcast END (трек закончился)")
+                    self._player_broadcast_pcm = None
+                    self._player_ended_flag = True
+                    break
+                chunk = pcm[pos:pos + CHUNK_SIZE].copy()
+                self._player_broadcast_pos += len(chunk)
+
+            # Opus требует ровно CHUNK_SIZE сэмплов; хвост паддим нулями.
+            if len(chunk) < CHUNK_SIZE:
+                chunk = np.pad(chunk, (0, CHUNK_SIZE - len(chunk)))
+            np.multiply(chunk, 32767, out=pcm_int16, casting='unsafe')
+
+            try:
+                encoded = self._player_encoder.encode(
+                    pcm_int16.tobytes(), CHUNK_SIZE
+                )
+            except Exception as e:
+                print(f"[Player] encode error: {e}")
+                time.sleep(0.02)
+                continue
+
+            self._player_broadcast_seq += 1
+            header = UDP_HEADER_STRUCT.pack(
+                self.my_uid, time.perf_counter(),
+                self._player_broadcast_seq,
+                FLAG_PLAYER,
+            )
+            try:
+                self.send_queue.put_nowait(header + encoded)
+            except queue.Full:
+                # send_queue переполнен (сеть лагает) — дропаем, чтобы не
+                # накапливать задержку. Opus FEC частично восстановит.
+                pass
+
+            if _first:
+                _first = False
+                print(f"[Player] первый чанк отправлен (seq={self._player_broadcast_seq})")
+
+            # Точно 20 мс между чанками (реальный темп воспроизведения)
+            next_send += CHUNK_SIZE / SAMPLE_RATE
+            sleep_time = next_send - time.perf_counter()
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+            else:
+                # Отстали (GIL/GC/нагрузка) — перескакиваем, не копим задержку
+                next_send = time.perf_counter()
+
+        print("[Player] Broadcast loop завершён")
+
+    def _player_stop_broadcast(self) -> None:
+        self._player_broadcast_stop.set()
+        self._player_broadcast_pause.clear()
+        t = self._player_broadcast_thread
+        if t is not None and t.is_alive():
+            t.join(timeout=0.5)
+        self._player_broadcast_thread = None
+        with self._player_broadcast_lock:
+            self._player_broadcast_pcm = None
+            self._player_broadcast_pos = 0
+            self._player_broadcast_seq = 0
+
+    def player_play(self, pos_ms: int | None = None) -> None:
+        """Продолжить воспроизведение (у DJ). pos_ms — перемотка."""
+        if pos_ms is not None:
+            with self._player_broadcast_lock:
+                if self._player_broadcast_pcm is not None:
+                    self._player_broadcast_pos = max(
+                        0,
+                        min(int(pos_ms / 1000 * SAMPLE_RATE),
+                            len(self._player_broadcast_pcm))
+                    )
+        self._player_broadcast_pause.clear()
+
+    def player_pause(self, pos_ms: int | None = None) -> None:
+        """Пауза (у DJ). Broadcast-поток замирает, слушатели слышат тишину."""
+        self._player_broadcast_pause.set()
+        if pos_ms is not None:
+            with self._player_broadcast_lock:
+                if self._player_broadcast_pcm is not None:
+                    self._player_broadcast_pos = max(
+                        0,
+                        min(int(pos_ms / 1000 * SAMPLE_RATE),
+                            len(self._player_broadcast_pcm))
+                    )
+
+    def player_stop(self) -> None:
+        """Полная остановка broadcast-потока."""
+        self._player_stop_broadcast()
+        # Очищаем приёмный JB — иначе у слушателя в очереди останутся
+        # старые пакеты и после остановки ещё пару секунд будет «хвост».
+        self._player_in_jb.reset()
+        try:
+            while True:
+                self._player_packets.get_nowait()
+        except queue.Empty:
+            pass
+
+    def player_get_pos_ms(self) -> int:
+        """Позиция воспроизведения у DJ."""
+        with self._player_broadcast_lock:
+            if self._player_broadcast_pcm is None:
+                return 0
+            return int(self._player_broadcast_pos / SAMPLE_RATE * 1000)
+
+    def player_consume_ended_flag(self) -> bool:
+        """Атомарно читает и сбрасывает флаг окончания трека (из GUI-таймера)."""
+        if self._player_ended_flag:
+            self._player_ended_flag = False
+            return True
+        return False
+
+    def set_player_volume(self, vol: float) -> None:
+        """Громкость плеера — ЛОКАЛЬНАЯ у каждого слушателя."""
+        self._player_vol = max(0.0, min(2.0, float(vol)))
+
     def set_nr_mode(self, mode: int):
         self.nr_mode = int(mode)
         self.global_settings.setValue("audio/nr_mode", self.nr_mode)
         labels = {0: "выкл", 1: "RNNoise", 2: "DeepFilterNet"}
-        print(f"[Audio] NR mode → {labels.get(self.nr_mode, "?")} ({self.nr_mode})")
+        print(f"[Audio] NR mode → {labels.get(self.nr_mode, '?')} ({self.nr_mode})")
 
     def set_vad_threshold(self, slider_val: int):
         threshold = max(1, min(50, slider_val)) / 1000.0
@@ -508,6 +756,12 @@ class AudioHandler(QObject):
     def stop(self):
         self._is_running.clear()
 
+        # Останавливаем плеер-broadcast (если активен).
+        try:
+            self._player_stop_broadcast()
+        except Exception:
+            pass
+
         t = getattr(self, '_pkt_thread', None)
         if t is not None and t.is_alive():
             t.join(timeout=0.5)
@@ -571,16 +825,47 @@ class AudioHandler(QObject):
 
             self._audio_users_snapshot = {}
 
+        # Плеер тоже сбрасываем — при переподключении старые пакеты не нужны.
+        try:
+            self._player_in_jb.reset()
+            while True:
+                self._player_packets.get_nowait()
+        except Exception:
+            pass
+
         print(f"[Audio] reset_voice_state: drained={drained} пакетов, "
               f"удалено {n_users} RemoteUser", flush=True)
 
     def _packet_processor_loop(self):
+        """
+        Разбирает входящие UDP-пакеты.
+          • FLAG_PLAYER → в отдельную очередь _player_packets (музыка).
+          • Обычный голос → в remote_users[uid].jitter_buffer.
+        """
         while self._is_running.is_set():
             try:
                 packet_data = self.incoming_packets.get(timeout=0.1)
                 uid, seq, data, flags = packet_data
-                if uid == self.my_uid: continue
+                if uid == self.my_uid:
+                    continue
 
+                # ── Пакет общего плеера ────────────────────────────────
+                if flags & FLAG_PLAYER:
+                    try:
+                        self._player_packets.put_nowait((seq, data))
+                    except queue.Full:
+                        # Дропаем самый старый, кладём новый — не копим задержку
+                        try:
+                            self._player_packets.get_nowait()
+                        except queue.Empty:
+                            pass
+                        try:
+                            self._player_packets.put_nowait((seq, data))
+                        except queue.Full:
+                            pass
+                    continue
+
+                # ── Обычный голос ──────────────────────────────────────
                 with self.users_lock:
                     is_new_user = uid not in self.remote_users
                     if is_new_user:
@@ -650,6 +935,12 @@ class AudioHandler(QObject):
         _in_peak = np.max(np.abs(denoised_float))
         if _in_peak > 0.98:
             denoised_float = denoised_float * (0.98 / _in_peak)
+
+        if self.voice_filter is not None and self.voice_filter.active != FILTER_NONE:
+            try:
+                denoised_float = self.voice_filter.process(denoised_float)
+            except Exception:
+                pass
 
         rms = np.sqrt(np.mean(denoised_float ** 2))
         self._vol_emit_counter += 1
@@ -804,7 +1095,7 @@ class AudioHandler(QObject):
             with self._stream_lock:
                 avail = self._stream_fill
                 if avail >= CHUNK_SIZE:
-                    _current_vol = self._stream_vol   # FIX: убрано * 0.4
+                    _current_vol = self._stream_vol
                     self.mix_buffer += self._stream_buf[:CHUNK_SIZE] * _current_vol
                     if AUDIO_DIAG_ENABLED:
                         _sb = self._stream_buf[:CHUNK_SIZE]
@@ -814,12 +1105,72 @@ class AudioHandler(QObject):
                         self._stream_buf[:remaining] = self._stream_buf[CHUNK_SIZE:avail]
                     self._stream_fill = remaining
                 elif avail > 0:
-                    _current_vol = self._stream_vol   # FIX: убрано * 0.4
+                    _current_vol = self._stream_vol
                     _fade = np.linspace(1.0, 0.0, avail, dtype=np.float32)
                     self.mix_buffer[:avail] += (
                         self._stream_buf[:avail] * _fade * _current_vol
                     )
                     self._stream_fill = 0
+
+        # ════════════════════════════════════════════════════════════════
+        # Общий плеер (UDP + Opus): микшируем пакеты из FLAG_PLAYER
+        # ════════════════════════════════════════════════════════════════
+        # Пакеты из _player_packets сначала раскладываем в JitterBuffer
+        # (чтобы упорядочить по seq и скомпенсировать сетевой джиттер),
+        # потом декодируем и добавляем в общий mix_buffer рядом с голосами.
+        try:
+            # 1. Разгружаем входную очередь в JB
+            while True:
+                try:
+                    seq, pdata = self._player_packets.get_nowait()
+                    self._player_in_jb.add(seq, pdata)
+                except queue.Empty:
+                    break
+
+            # 2. Декодируем один чанк из JB (или два, если сильно отстали)
+            n_chunks_to_decode = 1
+            if len(self._player_in_jb.buffer) > 10:
+                n_chunks_to_decode = 2
+
+            _player_vol = self._player_vol
+            for _ in range(n_chunks_to_decode):
+                pdata = self._player_in_jb.get()
+                if pdata is None:
+                    break
+                try:
+                    decoded = self._player_decoder.decode(pdata, CHUNK_SIZE)
+                    s = np.frombuffer(decoded, dtype=np.int16).astype(np.float32) / 32767.0
+                    if len(s) < CHUNK_SIZE:
+                        s = np.pad(s, (0, CHUNK_SIZE - len(s)))
+                    self.mix_buffer += s[:CHUNK_SIZE] * _player_vol
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"[Player] mix error: {e}")
+
+        # ── Локальное воспроизведение у DJ ─────────────────────────────
+        # Пакеты с FLAG_PLAYER от самого DJ не приходят обратно (uid==my_uid
+        # skip в _packet_processor_loop). Но DJ тоже должен слышать трек.
+        # Читаем напрямую из _player_broadcast_pcm с отставанием 2 чанка.
+        #
+        # ВАЖНО: этот блок ТОЖЕ должен уважать _player_broadcast_pause —
+        # иначе при паузе у DJ звук продолжается, хотя broadcast-поток стоит.
+        try:
+            if self.my_uid != 0 and not self._player_broadcast_pause.is_set():
+                with self._player_broadcast_lock:
+                    pcm = self._player_broadcast_pcm
+                    if pcm is not None:
+                        local_pos = self._player_broadcast_pos - CHUNK_SIZE * 2
+                        if local_pos < 0:
+                            local_pos = 0
+                        if local_pos < len(pcm):
+                            chunk = pcm[local_pos:local_pos + CHUNK_SIZE]
+                            if len(chunk) > 0:
+                                if len(chunk) < CHUNK_SIZE:
+                                    chunk = np.pad(chunk, (0, CHUNK_SIZE - len(chunk)))
+                                self.mix_buffer += chunk[:CHUNK_SIZE] * self._player_vol
+        except Exception as e:
+            print(f"[Player] local mix error: {e}")
 
         _limit = 0.95
         _over  = np.abs(self.mix_buffer) > _limit
@@ -887,7 +1238,6 @@ class AudioHandler(QObject):
             self._parent_of_my_room = channel_parents.get(my_room) if my_room else None
 
     def set_user_volume(self, uid, vol):
-
         vol = max(0.0, min(20.0, float(vol)))
         emit_zero_state = None
 
@@ -938,6 +1288,11 @@ class AudioHandler(QObject):
     def stop_speak_parent(self):
         self._speak_parent_active = False
 
+    def set_voice_filter(self, fid: str):
+        if self.voice_filter is not None:
+            self.voice_filter.set_filter(fid)
+            print(f"[Audio] Голосовой фильтр → '{fid}'")
+
     def add_incoming_packet(self, uid, seq, data, flags=0):
         try:
             self.incoming_packets.put_nowait((uid, seq, data, flags))
@@ -976,7 +1331,7 @@ class AudioHandler(QObject):
             host_api = apis[dev['hostapi']]
 
             if 'MME' not in host_api['name']:
-                return mme_idx  # уже не MME
+                return mme_idx
 
             if wasapi_host_idx is None:
                 print("[Audio] WASAPI недоступен, остаёмся на MME (возможно эхо)")
@@ -1016,7 +1371,7 @@ class AudioHandler(QObject):
                 f"[Audio] WASAPI-аналог для '{phys_name}' не найден. "
                 f"Форсируем дефолтный WASAPI (idx {default_wasapi})"
             )
-            return default_wasapi  # ← единственная важная строка
+            return default_wasapi
 
         except Exception as e:
             print(f"[Audio] _remap_to_wasapi error: {e}")

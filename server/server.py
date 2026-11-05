@@ -15,7 +15,7 @@ from config import (
     UDP_RECV_BUFFER_SIZE, UDP_SEND_BUFFER_SIZE,
     UDP_HEADER_STRUCT, UDP_HEADER_SIZE,
     FLAG_STREAM_VOICES, FLAG_WHISPER, FLAG_ANONYMOUS,
-    FLAG_SPEAK_PARENT,
+    FLAG_SPEAK_PARENT, FLAG_PLAYER,
     STREAM_VOICE_HEADER_STRUCT, STREAM_VOICE_HEADER_SIZE,
     ANONYMOUS_UID,
     CMD_LOGIN, CMD_JOIN_ROOM, CMD_STREAM_START, CMD_STREAM_STOP,
@@ -43,10 +43,16 @@ from config import (
     CMD_REMOTE_CONTROL_EVENT, CMD_REMOTE_CONTROL_STOP,
     RC_DENY_LIMIT, RC_COOLDOWN_SEC,
     CMD_TYPING, CHAT_DB_PATH, CHAT_HISTORY_MAX,
+    CMD_PLAYER_LOAD, CMD_PLAYER_PAUSE, CMD_PLAYER_RESUME, CMD_PLAYER_STOP,
+    PLAYER_MAX_B64_SIZE,
 )
 from .chat_db import ChatDB
 from .server_webrtc import PionSfuProxy
 
+# ─── Буфер TCP: 16 МБ достаточно для чата/файлов. ─────────────────────────
+# Плеер больше НЕ идёт через TCP (он идёт через UDP + Opus, FLAG_PLAYER),
+# поэтому большой буфер для base64-трека больше не нужен. Оставляем 16 МБ
+# с запасом под chat_media (10 МБ base64) и file_offer.
 _TCP_BUFFER_MAX = 16 * 1024 * 1024
 
 
@@ -55,12 +61,14 @@ class _ClientLeave(Exception):
     pass
 
 # Лимит размера одного base64-кадра камеры. При высоких настройках
-# (480px / q90) один кадр может достигать ~200-270 КБ base64, поэтому
-# берём щедрый потолок 400 КБ против реальных кадров, но против мусора.
+# (480px / q90) один кадр может достигать ~200-270 КБ base64.
 CAMERA_FRAME_MAX_B64 = 400_000
 
+
 class SFUServer:
-    def __init__(self, host='0.0.0.0', server_name=''):
+    def __init__(self, host='0.0.0.0', server_name='', pin=''):
+
+        self._pin = str(pin or '')
 
         self.tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -88,7 +96,6 @@ class SFUServer:
         self.watchers = {}
 
         # Камера-зрители: {streamer_uid: {viewer_uid: True}}.
-        # Отдельно от self.watchers (экран), т.к. камера — другой SFU.
         self.cam_watchers = {}
         self.cam_watchers_lock = threading.Lock()
 
@@ -96,8 +103,6 @@ class SFUServer:
         self.remote_controllers_lock  = threading.Lock()
 
         # Антиспам запросов управления.
-        #   _rc_deny_counts:    {(streamer_uid, viewer_uid): int}  — отказы подряд
-        #   _rc_cooldown_until: {(streamer_uid, viewer_uid): float} — ts окончания cooldown
         self._rc_deny_counts:    dict = {}
         self._rc_cooldown_until: dict = {}
         self._rc_antispam_lock        = threading.Lock()
@@ -121,12 +126,6 @@ class SFUServer:
         self._accepting:   bool = True
         self._announcer         = None
         self._owner_ip:    str  = ''
-        # Множество ВСЕХ локальных IP хоста (+loopback). Используется вместо
-        # сравнения с единственным _owner_ip: друг мог подключиться к хосту
-        # по любому туннелю (Radmin 26.x / ZeroTier 10.x / Tailscale 100.x)
-        # или физическому LAN, и со стороны хоста его собственные соединения
-        # приходят с РАЗНЫХ локальных адресов. Один _owner_ip не покрывал все
-        # интерфейсы → маршрутизация «локальный ли стример» могла ошибиться.
         self._owner_ips:   set  = {'127.0.0.1', '::1', 'localhost'}
 
         self._server_name = server_name or SERVER_NAME_DEFAULT
@@ -177,6 +176,14 @@ class SFUServer:
             target=self._bcast_loop, daemon=True, name="srv-bcast"
         )
         self._bcast_thread.start()
+
+        # ── Общий плеер: DJ + состояние на комнату ────────────────────
+        # Плеер сам трек не передаёт (он идёт через UDP с FLAG_PLAYER).
+        # Здесь хранится только «кто DJ» и позиция для UI pause/resume.
+        self._player_dj: dict[str, int] = {}
+        self._player_state: dict[str, dict] = {}
+        self._player_state_meta: dict[str, dict] = {}
+        self._player_state_lock = threading.Lock()
 
 
     def _bcast_loop(self) -> None:
@@ -233,8 +240,6 @@ class SFUServer:
             return False
         if ip in self._owner_ips:
             return True
-        # Подстраховка на случай, если набор адресов хоста изменился уже
-        # после старта (включили туннель позже): держим и единичный _owner_ip.
         return bool(self._owner_ip and ip == self._owner_ip)
 
     def _load_bans(self) -> None:
@@ -313,9 +318,6 @@ class SFUServer:
         if self._is_ban_protected(ip):
             print(f"[Server] ⚠ Попытка забанить защищённый IP={ip!r} — отклонено")
             return False
-        if not nick:
-
-            pass
         key = self._ban_key(ip, nick)
         with self._bans_lock:
             self._bans[key] = {
@@ -552,6 +554,7 @@ class SFUServer:
 
                 is_stream_voices = bool(flags & FLAG_STREAM_VOICES)
                 is_whisper       = bool(flags & FLAG_WHISPER)
+                is_player        = bool(flags & FLAG_PLAYER)
 
                 if is_whisper:
                     if len(data) < UDP_HEADER_SIZE + STREAM_VOICE_HEADER_SIZE:
@@ -562,7 +565,6 @@ class SFUServer:
                     with self.udp_lock:
                         target_addr = self.udp_map.get(target_uid)
                     if target_addr:
-
                         if flags & FLAG_ANONYMOUS:
                             new_header = UDP_HEADER_STRUCT.pack(
                                 ANONYMOUS_UID, msg_ts, seq, flags
@@ -577,6 +579,30 @@ class SFUServer:
 
                 elif is_stream_voices:
                     self._send_to_watchers(sender_uid, data)
+
+                elif is_player:
+                    # ── ОБЩИЙ ПЛЕЕР: релеим всем в той же комнате ─────
+                    # Не используем _can_hear (плеер не должен идти в дочерние
+                    # каналы — иначе в дочернем канале будет и плеер комнаты,
+                    # и плеер родителя, что нежелательно). Только равная комната.
+                    with self.clients_lock:
+                        target_uids = [
+                            c_data['uid']
+                            for c_data in self.clients.values()
+                            if c_data['uid'] != sender_uid
+                               and c_data.get('room') == sender_room
+                        ]
+                    with self.udp_lock:
+                        target_addrs = [
+                            self.udp_map[uid]
+                            for uid in target_uids
+                            if uid in self.udp_map
+                        ]
+                    for target_addr in target_addrs:
+                        try:
+                            self.udp_sock.sendto(data, target_addr)
+                        except Exception:
+                            pass
 
                 else:
                     speak_parent = bool(flags & FLAG_SPEAK_PARENT)
@@ -646,9 +672,6 @@ class SFUServer:
                         buffer   = buffer[idx:].lstrip()
                         action   = msg.get('action')
 
-                        # Явное прощание клиента: немедленно завершаем обработчик,
-                        # finally-блок ниже корректно удалит клиента из списка.
-                        # Это устраняет «мёртвые» дубли при переподключении.
                         if action == 'leave':
                             print(f"[Server] клиент uid={uid} прислал leave → отключаем")
                             raise _ClientLeave()
@@ -699,14 +722,27 @@ class SFUServer:
                                 except Exception:
                                     pass
                                 return
+
+                            if self._pin:
+                                client_pin = str(msg.get('pin', ''))
+                                if client_pin != self._pin:
+                                    print(f"[Server] 🔒 Неверный/пустой PIN от "
+                                          f"{client_nick!r} IP={client_ip}")
+                                    try:
+                                        self._safe_send(conn, json.dumps({
+                                            'action': 'pin_required',
+                                        }).encode('utf-8'))
+                                    except Exception:
+                                        pass
+                                    try:
+                                        conn.shutdown(socket.SHUT_WR)
+                                    except Exception:
+                                        pass
+                                    return
+
                             client_avatar = msg.get('avatar', '1.svg')
                             _gcn = self._general_channel_name
 
-                            # ── Защита от «мёртвых» дублей ────────────────────
-                            # Если в списке уже есть соединение с тем же nick+ip
-                            # (зависший призрак от прошлой сессии, чей TCP ещё не
-                            # отвалился) — выкидываем его ПЕРЕД регистрацией нового.
-                            # Иначе один и тот же пользователь висел бы дважды.
                             ghost_conns = []
                             with self.clients_lock:
                                 for _c, _d in list(self.clients.items()):
@@ -720,7 +756,6 @@ class SFUServer:
                                       f"(uid={_guid}, IP={client_ip}) перед новым входом")
                                 with self.clients_lock:
                                     self.clients.pop(_gc, None)
-                                # Чистим связанные ресурсы призрака.
                                 try:
                                     self._cleanup_uid_resources(_guid)
                                 except Exception as _e:
@@ -768,8 +803,8 @@ class SFUServer:
                             )
                             self._mark_dirty()
                             self.send_global_state()
+                            self._sync_player_state_to_conn(conn, _gcn)
 
-                        # ── Join Room ─────────────────────────────────────────
                         elif action == CMD_JOIN_ROOM:
                             _gcn_jr = self._general_channel_name
                             new_room = msg.get('room', _gcn_jr)[:CHANNEL_NAME_MAX_LEN]
@@ -801,6 +836,7 @@ class SFUServer:
                                     self._cleanup_temp_channels(old_room)
                                 self._mark_dirty()
                                 self.send_global_state()
+                                self._sync_player_state_to_conn(conn, new_room)
 
                         elif action == CMD_JOIN_CHANNEL_AUTH:
                             ch_name = msg.get('channel_name', '')[:CHANNEL_NAME_MAX_LEN]
@@ -899,7 +935,6 @@ class SFUServer:
                             self._mark_dirty()
                             self.send_global_state()
 
-                        # ── Update Status ─────────────────────────────────────
                         elif action == 'update_status':
                             new_mute = msg.get('mute', False)
                             new_deaf = msg.get('deaf', False)
@@ -924,7 +959,6 @@ class SFUServer:
                                 with self._client_pings_lock:
                                     self._client_pings[uid] = int(ping_ms)
 
-                        # ── Presence ──────────────────────────────────────────
                         elif action == CMD_UPDATE_PRESENCE:
                             icon = msg.get('status_icon', '')[:64]
                             text = msg.get('status_text', '')[:30]
@@ -987,8 +1021,6 @@ class SFUServer:
                             with self.clients_lock:
                                 if conn in self.clients:
                                     self.clients[conn]['is_camera'] = True
-                                    # Порт камера-SFU владельца (отдельный
-                                    # sidecar.exe). Зрители идут на него.
                                     self.clients[conn]['camera_sfu_port'] = int(
                                         msg.get('camera_sfu_port', 7820)
                                     )
@@ -1006,7 +1038,6 @@ class SFUServer:
                                     stopped_cam_uid = self.clients[conn]['uid']
                                     cam_nick = self.clients[conn]['nick']
                                     print(f"[Server] {cam_nick} выключил камеру")
-                            # Закрываем всех зрителей этой камеры.
                             if stopped_cam_uid is not None:
                                 with self.cam_watchers_lock:
                                     cam_viewers = list(
@@ -1020,7 +1051,6 @@ class SFUServer:
                             self.send_global_state()
 
                         elif action == 'camera_watch_start':
-                            # Зритель нажал на кружок аватарки → подписка на камеру.
                             cam_streamer_uid = msg.get('streamer_uid')
                             if cam_streamer_uid is not None:
                                 cw_uid = None
@@ -1028,9 +1058,6 @@ class SFUServer:
                                     if conn in self.clients:
                                         cw_uid = self.clients[conn]['uid']
                                 if cw_uid is not None:
-                                    # Защита от дубликата: если этот зритель уже
-                                    # подписан на эту камеру — НЕ триггерим повторно
-                                    # (повторный offer рвал рабочий поток).
                                     already_watching = False
                                     with self.cam_watchers_lock:
                                         if self.cam_watchers.get(
@@ -1090,9 +1117,6 @@ class SFUServer:
                                     )
 
                         elif action == 'camera_frame':
-                            # LEGACY: старый JPEG-over-TCP путь. Оставлен на
-                            # случай старых клиентов, но новые клиенты его НЕ
-                            # используют (камера идёт через WebRTC/SFU).
                             cam_b64 = msg.get('data', '')
                             if cam_b64 and len(cam_b64) <= CAMERA_FRAME_MAX_B64:
                                 src_uid = None
@@ -1219,6 +1243,100 @@ class SFUServer:
 
                         elif action == CMD_MIGRATE_READY:
                             self._handle_migrate_ready(uid)
+
+                        # ── Общий плеер: управление (pause/resume/stop) ───
+                        # Сам трек идёт через UDP с FLAG_PLAYER. Здесь только
+                        # DJ-команды и релей для UI-индикации у слушателей.
+                        elif action in (CMD_PLAYER_PAUSE,
+                                         CMD_PLAYER_RESUME,
+                                         CMD_PLAYER_STOP):
+                            with self.clients_lock:
+                                if conn not in self.clients:
+                                    continue
+                                sender_room = self.clients[conn].get('room')
+                                sender_uid  = self.clients[conn]['uid']
+                                sender_nick = self.clients[conn]['nick']
+                            if not sender_room:
+                                continue
+                            with self._player_state_lock:
+                                if action == CMD_PLAYER_STOP:
+                                    self._player_dj.pop(sender_room, None)
+                                    self._player_state.pop(sender_room, None)
+                                    self._player_state_meta.pop(sender_room, None)
+                                else:
+                                    self._player_dj[sender_room] = sender_uid
+                                    meta = self._player_state_meta.setdefault(
+                                        sender_room,
+                                        {'pos_ms': 0, 'paused': False,
+                                         'ts': time.time()},
+                                    )
+                                    meta['pos_ms'] = int(msg.get('pos_ms', 0))
+                                    meta['paused'] = (action == CMD_PLAYER_PAUSE)
+                                    meta['ts']     = time.time()
+                            msg['src_uid'] = sender_uid
+                            msg['from_nick'] = sender_nick
+                            try:
+                                payload = json.dumps(msg).encode('utf-8')
+                            except Exception:
+                                continue
+                            with self.clients_lock:
+                                targets = [
+                                    c for c, d in self.clients.items()
+                                    if d.get('room') == sender_room and c is not conn
+                                ]
+                            if targets:
+                                try:
+                                    self._bcast_queue.put_nowait((payload, targets))
+                                except _queue.Full:
+                                    pass
+                            print(f"[Server] 🎵 {sender_nick} → {action}")
+
+                        # ── Общий плеер: legacy LOAD (старый клиент) ─────
+                        # Новый клиент шлёт трек через UDP с FLAG_PLAYER, а не
+                        # через CMD_PLAYER_LOAD. Эта ветка нужна только если
+                        # к новому серверу подключится старый клиент — тогда
+                        # примем его base64 и рассылаем слушателям (медленно,
+                        # но совместимо).
+                        elif action == CMD_PLAYER_LOAD:
+                            with self.clients_lock:
+                                if conn not in self.clients:
+                                    continue
+                                sender_room = self.clients[conn].get('room')
+                                sender_uid  = self.clients[conn]['uid']
+                                sender_nick = self.clients[conn]['nick']
+                            if not sender_room:
+                                continue
+                            b64 = msg.get('data_b64', '')
+                            if not b64 or len(b64) > PLAYER_MAX_B64_SIZE:
+                                continue
+                            msg['src_uid']   = sender_uid
+                            msg['from_nick'] = sender_nick
+                            msg['seek_ms']   = 0
+                            msg['paused']    = False
+                            with self._player_state_lock:
+                                self._player_dj[sender_room] = sender_uid
+                                self._player_state[sender_room] = dict(msg)
+                                self._player_state_meta[sender_room] = {
+                                    'pos_ms': 0, 'paused': False,
+                                    'ts': time.time(),
+                                }
+                            try:
+                                payload = json.dumps(msg).encode('utf-8')
+                            except Exception:
+                                continue
+                            with self.clients_lock:
+                                targets = [
+                                    c for c, d in self.clients.items()
+                                    if d.get('room') == sender_room and c is not conn
+                                ]
+                            if targets:
+                                try:
+                                    self._bcast_queue.put_nowait((payload, targets))
+                                    print(f"[Server] 🎵 (legacy) {sender_nick} → LOAD "
+                                          f"'{msg.get('file_name')}' "
+                                          f"({len(targets)} слушателей)")
+                                except _queue.Full:
+                                    pass
 
                         elif action == CMD_SOUNDBOARD:
                             with self.clients_lock:
@@ -1356,9 +1474,6 @@ class SFUServer:
                                     if target_conn_mv and old_room_mv != dest_room_mv:
                                         with self.udp_lock:
                                             self.uid_to_room[target_uid_mv] = dest_room_mv
-                                        # Хост — администратор: даём доступ к
-                                        # паролю-каналу принудительно, чтобы при
-                                        # последующем ручном входе не спрашивало.
                                         with self._channel_auth_lock:
                                             self._channel_auth.setdefault(
                                                 target_conn_mv, set()
@@ -1439,7 +1554,7 @@ class SFUServer:
                         break
 
         except _ClientLeave:
-            pass  # штатное отключение по 'leave'
+            pass
         except Exception as e:
             err_code = getattr(e, 'winerror', None) or getattr(e, 'errno', None)
             is_disconnect = err_code in (10054, 10053, 104, 32)
@@ -1495,18 +1610,14 @@ class SFUServer:
                             self.watchers[s_uid].pop(u_id, None)
                     self.watchers.pop(u_id, None)
 
-                # Remote Control: снимаем активное управление, где участвует uid
                 with self.remote_controllers_lock:
-                    # клиент был стримером
                     self.remote_controllers.pop(u_id, None)
-                    # клиент был контролёром у кого-то — убираем эти пары
                     for s_uid in [
                         s for s, v in self.remote_controllers.items()
                         if v == u_id
                     ]:
                         self.remote_controllers.pop(s_uid, None)
 
-                # Remote Control: чистим антиспам-записи, где участвует uid
                 with self._rc_antispam_lock:
                     for d in (self._rc_deny_counts, self._rc_cooldown_until):
                         for key in [
@@ -1520,11 +1631,33 @@ class SFUServer:
                 if _sfu and was_viewer:
                     _sfu.close_viewer(u_id)
 
-                # Камера: чистим связи где uid был стримером ИЛИ зрителем.
+                # Общий плеер: если ушедший был DJ — шлём STOP всем в комнате.
+                # Сам broadcast-поток на его стороне уже мёртв (клиент ушёл),
+                # но UI у слушателей надо обновить.
+                with self._player_state_lock:
+                    rooms_to_stop = [
+                        r for r, dj in self._player_dj.items() if dj == u_id
+                    ]
+                    for r in rooms_to_stop:
+                        self._player_dj.pop(r, None)
+                        self._player_state.pop(r, None)
+                        self._player_state_meta.pop(r, None)
+                for r in rooms_to_stop:
+                    with self.clients_lock:
+                        room_conns = [
+                            c for c, d in self.clients.items()
+                            if d.get('room') == r
+                        ]
+                    stop_payload = json.dumps(
+                        {'action': CMD_PLAYER_STOP}
+                    ).encode('utf-8')
+                    for c in room_conns:
+                        self._safe_send(c, stop_payload)
+                    print(f"[Server] 🎵 плеер в комнате '{r}' "
+                          f"остановлен (DJ отключился)")
+
                 with self.cam_watchers_lock:
-                    # uid был владельцем камеры — закрываем всех его зрителей.
                     cam_viewers_of_uid = list(self.cam_watchers.pop(u_id, {}).keys())
-                    # uid был зрителем чужих камер — снимаем его подписки.
                     cam_streamers_uid_watched = []
                     for s_uid in list(self.cam_watchers.keys()):
                         if u_id in self.cam_watchers[s_uid]:
@@ -1555,12 +1688,23 @@ class SFUServer:
             self._mark_dirty()
             self.send_global_state()
 
+    def _sync_player_state_to_conn(self, conn, room: str) -> None:
+        """Отправить новому участнику комнаты актуальное состояние плеера."""
+        with self._player_state_lock:
+            state = self._player_state.get(room)
+            meta  = self._player_state_meta.get(room)
+        if not state or not meta:
+            return
+        pos_ms = int(meta['pos_ms'])
+        if not meta['paused']:
+            pos_ms += int((time.time() - meta['ts']) * 1000)
+        out = dict(state)
+        out['seek_ms'] = pos_ms
+        out['paused']  = bool(meta['paused'])
+        out['is_sync'] = True
+        self._safe_send(conn, json.dumps(out).encode('utf-8'))
+
     def _cleanup_uid_resources(self, u_id) -> None:
-        """
-        Освобождает все ресурсы, привязанные к uid, не трогая self.clients
-        (вызывающий уже удалил запись). Используется для зачистки «призраков»
-        при повторном входе того же пользователя.
-        """
         if u_id is None:
             return
         with self.udp_lock:
@@ -1834,7 +1978,7 @@ class SFUServer:
                    and cached[4] == s_nick_md)
 
         if hit:
-            cached_prefix: bytes = cached[1]  # JSON без '}' и без ts
+            cached_prefix: bytes = cached[1]
             broadcast_md = cached_prefix + f',"ts":{now_ts}}}'.encode('ascii')
         else:
             full_dict = {
@@ -1937,10 +2081,9 @@ class SFUServer:
             self._safe_send(tc, relay_dr)
 
     # ------------------------------------------------------------------
-    # Remote Control: relay запросов управления мышью/клавиатурой
+    # Remote Control
     # ------------------------------------------------------------------
     def _uid_to_conn(self, uid: int):
-        """Вернуть socket клиента по UID или None."""
         with self.clients_lock:
             return next(
                 (c for c, d in self.clients.items() if d.get('uid') == uid),
@@ -1948,26 +2091,19 @@ class SFUServer:
             )
 
     def _rc_send(self, conn, payload: dict) -> None:
-        """Сериализовать dict и отправить через _safe_send."""
         self._safe_send(conn, (json.dumps(payload) + '\n').encode('utf-8'))
 
     def _rc_cooldown_remaining(self, streamer_uid: int, viewer_uid: int) -> int:
-        """Сколько секунд осталось до конца cooldown пары (0 если cooldown нет)."""
         key = (streamer_uid, viewer_uid)
         with self._rc_antispam_lock:
             until = self._rc_cooldown_until.get(key, 0.0)
             remaining = until - time.time()
             if remaining <= 0:
-                # cooldown истёк — чистим, чтобы словарь не рос
                 self._rc_cooldown_until.pop(key, None)
                 return 0
             return int(remaining) + 1
 
     def _rc_register_deny(self, streamer_uid: int, viewer_uid: int) -> int:
-        """
-        Зафиксировать отказ. Возвращает остаток cooldown в секундах,
-        если после этого отказа лимит исчерпан (иначе 0).
-        """
         key = (streamer_uid, viewer_uid)
         with self._rc_antispam_lock:
             cnt = self._rc_deny_counts.get(key, 0) + 1
@@ -1979,19 +2115,12 @@ class SFUServer:
             return 0
 
     def _rc_reset_antispam(self, streamer_uid: int, viewer_uid: int) -> None:
-        """Сбросить счётчик отказов и cooldown пары (при выдаче управления)."""
         key = (streamer_uid, viewer_uid)
         with self._rc_antispam_lock:
             self._rc_deny_counts.pop(key, None)
             self._rc_cooldown_until.pop(key, None)
 
     def _process_rc_request(self, conn, msg: dict) -> None:
-        """
-        Зритель запрашивает управление → relay стримеру с sender_uid.
-        - Если у стримера уже есть активный контролёр — автоотказ зрителю.
-        - Если пара (стример, зритель) в cooldown — запрос молча отбрасывается
-          (стример не видит диалог, зритель не получает ответа).
-        """
         streamer_uid = msg.get('streamer_uid')
         nick         = str(msg.get('nick', '?'))[:32]
         if not streamer_uid:
@@ -2000,11 +2129,9 @@ class SFUServer:
         with self.clients_lock:
             viewer_uid = self.clients.get(conn, {}).get('uid', 0)
 
-        # Cooldown активен — тихо игнорируем (никакого диалога у стримера)
         if self._rc_cooldown_remaining(streamer_uid, viewer_uid) > 0:
             return
 
-        # Уже кто-то управляет — отказываем сразу
         with self.remote_controllers_lock:
             if streamer_uid in self.remote_controllers:
                 self._rc_send(conn, {
@@ -2025,12 +2152,6 @@ class SFUServer:
         })
 
     def _process_rc_response(self, conn, msg: dict) -> None:
-        """
-        Стример отвечает: relay ответа зрителю.
-        - granted=True  → записываем пару streamer→viewer, сбрасываем антиспам.
-        - granted=False → +1 к счётчику отказов; на RC_DENY_LIMIT-м отказе
-                          пара уходит в cooldown (зрителю шлём reason='cooldown').
-        """
         granted    = bool(msg.get('granted', False))
         viewer_uid = msg.get('viewer_uid')
         if not viewer_uid:
@@ -2063,10 +2184,6 @@ class SFUServer:
         })
 
     def _process_rc_event(self, conn, msg: dict) -> None:
-        """
-        Зритель шлёт событие мыши/клавиш → relay стримеру.
-        Только авторизованный контролёр может отправлять события.
-        """
         streamer_uid = msg.get('streamer_uid')
         if not streamer_uid:
             return
@@ -2076,7 +2193,7 @@ class SFUServer:
 
         with self.remote_controllers_lock:
             if self.remote_controllers.get(streamer_uid) != viewer_uid:
-                return  # не авторизован — игнорируем
+                return
 
         streamer_conn = self._uid_to_conn(streamer_uid)
         if not streamer_conn:
@@ -2088,10 +2205,6 @@ class SFUServer:
         })
 
     def _process_rc_stop(self, conn, msg: dict) -> None:
-        """
-        Остановка управления от любой стороны.
-        Удаляем запись из таблицы, уведомляем обе стороны.
-        """
         streamer_uid = msg.get('streamer_uid')
         if not streamer_uid:
             return
@@ -2107,12 +2220,10 @@ class SFUServer:
             'streamer_uid': streamer_uid,
         }
 
-        # Уведомить стримера
         streamer_conn = self._uid_to_conn(streamer_uid)
         if streamer_conn:
             self._rc_send(streamer_conn, stop_payload)
 
-        # Уведомить зрителя (если он не сам инициировал stop)
         if viewer_uid and viewer_uid != sender_uid:
             viewer_conn = self._uid_to_conn(viewer_uid)
             if viewer_conn:
@@ -2256,7 +2367,6 @@ class SFUServer:
             pass
 
     def start_embedded(self, host_ip: str, host_nick: str) -> None:
-        """Запускает сервер в фоновых потоках."""
         self._is_embedded = True
         self._accepting   = True
 
@@ -2267,9 +2377,6 @@ class SFUServer:
             except Exception as e:
                 print(f"[Server] ChatDB init error: {e}")
         self._owner_ip = host_ip
-        # Собираем ВСЕ локальные адреса хоста (по всем интерфейсам/туннелям),
-        # чтобы корректно опознавать собственные соединения независимо от
-        # того, по какому интерфейсу подключился друг. Loopback уже включён.
         try:
             from network_engine.server_discovery import get_all_local_ips
             self._owner_ips = {'127.0.0.1', '::1', 'localhost'}
@@ -2636,7 +2743,8 @@ class EmbeddedServerManager:
                     cls._instance = cls()
         return cls._instance
 
-    def start(self, host_ip: str, host_nick: str, server_name: str = '') -> None:
+    def start(self, host_ip: str, host_nick: str, server_name: str = '',
+              pin: str = '') -> None:
         if self.is_running():
             print("[EmbeddedServer] Уже запущен — повторный запуск пропущен")
             return
@@ -2651,7 +2759,7 @@ class EmbeddedServerManager:
                 pass
             server_name = server_name or 'InPulse Server'
 
-        self._server = SFUServer(server_name=server_name)
+        self._server = SFUServer(server_name=server_name, pin=pin)
         try:
             self._server.start_embedded(host_ip, host_nick)
         except Exception:

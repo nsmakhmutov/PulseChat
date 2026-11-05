@@ -145,7 +145,7 @@ class WebRTCMixin:
         width   = s.get("width", 1280)
         height  = s.get("height", 720)
         fps     = s.get("fps", 30)
-        bitrate = get_bitrate_for_resolution(width, height)
+        bitrate = get_bitrate_for_resolution(width, height, fps=fps)
 
         start_bitrate = max(500_000, int(bitrate * 0.4))
 

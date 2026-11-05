@@ -1,7 +1,3 @@
-# network_engine/features.py — Soundboard, Nudge, File Transfer, Draw Stroke, Host Mute
-#
-# Миксин FeaturesMixin: все методы используют self.* атрибуты NetworkClient.
-
 import base64
 import io
 import os
@@ -15,6 +11,8 @@ from PyQt6.QtCore import QSettings
 
 from config import (
     resource_path,
+    CMD_PLAYER_LOAD, CMD_PLAYER_PAUSE, CMD_PLAYER_RESUME, CMD_PLAYER_STOP,
+    PLAYER_MAX_B64_SIZE,
     CMD_NUDGE_VOTE, CMD_PLAY_NUDGE, CMD_NUDGE_TRIGGERED, NUDGE_SOUND_PATH,
     CMD_FILE_OFFER, CMD_FILE_OFFER_ROOM,
     CMD_QUICK_MSG, QUICK_MSG_MAX_LEN,
@@ -29,30 +27,21 @@ from config import (
 
 
 class FeaturesMixin:
-    """Методы фич: soundboard, nudge, file transfer, draw stroke, host mute."""
+    """Методы фич: soundboard, nudge, file transfer, draw stroke, host mute,
+    общий плеер (UDP + Opus, FLAG_PLAYER)."""
 
     # ------------------------------------------------------------------
     # Soundboard
     # ------------------------------------------------------------------
     def play_soundboard_file(self, filename, data_b64=None, from_nick=None,
                              src_uid=None):
-        """
-        Воспроизвести soundboard-файл через sounddevice.
-        Разрешён одновременный запуск нескольких звуков.
-        """
         try:
             _gs = getattr(self.audio, 'global_settings', None)
             if _gs is None:
                 _gs = QSettings("MyVoiceChat", "GlobalSettings")
 
-            # Звук при входе (__joinsound__) — это персональный звук входа
-            # пользователя. Громкость берём от «Системные звуки», тост автора
-            # НЕ показываем (это не обычный soundboard).
             is_join_sound = bool(filename and filename.startswith("__joinsound__:"))
 
-            # Свой собственный звук входа НЕ проигрываем у себя — его слышат
-            # только собеседники (сервер рассылает CMD_SOUNDBOARD всем, включая
-            # отправителя, поэтому отсекаем по src_uid == my_uid).
             if is_join_sound and src_uid is not None:
                 try:
                     if int(src_uid) == int(getattr(self.audio, 'my_uid', 0)):
@@ -87,9 +76,6 @@ class FeaturesMixin:
             if from_nick and not is_join_sound:
                 self.soundboard_played.emit(from_nick)
 
-            # Уведомляем UI, что от другого пользователя пришёл «звук при входе».
-            # UI использует это, чтобы не проигрывать дефолтный user_join.wav
-            # для этого uid (наш кастомный звук уже выполняет эту роль).
             if is_join_sound and src_uid is not None:
                 try:
                     _su = int(src_uid)
@@ -122,17 +108,6 @@ class FeaturesMixin:
             print(f"[Net] Soundboard error: {e}")
 
     def broadcast_join_sound(self) -> bool:
-        """
-        Транслируем свой «звук при входе» всем в текущей комнате через
-        существующий механизм soundboard-broadcast (CMD_SOUNDBOARD). На стороне
-        получателей сработает play_soundboard_file по маркеру __joinsound__:
-        играется на громкости системных звуков, без тоста. Свой собственный
-        звук у себя не играем (фильтр по src_uid в receive-пути).
-
-        Возвращает True, если файл валиден и широковещание отправлено —
-        вызывающая сторона использует этот флаг для подавления дефолтного
-        user_join.wav (его роль выполнит наш кастомный звук).
-        """
         try:
             from PyQt6.QtCore import QSettings
             gs = QSettings("MyVoiceChat", "GlobalSettings")
@@ -140,7 +115,6 @@ class FeaturesMixin:
             if not path or not os.path.exists(path):
                 return False
             size = os.path.getsize(path)
-            # Тот же лимит, что у кастомных soundboard-звуков: 1 МБ.
             if size <= 0 or size > 1 * 1024 * 1024:
                 return False
             with open(path, 'rb') as f:
@@ -158,6 +132,45 @@ class FeaturesMixin:
         except Exception as e:
             print(f"[Net] broadcast_join_sound error: {e}")
             return False
+
+    # ------------------------------------------------------------------
+    # Общий плеер (UDP + Opus, FLAG_PLAYER)
+    # ------------------------------------------------------------------
+    #
+    # Сам трек идёт через UDP + Opus (см. audio_engine.py::player_load и
+    # _player_broadcast_loop). Здесь — только управляющие команды:
+    #   • pause / resume / stop — мелкие JSON-сообщения (десятки байт),
+    #     сервер релеит их всем в комнате, чтобы UI обновился.
+    #   • send_player_load — LEGACY. Оставлен для совместимости со старым
+    #     сервером (новый его игнорирует в пользу UDP).
+
+    def send_player_load(self, file_name: str, data_b64: str,
+                         track_index: int = 0, track_total: int = 0) -> None:
+        """
+        LEGACY: отправка трека по TCP (base64). Не используется в новом
+        протоколе — трек идёт через UDP с FLAG_PLAYER. Метод оставлен для
+        совместимости со старым сервером.
+        """
+        if len(data_b64) > PLAYER_MAX_B64_SIZE:
+            print(f"[Player] LOAD отклонён: слишком большой b64 "
+                  f"({len(data_b64)} > {PLAYER_MAX_B64_SIZE})")
+            return
+        self.send_json({
+            'action':      CMD_PLAYER_LOAD,
+            'file_name':   str(file_name)[:200],
+            'data_b64':    data_b64,
+            'track_index': int(track_index),
+            'track_total': int(track_total),
+        })
+
+    def send_player_pause(self, pos_ms: int) -> None:
+        self.send_json({'action': CMD_PLAYER_PAUSE, 'pos_ms': int(pos_ms)})
+
+    def send_player_resume(self, pos_ms: int) -> None:
+        self.send_json({'action': CMD_PLAYER_RESUME, 'pos_ms': int(pos_ms)})
+
+    def send_player_stop(self) -> None:
+        self.send_json({'action': CMD_PLAYER_STOP})
 
     # ------------------------------------------------------------------
     # File Transfer P2P — только сигнализация через сервер
@@ -198,10 +211,6 @@ class FeaturesMixin:
         print(f"[Net] Nudge vote sent → target_uid={target_uid}")
 
     def _nudge_get_endpoint_vol(self):
-        """
-        Возвращает IAudioEndpointVolume дефолтного устройства воспроизведения.
-        Поддерживает ОБЕ версии pycaw.
-        """
         try:
             from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
             from comtypes import CLSCTX_ALL
@@ -223,7 +232,6 @@ class FeaturesMixin:
         except Exception as e:
             print(f"[Nudge] pycaw get_endpoint_vol error: {e}")
 
-        # ── Попытка 2: comtypes напрямую ──────────────────────────────────
         try:
             import comtypes
             import comtypes.client
@@ -364,7 +372,6 @@ class FeaturesMixin:
             print(f"[Nudge] restore error: {e}")
 
     def _play_nudge_sound(self):
-        """Воспроизвести Danger.mp3 + системный писк — НЕЗАВИСИМО от deaf/mute."""
         import winsound as _ws
 
         prev_scalar, was_muted = self._nudge_boost_volume()
@@ -422,7 +429,6 @@ class FeaturesMixin:
     # Remote Control
     # ------------------------------------------------------------------
     def send_remote_control_request(self, streamer_uid: int, nick: str) -> None:
-        """Зритель просит у стримера разрешение на управление мышью/клавиатурой."""
         self.send_json({
             'action':       CMD_REMOTE_CONTROL_REQUEST,
             'streamer_uid': int(streamer_uid),
@@ -430,7 +436,6 @@ class FeaturesMixin:
         })
 
     def send_remote_control_response(self, viewer_uid: int, granted: bool) -> None:
-        """Стример отвечает зрителю: True — разрешить, False — отклонить."""
         self.send_json({
             'action':     CMD_REMOTE_CONTROL_RESPONSE,
             'viewer_uid': int(viewer_uid),
@@ -438,20 +443,6 @@ class FeaturesMixin:
         })
 
     def send_remote_control_event(self, streamer_uid: int, event: dict) -> None:
-        """
-        Зритель отправляет событие мыши/клавиатуры стримеру.
-        event = {
-          'type': 'mouse_move'|'mouse_press'|'mouse_release'|'mouse_scroll'
-                  |'key_press'|'key_release',
-          'x': float,      # 0.0–1.0 нормализованные по экрану
-          'y': float,
-          'button': int,   # Qt.MouseButton (для mouse_*)
-          'key': int,      # Qt.Key (для key_*)
-          'modifiers': int,
-          'text': str,     # символ (для key_press)
-          'delta': int,    # для mouse_scroll
-        }
-        """
         self.send_json({
             'action':       CMD_REMOTE_CONTROL_EVENT,
             'streamer_uid': int(streamer_uid),
@@ -459,35 +450,28 @@ class FeaturesMixin:
         })
 
     def send_remote_control_stop(self, streamer_uid: int) -> None:
-        """Любая из сторон останавливает управление."""
         self.send_json({
             'action':       CMD_REMOTE_CONTROL_STOP,
             'streamer_uid': int(streamer_uid),
         })
 
     # ------------------------------------------------------------------
-    # Host Mute
+    # Host Mute / Move / Kick / Ban
     # ------------------------------------------------------------------
     def send_host_mute(self, target_uid: int) -> None:
         self.send_json({'action': CMD_HOST_MUTE, 'target_uid': int(target_uid)})
 
     def send_host_move(self, target_uid: int, room: str) -> None:
-        """Хост → сервер: переместить участника в другой канал."""
         self.send_json({
             'action':     CMD_HOST_MOVE,
             'target_uid': int(target_uid),
             'room':       str(room),
         })
 
-    # ------------------------------------------------------------------
-    # Host Kick / Ban / Unban
-    # ------------------------------------------------------------------
     def send_host_kick(self, target_uid: int) -> None:
-        """Хост → сервер: кикнуть участника (без записи в банлист)."""
         self.send_json({'action': CMD_HOST_KICK, 'target_uid': int(target_uid)})
 
     def send_host_ban(self, target_uid: int, reason: str = '') -> None:
-        """Хост → сервер: кикнуть + занести IP в банлист."""
         self.send_json({
             'action':     CMD_HOST_BAN,
             'target_uid': int(target_uid),
@@ -495,7 +479,6 @@ class FeaturesMixin:
         })
 
     def send_host_unban(self, ip: str, nick: str = '') -> None:
-        """Хост → сервер: убрать (IP, nick) из банлиста. В ответ прилетит CMD_BAN_LIST."""
         self.send_json({
             'action': CMD_HOST_UNBAN,
             'ip':     str(ip)[:45],
@@ -503,14 +486,12 @@ class FeaturesMixin:
         })
 
     def request_ban_list(self) -> None:
-        """Хост → сервер: запрос текущего снимка банлиста для UI."""
         self.send_json({'action': CMD_BAN_LIST_REQ})
 
     # ------------------------------------------------------------------
     # process_message dispatch для фич
     # ------------------------------------------------------------------
     def _process_features_message(self, msg: dict, act: str) -> bool:
-        """Обрабатывает сообщения фич. Возвращает True если обработано."""
 
         if act == 'play_soundboard':
             self.play_soundboard_file(
@@ -543,11 +524,6 @@ class FeaturesMixin:
             return True
 
         elif act == CMD_KICKED:
-            # Сервер уведомил что нас кикнули. Останавливаем сеть СИНХРОННО
-            # прямо здесь — до того как tcp_listen увидит EOF и попытается
-            # стартовать recovery. Сигнал emit попадёт в Qt-очередь и UI
-            # обработает его позже, но к этому моменту running=False и
-            # любой reconnect-путь уже отсечён.
             self._kicked_flag    = True
             self.running         = False
             self._is_connected   = False
@@ -556,7 +532,6 @@ class FeaturesMixin:
             return True
 
         elif act == CMD_BANNED:
-            # Аналогично CMD_KICKED — блокируем сеть синхронно, эмитим сигнал.
             self._kicked_flag    = True
             self.running         = False
             self._is_connected   = False
@@ -609,6 +584,25 @@ class FeaturesMixin:
 
         elif act == CMD_REMOTE_CONTROL_STOP:
             self.remote_control_stopped.emit()
+            return True
+
+        elif act == CMD_PLAYER_PAUSE:
+            self.player_paused.emit(int(msg.get('pos_ms', 0)))
+            return True
+
+        elif act == CMD_PLAYER_RESUME:
+            self.player_resumed.emit(int(msg.get('pos_ms', 0)))
+            return True
+
+        elif act == CMD_PLAYER_STOP:
+            self.player_stopped.emit()
+            return True
+
+        elif act == CMD_PLAYER_LOAD:
+            # LEGACY: старый TCP-путь. Новый клиент шлёт трек через UDP
+            # (FLAG_PLAYER), но если старый сервер пришлёт CMD_PLAYER_LOAD
+            # — мы хотя бы не упадём. Реально ничего не делаем.
+            print(f"[Player] legacy CMD_PLAYER_LOAD получен — игнорируем")
             return True
 
         return False

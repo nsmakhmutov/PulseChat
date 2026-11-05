@@ -13,14 +13,24 @@
 //
 //   FIX #35: защита от fps=0. Rational::new(1, 0) → FFmpeg panic.
 //     Теперь валидируем fps >= 1 при создании энкодера.
-
+//
+//   FIX #44 (v0.3.3): try_apply_bitrate_inplace теперь реально меняет bitrate
+//     у NVENC через av_opt_set с AV_OPT_SEARCH_CHILDREN. Раньше прямая запись
+//     в AVCodecContext.bit_rate игнорировалась NVENC (он читает из priv_data).
+//
+//   FIX #47 (v0.3.4): КАЧЕСТВО КАРТИНКИ.
+//     - preset p1 → p4 (было слишком быстро, плохое качество)
+//     - no-scenecut 1 → 0 (давало пиксели при смене сцен)
+//     - CBR → VBR с cq=21 (CBR тратил биты впустую на статике, но не хватало
+//       на движении; VBR даёт больше битов сложным кадрам)
+//     - bufsize bitrate → bitrate*2 (1x HRD-буфер заставлял NVENC дропать
+//       макроблоки при burst-нагрузке → кубики)
+//     - aq-strength 8 → 10 (больше битов краям, тексту, UI)
+//     - добавлены surfaces/delay/rc_init_qp для лучшей работы NVENC
 use anyhow::{anyhow, Context, Result};
 use tracing::{debug, info};
-
 use crate::capture::CapturedFrame;
-
 extern crate ffmpeg_next as ffmpeg;
-
 use ffmpeg::codec;
 use ffmpeg::format::Pixel;
 use ffmpeg::software::scaling;
@@ -57,11 +67,9 @@ pub struct HwEncoder {
     src_height: u32,
     is_low_res: bool,
     sharpen_strength: i16,
-
     // FIX #34: переиспользуемые буферы для sharpen (избегаем аллокаций на hot path)
     sharpen_prev_row: Vec<u8>,
     sharpen_curr_row: Vec<u8>,
-
     // FIX #34: переиспользуемый BGRA AvFrame
     bgra_frame: Option<AvFrame>,
     bgra_frame_dims: (u32, u32),
@@ -87,7 +95,7 @@ impl HwEncoder {
                 Ok(enc) => {
                     info!("Кодек: {} {}×{} @{} fps {} kbps [{}]",
                         profile.display_name, width, height, fps, bitrate / 1000,
-                        if enc.is_low_res { "CQ+sharpen" } else { "CBR" });
+                        if enc.is_low_res { "CQ+sharpen" } else { "VBR" });
                     return Ok(enc);
                 }
                 Err(e) => { debug!("{} недоступен: {e}", profile.codec_name); last_error = e; }
@@ -99,7 +107,6 @@ impl HwEncoder {
     fn try_create(profile: &EncoderProfile, width: u32, height: u32, fps: u32, bitrate: u32) -> Result<Self> {
         let codec = ffmpeg::encoder::find_by_name(&profile.codec_name)
             .ok_or_else(|| anyhow!("Кодек {} не найден", profile.codec_name))?;
-
         let ctx = codec::context::Context::new_with_codec(codec);
         let mut video = ctx.encoder().video()?;
 
@@ -112,42 +119,53 @@ impl HwEncoder {
         video.set_frame_rate(Some(Rational::new(fps as i32, 1)));
         video.set_bit_rate(bitrate as usize);
         video.set_max_bit_rate(bitrate as usize);
-
-        video.set_gop(if is_low_res { fps } else { fps * 2 });
+        video.set_gop(fps);
 
         let mut opts = ffmpeg::Dictionary::new();
         match profile.codec_name.as_str() {
-
             // ── NVENC ────────────────────────────────────────────────────────
+            // FIX #47: переписан для качества.
             "h264_nvenc" => {
-                opts.set("preset",      "p1");
+                // Preset: p1 — быстро, но плохо по качеству. p4 — баланс скорость/качество,
+                // на 720p30 NVENC всё равно успевает за ~5-10 мс (намного быстрее 33 мс).
+                opts.set("preset",      "p4");
                 opts.set("tune",        "ull");
                 opts.set("zerolatency", "1");
                 opts.set("forced-idr",  "1");
                 opts.set("bf",          "0");
                 opts.set("profile",     "high");
                 opts.set("rc-lookahead","0");
-                opts.set("no-scenecut", "1");
 
+                // РАЗРЕШАЕМ scenecut → автоматический IDR при смене сцены.
+                // Раньше no-scenecut=1 давал пиксели при открытии окон, скроллинге,
+                // переключении приложений (P-frame с огромным residual).
+                opts.set("no-scenecut", "0");
+
+                // VBR вместо CBR: больше битов на сложные кадры, меньше на простые.
+                // bufsize=bitrate*2 — правильный HRD-буфер (2x, не 1x).
+                opts.set("rc",          "vbr");
+                opts.set("maxrate",     &bitrate.to_string());
+                opts.set("bufsize",     &(bitrate * 2).to_string());
+
+                // AQ: больше битов на края, текст, UI-элементы.
+                opts.set("spatial-aq",  "1");
+                opts.set("temporal-aq", "1");
+                opts.set("aq-strength", "10");
+
+                // Low-latency constraints (сохраняем нулевую задержку)
+                opts.set("surfaces",    "8");
+                opts.set("delay",       "0");
+                opts.set("rc_init_qp",  "22");
+
+                // CQ (качество) — ниже = лучше, но больше битрейт.
+                // Для 720p cq=21 визуально близко к lossless.
                 if is_low_res {
-                    let cq = if height <= 360 { "24" } else { "22" };
-                    opts.set("rc",         "vbr");
-                    opts.set("cq",         cq);
-                    opts.set("maxrate",    &bitrate.to_string());
-                    opts.set("bufsize",    &(bitrate * 2).to_string());
-                    opts.set("spatial-aq", "1");
-                    opts.set("temporal-aq","1");
-                    opts.set("aq-strength","8");
+                    let cq = if height <= 360 { "26" } else { "24" };
+                    opts.set("cq", cq);
                 } else {
-                    opts.set("rc",         "cbr");
-                    opts.set("bufsize",    &bitrate.to_string());
-                    opts.set("maxrate",    &bitrate.to_string());
-                    opts.set("spatial-aq", "1");
-                    opts.set("temporal-aq","1");
-                    opts.set("aq-strength","8");
+                    opts.set("cq", "21");
                 }
             }
-
             // ── AMF ──────────────────────────────────────────────────────────
             "h264_amf" => {
                 opts.set("usage",        "ultralowlatency");
@@ -160,7 +178,6 @@ impl HwEncoder {
                 opts.set("bf_ref",       "0");
                 opts.set("vbaq",         "1");
             }
-
             // ── QSV ──────────────────────────────────────────────────────────
             "h264_qsv" => {
                 opts.set("preset",      "veryfast");
@@ -169,7 +186,6 @@ impl HwEncoder {
                 opts.set("async_depth", "1");
                 opts.set("bf",          "0");
             }
-
             // ── libx264 ──────────────────────────────────────────────────────
             "libx264" => {
                 opts.set("profile",  "high");
@@ -187,7 +203,6 @@ impl HwEncoder {
                 opts.set("maxrate", &bitrate.to_string());
                 opts.set("bufsize", &(bitrate * 2).to_string());
             }
-
             _ => {}
         }
 
@@ -239,11 +254,13 @@ impl HwEncoder {
         {
             let stride = bgra_frame.stride(0);
             let plane = bgra_frame.data_mut(0);
+
             for row in 0..src_h as usize {
                 let ss = row * frame.stride as usize;
                 let se = ss + (src_w * 4) as usize;
                 let ds = row * stride;
                 let de = ds + (src_w * 4) as usize;
+
                 if se <= frame.data.len() && de <= plane.len() {
                     plane[ds..de].copy_from_slice(&frame.data[ss..se]);
                 }
@@ -261,13 +278,15 @@ impl HwEncoder {
         }
 
         yuv_frame.set_pts(Some(self.frame_index));
+
         if self.force_keyframe {
             yuv_frame.set_kind(ffmpeg::util::picture::Type::I);
             self.force_keyframe = false;
         }
-        self.frame_index += 1;
 
+        self.frame_index += 1;
         self.encoder.send_frame(&yuv_frame)?;
+
         let mut packets = Vec::new();
         let mut pkt = Packet::empty();
         while self.encoder.receive_packet(&mut pkt).is_ok() {
@@ -277,6 +296,7 @@ impl HwEncoder {
                 is_key: pkt.is_key(), timestamp_ns: frame.timestamp_ns,
             });
         }
+
         Ok(packets)
     }
 
@@ -288,6 +308,7 @@ impl HwEncoder {
     ) {
         let y_stride = frame.stride(0);
         let y_plane  = frame.data_mut(0);
+
         let (w, h) = (w as usize, h as usize);
 
         // Подготовим буферы нужного размера (resize никогда не уменьшает capacity)
@@ -309,15 +330,18 @@ impl HwEncoder {
                           + y_plane[below_off + x] as i16
                           + curr_orig[x - 1] as i16
                           + curr_orig[x + 1] as i16) >> 2;
+
                 let sharp = c + (c - blur) * strength / 10;
                 y_plane[row_off + x] = sharp.clamp(0, 255) as u8;
             }
+
             prev_row[..w].copy_from_slice(&curr_orig[..w]);
         }
     }
 
     pub fn flush(&mut self) -> Result<Vec<EncodedPacket>> {
         self.encoder.send_eof()?;
+
         let mut out = Vec::new();
         let mut pkt = Packet::empty();
         while self.encoder.receive_packet(&mut pkt).is_ok() {
@@ -327,41 +351,57 @@ impl HwEncoder {
                 is_key: pkt.is_key(), timestamp_ns: 0,
             });
         }
+
         Ok(out)
     }
 
     pub fn request_keyframe(&mut self) { self.force_keyframe = true; }
 
+    /// FIX #41 (v0.3.2): раньше "soft"-путь (изменение ≤20%) только обновлял
+    /// self.bitrate для последующих расчётов % — реальный AVCodecContext
+    /// НИКОГДА не трогался, при этом force_keyframe=true форсировал IDR.
+    /// Итог: ABR почти никогда не менял фактический битрейт энкодера
+    /// (обычные шаги ABR — 5-18%, всегда ≤20%), но на КАЖДЫЙ такой "пустой"
+    /// шаг гнал полноразмерный keyframe. Под RadminVPN (где джиттер скачет
+    /// чаще, чем в обычном интернете) это превращалось в петлю: сеть
+    /// подтормозила → ABR "снижает" битрейт (без эффекта) → форсирует IDR →
+    /// IDR грузит и без того забитый канал → сеть ещё хуже → снова ABR.
+    ///
+    /// Теперь: реальное изменение bit_rate/rc_max_rate применяется на месте
+    /// (in-place) для ЛЮБОЙ величины изменения, если энкодер это позволяет
+    /// (NVENC/AMF — да, libx264/QSV — нет, для них нужен rebuild).
+    /// force_keyframe форсируется ТОЛЬКО когда энкодер реально пересоздаётся
+    /// (меняются SPS/PPS, декодеру нужен новый opening IDR) — не на простое
+    /// изменение целевого битрейта, которое кодек и так подхватывает на
+    /// следующих кадрах без необходимости в IDR.
     pub fn set_bitrate(&mut self, bitrate: u32) -> Result<()> {
         if bitrate == self.bitrate {
             return Ok(());
         }
 
-        let ratio      = bitrate as f64 / self.bitrate as f64;
-        let pct_change = ((ratio - 1.0) * 100.0).abs();
-
+        let ratio = bitrate as f64 / self.bitrate as f64;
         info!(
             "[ABR] {} → {} kbps ({:+.0}%)",
             self.bitrate / 1000, bitrate / 1000,
             (ratio - 1.0) * 100.0
         );
 
-        if pct_change <= 20.0 {
-            self.bitrate = bitrate;
-            self.force_keyframe = true;
-            info!("[ABR] soft: IDR only, без пересоздания");
-            return Ok(());
-        }
-
+        // Пытаемся применить на месте (без пересоздания энкодера) для ЛЮБОЙ
+        // величины изменения — раньше это делалось только при pct_change>20%,
+        // из-за чего типичные плавные шаги ABR (≤20%) вообще не долетали до
+        // энкодера.
         if self.try_apply_bitrate_inplace(bitrate) {
             self.bitrate = bitrate;
-            self.force_keyframe = true;
-            info!("[ABR] in-place: AVCodecContext обновлён + IDR");
+            // IDR не форсируем: bit_rate/rc_max_rate обновлены в реальном
+            // AVCodecContext, кодек применит новый таргет со следующего
+            // кадра сам, без необходимости в дорогом полном кадре.
+            info!("[ABR] in-place: AVCodecContext обновлён ({} kbps), без IDR", bitrate / 1000);
             return Ok(());
         }
 
-        self.force_keyframe = true;
-
+        // Сюда попадаем только для libx264/QSV (in-place недоступен) —
+        // там реально нужен rebuild энкодера, и вот тут IDR оправдан:
+        // после пересоздания меняются SPS/PPS, декодеру нужен opening-кадр.
         let new = Self::try_create(
             &self.profile, self.width, self.height, self.fps, bitrate,
         )
@@ -374,29 +414,71 @@ impl HwEncoder {
         self.src_width   = 0;
         self.src_height  = 0;
         self.force_keyframe = true;
+
         // Также сбрасываем кэшированный BGRA buffer — после пересоздания
         // swscale первое сравнение size пройдёт заново.
         self.bgra_frame = None;
         self.bgra_frame_dims = (0, 0);
-        info!("[ABR] rebuild: новый энкодер {} kbps", bitrate / 1000);
+
+        info!("[ABR] rebuild: новый энкодер {} kbps + IDR", bitrate / 1000);
         Ok(())
     }
 
+    /// FIX #44 (v0.3.3): реальное изменение bitrate у NVENC/AMF через av_opt_set.
+    /// Раньше прямая запись в AVCodecContext.bit_rate игнорировалась NVENC —
+    /// он читает из priv_data, которая устанавливается при avcodec_open2.
+    /// Теперь используем av_opt_set с AV_OPT_SEARCH_CHILDREN, чтобы достучаться
+    /// до priv_data и реально изменить bitrate на лету.
     fn try_apply_bitrate_inplace(&mut self, bitrate: u32) -> bool {
         match self.profile.codec_name.as_str() {
             "libx264" | "h264_qsv" => return false,
             _ => {}
         }
+
         unsafe {
             let ctx = self.encoder.as_mut_ptr();
             if ctx.is_null() {
                 return false;
             }
-            (*ctx).bit_rate       = bitrate as i64;
-            (*ctx).rc_max_rate    = bitrate as i64;
-            (*ctx).rc_buffer_size = bitrate as i32;
+
+            // Для NVENC/AMF нужно менять через AVOption, а не прямым присваиванием
+            let bitrate_str = bitrate.to_string();
+
+            // Целевой bitrate
+            let key_b = std::ffi::CString::new("b").unwrap();
+            let val_b = std::ffi::CString::new(bitrate_str.as_str()).unwrap();
+            let ret_b = ffmpeg::sys::av_opt_set(
+                ctx as *mut _,
+                key_b.as_ptr(),
+                val_b.as_ptr(),
+                ffmpeg::sys::AV_OPT_SEARCH_CHILDREN,
+            );
+
+            // Максимальный bitrate (для VBR/CBR)
+            let key_maxrate = std::ffi::CString::new("maxrate").unwrap();
+            let val_maxrate = std::ffi::CString::new(bitrate_str.as_str()).unwrap();
+            let ret_max = ffmpeg::sys::av_opt_set(
+                ctx as *mut _,
+                key_maxrate.as_ptr(),
+                val_maxrate.as_ptr(),
+                ffmpeg::sys::AV_OPT_SEARCH_CHILDREN,
+            );
+
+            // Buffer size (для HRD compliance)
+            let bufsize = bitrate * 2;
+            let key_bufsize = std::ffi::CString::new("bufsize").unwrap();
+            let val_bufsize = std::ffi::CString::new(bufsize.to_string()).unwrap();
+            let ret_buf = ffmpeg::sys::av_opt_set(
+                ctx as *mut _,
+                key_bufsize.as_ptr(),
+                val_bufsize.as_ptr(),
+                ffmpeg::sys::AV_OPT_SEARCH_CHILDREN,
+            );
+
+            // Успех если хотя бы b и maxrate применились
+            let _ = ret_buf;
+            ret_b >= 0 && ret_max >= 0
         }
-        true
     }
 
     pub fn encode_yuv(
@@ -416,13 +498,15 @@ impl HwEncoder {
         }
 
         yuv_frame.set_pts(Some(self.frame_index));
+
         if self.force_keyframe {
             yuv_frame.set_kind(ffmpeg::util::picture::Type::I);
             self.force_keyframe = false;
         }
-        self.frame_index += 1;
 
+        self.frame_index += 1;
         self.encoder.send_frame(&yuv_frame)?;
+
         let mut packets = Vec::new();
         let mut pkt = Packet::empty();
         while self.encoder.receive_packet(&mut pkt).is_ok() {
@@ -434,6 +518,7 @@ impl HwEncoder {
                 timestamp_ns,
             });
         }
+
         Ok(packets)
     }
 
@@ -441,34 +526,7 @@ impl HwEncoder {
     pub fn is_hardware(&self) -> bool { self.profile.is_hardware }
 }
 
-// ─── Frame Dedup ─────────────────────────────────────────────────────────────
-/// Сравнивает два BGRA-кадра по сэмплированным пикселям.
-pub fn frame_changed(prev: &[u8], curr: &[u8], width: u32, height: u32, stride: u32) -> bool {
-    let total = (width * height) as usize;
-    let step: usize = 16;
-    let thresh: u8 = 8;
-    let limit = total / step / 300;
-
-    let (w, s) = (width as usize, stride as usize);
-    let mut changed: usize = 0;
-    let mut i: usize = 0;
-    while i < total {
-        let off = (i / w) * s + (i % w) * 4;
-        if off + 2 < curr.len() && off + 2 < prev.len() {
-            if curr[off].abs_diff(prev[off]) > thresh
-            || curr[off+1].abs_diff(prev[off+1]) > thresh
-            || curr[off+2].abs_diff(prev[off+2]) > thresh {
-                changed += 1;
-                if changed > limit { return true; }
-            }
-        }
-        i += step;
-    }
-    false
-}
-
 // ─── LQ Encoder (Simulcast) ──────────────────────────────────────────────────
-
 pub struct LqEncoder {
     inner:           HwEncoder,
     combined_scaler: scaling::Context,
@@ -525,6 +583,7 @@ impl LqEncoder {
             self.src_width  = frame.width;
             self.src_height = frame.height;
             self.inner.request_keyframe();
+
             // сбрасываем кэшированный BGRA buffer
             self.bgra_frame = None;
             self.bgra_frame_dims = (0, 0);
@@ -545,11 +604,13 @@ impl LqEncoder {
         {
             let stride = bgra_frame.stride(0);
             let plane  = bgra_frame.data_mut(0);
+
             for row in 0..frame.height as usize {
                 let ss = row * frame.stride as usize;
                 let se = ss + (frame.width * 4) as usize;
                 let ds = row * stride;
                 let de = ds + (frame.width * 4) as usize;
+
                 if se <= frame.data.len() && de <= plane.len() {
                     plane[ds..de].copy_from_slice(&frame.data[ss..se]);
                 }

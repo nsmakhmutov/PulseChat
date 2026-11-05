@@ -13,7 +13,7 @@ from PyQt6.QtGui import QIcon, QGuiApplication, QPainter, QColor, QPen, QPainter
 from config import (resource_path, FILE_CHUNK_SIZE, FILE_TRANSFER_TIMEOUT)
 
 CUSTOM_SOUND_MAX_BYTES = 1 * 1024 * 1024
-CUSTOM_SOUND_SLOTS     = 6
+CUSTOM_SOUND_SLOTS     = 12
 
 def _slider_to_vol(slider_int: int) -> float:
 

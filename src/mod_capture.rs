@@ -19,10 +19,18 @@ pub mod wgc;
 pub use wgc::ScreenCapture;
 
 /// Захваченный кадр — владеет буфером BGRA пикселей.
+///
+/// FIX #43 (v0.3.2): data — bytes::Bytes, а не Vec<u8>. Раньше grab() делал
+/// `.clone()` заполненного Vec — это ВТОРОЙ memcpy кадра (после GPU→CPU Map),
+/// на 4K это ~33 МБ лишнего копирования 30 раз в секунду, то есть ~1 ГБ/с
+/// чистого CPU/memory-bandwidth оверхеда. Bytes::from(mem::take(...)) просто
+/// забирает владение уже заполненным буфером без копии; Bytes реализует
+/// Deref<Target=[u8]>, так что все места, читающие frame.data как срез,
+/// продолжают работать без изменений.
 #[derive(Clone)]
 pub struct CapturedFrame {
     /// BGRA8 пиксели (row-major, без padding между строками)
-    pub data: Vec<u8>,
+    pub data: bytes::Bytes,
     pub width: u32,
     pub height: u32,
     /// Stride в байтах (может быть > width*4 из-за alignment)

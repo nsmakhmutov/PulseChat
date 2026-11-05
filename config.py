@@ -1,6 +1,8 @@
 import sys
 import os
 import struct
+
+
 def resource_path(relative_path):
     """Получает абсолютный путь к ресурсам, работает для dev и для PyInstaller."""
     try:
@@ -8,6 +10,7 @@ def resource_path(relative_path):
     except Exception:
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
+
 
 # ── Сетевые настройки
 DEFAULT_PORT_TCP = 5000
@@ -44,17 +47,38 @@ VIDEO_FPS     = 30
 #
 #   Переключение делается на лету и только для того VideoReceiver, чей стрим
 #       сейчас под управлением, — см. VideoReceiver.set_low_latency().
-VIEWER_JITTER_BUFFER_MS         = 700
-VIEWER_JITTER_BUFFER_MS_CONTROL = 90
+#
+# FIX #49: было 150 мс. Для 60 fps при 1080p на RadminVPN 150 мс оказалось
+# мало — при микро-пиках канала jitter buffer не успевал, и картинка дёргалась.
+# 180 мс — баланс: достаточно для 60 fps, не даёт заметной задержки на управлении.
+VIEWER_JITTER_BUFFER_MS         = 180
+VIEWER_JITTER_BUFFER_MS_CONTROL = 80
 VIDEO_BITRATE = 4_500_000
 
-# ── HQ битрейты по разрешению
+# ── HQ битрейты по (width, height, fps).
+# Правило H.264 NVENC для «чисто»:
+#   720p30 ≈ 4-5 Mbps, 720p60 ≈ 6-7 Mbps
+#   1080p30 ≈ 8-10 Mbps, 1080p60 ≈ 12-14 Mbps
+# Ниже — картинка мылится, выше — не нужно (упирается в канал).
+VIDEO_BITRATES_FPS: dict = {
+    (1920, 1080, 60): 14_000_000,
+    (1920, 1080, 30): 10_000_000,
+    (1280,  720, 60):  7_000_000,
+    (1280,  720, 30):  5_000_000,
+    ( 854,  480, 60):  3_500_000,
+    ( 854,  480, 30):  2_500_000,
+    ( 640,  360, 60):  2_000_000,
+    ( 640,  360, 30):  1_500_000,
+}
+
+# ── Старое API (без fps) — для обратной совместимости.
+# FIX #49: 720p поднят с 4 до 5 Mbps — 4 Mbps для HD-стрима слишком мало.
 VIDEO_BITRATES: dict = {
     (3840, 2160): 20_000_000,
     (2560, 1440): 12_000_000,
     (1920, 1080): 10_000_000,
-    (1280,  720):  5_500_000,
-    ( 854,  480):  3_000_000,
+    (1280,  720):  5_000_000,
+    ( 854,  480):  2_500_000,
     ( 640,  360):  1_500_000,
 }
 
@@ -76,20 +100,49 @@ def get_lq_resolution(hq_width: int, hq_height: int) -> tuple:
     return lq_w, lq_h
 
 
-def get_bitrate_for_resolution(width: int, height: int, lq: bool = False) -> int:
-    """Возвращает битрейт для заданного разрешения."""
-    table = VIDEO_BITRATES_LQ if lq else VIDEO_BITRATES
-    if (width, height) in table:
-        return table[(width, height)]
+def get_bitrate_for_resolution(width: int, height: int,
+                                lq: bool = False, fps: int = 0) -> int:
+    """
+    Возвращает битрейт для заданного разрешения (и опционально fps).
 
+    FIX #49: добавлен параметр fps. Раньше таблица была только по разрешению,
+    и 720p60 получал те же 4 Mbps, что и 720p30 — не хватало на 60 fps.
+
+    Приоритет:
+      1) точное совпадение (width, height, fps) для HQ
+      2) точное совпадение (width, height) для HQ/LQ с поправкой на fps
+      3) эвристика по площади пикселей + поправка на fps
+    """
+    if lq:
+        table = VIDEO_BITRATES_LQ
+        if (width, height) in table:
+            return table[(width, height)]
+        ref_w, ref_h = 1280, 720
+        ref_br = 1_000_000
+        pixels = width * height
+        ref_pixels = ref_w * ref_h
+        estimated = int(ref_br * (pixels / ref_pixels) ** 0.75)
+        return max(400_000, min(estimated, 4_000_000))
+
+    # HQ: сначала пробуем точное (width, height, fps)
+    if fps > 0 and (width, height, fps) in VIDEO_BITRATES_FPS:
+        return VIDEO_BITRATES_FPS[(width, height, fps)]
+
+    # HQ: точное по разрешению с поправкой на fps (+40% для 60fps)
+    if (width, height) in VIDEO_BITRATES:
+        base = VIDEO_BITRATES[(width, height)]
+        if fps >= 60:
+            base = int(base * 1.4)
+        return base
+
+    # Fallback для нестандартных разрешений
     ref_w, ref_h = 1280, 720
-    ref_br = 1_000_000 if lq else 4_500_000
+    ref_br = 5_000_000
     pixels = width * height
     ref_pixels = ref_w * ref_h
     estimated = int(ref_br * (pixels / ref_pixels) ** 0.75)
-
-    if lq:
-        return max(400_000, min(estimated, 4_000_000))
+    if fps >= 60:
+        estimated = int(estimated * 1.4)
     return max(1_500_000, min(estimated, 20_000_000))
 
 
@@ -103,7 +156,17 @@ UDP_HEADER_STRUCT = struct.Struct("!IdIB")
 UDP_HEADER_SIZE   = UDP_HEADER_STRUCT.size
 
 # ── UDP Flags
+#
+# Бит 0 (1)   — mute   (голос замьючен у источника)
+# Бит 1 (2)   — deaf   (динамики замьючены у источника)
+# Бит 2 (4)   — PLAYER (общий плеер: музыка транслируется в голосовой канал)
+# Бит 3 (8)   — SPEAK_PARENT (из дочернего канала — говорить в родительский)
+# Бит 4 (16)  — LOOPBACK (резерв)
+# Бит 5 (32)  — STREAM_VOICES (голоса зрителей стрима)
+# Бит 6 (64)  — WHISPER (шёпот конкретному пользователю)
+# Бит 7 (128) — ANONYMOUS (анонимный шёпот)
 
+FLAG_PLAYER         = 4     # общий плеер (музыка в голосовой канал)
 FLAG_SPEAK_PARENT   = 8     # из дочернего: голос идёт и в дочерний, и в родительский
 FLAG_LOOPBACK_AUDIO = 16
 FLAG_STREAM_VOICES  = 32
@@ -165,6 +228,42 @@ CMD_JOIN_ROOM       = 'join_room'
 CMD_CHAT_MSG        = 'chat_msg'
 CMD_SYNC_USERS      = 'sync_users'
 CMD_SOUNDBOARD      = 'play_soundboard'
+
+# ── Общий плеер (совместное прослушивание музыки в комнате) ─────────────────
+#
+# АРХИТЕКТУРА (v2): музыка транслируется В ГОЛОСОВОЙ КАНАЛ через UDP + Opus,
+# тем же путём, что и обычный голос, но с отдельным флагом FLAG_PLAYER.
+#
+# Почему не через TCP:
+#   • Раньше трек шёл как base64-строка в JSON-сообщении (10 МБ) → на VPN
+#     это занимало 30-40 секунд, слушатель начинал слышать трек с огромной
+#     задержкой.
+#   • Через UDP + Opus чанки по 20 мс: задержка старта ~200-400 мс,
+#     идеальная синхронизация между всеми участниками комнаты.
+#
+# Управление (pause/resume/stop/next/prev) по-прежнему идёт через TCP JSON —
+# эти команды мелкие (десятки байт) и мгновенные.
+#
+# См. FLAG_PLAYER — сервер релеит такие пакеты всем в комнате как обычный
+# голос (см. _can_hear в server.py), а клиент-слушатель микширует их в
+# общий mix_buffer рядом с голосами собеседников.
+CMD_PLAYER_LOAD     = 'player_load'          # legacy; не используется
+CMD_PLAYER_PAUSE    = 'player_pause'
+CMD_PLAYER_RESUME   = 'player_resume'
+CMD_PLAYER_STOP     = 'player_stop'
+
+# Совместимость со старым API (на случай старых клиентов)
+PLAYER_MAX_B64_SIZE = 40_000_000
+PLAYER_DEFAULT_VOL  = 0.60
+PLAYER_ALLOWED_EXT  = ('.mp3', '.wav', '.ogg', '.flac',
+                       '.m4a', '.aac', '.opus')
+
+PLAYER_ICON_PREV   = 'prev.svg'
+PLAYER_ICON_PLAY   = 'play.svg'
+PLAYER_ICON_PAUSE  = 'pause.svg'
+PLAYER_ICON_NEXT   = 'next.svg'
+PLAYER_ICON_FOLDER = 'folder.svg'
+
 CMD_UPDATE_STATUS   = 'update_status'
 CMD_STREAM_START    = 'stream_start'
 CMD_STREAM_STOP     = 'stream_stop'
@@ -181,6 +280,7 @@ CMD_FILE_OFFER_ROOM   = 'file_offer_room'
 FILE_CHUNK_SIZE       = 65536
 FILE_TRANSFER_TIMEOUT = 30
 
+
 def get_appdata_dir() -> str:
     appdata = os.environ.get('APPDATA')
     if appdata:
@@ -189,6 +289,7 @@ def get_appdata_dir() -> str:
         path = os.path.join(os.path.expanduser("~"), ".InPulse")
     os.makedirs(path, exist_ok=True)
     return path
+
 
 USER_CONFIG_PATH = os.path.join(get_appdata_dir(), "user_config.json")
 KNOWN_USERS_PATH = os.path.join(get_appdata_dir(), "known_users.json")

@@ -17,25 +17,25 @@
 //     аллоцировался заново через `vec![0u8; ...]`. При 30 fps = 112 MB/сек
 //     мусора для GC аллокатора. Теперь используем tokio::sync::mpsc с Bytes
 //     (Arc<[u8]>, zero-copy clone) + capture переиспользует 2 буфера ping-pong.
-
+//
+//   FIX #46 (v0.3.3): буфер frame_tx увеличен с 4 до 8 кадров. При burst-нагрузке
+//     (смена сцены, NVENC задумался на 20мс) буфер 4 кадра = 133ms — кадры
+//     начинают дропаться. 8 кадров = 266ms — запас по стабильности.
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
-
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
-
 use crate::capture::{CapturedFrame, ScreenCapture};
 use crate::encode::{self, HwEncoder, LqEncoder};
 use crate::ipc::{self, Event};
 use crate::webrtc_out::WebRtcSender;
 
 // ─── Config ──────────────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone)]
 pub struct StreamConfig {
     pub monitor: u32,
@@ -53,13 +53,13 @@ impl StreamConfig {
         let h = (self.height / 2).max(180);
         (w & !1, h & !1)
     }
+
     pub fn lq_bitrate(&self) -> u32 {
         (self.bitrate / 4).max(500_000)
     }
 }
 
 // ─── Stats ───────────────────────────────────────────────────────────────────
-
 pub struct StreamStats {
     pub frames_captured: AtomicU64,
     pub frames_encoded:  AtomicU64,
@@ -81,11 +81,11 @@ impl Default for StreamStats {
 }
 
 // ─── Encoders wrapper ────────────────────────────────────────────────────────
-
 struct Encoders {
     hq: HwEncoder,
     lq: Option<LqEncoder>,
 }
+
 unsafe impl Send for Encoders {}
 
 // ─── Pipeline ────────────────────────────────────────────────────────────────
@@ -95,7 +95,6 @@ unsafe impl Send for Encoders {}
 //   encode_running — управляет tokio-задачей энкодинга.
 //   При restart_capture перезапускаем оба, но через ЯВНОЕ ожидание
 //   завершения старых перед запуском новых.
-
 pub struct Pipeline {
     capture_running: Arc<AtomicBool>,
     encode_running:  Arc<AtomicBool>,
@@ -127,7 +126,8 @@ impl Pipeline {
             config.width, config.height, config.fps, config.bitrate / 1000
         );
 
-        let (frame_tx, frame_rx) = mpsc::channel::<CapturedFrame>(4);
+        // FIX #46: буфер увеличен с 4 до 8 кадров
+        let (frame_tx, frame_rx) = mpsc::channel::<CapturedFrame>(8);
 
         let cap_running = capture_running.clone();
         let cap_stats   = stats.clone();
@@ -219,7 +219,8 @@ impl Pipeline {
         self.capture_running = Arc::new(AtomicBool::new(true));
         self.encode_running  = Arc::new(AtomicBool::new(true));
 
-        let (frame_tx, frame_rx) = mpsc::channel::<CapturedFrame>(4);
+        // FIX #46: буфер увеличен с 4 до 8 кадров
+        let (frame_tx, frame_rx) = mpsc::channel::<CapturedFrame>(8);
 
         // 5. Новый capture thread
         let cap_running = self.capture_running.clone();
@@ -269,17 +270,22 @@ impl Pipeline {
 
     pub async fn stop(&mut self) -> Result<()> {
         info!("Pipeline: остановка...");
+
         self.capture_running.store(false, Ordering::Release);
         self.encode_running.store(false, Ordering::Release);
 
         if let Some(h) = self.capture_handle.take() {
             let _ = tokio::task::spawn_blocking(move || { let _ = h.join(); }).await;
         }
+
         if let Some(h) = self.encode_handle.take() {
             let _ = h.await;
         }
+
         self.webrtc_sender.close().await?;
+
         ipc::send_event(&Event::StreamStopped).await?;
+
         info!("Pipeline остановлен");
         Ok(())
     }
@@ -293,7 +299,6 @@ impl Drop for Pipeline {
 }
 
 // ─── Capture loop ────────────────────────────────────────────────────────────
-
 fn capture_loop(
     config: StreamConfig, running: Arc<AtomicBool>,
     stats: Arc<StreamStats>, frame_tx: mpsc::Sender<CapturedFrame>,
@@ -324,6 +329,7 @@ fn capture_loop(
 
     while running.load(Ordering::Acquire) {
         let t = Instant::now();
+
         match capture.grab() {
             Ok(Some(frame)) => {
                 stats.frames_captured.fetch_add(1, Ordering::Relaxed);
@@ -338,6 +344,7 @@ fn capture_loop(
             Ok(None) => {}
             Err(e) => { warn!("Capture error: {e:#}"); thread::sleep(Duration::from_millis(100)); continue; }
         }
+
         let elapsed = t.elapsed();
         if elapsed < frame_dur { thread::sleep(frame_dur - elapsed); }
     }
@@ -347,7 +354,6 @@ fn capture_loop(
 }
 
 // ─── Encode + relay loop ─────────────────────────────────────────────────────
-
 async fn encode_loop(
     config:   StreamConfig,
     running:  Arc<AtomicBool>,
@@ -357,7 +363,7 @@ async fn encode_loop(
     target_bitrate: Arc<AtomicU32>,
 ) -> Result<()> {
     let hq = HwEncoder::new(config.width, config.height, config.fps, config.bitrate)
-        .context("HQ encoder")?;
+        .context("HQ encoder ")?;
 
     let lq = if config.simulcast {
         let (w, h) = config.lq_resolution();
@@ -414,28 +420,14 @@ async fn encode_loop(
             info!("[Pipeline] PLI → IDR + dedup reset");
         }
 
-        // ── Frame Dedup ─────────────────────────────────────────────────
-        let must_encode = skip_count >= max_skip
-            || prev_frame_data.len() != frame.data.len()
-            || encode::frame_changed(&prev_frame_data, &frame.data,
-                                     frame.width, frame.height, frame.stride);
-
-        if !must_encode {
-            skip_count += 1;
-            dedup_skipped_total += 1;
-            stats.frames_skipped.fetch_add(1, Ordering::Relaxed);
-            continue;
-        }
-
+        // ── Frame Dedup ОТКЛЮЧЁН ────────────────────────────────────────
+        // Причина: RTP timestamp в WebRTC растёт на каждый отправленный
+        // кадр. Если мы пропускаем 30 статичных кадров подряд (было
+        // max_skip=fps=30), RTP timestamp viewer'а отстаёт на секунду
+        // от реального времени → «замирание и рывок». Трафик от кодирования
+        // статичных кадров минимален (P-frame статики ~200-500 байт у NVENC),
+        // а плавность восстанавливается полностью.
         skip_count = 0;
-
-        // Сохраняем prev_frame_data без лишних аллокаций
-        if prev_frame_data.len() != frame.data.len() {
-            prev_frame_data.clear();
-            prev_frame_data.extend_from_slice(&frame.data);
-        } else {
-            prev_frame_data.copy_from_slice(&frame.data);
-        }
 
         // ── HQ encode → WebRTC ──────────────────────────────────────────
         match encoders.hq.encode(&frame) {

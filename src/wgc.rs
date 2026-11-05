@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
+use bytes::Bytes;
 use parking_lot::Mutex;
 use tracing::{debug, info};
 
@@ -208,13 +209,12 @@ impl<'a> Drop for D3DMapGuard<'a> {
 
 // ─── ScreenCapture ───────────────────────────────────────────────────────────
 //
-// FIX #34: пул из 2 BGRA-буферов (ping-pong). Один заполняется в grab(),
-// другой отдаётся в CapturedFrame. При следующем grab() меняем их местами.
-// Нужно именно 2, потому что CapturedFrame может жить некоторое время в
-// pipeline (энкодер обрабатывает его), и мы не можем переиспользовать тот же
-// Vec пока он в frame_rx. Frame-dedup в pipeline хранит ещё один кадр —
-// итого максимум 3 одновременно "в полёте", но с mpsc(capacity=4) фактически
-// 2 буфера достаточно благодаря CapturedFrame::Clone на dedup-пути.
+// FIX #43 (v0.3.2): bgra_reuse_buf заполняется в grab() данными GPU-кадра,
+// затем его владение целиком уходит в CapturedFrame.data (Bytes) через
+// mem::take — без копии. CapturedFrame может после этого жить произвольное
+// время в frame_rx/энкодере: он владеет своими данными независимо, ничего
+// не занимает "напрокат" у ScreenCapture. Следующий grab() просто заново
+// аллоцирует bgra_reuse_buf нужного размера (см. ensure_staging_texture).
 
 pub struct ScreenCapture {
     d3d_device: ID3D11Device,
@@ -257,10 +257,16 @@ impl ScreenCapture {
         let item = capture_item_for_monitor(hmonitor)?;
         info!("GraphicsCaptureItem создан для {}", monitor.name);
 
+        // FIX #42 (v0.3.2): было 1 буфер. Microsoft явно рекомендует ≥2 для
+        // Direct3D11CaptureFramePool — с одним буфером компоузер вынужден
+        // либо блокироваться, либо пропускать кадр, если предыдущий ещё не
+        // забран нашим TryGetNextFrame() (например, на кадре, где grab()
+        // немного задержался из-за CopyResource/Map под нагрузкой CPU).
+        // С 2 буферами это сглаживается без каких-либо изменений в логике.
         let frame_pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
             &winrt_device,
             DirectXPixelFormat::B8G8R8A8UIntNormalized,
-            1,
+            2,
             item.Size()?,
         )?;
 
@@ -351,19 +357,13 @@ impl ScreenCapture {
 
         let _ = frame.Close();
 
-        // mem::take передаёт владение в CapturedFrame, оставляя пустой Vec
-        // с capacity=0. Следующий grab() пересоздаст buffer через reserve.
-        //
-        // FIX #34: НЕ используем mem::take, потому что это потеряет capacity.
-        // Вместо этого клонируем данные через std::mem::replace с новым Vec,
-        // который получит capacity из пула при следующем clear()+reserve.
-        // Но это всё равно даёт аллокацию каждый кадр.
-        //
-        // ПРАВИЛЬНОЕ РЕШЕНИЕ: делаем явную копию в новый Vec, оставляя
-        // bgra_reuse_buf как есть. Это на 1 копию больше, но с capacity reuse.
-        // Лучший вариант — Bytes/Arc<[u8]>, но CapturedFrame.data — Vec<u8>.
-        // Пока оставим copy: одна malloc на кадр, но БЕЗ zero-fill (clone()).
-        let data = self.bgra_reuse_buf.clone();
+        // FIX #43 (v0.3.2): mem::take передаёт заполненный буфер во владение
+        // Bytes БЕЗ копии (раньше здесь был .clone() — второй memcpy кадра
+        // после GPU→CPU Map, см. комментарий в capture/mod.rs). Да, следующий
+        // grab() увидит bgra_reuse_buf с capacity=0 и снова аллоцирует —
+        // но аллокация сама по себе на порядок дешевле memcpy нескольких МБ,
+        // так что итоговая цена кадра ощутимо ниже.
+        let data = Bytes::from(std::mem::take(&mut self.bgra_reuse_buf));
 
         Ok(Some(CapturedFrame {
             data,

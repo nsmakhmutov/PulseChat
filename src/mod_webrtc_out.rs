@@ -10,17 +10,22 @@
 //     и возвращался, но spawned send_loop продолжал работать пока frame_tx
 //     не дропнется. При быстром stop()+start() Pipeline могло оказаться два
 //     send_loop на один PC. Теперь держим JoinHandle и awaitим в close().
-
+//
+//   FIX #48 (v0.3.4): ОТКАЧЕН KEYFRAME_PACE_EXTRA. Раньше для keyframe
+//     добавляли +12 мс к duration Sample. Это ломало RTP-timestamp: у viewer
+//     timestamp отставал от реального времени на ~12 мс × количество keyframe,
+//     за 1 минуту набегало +720 мс дрейфа → jitter buffer не справлялся →
+//     microfreezes. Теперь duration у ВСЕХ кадров одинаковый = frame_dur.
+//     Pacing keyframe (чтобы burst 400 КБ не выстрелил в UDP одним залпом)
+//     делается через явный sleep в send_loop, что не влияет на timestamp.
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-
 use anyhow::{Context, Result};
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
-
 use webrtc::api::interceptor_registry::register_default_interceptors;
 use webrtc::api::media_engine::{MediaEngine, MIME_TYPE_H264};
 use webrtc::api::APIBuilder;
@@ -35,9 +40,6 @@ use webrtc::rtp_transceiver::rtp_codec::{
 use webrtc::rtp_transceiver::RTCPFeedback;
 use webrtc::track::track_local::track_local_static_sample::TrackLocalStaticSample;
 use webrtc::track::track_local::TrackLocal;
-
-// I-frame pacing: пауза после отправки полного I-кадра.
-const KEYFRAME_PACE_DELAY: Duration = Duration::from_millis(30);
 
 pub struct WebRtcSender {
     pc:             Arc<RTCPeerConnection>,
@@ -109,6 +111,7 @@ impl WebRtcSender {
             ice_servers: vec![],
             ..Default::default()
         };
+
         let pc = Arc::new(
             api.new_peer_connection(cfg)
                 .await
@@ -176,7 +179,7 @@ impl WebRtcSender {
         let offer_sdp = local.sdp.clone();
         info!("WebRTC offer ready, len={}", offer_sdp.len());
 
-        let (frame_tx, frame_rx) = mpsc::channel::<(Bytes, bool)>(4);
+        let (frame_tx, frame_rx) = mpsc::channel::<(Bytes, bool)>(8);
         let (answer_tx, answer_rx) = oneshot::channel::<String>();
 
         let send_loop = tokio::spawn(send_loop(
@@ -291,18 +294,30 @@ async fn send_loop(
     // FIX #35: fps гарантированно >= 1 (валидация в WebRtcSender::new)
     let frame_dur = Duration::from_secs_f64(1.0 / fps as f64);
 
+    // FIX #48: убран KEYFRAME_PACE_EXTRA. duration теперь ОДИНАКОВЫЙ для всех
+    // кадров = frame_dur. Это критично: RTP-timestamp продвигается ровно на
+    // frame_dur за кадр и не «дрейфует» относительно реального времени.
+    //
+    // Раньше при keyframe duration = frame_dur + 12мс → timestamp отставал на
+    // 12мс за каждый keyframe (1/сек) → за минуту накапливалось 720мс дрейфа
+    // → jitter buffer viewer'а не справлялся → microfreezes.
     while let Some((data, is_key)) = rx.recv().await {
         let sample = Sample {
             data,
             duration: frame_dur,
             ..Default::default()
         };
+
         if let Err(e) = track.write_sample(&sample).await {
             warn!("[WebRTC send_loop] write_sample: {e}");
         }
 
+        // FIX #48: мягкий pacing для keyframe. Не меняет RTP-timestamp
+        // (duration тот же), только даёт сети «продышаться» — keyframe
+        // 400 КБ идёт от write_sample burst'ом, а тут мы просто делаем
+        // небольшую паузу перед следующим кадром, чтобы не забить UDP-буфер.
         if is_key {
-            tokio::time::sleep(KEYFRAME_PACE_DELAY).await;
+            tokio::time::sleep(Duration::from_millis(4)).await;
         }
     }
 

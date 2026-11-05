@@ -639,9 +639,6 @@ class SettingsDialog(QDialog):
 
         self.av_lbl = QLabel()
         self.av_lbl.setFixedSize(96, 96)
-        # Раньше тут была квадратная рамка border: 2px + radius 10px. Аватарки
-        # уже сами по себе круглые (PNG с прозрачным фоном), рамка визуально
-        # лишняя — убираем фон и обводку.
         self.av_lbl.setStyleSheet("background: transparent; border: none;")
         self.av_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.cur_av = self.mw.avatar
@@ -698,10 +695,6 @@ class SettingsDialog(QDialog):
         """)
         nick_col.addWidget(self.ed_nick)
 
-        # ── Звук при входе ───────────────────────────────────────────────
-        # Свой звук (wav/mp3, ≤3 сек), который услышат собеседники, когда вы
-        # заходите в комнату. Если задан — стандартный user_join.wav у других
-        # НЕ воспроизводится. Громкость регулируется ползунком «Системные звуки».
         lbl_join = QLabel("Звук при входе")
         lbl_join.setStyleSheet("color: rgba(200,200,210,0.8); font-size: 12px;")
         nick_col.addSpacing(4)
@@ -924,7 +917,7 @@ class SettingsDialog(QDialog):
         self._ban_list_widget.clear()
         if not entries:
             placeholder = QListWidgetItem("— нет забаненных —")
-            placeholder.setFlags(Qt.ItemFlag.NoItemFlags)  # не выделяется
+            placeholder.setFlags(Qt.ItemFlag.NoItemFlags)
             self._ban_list_widget.addItem(placeholder)
             self._btn_unban.setEnabled(False)
             return
@@ -990,7 +983,6 @@ class SettingsDialog(QDialog):
             fsize = os.path.getsize(path)
         except OSError:
             fsize = 0
-        # Тот же лимит размера, что у кастомных звуков (1 МБ).
         if fsize > CUSTOM_SOUND_MAX_BYTES:
             QMessageBox.warning(
                 self, "Файл слишком большой",
@@ -998,17 +990,12 @@ class SettingsDialog(QDialog):
                 f"Выбранный файл: {fsize // 1024} КБ."
             )
             return
-        # Ограничение длительности — строго 3 секунды для ЛЮБОГО формата
-        # (wav и mp3). Длительность читаем из заголовка через soundfile.info()
-        # (не загружая весь файл). Если длительность определить не удалось —
-        # файл отклоняем (ограничение строгое, без исключений).
         dur = None
         try:
             import soundfile as _sf
             info = _sf.info(path)
             dur = info.frames / info.samplerate if info.samplerate else None
         except Exception:
-            # Фолбэк для wav, если soundfile недоступен.
             if path.lower().endswith(".wav"):
                 try:
                     with wave.open(path, 'rb') as wf:
@@ -1096,9 +1083,6 @@ class SettingsDialog(QDialog):
 
         self.cb_nr.currentIndexChanged.connect(self._on_nr_mode_changed)
 
-        # «Качество звука (Битрейт)» создаём ЗДЕСЬ, но добавляем в layout НИЖЕ
-        # — под устройствами ввода/вывода (так попросил пользователь, чтобы
-        # параметр стоял рядом с устройствами, к которым он применяется).
         self.cb_bitrate = QComboBox()
         bitrate_options = {
             "24 kbps (Рация)": 24,
@@ -1116,14 +1100,12 @@ class SettingsDialog(QDialog):
             lambda: self.audio.set_bitrate(self.cb_bitrate.currentData())
         )
 
-        # ── Ввод/вывод + кнопка «Обновить» (подхват новых устройств) ──
         dev_hdr = QHBoxLayout()
         dev_lbl = QLabel("Устройства ввода/вывода:")
         dev_lbl.setStyleSheet("font-weight: bold;")
         btn_dev_refresh = QPushButton("⟳ Обновить")
         btn_dev_refresh.setFixedHeight(28)
-        btn_dev_refresh.setFixedWidth(124)  # FIX #4: фикс ширины — текст при
-        #                                      анимации не дёргает кнопку
+        btn_dev_refresh.setFixedWidth(124)
         btn_dev_refresh.setToolTip("Пересканировать аудиоустройства "
                                    "(подхватить подключённые после запуска)")
         btn_dev_refresh.clicked.connect(self._refresh_audio_devices_clicked)
@@ -1137,7 +1119,6 @@ class SettingsDialog(QDialog):
         aud_lay.addWidget(self.cb_in)
         aud_lay.addWidget(QLabel("Вывод:"))
         aud_lay.addWidget(self.cb_out)
-        # Битрейт стоит сразу под устройствами — это параметр того же блока.
         aud_lay.addWidget(QLabel("Качество звука (Битрейт):"))
         aud_lay.addWidget(self.cb_bitrate)
         aud_lay.addWidget(nr_label)
@@ -1180,16 +1161,7 @@ class SettingsDialog(QDialog):
         aud_lay.addStretch()
         self.tabs.addTab(aud_tab, "Аудио")
 
-    # ───────────────────────────────────────────────────────────────────
-    #  Вкладка «Видео» — выбор источника камеры
-    # ───────────────────────────────────────────────────────────────────
     def _enumerate_cameras_fast(self):
-        """
-        БЫСТРАЯ перечислялка камер — ТОЛЬКО имена из Qt (QMediaDevices).
-        Не открывает устройство, отрабатывает за миллисекунды. Используется
-        для мгновенного заполнения combobox при открытии диалога; глубокая
-        OpenCV-проба запускается фоном через _enumerate_cameras_slow_async.
-        """
         cams: list[tuple[int, str]] = []
         try:
             from PyQt6.QtMultimedia import QMediaDevices
@@ -1203,7 +1175,6 @@ class SettingsDialog(QDialog):
             pass
         if not cams:
             cams = [(0, "Камера по умолчанию")]
-        # Маркер «виртуальная» — оставляем как в _enumerate_cameras().
         out: list[tuple[int, str]] = []
         for i, name in cams:
             low = name.lower()
@@ -1213,26 +1184,8 @@ class SettingsDialog(QDialog):
         return out
 
     def refresh_camera_list(self, force_deep_probe: bool = False):
-        """
-        Перезаполняет combobox камер.
-
-        Раньше всегда зовался _enumerate_cameras() синхронно — он делает
-        cv2.VideoCapture для каждого из 8 индексов через DirectShow, что на
-        Windows может занимать ~2-3 секунды и заметно тормозит открытие
-        окна Настроек.
-
-        Теперь:
-          • Если на mw есть свежий кэш списка камер — берём его мгновенно.
-          • Если кэша нет — мгновенно заполняем combobox быстрой Qt-проверкой
-            (только имена устройств, без открытия), а глубокую OpenCV-пробу
-            запускаем в фоне через QThread. Когда фон завершится, combobox
-            автоматически обновится по сигналу.
-          • force_deep_probe=True — для кнопки «⟳ Обновить»: инвалидирует
-            кэш и принудительно перезапускает фон.
-        """
         self.cb_cam.clear()
 
-        # 1) Свежий кэш на mw (TTL 5 минут) — отрабатывает мгновенно.
         cache_ttl = 5 * 60
         cached = getattr(self.mw, '_cam_list_cache', None) if hasattr(self, 'mw') else None
         cached_t = getattr(self.mw, '_cam_list_cache_ts', 0.0) if hasattr(self, 'mw') else 0.0
@@ -1247,7 +1200,6 @@ class SettingsDialog(QDialog):
         if use_cache:
             cams = cached
         else:
-            # 2) Мгновенный fallback по Qt-именам; параллельно — фон с OpenCV.
             cams = self._enumerate_cameras_fast()
             self._start_camera_probe_async()
 
@@ -1271,11 +1223,6 @@ class SettingsDialog(QDialog):
             self.cb_cam.setCurrentIndex(chosen)
 
     def _start_camera_probe_async(self):
-        """
-        Запускает глубокую OpenCV-пробу камер в фоновом QThread. По завершении
-        — обновляет кэш на mw и (если диалог ещё жив) переапаковывает combobox.
-        """
-        # Если уже идёт — не запускаем повторно.
         if getattr(self, '_cam_probe_thread', None) is not None:
             try:
                 if self._cam_probe_thread.isRunning():
@@ -1300,14 +1247,12 @@ class SettingsDialog(QDialog):
 
         th = _ProbeThread(self)
         th.done.connect(self._on_camera_probe_done)
-        # Чистим ссылку и поток после завершения.
         th.finished.connect(lambda: setattr(self, '_cam_probe_thread', None))
         th.finished.connect(th.deleteLater)
         self._cam_probe_thread = th
         th.start()
 
     def _on_camera_probe_done(self, cams: list):
-        """Слот: пришёл результат фоновой пробы. Кэшируем + обновляем combobox."""
         try:
             if hasattr(self, 'mw'):
                 self.mw._cam_list_cache = cams
@@ -1315,34 +1260,19 @@ class SettingsDialog(QDialog):
         except Exception:
             pass
 
-        # Диалог мог быть закрыт за время пробы — тогда виджет уже dead.
         try:
             if self.cb_cam is None:
                 return
-            # Перезаполнить и восстановить выбор.
             self.cb_cam.clear()
             for idx, name in cams:
                 self.cb_cam.addItem(name, idx)
             self._restore_selected_camera()
         except RuntimeError:
-            # cb_cam уже удалён (диалог закрылся) — игнорируем.
             pass
 
     def _enumerate_cameras(self):
-        """
-        Возвращает список (index, human_name) доступных камер, ВКЛЮЧАЯ
-        виртуальные (OBS Virtual Camera и т.п.).
-
-        ВАЖНО: если камера СЕЙЧАС транслируется, мы НЕ открываем её повторно
-        через cv2.VideoCapture для проверки — на Windows DirectShow это
-        «крадёт» устройство и убивает живой кружок трансляции. В этом случае
-        полностью полагаемся на имена из QMediaDevices (они не открывают
-        устройство). OpenCV-проба индексов выполняется только когда камера
-        выключена.
-        """
         import os
 
-        # Индекс камеры, которая сейчас транслируется (если есть) — его НЕ трогаем.
         busy_index = None
         camera_is_on = False
         try:
@@ -1352,7 +1282,6 @@ class SettingsDialog(QDialog):
         except Exception:
             busy_index = None
 
-        # 1) Имена из Qt (НЕ открывают устройство — безопасно всегда).
         qt_names: dict[int, str] = {}
         try:
             from PyQt6.QtMultimedia import QMediaDevices
@@ -1365,7 +1294,6 @@ class SettingsDialog(QDialog):
         except Exception:
             pass
 
-        # 2) OpenCV-проба индексов — ТОЛЬКО когда камера выключена.
         opened_idx: list[int] = []
         if not camera_is_on:
             try:
@@ -1374,7 +1302,6 @@ class SettingsDialog(QDialog):
                 consecutive_miss = 0
                 for i in range(8):
                     if i == busy_index:
-                        # на всякий случай: занятый индекс не открываем
                         continue
                     cap = None
                     found = False
@@ -1402,7 +1329,6 @@ class SettingsDialog(QDialog):
             except Exception:
                 pass
 
-        # 3) Объединяем: индексы из Qt + реально открывшиеся + текущий занятый.
         idx_set = set(opened_idx) | set(qt_names.keys())
         if busy_index is not None:
             idx_set.add(busy_index)
@@ -1424,13 +1350,12 @@ class SettingsDialog(QDialog):
         vid_tab = QWidget()
         vid_lay = QVBoxLayout(vid_tab)
 
-        # ── Источник камеры (стиль как у «Устройства ввода/вывода») ──
         src_hdr = QHBoxLayout()
         src_lbl = QLabel("Выбор источника камеры")
         src_lbl.setStyleSheet("font-weight: bold;")
         btn_refresh = QPushButton("⟳ Обновить")
         btn_refresh.setFixedHeight(28)
-        btn_refresh.setFixedWidth(124)  # FIX #4: фикс ширины (см. вкладку Аудио)
+        btn_refresh.setFixedWidth(124)
         btn_refresh.setToolTip("Обновить список камер "
                                "(подхватить подключённые после запуска)")
         btn_refresh.clicked.connect(self._refresh_cameras_clicked)
@@ -1449,7 +1374,6 @@ class SettingsDialog(QDialog):
 
         vid_lay.addSpacing(12)
 
-        # ── Параметры трансляции камеры ──────────────────────────────────
         from ui_main.camera_capture import (
             CAM_SEND_FPS, CAM_JPEG_QUALITY, CAM_SEND_SIZE,
             CAM_FPS_MIN, CAM_FPS_MAX, CAM_SIZE_MIN, CAM_SIZE_MAX,
@@ -1460,7 +1384,6 @@ class SettingsDialog(QDialog):
         params_title.setStyleSheet("font-weight: bold;")
         vid_lay.addWidget(params_title)
 
-        # FPS
         _fps0 = int(self.app_settings.value("camera_send_fps", CAM_SEND_FPS) or CAM_SEND_FPS)
         _fps0 = max(CAM_FPS_MIN, min(CAM_FPS_MAX, _fps0))
         self.lbl_cam_fps = QLabel(f"Частота кадров (FPS): {_fps0}")
@@ -1473,7 +1396,6 @@ class SettingsDialog(QDialog):
         vid_lay.addWidget(self.lbl_cam_fps)
         vid_lay.addWidget(self.sl_cam_fps)
 
-        # Качество JPEG
         _q0 = int(self.app_settings.value("camera_jpeg_quality", CAM_JPEG_QUALITY) or CAM_JPEG_QUALITY)
         _q0 = max(CAM_QUALITY_MIN, min(CAM_QUALITY_MAX, _q0))
         self.lbl_cam_q = QLabel(f"Качество (JPEG): {_q0}")
@@ -1486,7 +1408,6 @@ class SettingsDialog(QDialog):
         vid_lay.addWidget(self.lbl_cam_q)
         vid_lay.addWidget(self.sl_cam_q)
 
-        # Размер кадра (разрешение кружка)
         _sz0 = int(self.app_settings.value("camera_send_size", CAM_SEND_SIZE) or CAM_SEND_SIZE)
         _sz0 = max(CAM_SIZE_MIN, min(CAM_SIZE_MAX, _sz0))
         self.lbl_cam_sz = QLabel(f"Размер кадра: {_sz0}px")
@@ -1502,48 +1423,38 @@ class SettingsDialog(QDialog):
 
         vid_lay.addSpacing(16)
 
-        # ── Превью камеры (кликабельный кружок) ──────────────────────────
         preview_title = QLabel("Превью камеры")
         preview_title.setStyleSheet("font-weight: bold;")
         vid_lay.addWidget(preview_title)
 
         vid_lay.addSpacing(10)
 
-        _PV = 170   # диаметр превью
+        _PV = 170
         self._preview_diameter = _PV
 
-        # Кликабельный кружок: клик включает/выключает превью.
-        # При выключенном — иконка Play + текст; при наведении в активном
-        # режиме — полупрозрачный оверлей Pause + «Остановить».
         self.cam_preview_circle = _CameraPreviewCircle(_PV)
         self.cam_preview_circle.clicked.connect(self._toggle_camera_preview)
 
-        # Прижимаем кружок к левому краю.
         prev_row = QHBoxLayout()
         prev_row.addWidget(self.cam_preview_circle, alignment=Qt.AlignmentFlag.AlignLeft)
         prev_row.addStretch()
         vid_lay.addLayout(prev_row)
 
         self._preview_thread = None
-        self._preview_active = False      # идёт ли сейчас превью
-        self._preview_uses_main = False   # превью подключено к рабочей камере?
+        self._preview_active = False
+        self._preview_uses_main = False
 
         vid_lay.addSpacing(12)
         vid_lay.addStretch()
         self.tabs.addTab(vid_tab, "Видео")
 
-    # ── Превью камеры в настройках ──────────────────────────────────────
     def _toggle_camera_preview(self):
-        # Клик по кружку: если идёт превью — останавливаем, иначе запускаем.
         if getattr(self, "_preview_active", False):
             self._stop_camera_preview()
         else:
             self._start_camera_preview()
 
     def _start_camera_preview(self):
-        # Если основная камера УЖЕ работает (идёт трансляция) — НЕ открываем
-        # второй захват (это убивает живой кружок на Windows). Вместо этого
-        # подключаем превью к кадрам уже работающего потока.
         main_cap = getattr(self.mw, "_cam_capture", None) if hasattr(self, "mw") else None
         main_on = bool(getattr(self.mw, "is_camera_on", False)) if hasattr(self, "mw") else False
 
@@ -1558,7 +1469,6 @@ class SettingsDialog(QDialog):
                 print(f"[Preview] не удалось подключиться к рабочей камере: {e}")
                 self._preview_uses_main = False
 
-        # Иначе — свой отдельный поток превью.
         try:
             from ui_main.camera_capture import CameraCaptureThread, CV2_AVAILABLE
         except Exception as e:
@@ -1575,7 +1485,6 @@ class SettingsDialog(QDialog):
         except Exception:
             pass
 
-        # Останавливаем прошлый поток БЕЗ сброса состояния кружка.
         self._stop_camera_preview(reset_ui=False)
 
         self._preview_thread = CameraCaptureThread(
@@ -1595,7 +1504,6 @@ class SettingsDialog(QDialog):
         self._preview_thread.start()
 
     def _fail_preview(self, text: str):
-        """Сбросить превью в выключенное состояние с подсказкой/ошибкой."""
         self._preview_active = False
         if hasattr(self, "cam_preview_circle"):
             self.cam_preview_circle.set_active(False)
@@ -1629,8 +1537,6 @@ class SettingsDialog(QDialog):
             self.cam_preview_circle.set_frame(out)
 
     def _stop_camera_preview(self, reset_ui: bool = True):
-        # Если превью было подключено к РАБОЧЕЙ камере — только отключаем сигнал,
-        # сам захват трансляции НЕ трогаем (он продолжает жить).
         if getattr(self, "_preview_uses_main", False):
             main_cap = getattr(self.mw, "_cam_capture", None) if hasattr(self, "mw") else None
             if main_cap is not None:
@@ -1674,7 +1580,7 @@ class SettingsDialog(QDialog):
         outer.addWidget(hk_group, stretch=1)
 
         hdr_row = QHBoxLayout()
-        hdr_row.setContentsMargins(4, 0, 36, 0)   # 36 = ширина кнопки «✕»
+        hdr_row.setContentsMargins(4, 0, 36, 0)
         hdr_row.setSpacing(8)
         lbl_func = QLabel("Действие")
         lbl_func.setStyleSheet("font-weight: bold; font-size: 12px;")
@@ -1694,7 +1600,7 @@ class SettingsDialog(QDialog):
         self._hk_rows_layout = QVBoxLayout(self._hk_rows_container)
         self._hk_rows_layout.setSpacing(5)
         self._hk_rows_layout.setContentsMargins(0, 0, 0, 0)
-        self._hk_rows_layout.addStretch()   # прижимаем строки сверху
+        self._hk_rows_layout.addStretch()
         scroll.setWidget(self._hk_rows_container)
         hk_group_lay.addWidget(scroll, stretch=1)
 
@@ -1938,24 +1844,54 @@ class SettingsDialog(QDialog):
 
         cust_group = QGroupBox("🎵  Мои звуки")
         cust_group.setStyleSheet("QGroupBox { font-weight: bold; }")
-        cust_lay = QVBoxLayout(cust_group)
+        cust_group_lay = QVBoxLayout(cust_group)
+        cust_group_lay.setContentsMargins(10, 10, 10, 10)
+        cust_group_lay.setSpacing(8)
 
         desc = QLabel(
-            "Добавьте собственные звуки (.mp3 / .wav), максимум 1 МБ (~7 сек)."
+            f"Добавьте собственные звуки (.mp3 / .wav), максимум 1 МБ (~7 сек). "
+            f"Слотов: {CUSTOM_SOUND_SLOTS}."
         )
         desc.setStyleSheet("font-size: 11px; color: #aaa; font-weight: normal;")
         desc.setWordWrap(True)
-        cust_lay.addWidget(desc)
+        cust_group_lay.addWidget(desc)
 
-        self._custom_sound_rows: list[dict] = []   # список виджетов каждого слота
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("""
+            QScrollArea { background: transparent; border: none; }
+            QScrollBar:vertical {
+                background: rgba(255,255,255,0.04);
+                width: 8px; border-radius: 4px; margin: 0;
+            }
+            QScrollBar::handle:vertical {
+                background: rgba(255,255,255,0.22);
+                border-radius: 4px;
+                min-height: 24px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+        """)
+
+        rows_container = QWidget()
+        rows_container.setStyleSheet("background: transparent;")
+        cust_lay = QVBoxLayout(rows_container)
+        cust_lay.setSpacing(6)
+        cust_lay.setContentsMargins(0, 0, 0, 4)
+
+        self._custom_sound_rows: list[dict] = []
 
         for i in range(CUSTOM_SOUND_SLOTS):
             saved_path = self.app_settings.value(f"custom_sound_{i}_path", "")
             saved_name = self.app_settings.value(f"custom_sound_{i}_name", "")
             self._add_custom_sound_row(cust_lay, i, saved_path, saved_name)
 
-        lay.addWidget(cust_group)
-        lay.addStretch()
+        cust_lay.addStretch()
+        scroll.setWidget(rows_container)
+        cust_group_lay.addWidget(scroll, stretch=1)
+
+        lay.addWidget(cust_group, stretch=1)
         self.tabs.addTab(tab, "SoundBoard")
 
     def _add_custom_sound_row(self, parent_lay: QVBoxLayout, idx: int,
@@ -2106,10 +2042,6 @@ class SettingsDialog(QDialog):
             mw = self.mw
             if hasattr(mw, '_sb_panel') and mw._sb_panel is not None:
                 try:
-                    # Ребилдим панель даже если она сейчас скрыта — так её
-                    # состояние всегда совпадает с настройками (двусторонняя
-                    # синхронизация: оба источника читают/пишут одни ключи
-                    # QSettings, а UI обновляется при любом изменении).
                     mw._sb_panel.rebuild()
                 except RuntimeError:
                     pass
@@ -2118,7 +2050,7 @@ class SettingsDialog(QDialog):
 
     def setup_version_tab(self):
         class _Bridge(QObject):
-            sig_found    = pyqtSignal(str, str)   # version, download_url
+            sig_found    = pyqtSignal(str, str)
             sig_no_upd   = pyqtSignal()
             sig_error    = pyqtSignal(str)
             sig_progress = pyqtSignal(int)
@@ -2147,6 +2079,19 @@ class SettingsDialog(QDialog):
         about_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         about_lbl.setWordWrap(True)
         about_lbl.setStyleSheet("font-size: 13px; line-height: 1.6;")
+        about_lbl.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._egg_clicks = 0
+        self._features_tab_added = False
+
+        def _about_click(ev):
+            self._egg_clicks += 1
+            if self._egg_clicks >= 10 and not self._features_tab_added:
+                self.setup_features_tab()
+                self._features_tab_added = True
+                idx = self.tabs.count() - 1
+                self.tabs.setCurrentIndex(idx)
+            QLabel.mousePressEvent(about_lbl, ev)
+        about_lbl.mousePressEvent = _about_click
         lay.addWidget(about_lbl)
 
         sep = QFrame()
@@ -2211,6 +2156,168 @@ class SettingsDialog(QDialog):
 
         lay.addStretch()
         self.tabs.addTab(tab, "Версия")
+
+    def setup_features_tab(self):
+        from audio_engine.voice_filters import (
+            FILTER_ORDER, FILTER_LABELS, FILTER_NONE,
+        )
+
+        tab = QWidget()
+        lay = QVBoxLayout(tab)
+        lay.setSpacing(14)
+        lay.setContentsMargins(20, 20, 20, 20)
+
+        title = QLabel("✨ Фичи")
+        title.setStyleSheet("font-size: 18px; font-weight: bold; color: #cdd6f4;")
+        lay.addWidget(title)
+
+        hint = QLabel("Экспериментальные функции. Сбрасываются при перезапуске.")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("font-size: 12px; color: #8899bb;")
+        lay.addWidget(hint)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setFrameShadow(QFrame.Shadow.Sunken)
+        lay.addWidget(sep)
+
+        # ── Голосовой фильтр ────────────────────────────────────────────
+        vf_title = QLabel("🎙 Голосовой фильтр")
+        vf_title.setStyleSheet("font-size: 15px; font-weight: bold; color: #c8d0e0;")
+        lay.addWidget(vf_title)
+
+        vf_desc = QLabel(
+            "Изменяет ваш голос в реальном времени. Эффект слышат все участники "
+            "голосового канала."
+        )
+        vf_desc.setWordWrap(True)
+        vf_desc.setStyleSheet("font-size: 12px; color: #8899bb;")
+        lay.addWidget(vf_desc)
+
+        self._vf_combo = QComboBox()
+        for fid in FILTER_ORDER:
+            self._vf_combo.addItem(FILTER_LABELS[fid], fid)
+        cur = FILTER_NONE
+        try:
+            if getattr(self.audio, 'voice_filter', None) is not None:
+                cur = self.audio.voice_filter.active
+        except Exception:
+            cur = FILTER_NONE
+        ci = self._vf_combo.findData(cur)
+        if ci >= 0:
+            self._vf_combo.setCurrentIndex(ci)
+        self._vf_combo.setFixedHeight(36)
+        self._vf_combo.currentIndexChanged.connect(self._on_voice_filter_changed)
+        lay.addWidget(self._vf_combo)
+
+        descs = {
+            "chipmunk": "Завышенный писклявый тон — как бурундук/Масяня.",
+            "vader":    "Глубокий бас с металлическим эхом и тяжёлым придыханием.",
+            "whisper_low": "Низкий приглушённый голос с придыханием.",
+            "autotune": "Подстройка высоты к нотам — для «пения» в разговоре.",
+            "demon":    "Сверхнизкий двойной голос с шипящим верхом и эхом преисподней.",
+        }
+        self._vf_desc_lbl = QLabel(descs.get(cur, ""))
+        self._vf_desc_lbl.setWordWrap(True)
+        self._vf_desc_lbl.setStyleSheet(
+            "font-size: 12px; color: #a0c0ff; padding: 6px 0;")
+        self._vf_descs = descs
+        lay.addWidget(self._vf_desc_lbl)
+
+        # ── Общий плеер ────────────────────────────────────────────────
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.Shape.HLine)
+        sep2.setFrameShadow(QFrame.Shadow.Sunken)
+        lay.addWidget(sep2)
+
+        player_title = QLabel("🎵 Общий плеер")
+        player_title.setStyleSheet(
+            "font-size: 15px; font-weight: bold; color: #c8d0e0;")
+        lay.addWidget(player_title)
+
+        player_desc = QLabel(
+            "Совместное прослушивание музыки в голосовом канале. "
+            "Включите — над кнопкой «Чат» появится панель плеера. "
+            "Все участники комнаты слышат трек синхронно; "
+            "управлять воспроизведением может только владелец (DJ)."
+        )
+        player_desc.setWordWrap(True)
+        player_desc.setStyleSheet("font-size: 12px; color: #8899bb;")
+        lay.addWidget(player_desc)
+
+        self._cb_player = QCheckBox("Включить общий плеер")
+        self._cb_player.setChecked(
+            self.app_settings.value("player_enabled", "false") == "true"
+        )
+        self._cb_player.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._cb_player.setStyleSheet("""
+            QCheckBox {
+                color: #c8b0ff;
+                font-size: 13px;
+                padding: 4px 0;
+                background: transparent;
+                spacing: 8px;
+            }
+            QCheckBox::indicator {
+                width: 16px; height: 16px;
+                border: 1px solid rgba(130,100,220,0.60);
+                border-radius: 3px;
+                background: rgba(255,255,255,0.04);
+            }
+            QCheckBox::indicator:checked {
+                background: #7b52d4;
+                border-color: #9b72f4;
+            }
+        """)
+        self._cb_player.toggled.connect(self._on_player_toggled)
+        lay.addWidget(self._cb_player)
+
+        _pv = int(self.app_settings.value("player_volume", 70))
+        self.lbl_player_vol = QLabel(f"Громкость плеера: {_pv}%")
+        self.lbl_player_vol.setStyleSheet(
+            "font-size: 12px; color: #c8d0e0;")
+        lay.addWidget(self.lbl_player_vol)
+
+        self.sl_player_vol = QSlider(Qt.Orientation.Horizontal)
+        self.sl_player_vol.setRange(0, 100)
+        self.sl_player_vol.setValue(_pv)
+        self.sl_player_vol.valueChanged.connect(
+            self._on_player_volume_changed)
+        lay.addWidget(self.sl_player_vol)
+
+        lay.addStretch()
+        self.tabs.addTab(tab, "Фичи")
+
+    def _on_voice_filter_changed(self, idx: int):
+        fid = self._vf_combo.itemData(idx)
+        if hasattr(self.audio, 'set_voice_filter'):
+            self.audio.set_voice_filter(fid)
+        if hasattr(self, '_vf_desc_lbl'):
+            self._vf_desc_lbl.setText(self._vf_descs.get(fid, ""))
+
+    def _on_player_toggled(self, checked: bool) -> None:
+        self.app_settings.setValue(
+            "player_enabled", "true" if checked else "false")
+        mw = self.mw
+        if hasattr(mw, "_update_player_visibility"):
+            try:
+                mw._update_player_visibility()
+            except Exception as e:
+                print(f"[Settings] player visibility error: {e}")
+        if not checked and hasattr(mw, "_player_stop_local"):
+            try:
+                mw._player_stop_local()
+            except Exception:
+                pass
+
+    def _on_player_volume_changed(self, val: int) -> None:
+        self.app_settings.setValue("player_volume", int(val))
+        self.lbl_player_vol.setText(f"Громкость плеера: {val}%")
+        try:
+            self.mw.audio.set_player_volume(val / 100.0)
+            self.mw._player_volume = val / 100.0
+        except Exception:
+            pass
 
     def _slot_update_found(self, version: str, download_url: str):
         self._pending_download_url = download_url
@@ -2339,38 +2446,22 @@ class SettingsDialog(QDialog):
         self.cb_out.setCurrentText(s_out)
 
     def _animate_refresh_button(self, btn, work_fn=None):
-        """
-        FIX #4: мягкая, ненавязчивая анимация кнопки «Обновить» на вкладках
-        «Аудио»/«Видео», чтобы было понятно, что клик сработал и устройства
-        пересканированы.
-
-        Поведение: глиф ⟳ плавно крутится ~0.6 c (кнопка на это время
-        отключена и показывает «Обновление…»), затем коротко мигает «✓ Готово»
-        и возвращается к «⟳ Обновить». Без сторонних ресурсов и без навязчивых
-        вспышек. `work_fn`, если передан, выполняется один раз в начале спина.
-        """
         if btn is None:
             return
-        # Если анимация уже идёт для этой кнопки — игнорируем повторный клик.
         if getattr(btn, "_refresh_anim_active", False):
             return
         btn._refresh_anim_active = True
         btn.setEnabled(False)
 
-        # Выполняем саму работу (пересканирование) сразу — пока крутится спиннер.
         if work_fn is not None:
             try:
                 work_fn()
             except Exception as e:
                 print(f"[Settings] refresh work_fn error: {e}")
 
-        # Анимация прогресса через точки — гарантированно отображается в любом
-        # шрифте (без риска «квадратиков» от редких глифов спиннера). Мягко и
-        # ненавязчиво: «Обновление», «Обновление.», «Обновление..», «...».
         frames = ["", ".", "..", "..."]
         state = {"i": 0, "ticks": 0}
         timer = QTimer(self)
-        # ~0.6 c: 12 тиков по 50 мс.
         TOTAL_TICKS = 12
 
         def _tick():
@@ -2378,11 +2469,9 @@ class SettingsDialog(QDialog):
             if state["ticks"] >= TOTAL_TICKS:
                 timer.stop()
                 timer.deleteLater()
-                # Короткое подтверждение, затем возврат в исходное состояние.
                 btn.setText("✓ Готово")
                 QTimer.singleShot(650, _restore)
                 return
-            # Меняем фазу точек примерно каждые 3 тика — спокойный темп.
             state["i"] = (state["ticks"] // 3) % len(frames)
             btn.setText(f"⟳ Обновление{frames[state['i']]}")
 
@@ -2396,47 +2485,33 @@ class SettingsDialog(QDialog):
         timer.start(50)
 
     def _refresh_cameras_clicked(self):
-        """Обновление списка камер с мягкой анимацией кнопки (FIX #4).
-        Принудительно инвалидирует кэш и запускает фоновую глубокую пробу."""
         self._animate_refresh_button(
             getattr(self, "_btn_cam_refresh", None),
             work_fn=lambda: self.refresh_camera_list(force_deep_probe=True),
         )
 
     def _refresh_audio_devices_clicked(self):
-        """Обновление аудиоустройств с мягкой анимацией кнопки (FIX #4)."""
         self._animate_refresh_button(
             getattr(self, "_btn_dev_refresh", None),
             work_fn=self._do_refresh_audio_devices,
         )
 
     def _do_refresh_audio_devices(self):
-        """
-        Пересканирует аудиоустройства, подхватывая подключённые ПОСЛЕ запуска.
-
-        sounddevice/PortAudio кэширует список устройств при инициализации,
-        поэтому простой повторный query_devices() вернёт старый список.
-        Принудительно ре-инициализируем PortAudio (_terminate/_initialize),
-        затем перезаполняем списки, сохраняя текущий выбор пользователя.
-        """
         cur_in = self.cb_in.currentText()
         cur_out = self.cb_out.currentText()
 
-        # Ре-инициализация PortAudio → актуальный список устройств.
         try:
             sd._terminate()
             sd._initialize()
         except Exception as e:
             print(f"[Settings] PortAudio reinit: {e}")
 
-        # Перечитываем список.
         try:
             self.refresh_devices_list()
         except Exception as e:
             print(f"[Settings] refresh_devices_list error: {e}")
             return
 
-        # Возвращаем прежний выбор, если он ещё доступен.
         if cur_in:
             idx = self.cb_in.findText(cur_in)
             if idx != -1:
@@ -2489,7 +2564,6 @@ class SettingsDialog(QDialog):
             self.audio.volume_level_signal.disconnect(self.mic_vad.set_level)
         except (RuntimeError, TypeError):
             pass
-        # Останавливаем превью камеры, чтобы не держать устройство и поток.
         try:
             self._stop_camera_preview()
         except Exception:
@@ -2500,12 +2574,10 @@ class SettingsDialog(QDialog):
         s = self.app_settings
         s.setValue("device_in_name", self.cb_in.currentText())
         s.setValue("device_out_name", self.cb_out.currentText())
-        # ── Источник камеры (вкладка «Видео») ──
         if hasattr(self, "cb_cam") and self.cb_cam.count() > 0:
             s.setValue("camera_name", self.cb_cam.currentText())
             cam_data = self.cb_cam.currentData()
             s.setValue("camera_index", int(cam_data) if cam_data is not None else 0)
-        # ── Параметры трансляции камеры ──
         if hasattr(self, "sl_cam_fps"):
             s.setValue("camera_send_fps", self.sl_cam_fps.value())
             s.setValue("camera_preview_fps", self.sl_cam_fps.value())
@@ -2531,8 +2603,6 @@ class SettingsDialog(QDialog):
         for i, row in enumerate(self._hk_rows):
             data = row["cb"].currentData()
 
-            # FIX: переменная hk раньше нигде не определялась → NameError в
-            # save_all → диалог настроек не закрывался по «Сохранить».
             try:
                 hk = row["hk"].get_hotkey()
             except Exception:

@@ -3,7 +3,9 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QComboBox, QCheckBox,
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QGuiApplication
 
+from config import get_bitrate_for_resolution
 from .ui_dialogs import _DialogTitleBar
+
 
 class StreamSettingsDialog(QDialog):
     def __init__(self, parent=None):
@@ -11,7 +13,7 @@ class StreamSettingsDialog(QDialog):
         self.setWindowFlag(Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setWindowTitle("Настройки трансляции")
-        self.setMinimumWidth(380)
+        self.setMinimumWidth(400)
 
         root_lay = QVBoxLayout(self)
         root_lay.setContentsMargins(0, 0, 0, 0)
@@ -61,6 +63,9 @@ class StreamSettingsDialog(QDialog):
                 background-color: rgba(255,255,255,0.13);
                 border-color: rgba(255,255,255,0.22);
             }
+            QLabel#hintLabel {
+                color: #8899bb; font-size: 11px;
+            }
         """)
         root_lay.addWidget(self._card)
 
@@ -107,24 +112,50 @@ class StreamSettingsDialog(QDialog):
 
         layout.addWidget(QLabel("Разрешение:"))
         self.res_combo = QComboBox()
+        # Храним только (width, height), описание формируется динамически
+        # после выбора fps — чтобы показать актуальный bitrate.
+        self._res_choices: list[tuple[int, int]] = [
+            (1920, 1080),   # 1080p (Full HD)
+            (1280,  720),   # 720p (HD)
+            ( 854,  480),   # 480p (SD)
+            ( 640,  360),   # 360p
+        ]
+        for (w, h) in self._res_choices:
+            label = {
+                (1920, 1080): "1080p  (Full HD)",
+                (1280,  720): "720p   (HD)",
+                ( 854,  480): "480p   (SD)",
+                ( 640,  360): "360p",
+            }.get((w, h), f"{w}×{h}")
+            self.res_combo.addItem(label, (w, h))
 
-        self._fixed_res_options: dict[str, tuple[int, int]] = {
-            "720p  (HD)   — 4,5 Mbps":  (1280, 720),
-            "480p  (SD)   — 2 Mbps":  ( 854, 480),
-            "360p         — 1 Mbps":  ( 640, 360),
-        }
-
-        for text, res in self._fixed_res_options.items():
-            self.res_combo.addItem(text, res)
-
-        self.res_combo.setCurrentIndex(1)
+        self.res_combo.setCurrentIndex(1)  # 720p по умолчанию
         layout.addWidget(self.res_combo)
 
         layout.addWidget(QLabel("Частота кадров (FPS):"))
         self.fps_combo = QComboBox()
-        self.fps_combo.addItems(["15", "30"])
+        self.fps_combo.addItems(["30", "60"])
         self.fps_combo.setCurrentText("30")
         layout.addWidget(self.fps_combo)
+
+        # Строка с предполагаемым битрейтом — обновляется при смене
+        # разрешения или fps.
+        self.lbl_bitrate = QLabel()
+        self.lbl_bitrate.setObjectName("hintLabel")
+        layout.addWidget(self.lbl_bitrate)
+
+        def _update_bitrate_label():
+            w, h = self.res_combo.currentData() or (1280, 720)
+            fps  = int(self.fps_combo.currentText())
+            br   = get_bitrate_for_resolution(w, h, fps=fps)
+            self.lbl_bitrate.setText(
+                f"Битрейт: ~{br // 1000} kbps ({w}×{h} @ {fps} fps). "
+                f"Требуемая скорость канала: ≥ {int(br * 1.2) // 1000} kbps."
+            )
+
+        self.res_combo.currentIndexChanged.connect(lambda _: _update_bitrate_label())
+        self.fps_combo.currentIndexChanged.connect(lambda _: _update_bitrate_label())
+        _update_bitrate_label()
 
         def _fix_stream_combo(combo):
             try:
@@ -196,7 +227,6 @@ class StreamSettingsDialog(QDialog):
         self.adjustSize()
 
     def get_settings(self) -> dict:
-
         monitor_idx  = self.monitor_combo.currentData()
         fps          = int(self.fps_combo.currentText())
         audio_on     = self.cb_stream_audio.isChecked()

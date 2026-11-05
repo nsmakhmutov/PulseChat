@@ -60,6 +60,12 @@ class NetworkClient(WebRTCMixin, CameraWebRTCMixin, ChatMixin, FeaturesMixin, QO
     soundboard_played   = pyqtSignal(str)
     join_sound_received = pyqtSignal(int)   # src_uid: чей это звук входа
 
+    # ── Общий плеер ─────────────────────────────────────────────────────
+    player_loaded  = pyqtSignal(dict)
+    player_paused  = pyqtSignal(int)
+    player_resumed = pyqtSignal(int)
+    player_stopped = pyqtSignal()
+
     nudge_received  = pyqtSignal()
     nudge_triggered = pyqtSignal(str, str)
 
@@ -86,6 +92,7 @@ class NetworkClient(WebRTCMixin, CameraWebRTCMixin, ChatMixin, FeaturesMixin, QO
 
     kicked            = pyqtSignal(str)
     banned            = pyqtSignal(str)
+    pin_required      = pyqtSignal()
     ban_list_updated  = pyqtSignal(list)
 
     draw_stroke_received = pyqtSignal(int, str, str, list, int)
@@ -118,6 +125,7 @@ class NetworkClient(WebRTCMixin, CameraWebRTCMixin, ChatMixin, FeaturesMixin, QO
         self._ip     = None
         self._nick   = None
         self._avatar = None
+        self._pin    = ''
         self._is_connected       = False
         self._reconnecting       = False
         self._reconnect_attempts = 0
@@ -166,10 +174,11 @@ class NetworkClient(WebRTCMixin, CameraWebRTCMixin, ChatMixin, FeaturesMixin, QO
         except Exception as e:
             print(f"[Net] Socket init error: {e}")
 
-    def connect_to_server(self, ip, nick, avatar):
+    def connect_to_server(self, ip, nick, avatar, pin=''):
         self._ip     = ip
         self._nick   = nick
         self._avatar = avatar
+        self._pin    = str(pin or '')
         self._reconnect_attempts = 0
         self._reconnecting       = False
         self._kicked_flag        = False
@@ -208,7 +217,8 @@ class NetworkClient(WebRTCMixin, CameraWebRTCMixin, ChatMixin, FeaturesMixin, QO
         except Exception:
             pass
 
-        self.send_json({"action": "login", "nick": self._nick, "avatar": self._avatar})
+        self.send_json({"action": "login", "nick": self._nick,
+                        "avatar": self._avatar, "pin": getattr(self, "_pin", "")})
         self.running       = True
         self._is_connected = True
         self._shutdown_event.clear()
